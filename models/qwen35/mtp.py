@@ -42,6 +42,12 @@ class MTP:
         self.mlp = MLP(sd, f"{p}.layers.0.mlp", bench)
         self.norm = RMSNorm(sd[f"{p}.norm.weight"])
         self.pos = torch.zeros(1, dtype=torch.long, device="cuda")
+        #: mRoPE offset of the request being drafted, matching ``Qwen35.rope_delta``:
+        #: the drafter's rotation reads ``pos + rope_delta`` while ``pos`` keeps
+        #: addressing the KV slot.  The caller (``Qwen35.spec_step`` /
+        #: ``spec_step_batch``) copies the row's value in before a draft, because
+        #: the captured draft graph can only add a buffer, not branch on one.
+        self.rope_delta = torch.zeros(1, dtype=torch.long, device="cuda")
 
         # Drafting runs as a captured graph. The chain (h, token) -> (h', token')
         # lives entirely in these device buffers, so K drafts are K replays with
@@ -75,13 +81,15 @@ class MTP:
     def reset(self) -> None:
         self.attn.reset()
         self.pos.zero_()
+        self.rope_delta.zero_()
 
     def _draft_impl(self) -> None:
         """One draft step over fixed buffers; the tail token feeds the next."""
-        cos_tbl, sin_tbl, mask_idx = self._ctx
+        cos_tbl, sin_tbl, mask_idx = self._ctx[0], self._ctx[1], self._ctx[2]
         e = self.embed.lookup(self.tok_in).view(-1)
         x = self.fc(torch.cat([self.pre_norm_emb(e), self.pre_norm_hid(self.h_in)], dim=-1))
-        h = x + self.attn(self.in_ln(x), self.pos, cos_tbl, sin_tbl, mask_idx)
+        h = x + self.attn(self.in_ln(x), self.pos, cos_tbl, sin_tbl, mask_idx,
+                          self.rope_delta)
         h = h + self.mlp(self.post_ln(h))
         h = self.norm(h)
         self.h_in.copy_(h)
@@ -122,24 +130,37 @@ class MTP:
             out_toks[i:i + 1].copy_(self.tok_in)
 
     def step(self, h_prev: torch.Tensor, tok: torch.Tensor, ctx) -> tuple[torch.Tensor, torch.Tensor]:
-        """One eager draft step at ``self.pos``; returns (h', logits) and advances pos."""
-        cos_tbl, sin_tbl, mask_idx = ctx
+        """One eager draft step at ``self.pos``; returns (h', logits) and advances pos.
+
+        ``ctx`` is the main model's ``(cos_tbl, sin_tbl, mask_idx)`` (an optional
+        4th entry is ignored); the rotation adds :attr:`rope_delta`, which the
+        caller keeps in step with the main model's row.
+        """
+        cos_tbl, sin_tbl, mask_idx = ctx[0], ctx[1], ctx[2]
         e = self.embed.lookup(tok.reshape(1)).view(-1)
         x = self.fc(torch.cat([self.pre_norm_emb(e), self.pre_norm_hid(h_prev)], dim=-1))
-        h = x + self.attn(self.in_ln(x), self.pos, cos_tbl, sin_tbl, mask_idx)
+        h = x + self.attn(self.in_ln(x), self.pos, cos_tbl, sin_tbl, mask_idx,
+                          self.rope_delta)
         h = h + self.mlp(self.post_ln(h))
         h = self.norm(h)
         self.pos.add_(1)
         return h, self.embed(h)
 
     def prefill(self, H: torch.Tensor, next_toks: torch.Tensor, positions: torch.Tensor,
-                ctx) -> None:
+                ctx, rope=None) -> None:
         """Fill the MTP KV cache over a run of prompt positions.
 
         ``H[i]`` is the main model's hidden state at ``positions[i]`` and
         ``next_toks[i]`` is the token that follows it -- the MTP head is trained on
         exactly that pair, so the caller passes the already-shifted tokens (there is
         no shift inside, or a chunked caller would shift twice).
+
+        ``rope`` is an optional explicit ``(cos, sin)`` pair of ``[n, rot]`` rows
+        for a prompt region that contains image tokens (``ops.mrope``): the
+        drafter is a full-attention layer over the same positions as the main
+        model, so it has to rotate identically.  ``None`` keeps the 1-D table
+        path; either way ``positions`` addresses the KV slots and ``ctx`` stays
+        the main model's tuple.
 
         The queries are tiled and the keys streamed like the main attention
         (``PREFILL_ATTN_TILE`` / ``PREFILL_ATTN_KB``): without the query tiles the
@@ -149,6 +170,10 @@ class MTP:
         n = min(int(positions.shape[0]), int(H.shape[0]), int(next_toks.shape[0]))
         if n <= 0:
             return
+        if len(ctx) > 3:                  # the caller put the rope pair on ctx
+            if rope is None:
+                rope = ctx[3]
+            ctx = ctx[:3]
         e = self.embed.lookup(next_toks[:n])
         # ``fc`` must go through the batched path: the fused GEMV takes a single
         # [K] vector, so calling it with [n, 2*hidden] silently reads row 0 only.
@@ -162,8 +187,10 @@ class MTP:
             tiles = ([(q0, min(q0 + Q, n_loc), base, base + min(q0 + Q, n_loc))
                       for q0 in range(0, n_loc, Q)]
                      if n_loc > Q else None)
+            rope_c = None if rope is None else (rope[0][c0:c1], rope[1][c0:c1])
             x[c0:c1] = x[c0:c1] + self.attn.prefill(self.in_ln(x[c0:c1]),
-                                                    positions[c0:c1], ctx, tiles)
+                                                    positions[c0:c1], ctx, tiles,
+                                                    rope=rope_c)
             x[c0:c1] = x[c0:c1] + self.mlp.prefill(self.post_ln(x[c0:c1]))
             _ = self.norm(x[c0:c1])
         self.pos.fill_(int(positions[n - 1]) + 1)
@@ -212,6 +239,10 @@ class MTP:
         self.b_h_prev = torch.zeros(capacity, hidden, dtype=D, device="cuda")
         self.b_logits = torch.zeros(capacity, self.embed.shape[0], dtype=D, device="cuda")
         self._ctx_lens = torch.ones(capacity, dtype=torch.int32, device="cuda")
+        #: Per-row mRoPE offset of the batched drafter, mirrored from the main
+        #: model's ``rope_delta`` by the caller (``Qwen35.spec_step_batch``); 0 for
+        #: a text-only bucket, so the default bucket is unchanged.
+        self.b_rope_delta = torch.zeros(capacity, dtype=torch.long, device="cuda")
         self.capture_draft_batch()
 
     def check_len(self, max_position: int) -> None:
@@ -223,14 +254,15 @@ class MTP:
 
     def _draft_batch_impl(self, rows: int) -> None:
         """One draft step for ``rows`` rows: the chain tail feeds the next replay."""
-        cos_tbl, sin_tbl, mask_idx = self._ctx
+        cos_tbl, sin_tbl, mask_idx = self._ctx[0], self._ctx[1], self._ctx[2]
         self._ctx_lens[:rows].copy_(
             self.b_pos[:rows].to(torch.int32).add_(1))
         e = self.embed.lookup(self.b_tok[:rows])
         x = batch_proj(self.fc, torch.cat([self.pre_norm_emb(e),
                                            self.pre_norm_hid(self.b_h[:rows])], dim=-1))
         h = x + self.attn_b.batch(self.in_ln(x), self.b_pos[:rows],
-                                  (cos_tbl, sin_tbl, mask_idx, self._ctx_lens))
+                                  (cos_tbl, sin_tbl, mask_idx, self._ctx_lens,
+                                   self.b_rope_delta))
         h = h + self.mlp.batch(self.post_ln(h))
         h = self.norm(h)
         self.b_h[:rows].copy_(h)
@@ -271,16 +303,21 @@ class MTP:
 
     @torch.no_grad()
     def prefill_row(self, row: int, H: torch.Tensor, next_toks: torch.Tensor,
-                    positions: torch.Tensor, ctx) -> None:
+                    positions: torch.Tensor, ctx, rope=None) -> None:
         """Fill one row's paged drafter KV over a run of prompt positions.
 
         Same maths as :meth:`prefill`, but the attention writes/reads ``row``'s
-        slot map instead of the single-stream dense cache.
+        slot map instead of the single-stream dense cache.  ``rope`` is the same
+        optional explicit 3-D ``(cos, sin)`` pair (image tokens in this region).
         """
         assert self.attn_b is not None, "enable_spec_batch() first"
         n = min(int(positions.shape[0]), int(H.shape[0]), int(next_toks.shape[0]))
         if n <= 0:
             return
+        if len(ctx) > 3:                  # the caller put the rope pair on ctx
+            if rope is None:
+                rope = ctx[3]
+            ctx = ctx[:3]
         # The drafter pool only addresses positions in [0, batch_len): a prompt
         # longer than the drafter window must not write past it.  Prefill the
         # prefix that fits and let spec_step_batch report the overflow via
@@ -300,8 +337,10 @@ class MTP:
             tiles = ([(q0, min(q0 + Q, n_loc), base, base + min(q0 + Q, n_loc))
                       for q0 in range(0, n_loc, Q)]
                      if n_loc > Q else None)
+            rope_c = None if rope is None else (rope[0][c0:c1], rope[1][c0:c1])
             x[c0:c1] = x[c0:c1] + self.attn_b.prefill(
-                self.in_ln(x[c0:c1]), positions[c0:c1], ctx, tiles, row=row)
+                self.in_ln(x[c0:c1]), positions[c0:c1], ctx, tiles, row=row,
+                rope=rope_c)
             x[c0:c1] = x[c0:c1] + self.mlp.prefill(self.post_ln(x[c0:c1]))
 
     def close(self) -> None:

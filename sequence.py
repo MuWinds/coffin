@@ -65,6 +65,10 @@ class Sequence:
         self.matched: int = 0
         #: Set by the runner when the model itself ended the sequence.
         self.stop_reason: str | None = None
+        #: Multimodal payload of the prompt (``mm_input.MMInput``) or ``None``.
+        #: Carried here so the runner, the block manager and the radix tree can
+        #: all see the image digest without a parallel side table.
+        self.mm = None
 
     def __len__(self) -> int:
         return len(self.token_ids)

@@ -122,7 +122,8 @@ class FullAttn:
         q = (x.float() / s[:, None]).round().clamp_(-127, 127).to(torch.int8)
         return q, s
 
-    def __call__(self, x: torch.Tensor, pos1, cos_tbl, sin_tbl, mask_idx) -> torch.Tensor:
+    def __call__(self, x: torch.Tensor, pos1, cos_tbl, sin_tbl, mask_idx,
+                 rope_delta=None) -> torch.Tensor:
         qg, k, v = self.qkv(x)
         qg = qg.reshape(self.nh, 2 * self.hd)
         q, gate = qg[:, :self.hd], qg[:, self.hd:]
@@ -130,8 +131,13 @@ class FullAttn:
         k = self.k_norm(k.reshape(self.nkv, self.hd))
         v = v.reshape(self.nkv, self.hd)
 
-        cos = cos_tbl.index_select(0, pos1)
-        sin = sin_tbl.index_select(0, pos1)
+        # ``pos1`` stays the *token index* everywhere else in this method (it is
+        # what addresses the KV slot); only the rotation reads the mRoPE position,
+        # which is ``token_index + rope_delta`` once a prompt has an image.  With
+        # no image ``rope_delta`` is 0 and the lookup is the old one, bit for bit.
+        idx = pos1 if rope_delta is None else pos1 + rope_delta
+        cos = cos_tbl.index_select(0, idx)
+        sin = sin_tbl.index_select(0, idx)
         q, k = apply_rope(q, k, cos, sin, self.rot)
 
         qk, sk = self._quant(k)
@@ -192,9 +198,14 @@ class FullAttn:
         kernels are numerically identical to the single-row ones.  Without the
         batch kernels this falls back to calling the single-token kernel once per
         row on row slices; both paths must stay bit-identical per row.
+
+        ``ctx`` may carry a 5th entry: the per-row ``rope_delta`` ``[B]`` long
+        (mRoPE text offset of a request that has an image).  It only moves the
+        cos/sin lookup; ``positions`` keeps addressing the KV slot.
         """
         cos_tbl, sin_tbl, mask_idx = ctx[0], ctx[1], ctx[2]
         ctx_lens = ctx[3] if len(ctx) > 3 else None
+        rope_delta = ctx[4] if len(ctx) > 4 else None
         B = x.shape[0]
         if not hip_ops.available() or self.pool is None:
             raise RuntimeError("batched attention needs hip_ops and a paged pool")
@@ -205,8 +216,9 @@ class FullAttn:
         k = self.k_norm(k.reshape(B, self.nkv, self.hd))
         v = v.reshape(B, self.nkv, self.hd)
 
-        cos = cos_tbl.index_select(0, positions).unsqueeze(1)   # [B, 1, rot]
-        sin = sin_tbl.index_select(0, positions).unsqueeze(1)
+        rope_pos = positions if rope_delta is None else positions + rope_delta[:B]
+        cos = cos_tbl.index_select(0, rope_pos).unsqueeze(1)   # [B, 1, rot]
+        sin = sin_tbl.index_select(0, rope_pos).unsqueeze(1)
         q, k = apply_rope(q, k, cos, sin, self.rot)
 
         kp, vp, kps, vps = self._pool_views()
@@ -282,8 +294,11 @@ class FullAttn:
         q = self.q_norm(q)
         k = self.k_norm(k.view(b, c, self.nkv, self.hd))
         v = v.view(b, c, self.nkv, self.hd)
-        cos = cos_tbl.index_select(0, positions.reshape(-1)).view(b, c, 1, self.rot)
-        sin = sin_tbl.index_select(0, positions.reshape(-1)).view(b, c, 1, self.rot)
+        # The rotation's position is ``token index + rope_delta``; the KV slot and
+        # the per-row window stay at the token index.
+        rope_pos = positions if len(ctx) < 5 else positions + ctx[4][:b, None]
+        cos = cos_tbl.index_select(0, rope_pos.reshape(-1)).view(b, c, 1, self.rot)
+        sin = sin_tbl.index_select(0, rope_pos.reshape(-1)).view(b, c, 1, self.rot)
         q, k = apply_rope(q, k, cos, sin, self.rot)
 
         # every verified token's K/V goes in, then the multi-query attention reads
@@ -312,17 +327,20 @@ class FullAttn:
         Same attention as the decode step (the fused paged kernel, so the numbers
         agree with greedy), one batched launch for the whole bucket: the verify
         graph projects all ``B*c`` tokens once and then walks the ``c`` token
-        positions through this entry point.
+        positions through this entry point.  ``ctx`` may carry the per-row
+        ``rope_delta`` as a 5th entry (mRoPE after an image; ``positions`` keeps
+        addressing the KV slot).
         """
-        cos_tbl, sin_tbl, mask_idx = ctx
+        cos_tbl, sin_tbl, mask_idx = ctx[0], ctx[1], ctx[2]
         b = qg.shape[0]
         qg = qg.reshape(b, self.nh, 2 * self.hd)
         q, gate = qg[..., :self.hd], qg[..., self.hd:]
         q = self.q_norm(q)
         k = self.k_norm(k.reshape(b, self.nkv, self.hd))
         v = v.reshape(b, self.nkv, self.hd)
-        cos = cos_tbl.index_select(0, positions).unsqueeze(1)
-        sin = sin_tbl.index_select(0, positions).unsqueeze(1)
+        rope_pos = positions if len(ctx) < 5 else positions + ctx[4][:b]
+        cos = cos_tbl.index_select(0, rope_pos).unsqueeze(1)
+        sin = sin_tbl.index_select(0, rope_pos).unsqueeze(1)
         q, k = apply_rope(q, k, cos, sin, self.rot)
         qk, sk = self._quant_rows(k)
         qv, sv = self._quant_rows(v)
@@ -338,16 +356,28 @@ class FullAttn:
 
     def prefill_attend(self, qg: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                        positions: torch.Tensor, ctx, tiles: list | None = None,
-                       row: int | None = None) -> torch.Tensor:
+                       row: int | None = None, rope=None) -> torch.Tensor:
         """Attention half of prefill: raw ``(qg, k, v)`` -> gated ``[C, nh*hd]``.
 
         Writes the C tokens into ``row``'s KV slots and attends over that row's
         own window.  ``o_proj`` is left to the caller, so a group prefill can run
         it once over every sequence's output (it is a weight read).
+
+        ``rope`` is an optional explicit ``(cos, sin)`` pair of ``[C, rot]`` rows
+        (``ops.mrope.MRopeMapper``), used by a chunk that contains image tokens:
+        there the three position axes differ per token, so a single table lookup
+        cannot produce the rotation, and the causal/KV side still uses
+        ``positions``.  ``None`` keeps the 1-D table path unchanged.  When the
+        argument is ``None`` but ``ctx`` carries a 4th entry, that entry is the
+        rope pair: the prefill call chain (``Layer.prefill`` ->
+        ``prefill_state``) only forwards ``ctx``, and this is the same pass-through
+        style ``FullAttn.batch`` already uses for ``ctx_lens``.
         """
         if row is None:
             row = self.prefill_row
-        cos_tbl, sin_tbl, mask_idx = ctx
+        cos_tbl, sin_tbl, mask_idx = ctx[0], ctx[1], ctx[2]
+        if rope is None and len(ctx) > 3:
+            rope = ctx[3]
         C = qg.shape[0]
         if tiles is None:
             p0, p1 = int(positions[0]), int(positions[-1]) + 1
@@ -359,8 +389,12 @@ class FullAttn:
         k = self.k_norm(k.reshape(C, self.nkv, self.hd))
         v = v.reshape(C, self.nkv, self.hd)
 
-        cos = cos_tbl.index_select(0, positions).unsqueeze(1)   # [C, 1, rot]
-        sin = sin_tbl.index_select(0, positions).unsqueeze(1)
+        if rope is None:
+            cos = cos_tbl.index_select(0, positions).unsqueeze(1)   # [C, 1, rot]
+            sin = sin_tbl.index_select(0, positions).unsqueeze(1)
+        else:
+            cos = rope[0].to(cos_tbl.dtype).unsqueeze(1)            # [C, 1, rot]
+            sin = rope[1].to(sin_tbl.dtype).unsqueeze(1)
         q, k = apply_rope(q, k, cos, sin, self.rot)
 
         qk, sk = self._quant_seq(k)
@@ -438,7 +472,8 @@ class FullAttn:
         return out.reshape(C, -1)
 
     def prefill(self, x: torch.Tensor, positions: torch.Tensor, ctx,
-                tiles: list | None = None, row: int | None = None) -> torch.Tensor:
+                tiles: list | None = None, row: int | None = None,
+                rope=None) -> torch.Tensor:
         """``x`` [C, hidden] -> [C, hidden]; writes C tokens into the KV cache.
 
         With ``tiles`` (``(q0, q1, kend)`` triples from ``Qwen35.prefill``) the
@@ -449,20 +484,24 @@ class FullAttn:
         thrown away.  Tiling cuts the score/softmax/PV traffic by the same fraction
         and makes the block small enough to stay in cache.  ``row`` selects the
         slot-map row (default: the staging row); the batched drafter passes each
-        sequence's own row.
+        sequence's own row.  ``rope`` is the optional explicit 3-D ``(cos, sin)``
+        for a chunk with image tokens (see :meth:`prefill_attend`).
         """
         proj = self.prefill_project(x)
         out = self.prefill_attend(*proj, positions, ctx, tiles,
-                                  self.prefill_row if row is None else row)
+                                  self.prefill_row if row is None else row, rope)
         return self.o_proj.prefill(out)
 
-    def verify(self, x: torch.Tensor, positions, cos_tbl, sin_tbl, mask_idx) -> torch.Tensor:
+    def verify(self, x: torch.Tensor, positions, cos_tbl, sin_tbl, mask_idx,
+               rope_delta=None) -> torch.Tensor:
         """``x`` [C, hidden] -> [C, hidden] for C drafted tokens at ``positions``.
 
         The projections are batched; each token then runs through the same fused
         attention as the decode step, writing its own KV slot. Rollback is free
         here: the cache is position-indexed, so rewinding is just the position
-        counter.
+        counter.  ``rope_delta`` (optional, 0-d or ``[1]`` long) is the request's
+        mRoPE offset: ``positions`` keeps addressing KV slots, the rotation reads
+        ``positions + rope_delta``.
         """
         C = x.shape[0]
         qg, k, v = self.qkv.prefill(x)
@@ -471,12 +510,13 @@ class FullAttn:
         q = self.q_norm(q)
         k = self.k_norm(k.reshape(C, self.nkv, self.hd))
         v = v.reshape(C, self.nkv, self.hd)
+        rope_pos = positions if rope_delta is None else positions + rope_delta.reshape(())
         out = torch.empty(C, self.nh, self.hd, dtype=D, device="cuda")
         kp, vp, kps, vps = self._pool_views() if self.pool is not None else (None,) * 4
         for i in range(C):
             qi, ki, vi = q[i], k[i], v[i]
-            cos = cos_tbl.index_select(0, positions[i:i + 1])
-            sin = sin_tbl.index_select(0, positions[i:i + 1])
+            cos = cos_tbl.index_select(0, rope_pos[i:i + 1])
+            sin = sin_tbl.index_select(0, rope_pos[i:i + 1])
             qi, ki = apply_rope(qi, ki, cos, sin, self.rot)
             qk, sk = self._quant(ki)
             qv, sv = self._quant(vi)

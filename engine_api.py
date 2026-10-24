@@ -192,15 +192,22 @@ def create_model(model_dir: str | Path, max_seq: int = 4096, bench: bool = True,
 
 def load_weights(model_dir: str | Path, quant: bool = False,
                  weight_dtype: "torch.dtype | None" = None,
-                 architecture: str | None = None) -> dict:
+                 architecture: str | None = None, vision: bool | None = None,
+                 vision_quant: bool = False) -> dict:
     """Read this checkpoint's weights onto the GPU, for a resident server.
 
     Kept separate from :func:`create_model` because a reload rebuilds the model
     from the tensors already in VRAM instead of reading 9 GB from disk again.
+
+    ``vision``/``vision_quant`` control the tower's tensors only: ``None`` means
+    "load them iff the checkpoint declares a ``vision_config``", and
+    ``vision_quant`` stores the tower's GEMM weights as int8 (a separate memory
+    policy from the text model's, which ``quant`` governs).
     """
     entry = _entry_for(model_dir, architecture)
     kwargs: dict[str, Any] = {} if weight_dtype is None else {"weight_dtype": weight_dtype}
-    return entry.load_weights(Path(model_dir), quant=quant, **kwargs)
+    return entry.load_weights(Path(model_dir), quant=quant, vision=vision,
+                              vision_quant=vision_quant, **kwargs)
 
 
 def describe(model_dir: str | Path, architecture: str | None = None) -> dict:
@@ -220,12 +227,15 @@ def describe(model_dir: str | Path, architecture: str | None = None) -> dict:
 #: ``from ops.gemv import GEMV`` at the top of a model module picks up the class
 #: object the just-reloaded ops module defines.
 _RELOAD_ORDER = (
-    "ops.dtypes", "ops.gemv", "ops.embed", "ops.norm", "ops.rope", "ops.delta",
+    "ops.dtypes", "ops.gemv", "ops.embed", "ops.norm", "ops.rope", "ops.mrope",
+    "ops.delta",
     "ops",
     "models.qwen35.tuning", "models.qwen35.weights", "models.qwen35.batch",
+    "models.qwen35.vision",
     "models.qwen35.linear_attn",
     "models.qwen35.full_attn", "models.qwen35.blocks", "models.qwen35.mtp",
     "models.qwen35.model", "models.qwen35", "models",
+    "mm_input",
     "config", "sequence", "paged_cache", "radix_cache", "block_manager",
     "prefix_engine", "model_runner", "scheduler", "llm_engine",
     "engine_api",

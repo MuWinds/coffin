@@ -101,11 +101,19 @@ class LLMEngine:
         self.build_s = time.time() - t0
 
     def add_request(self, token_ids: list[int],
-                    params: SamplingParams | None = None) -> Sequence:
+                    params: SamplingParams | None = None,
+                    mm=None) -> Sequence:
+        """Queue one prompt; ``mm`` is its image payload (``mm_input.MMInput``).
+
+        The payload rides on the sequence so the runner, the block manager and the
+        radix tree all read the same object: the tree needs ``mm.digest``/``spans``
+        to salt its block keys, and the model needs the embeddings.
+        """
         params = params or SamplingParams()
         if not params.eos:
             params.eos = set(self.eos)
         seq = Sequence(token_ids, params)
+        seq.mm = mm
         self.scheduler.add(seq)
         self.n_requests += 1
         self.n_prompt_tokens += len(seq)
@@ -238,9 +246,10 @@ class LLMEngine:
 
     @torch.inference_mode()
     def generate(self, token_ids: list[int],
-                 params: SamplingParams | None = None) -> dict:
+                 params: SamplingParams | None = None,
+                 mm=None) -> dict:
         """One full request; returns tokens plus the prefill/decode split."""
-        seq = self.add_request(token_ids, params)
+        seq = self.add_request(token_ids, params, mm=mm)
         t0 = time.time()
         out = list(self.stream(seq))
         total = time.time() - t0

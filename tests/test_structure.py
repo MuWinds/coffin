@@ -96,8 +96,14 @@ class RegistryTest(unittest.TestCase):
     def test_load_weights_dispatches_to_the_family_loader(self):
         seen: dict = {}
 
-        def _fake_loader(model_dir, quant=False, weight_dtype=None):
-            seen["call"] = (model_dir, quant, weight_dtype)
+        # The family loader contract: positional ``model_dir`` plus the text
+        # quantisation knobs and the vision ones (defaults so a text-only family
+        # can ignore them).  The vision kwargs are new -- the multimodal work
+        # added them, and this test is what keeps the dispatch and the contract
+        # in step for every family, not just qwen35.
+        def _fake_loader(model_dir, quant=False, weight_dtype=None,
+                         vision=None, vision_quant=False):
+            seen["call"] = (model_dir, quant, weight_dtype, vision, vision_quant)
             return {"ok": True}
 
         real = engine_api._REGISTRY["qwen3_5"]
@@ -107,7 +113,7 @@ class RegistryTest(unittest.TestCase):
         finally:
             engine_api._REGISTRY["qwen3_5"] = real
         self.assertEqual(weights, {"ok": True})
-        self.assertEqual(seen["call"][1:], (True, None))
+        self.assertEqual(seen["call"][1:], (True, None, None, False))
 
 
 @unittest.skipUnless(support.has_model(), f"no checkpoint at {support.MODEL_DIR}")

@@ -60,6 +60,9 @@ with the totals just before ``[DONE]``.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
+import itertools
 import json
 import os
 import re
@@ -75,6 +78,202 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 SOCK = os.environ.get("ENGINE_SOCK", "/tmp/qwen35.sock")
 TOOL_OPEN = "<tool_call>"
 STATE: dict = {}
+
+# ---------------------------------------------------------------------------
+# Image parts: what this process validates, and what it deliberately does not
+# ---------------------------------------------------------------------------
+# This file is stdlib-only on purpose (no torch, no PIL) so the HTTP skin can run
+# anywhere the engine socket is reachable.  Everything here is therefore a *cheap*
+# check -- the shape of the data URL, the decoded byte counts, the image count --
+# and it exists to answer 400 before a byte reaches the engine.  The expensive
+# checks (PIL decode, decompression-bomb size, the processor's token expansion)
+# belong to serve.py, which owns those libraries and re-validates authoritatively
+# against its own configured limits.
+#
+#: Decoded bytes of one image.  A 1 MP PNG is ~1-3 MB, so 8 MiB is generous and
+#: still bounded; base64 inflates it 4/3 on the wire.
+MAX_IMAGE_BYTES = int(os.environ.get("ENGINE_MAX_IMAGE_BYTES", 8 * 1024 * 1024))
+#: Images per request.  Four 1 MP images are already ~4k image tokens.
+MAX_IMAGES = int(os.environ.get("ENGINE_MAX_IMAGES", 4))
+#: Base64 characters of all image parts of one request, before decoding.
+MAX_IMAGE_TOTAL_BYTES = int(os.environ.get("ENGINE_MAX_IMAGE_TOTAL_BYTES", 16 * 1024 * 1024))
+#: MIME types accepted on the data URL.  The processor decodes with PIL, so the
+#: set is "what PIL opens reliably and the model was trained on".
+IMAGE_MIMES = ("image/png", "image/jpeg", "image/jpg", "image/webp", "image/bmp",
+               "image/gif")
+_DATA_URL = re.compile(r"^data:(?P<mime>[-\w.+]+/[-\w.+]+)?(?P<params>[^,]*),"
+                       r"(?P<data>.*)$", re.DOTALL)
+
+
+class ImagePartError(ValueError):
+    """A client-supplied image part this process refuses (-> HTTP 400)."""
+
+
+def _decode_data_url(url: str) -> tuple[bytes, str]:
+    """``data:image/png;base64,...`` -> ``(raw bytes, mime)``.
+
+    Only base64 data URLs are accepted: v1 does not fetch ``http(s)`` URLs (the
+    container has no egress and a fetch would be an SSRF surface), and a URL that
+    would make the *server* do the I/O is exactly the thing a caller cannot audit.
+    """
+    if not isinstance(url, str) or not url:
+        raise ImagePartError("image_url.url must be a non-empty string")
+    m = _DATA_URL.match(url.strip())
+    if not m:
+        if url.lower().startswith(("http://", "https://")):
+            raise ImagePartError(
+                "only `data:` URLs are supported for image_url; this build does not "
+                "fetch remote images -- send the bytes inline as "
+                "`data:image/png;base64,...`")
+        raise ImagePartError(
+            "image_url.url must be a `data:image/<type>;base64,<payload>` URL")
+    mime = (m.group("mime") or "image/png").lower()
+    if mime == "image/jpg":
+        mime = "image/jpeg"
+    if mime not in IMAGE_MIMES:
+        raise ImagePartError(
+            f"unsupported image type {mime!r}; supported: {', '.join(sorted(set(IMAGE_MIMES)))}")
+    params = (m.group("params") or "").lower()
+    if "base64" not in params:
+        raise ImagePartError("image_url.url must be base64-encoded (data:...;base64,)")
+    b64 = re.sub(r"\s+", "", m.group("data") or "")
+    if not b64:
+        raise ImagePartError("image_url.url carries no data")
+    try:
+        raw = base64.b64decode(b64, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ImagePartError(f"image_url.url is not valid base64: {exc}") from None
+    if not raw:
+        raise ImagePartError("image_url.url decodes to zero bytes")
+    if len(raw) > MAX_IMAGE_BYTES:
+        raise ImagePartError(
+            f"image is {len(raw) / 2**20:.2f} MiB decoded, over the "
+            f"{MAX_IMAGE_BYTES / 2**20:.0f} MiB per-image limit; downscale it first")
+    return raw, mime
+
+
+def _split_parts(content, budget: dict) -> tuple[object, list[dict]]:
+    """Split one message's ``content`` into (template-safe content, image payloads).
+
+    An OpenAI vision message is a *parts* array in which one part carries the
+    image bytes and the rest carry text.  The checkpoint's chat template knows only
+    two things: text, and a ``{"type": "image"}`` marker that it renders as
+    ``<|vision_start|><|image_pad|><|vision_end|>`` (the placeholders the engine's
+    processor later expands to one token per visual patch).  So the image parts are
+    lifted out of the array -- their bytes become ``images[]`` on the engine
+    request -- and replaced in place by that marker, which keeps the *order* of
+    text and images exactly as the client wrote it.
+
+    ``budget`` is a mutable per-request dict (``{"images": n, "b64": chars}``) so
+    the count and total-size limits apply to the whole request, not per message.
+    ``b64`` counts the *data URL* characters the client sent (what has to travel
+    over the wire and be held in memory), not just the payload.
+
+    Returns ``(content, images)``: ``content`` is the untouched value when the
+    message has no image part, which is what keeps the text-only request path
+    byte-for-byte what it was.
+    """
+    if not isinstance(content, list):
+        return content, []
+    parts: list = []
+    images: list[dict] = []
+    for part in content:
+        if isinstance(part, str):
+            parts.append({"type": "text", "text": part})
+            continue
+        if not isinstance(part, dict):
+            raise ImagePartError(f"content part must be an object, got {type(part).__name__}")
+        kind = part.get("type")
+        if kind in (None, "text"):
+            parts.append({"type": "text", "text": part.get("text") or ""})
+            continue
+        if kind in ("video", "video_url", "input_video"):
+            raise ImagePartError(
+                "video input is not supported: frame count -> token count is not "
+                "bounded by this build's image limits")
+        if kind == "input_audio":
+            raise ImagePartError("audio input is not supported by this model")
+        if kind not in ("image_url", "image"):
+            raise ImagePartError(f"unsupported content part type {kind!r}")
+        holder = part.get("image_url")
+        if isinstance(holder, dict):
+            url = holder.get("url")
+        elif isinstance(holder, str):
+            url = holder
+        else:
+            url = None
+        if url is None and kind == "image":
+            url = part.get("image")
+            if isinstance(url, dict):
+                url = url.get("url")
+        if url is None:
+            raise ImagePartError(
+                f"`{kind}` part has no `image_url.url`; send "
+                "{{\"type\": \"image_url\", \"image_url\": {{\"url\": "
+                "\"data:image/png;base64,...\"}}}}")
+        # Count and total-size limits are checked before the decode: a request that
+        # already has too many images should not pay to base64-decode one more.
+        if budget.get("images", 0) >= MAX_IMAGES:
+            raise ImagePartError(
+                f"too many images: {MAX_IMAGES} per request is the limit")
+        budget["images"] = budget.get("images", 0) + 1
+        budget["b64"] = budget.get("b64", 0) + len(url)
+        if budget["b64"] > MAX_IMAGE_TOTAL_BYTES:
+            raise ImagePartError(
+                f"images total {budget['b64'] / 2**20:.2f} MiB of base64, over the "
+                f"{MAX_IMAGE_TOTAL_BYTES / 2**20:.0f} MiB per-request limit; send fewer "
+                f"or smaller images")
+        raw, mime = _decode_data_url(url)
+        images.append({"b64": base64.b64encode(raw).decode(), "mime": mime})
+        parts.append({"type": "image"})      # the template's own marker
+    return parts, images
+
+
+def _split_messages(messages: list) -> tuple[list, list[dict], str | None]:
+    """Pull every image out of a request's ``messages``.
+
+    ``-> (messages, images, error)``.  ``error`` is a human-readable 400 message,
+    or ``None``.  The three rules that cannot be deferred to the engine:
+
+    * a ``system`` message may not carry an image -- the template raises on it, so
+      the client would otherwise get an opaque 500 from a generation it cannot
+      debug;
+    * the per-request count/size budget (see ``_split_parts``);
+    * an image part in a role whose content the template never renders as media.
+    """
+    budget: dict = {"images": 0, "b64": 0}
+    out: list = []
+    images: list[dict] = []
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        m = dict(msg)
+        role = str(m.get("role") or "user").lower()
+        try:
+            content, found = _split_parts(m.get("content"), budget)
+        except ImagePartError as exc:
+            return [], [], str(exc)
+        if found:
+            if role in ("system", "developer"):
+                # The template itself raises for this, so reject it with a message
+                # that says what to do instead of surfacing a jinja traceback.
+                return [], [], ("a system message cannot contain images: the chat "
+                                "template rejects it; put the image in a user turn")
+            if role == "assistant":
+                # Historical assistant turns carry text; an image there has no
+                # template rendering and would be silently dropped.
+                return [], [], ("an assistant message cannot carry images; put the "
+                                "image in a user or tool message")
+            # ``tool`` IS accepted: an agent that calls a screenshot tool gets the
+            # capture back as the tool result, and that is the single most common
+            # way images enter this server.  The template renders it exactly like a
+            # user image (vision_start/image_pad/vision_end inside the message), and
+            # the processor expands it in prompt order, so no special case is
+            # needed beyond collecting the payload here.
+            images.extend(found)
+        m["content"] = content
+        out.append(m)
+    return out, images, None
 
 
 class EngineClient:
@@ -152,6 +351,36 @@ def _text_of(content) -> str:
     return str(content)
 
 
+def _has_image_part(content) -> bool:
+    return isinstance(content, list) and any(
+        isinstance(p, dict) and p.get("type") in ("image", "image_url") for p in content)
+
+
+def _template_content(content):
+    """What the chat template should receive for one message's ``content``.
+
+    Text-only content is flattened to a string (exactly as before, so a text-only
+    request renders byte-for-byte what it used to).  A message that carries an
+    image keeps its *parts array*, because that is the only shape the template
+    understands for media: each ``{"type": "image"}`` marker becomes
+    ``<|vision_start|><|image_pad|><|vision_end|>`` in place, preserving the
+    interleaving of text and images the client wrote.
+    """
+    if not _has_image_part(content):
+        return _text_of(content)
+    out = []
+    for part in content:
+        if isinstance(part, str):
+            part = {"type": "text", "text": part}
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") in ("image", "image_url"):
+            out.append({"type": "image"})
+        else:
+            out.append({"type": "text", "text": part.get("text") or ""})
+    return out
+
+
 def _norm_messages(messages: list) -> list[dict]:
     """Make the client's message list safe for the checkpoint's jinja template.
 
@@ -166,6 +395,9 @@ def _norm_messages(messages: list) -> list[dict]:
 
     and one whose ``arguments`` is the OpenAI JSON *string* rather than a mapping
     -- the template iterates that field with ``|items``.
+
+    A parts array that carries images is *not* flattened: the template renders
+    ``{"type": "image"}`` itself (see ``_template_content``).
     """
     out: list[dict] = []
     for msg in messages:
@@ -180,7 +412,7 @@ def _norm_messages(messages: list) -> list[dict]:
         elif role not in ("system", "user", "assistant", "tool"):
             role = "user"
         m["role"] = role
-        m["content"] = _text_of(m.get("content"))
+        m["content"] = _template_content(m.get("content"))
         calls = m.get("tool_calls")
         if isinstance(calls, list):
             fixed = []
@@ -724,9 +956,17 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
     def _chat(self, body: dict) -> None:
-        messages = _norm_messages(body.get("messages") or [])
+        raw_messages, images, err = _split_messages(body.get("messages") or [])
+        if err:
+            self._error(400, err)
+            return
+        messages = _norm_messages(raw_messages)
         if not messages:
             self._error(400, "`messages` must be a non-empty array")
+            return
+        if images and STATE.get("vision") is False:
+            self._error(503, "this server was started with --no-vision: image inputs "
+                             "are disabled", "server_error")
             return
         max_new = _max_tokens(body)
         temperature = float(body.get("temperature") or 0.0)
@@ -741,6 +981,7 @@ class Handler(BaseHTTPRequestHandler):
                                         "chat_template_kwargs") if k in body)
         print(f"[http] chat: {len(messages)} msgs {roles} max_new={max_new} "
               f"stream={stream} think={think} tools={bool(tools)} "
+              f"images={len(images)} "
               f"tool_choice={json.dumps(body.get('tool_choice'), ensure_ascii=False)} "
               f"forced_call={bool(forced)} usage_chunk={include_usage} "
               f"think_keys={think_keys}", flush=True)
@@ -753,6 +994,12 @@ class Handler(BaseHTTPRequestHandler):
                # the engine's own wall-clock cap: the only cutoff that also fires when
                # the client goes quiet without closing its socket
                "max_seconds": STATE.get("max_decode_seconds") or None}
+        if images:
+            # Base64 (already validated and re-encoded here) travels on the socket
+            # JSON: the engine decodes, preprocesses and expands the placeholder
+            # tokens itself with the checkpoint's own processor, so this process
+            # stays stdlib-only and never has to agree with it numerically.
+            req["images"] = images
         cid = "chatcmpl-" + uuid.uuid4().hex[:24]
         created = int(time.time())
         if stream:
@@ -786,7 +1033,13 @@ class Handler(BaseHTTPRequestHandler):
                    single_call: bool = False) -> None:
         out = STATE["engine"].call(req)
         if not out.get("ok", True):
-            self._error(500, f"engine: {out.get('error')}", "server_error")
+            # The engine says *why* and with which status: a bad image is a 400, a
+            # server without a vision tower a 503.  Collapsing all of them into 500
+            # would tell a client to retry a request that can never succeed.
+            self._error(int(out.get("status") or 500),
+                        f"engine: {out.get('error')}",
+                        "invalid_request_error" if int(out.get("status") or 500) < 500
+                        else "server_error")
             return
         calls = out.get("tool_calls") or []
         if single_call and len(calls) > 1:      # parallel_tool_calls: false
@@ -831,11 +1084,28 @@ class Handler(BaseHTTPRequestHandler):
         # one (the opener lives in the prompt, not in the generated text).
         tstream = ToolStream(seed=req.get("tool_prefix") or "",
                              max_calls=1 if single_call else None)
+        # The engine validates the request (image decode, processor expansion, the
+        # placeholder self-check) *before* its ``start`` line, so its first line can
+        # still be a rejection.  Nothing is written before that line arrives: an
+        # image request that is refused then gets a real 400/503 with the JSON error
+        # body an OpenAI client expects, instead of a 200 SSE stream carrying an
+        # error event -- which no client retries or reports usefully.
+        lines = STATE["engine"].stream(req)
+        try:
+            first = next(lines)
+        except StopIteration:
+            first = None
+        if first is not None and first.get("type") == "error":
+            self._error(int(first.get("status") or 400),
+                        f"engine: {first.get('error') or 'rejected the request'}")
+            return
         self._sse_start()
         emit([{"index": 0, "delta": {"role": "assistant", "content": ""},
                "finish_reason": None}])
         try:
-            for line in STATE["engine"].stream(req):
+            for line in itertools.chain([first] if first is not None else [], lines):
+                if line is None:
+                    continue
                 if line.get("type") == "start":
                     flt = AnswerFilter(bool(line.get("prompt_opens_think")))
                     if line.get("forced_tool"):
@@ -921,6 +1191,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    global MAX_IMAGES, MAX_IMAGE_BYTES, MAX_IMAGE_TOTAL_BYTES
+
     ap = argparse.ArgumentParser(description="OpenAI-compatible HTTP API in front of "
                                      "engine serve.py")
     ap.add_argument("--sock", default=SOCK,
@@ -948,7 +1220,26 @@ def main() -> None:
                          "every later request queues behind it")
     ap.add_argument("--timeout", type=float, default=900.0,
                     help="per-request engine timeout, seconds")
+    # -- image limits -------------------------------------------------------
+    # These mirror the defaults serve.py starts with; they are *this* process's
+    # cheap pre-check, and serve.py re-validates against its own configured limits
+    # (whatever --image-max-pixels / --max-images it was actually started with).
+    # Raising one here without raising it there just moves the 400 to the engine.
+    ap.add_argument("--max-images", type=int, default=MAX_IMAGES,
+                    help=f"images per request (default {MAX_IMAGES}); serve.py "
+                         f"re-checks against its own --max-images")
+    ap.add_argument("--max-image-bytes", type=int, default=MAX_IMAGE_BYTES,
+                    help="decoded bytes allowed per image (default 8 MiB)")
+    ap.add_argument("--max-image-total-bytes", type=int, default=MAX_IMAGE_TOTAL_BYTES,
+                    help="base64 characters of all image parts of one request "
+                         "(default 16 MiB)")
     args = ap.parse_args()
+
+    # The module-level defaults are what the pure functions use; the flags only
+    # exist because a deployment may want tighter limits than the defaults.
+    MAX_IMAGES = int(args.max_images)
+    MAX_IMAGE_BYTES = int(args.max_image_bytes)
+    MAX_IMAGE_TOTAL_BYTES = int(args.max_image_total_bytes)
 
     engine = EngineClient(args.sock, timeout=args.timeout)
     for _ in range(3):
@@ -968,13 +1259,22 @@ def main() -> None:
                   "enable_thinking": args.enable_thinking,
                   "default_max_tokens": args.default_max_tokens or -1,
                   "max_decode_seconds": args.max_decode_seconds,
+                  # what the engine can actually do with an image: the server may
+                  # have been started with --no-vision, and answering 503 here saves
+                  # a round trip that can only fail
+                  "vision": bool(info.get("vision", True)),
+                  "image_limits": {"max_images": MAX_IMAGES,
+                                   "max_image_bytes": MAX_IMAGE_BYTES,
+                                   "max_image_total_bytes": MAX_IMAGE_TOTAL_BYTES},
                   "created": int(time.time())})
     print(f"[server] engine up: {json.dumps(info, ensure_ascii=False)}", flush=True)
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     srv.daemon_threads = True
     print(f"[server] listening on http://{args.host}:{args.port}/v1 "
           f"(model id {served}, arch {info.get('arch')}, thinking={args.enable_thinking}, "
-          f"max_decode_seconds={args.max_decode_seconds or 'none'})", flush=True)
+          f"max_decode_seconds={args.max_decode_seconds or 'none'}, "
+          f"vision={STATE['vision']}, images<={MAX_IMAGES}x"
+          f"{MAX_IMAGE_BYTES / 2**20:.0f}MiB)", flush=True)
     srv.serve_forever()
 
 

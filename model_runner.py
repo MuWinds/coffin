@@ -112,7 +112,7 @@ class ModelRunner:
         """Feed the prompt (minus the cached prefix) and return next-token logits."""
         t0 = time.time()
         if self.pc is not None:
-            logits = self.pc.prefill(seq.token_ids)
+            logits = self.pc.prefill(seq.token_ids, mm=seq.mm)
             seq.matched = self.pc.last_matched
             if self.pc.seq is not None:
                 seq.block_table = list(self.pc.seq.blocks)
@@ -120,7 +120,7 @@ class ModelRunner:
             logits = self._prefill_batched(seq)
         else:
             self.model.reset()
-            logits = self.model.prefill(seq.token_ids)
+            logits = self.model.prefill(seq.token_ids, mm=seq.mm)
         seq.num_cached_tokens = int(self.model.pos1)
         seq.num_scheduled_tokens = seq.num_cached_tokens - seq.matched
         self.last_prefill_s = time.time() - t0
@@ -147,7 +147,8 @@ class ModelRunner:
         if radix is not None:
             bm.reserve((seq.num_tokens + bs - 1) // bs + 1)
             blocks, matched, states = bm.match_prefix(seq.token_ids[:-1],
-                                                      require_states=True)
+                                                      require_states=True,
+                                                      mm=seq.mm)
             seq.block_table = list(blocks)
             seq.matched = matched
         bm.ensure_blocks(seq, seq.num_tokens)
@@ -177,7 +178,7 @@ class ModelRunner:
         for c0 in range(0, head_len, step):
             c1 = min(c0 + step, head_len)
             logits = model.prefill(rest[c0:c1], chunk=self.cfg.chunk,
-                                   spec_row=spec_row)
+                                   spec_row=spec_row, mm=seq.mm)
             states_at[matched + c1] = model.snapshot_linear_states(row=stage)
             while len(states_at) > self.cfg.snapshots:
                 droppable = [k for k in states_at if k != matched]
@@ -186,11 +187,11 @@ class ModelRunner:
                 del states_at[min(droppable)]
         if head_len < len(rest) or logits is None:
             logits = model.prefill(rest[head_len:], chunk=self.cfg.chunk,
-                                   spec_row=spec_row)
+                                   spec_row=spec_row, mm=seq.mm)
 
         model.move_linear_states(stage, row)
         if radix is not None:
-            radix.insert(seq.token_ids, seq.block_table, states_at)
+            radix.insert(seq.token_ids, seq.block_table, states_at, mm=seq.mm)
         return logits
 
     def can_group_prefill(self) -> bool:
@@ -205,7 +206,8 @@ class ModelRunner:
         bs = bm.block_size
         bm.reserve((seq.num_tokens + bs - 1) // bs + 1)
         blocks, matched, states = bm.match_prefix(seq.token_ids[:-1],
-                                                  require_states=True)
+                                                  require_states=True,
+                                                  mm=seq.mm)
         seq.block_table = list(blocks)
         seq.matched = matched
         return matched, states
@@ -218,6 +220,9 @@ class ModelRunner:
         and recurrent state first (into its own row), the group forward starts
         every prompt at its own ``matched`` offset, and the block-boundary
         snapshots it returns are inserted back into the radix tree.
+
+        Image prompts pass their payload on ``seq.mm``; ``model.prefill_group``
+        reads it from the sequences itself, so this path needs no mm argument.
         """
         t0 = time.time()
         bm = self.bm
@@ -250,7 +255,7 @@ class ModelRunner:
                 if not droppable:
                     break
                 del states_at[min(droppable)]
-            radix.insert(seq.token_ids, seq.block_table, states_at)
+            radix.insert(seq.token_ids, seq.block_table, states_at, mm=seq.mm)
         self.last_prefill_s = time.time() - t0
         return logits
 

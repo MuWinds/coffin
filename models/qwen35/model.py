@@ -23,10 +23,11 @@ from models.qwen35.linear_attn import LinearAttn
 from models.qwen35.mtp import MTP
 from models.qwen35.tuning import CKPT, PREFILL_ATTN_TILE
 from models.qwen35.weights import load_weights
-from ops.dtypes import D
+from ops.dtypes import D, WF
 from ops.embed import TiedEmbedding
+from ops.mrope import mrope_cos_sin, scatter_image_embeds
 from ops.norm import RMSNorm
-from ops.rope import make_rope_tables
+from ops.rope import make_inv_freq, make_rope_tables
 from paged_cache import PagedKVCache
 
 
@@ -38,7 +39,8 @@ class Qwen35:
         :meth:`enable_paging` (PrefixCacheEngine does). The MTP layer is not paged
         -- its cache is not part of a prefix snapshot -- so it keeps its own."""
         model_dir = Path(model_dir)
-        self.cfg = json.loads((model_dir / "config.json").read_text())["text_config"]
+        self.raw_cfg = json.loads((model_dir / "config.json").read_text())
+        self.cfg = self.raw_cfg["text_config"]
         self.max_seq = max_seq
         sd = weights if weights is not None else load_weights(model_dir)
 
@@ -48,14 +50,26 @@ class Qwen35:
                        for i in range(self.cfg["num_hidden_layers"])]
         self.lm_head = self.embed
         self.mtp = MTP(sd, self.cfg, bench, max_seq) if "mtp.fc.weight" in sd else None
+        #: Vision tensors stay in the resident dict but are only turned into a
+        #: tower on the first image request (see ``enable_vision``); a text-only
+        #: server therefore carries the 0.62 GiB but never builds the module.
+        self.vision_sd = {k: v for k, v in sd.items()
+                          if k.startswith("model.visual.")}
+        self.vision = None
         if weights is None:                 # caller-owned dict stays resident
             sd.clear()
         torch.cuda.empty_cache()
 
         rp = self.cfg["rope_parameters"]
         self.rot = int(self.cfg["head_dim"] * rp["partial_rotary_factor"])
+        #: The one frequency axis: the 1-D decode tables and the 3-D mRoPE tables
+        #: both derive from it, so a text-only prompt gets identical cos/sin on
+        #: either path.
+        self.inv_freq = make_inv_freq(self.cfg["head_dim"], self.rot,
+                                      rp["rope_theta"], "cuda")
         self.cos_tbl, self.sin_tbl = make_rope_tables(
-            self.cfg["head_dim"], self.rot, rp["rope_theta"], max_seq, "cuda")
+            self.cfg["head_dim"], self.rot, rp["rope_theta"], max_seq, "cuda",
+            inv_freq=self.inv_freq)
 
         # graph-friendly fixed buffers.  ``pos``/``token_in``/``logits_out`` grow a
         # leading row dim when ``enable_batching`` is used; with the default
@@ -77,6 +91,17 @@ class Qwen35:
         self.pos = torch.zeros(1, dtype=torch.long, device="cuda")
         self.pos1 = self.pos[:1]
         self.mask_idx = torch.arange(max_seq, dtype=torch.long, device="cuda")
+        #: mRoPE offset of the request being decoded, per row: the mRoPE position
+        #: of token ``i`` is ``i + rope_delta``.  0 for a text-only request (where
+        #: the three axes collapse to 1-D and this is the identity), and the
+        #: constant ``MMInput.rope_delta`` after a prompt that contains an image --
+        #: the image block ends at ``max(h, w) / merge`` while consuming
+        #: ``h*w/merge**2`` tokens, so from then on the position runs ahead of the
+        #: token index.  Keeping it a *buffer add* inside the captured graphs is
+        #: what lets decode stay one replay: only the cos/sin row moves, every KV
+        #: slot is still addressed by the token index.
+        self.rope_delta = torch.zeros(1, dtype=torch.long, device="cuda")
+        self.rope_delta1 = self.rope_delta[:1]
         self.token_in = torch.zeros(1, dtype=torch.long, device="cuda")
         self.logits_out = torch.zeros(self.embed.shape[0], dtype=D, device="cuda")
         self.logits_single = self.logits_out
@@ -149,6 +174,8 @@ class Qwen35:
         self.mtp_prefill = False        # speculative decoding is single-stream only
         self.pos = torch.zeros(capacity, dtype=torch.long, device="cuda")
         self.pos1 = self.pos[self.prefill_row:self.prefill_row + 1]
+        self.rope_delta = torch.zeros(capacity, dtype=torch.long, device="cuda")
+        self.rope_delta1 = self.rope_delta[self.prefill_row:self.prefill_row + 1]
         self.token_in = torch.zeros(capacity, dtype=torch.long, device="cuda")
         self.logits_out = torch.zeros(capacity, self.embed.shape[0], dtype=D, device="cuda")
         self.logits_single = self.logits_out[self.prefill_row]
@@ -189,6 +216,13 @@ class Qwen35:
         tensors (and the device-resident slot map), so switching afterwards would
         leave a graph writing somewhere else. Returns the pool, which the caller
         drives through a :class:`~radix_cache.RadixCache`.
+
+        Caller contract: **assign a block table before any prefill or capture**.
+        ``pos2slot`` starts as all zeros, so running ``prefill()``/``capture()``
+        on a freshly paged model makes every position address pool slot 0 and
+        successive prefills read each other's KV.  The symptom looks like a
+        non-deterministic model but is a caller error; ``PrefixCacheEngine``
+        satisfies the contract by allocating blocks and calling ``assign_table``.
         """
         if self._graph is not None:
             raise RuntimeError("enable_paging() must be called before capture()")
@@ -210,6 +244,42 @@ class Qwen35:
         if self.batch_capacity > 1:
             self._prepare_pool_rows()
         return pool
+
+    def enable_vision(self, quant: bool = False, dtype=D) -> "VisionTower":
+        """Attach the vision tower, built lazily so text-only serving pays nothing.
+
+        The tower is not part of the decode graph: an image is encoded once per
+        request, before its tokens are prefilled, so it can be a plain eager
+        module.  Its weights live in the same resident dict as the text ones and
+        are released by :meth:`close`.
+        """
+        from models.qwen35.vision import VisionTower
+
+        if self.pool is None:
+            raise RuntimeError("enable_vision() needs the paged model (serve path)")
+        cfg = self.raw_cfg.get("vision_config")
+        if not cfg:
+            raise RuntimeError("this checkpoint has no vision_config")
+        if self.vision is None:
+            self.vision = VisionTower(self.vision_sd, cfg, device="cuda",
+                                      quant=quant, dtype=dtype)
+        return self.vision
+
+    def image_embeds(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
+        """Encode a batch of images into LLM token embeddings ``[Σtokens, hidden]``.
+
+        ``pixel_values`` is the processor's flattened patch tensor
+        ``[Σ t*h*w, C*tps*p*p]`` and ``grid_thw`` its ``(t, h, w)`` patch grids, in
+        prompt order.  The result is in that same order, which is exactly the order
+        of the prompt's ``<|image_pad|>`` tokens, so the caller can splice it in
+        without permuting anything.
+        """
+        if self.vision is None:
+            raise RuntimeError("vision tower not enabled (enable_vision())")
+        pv = pixel_values.to(device="cuda", dtype=WF)
+        gt = grid_thw.to(device="cuda", dtype=torch.long)
+        with torch.no_grad():
+            return self.vision(pv, gt).to(D)
 
     def snapshot_linear_states(self, row: int = 0) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
         """Clone every linear-attention layer's recurrent and conv state for ``row``.
@@ -239,7 +309,10 @@ class Qwen35:
 
         The bridge between the two halves of a batched step: a new request is
         prefilled on the staging row (``prefill_row``), then its recurrent state
-        is moved into the free decode row that will carry on generating.
+        is moved into the free decode row that will carry on generating.  The
+        row's :attr:`rope_delta` travels with it -- it belongs to the sequence,
+        not to the row, and losing it would rotate the next tokens of an
+        image prompt at the wrong angle.
         """
         if src_row == dst_row:
             return
@@ -248,6 +321,7 @@ class Qwen35:
             if isinstance(mix, LinearAttn):
                 mix.state[dst_row].copy_(mix.state[src_row])
                 mix.conv_state[dst_row].copy_(mix.conv_state[src_row])
+        self.rope_delta[dst_row].copy_(self.rope_delta[src_row])
 
     def zero_linear_states(self, row: int) -> None:
         """Clear one row's recurrent state (before a fresh sequence occupies it)."""
@@ -256,6 +330,7 @@ class Qwen35:
             if isinstance(mix, LinearAttn):
                 mix.state[row].zero_()
                 mix.conv_state[row].zero_()
+        self.rope_delta[row].zero_()
 
     def _forward(self) -> None:
         """One token on the single-stream path (the prefill/staging row).
@@ -263,10 +338,15 @@ class Qwen35:
         This is the graph ``capture()`` records for the single-stream engine and
         the eager reference the batched path is compared against; it writes the
         staging row, never a decode row.
+
+        The rotation reads ``pos + rope_delta`` while the KV slot stays at ``pos``
+        (see ``rope_delta``); with a text-only request the buffer is 0 and this is
+        exactly the old one-term lookup.
         """
         pr = self.prefill_row
         x = self.embed.lookup(self.token_in[pr:pr + 1]).view(-1)
-        ctx = (self.pos1, self.cos_tbl, self.sin_tbl, self.mask_idx)
+        ctx = (self.pos1, self.cos_tbl, self.sin_tbl, self.mask_idx,
+               self.rope_delta1)
         for layer in self.layers:
             x = layer(x, ctx)
         x = self.norm(x)
@@ -280,10 +360,15 @@ class Qwen35:
         a captured graph); attention and the delta-net recurrence call the
         existing single-token kernels once per row, on row slices of their
         per-row buffers, so each row's numbers match a solo decode exactly.
+
+        ``positions`` stays the raw token index (it addresses the KV slot and the
+        context window); the 5th ``ctx`` entry carries the per-row ``rope_delta``
+        so only the rotation is shifted (mRoPE after an image).
         """
         x = self.embed.lookup(self.token_in[:rows])           # [rows, hidden]
         positions = self.pos[:rows]
-        ctx = (self.cos_tbl, self.sin_tbl, self.mask_idx, self.ctx_lens)
+        ctx = (self.cos_tbl, self.sin_tbl, self.mask_idx, self.ctx_lens,
+               self.rope_delta)
         for layer in self.layers:
             x = layer.batch(x, positions, ctx)
         x = self.norm(x)
@@ -292,6 +377,7 @@ class Qwen35:
 
     def reset(self) -> None:
         self.pos.zero_()
+        self.rope_delta.zero_()
         for layer in self.layers:
             layer.reset()
         if self.mtp is not None:
@@ -309,7 +395,8 @@ class Qwen35:
 
     @torch.no_grad()
     def prefill(self, tokens: list[int], chunk: int = 2048,
-                spec_row: int | None = None) -> torch.Tensor:
+                spec_row: int | None = None,
+                mm: "MMInput | None" = None) -> torch.Tensor:
         """Process a whole prompt in batched GEMMs; returns the last token's logits.
 
         ``chunk`` is the GEMM's M, and it is worth a lot: rocBLAS on fp16 reaches
@@ -321,6 +408,23 @@ class Qwen35:
 
         Falls back to the one-token path for very short prompts, where the fixed
         setup cost outweighs the batching win.
+
+        ``mm`` (an :class:`mm_input.MMInput`) is the request's image payload.  It
+        changes exactly two things, both per chunk and both in *absolute* prompt
+        coordinates (``tokens`` is the whole prompt, so chunk ``[c0, c1)`` is
+        prompt ``[pos0+c0, pos0+c1)``):
+
+        * the gather buffer's image rows are overwritten with the tower's
+          embeddings (``mm.spans`` overlap, so a chunk that starts inside an image
+          copies only its own rows -- no chunk-boundary assumption);
+        * the full-attention layers rotate with the explicit 3-D cos/sin of those
+          tokens (``ops.mrope.mrope_cos_sin`` over ``mm.slice_positions``) instead
+          of the 1-D table.
+
+        What it deliberately does *not* change: the causal mask, the KV slot and
+        the context window keep using the token index, which is why decode
+        afterwards only needs the scalar ``rope_delta``.  ``mm=None`` is the old
+        path, bit for bit.
         """
         n = len(tokens)
         pos0 = int(self.pos1)
@@ -331,6 +435,10 @@ class Qwen35:
         if n < 4:
             # tiny prompts are memory-bound: hipBLAS at M<4 is slower than the
             # dedicated GEMV kernel, so just walk them through the decode path.
+            # ``rope_delta`` is a decode-graph input, so it has to be in place
+            # before the first ``logits`` call.
+            if mm is not None:
+                self.rope_delta[self.prefill_row] = int(mm.rope_delta)
             lg = None
             for t in tokens:
                 lg = self.logits(t)
@@ -353,27 +461,45 @@ class Qwen35:
             tiles = ([(q0, min(q0 + Q, n_loc), base, base + min(q0 + Q, n_loc))
                       for q0 in range(0, n_loc, Q)]
                      if n_loc > Q else None)
+            layer_ctx = ctx
+            rope = None
+            if mm is not None:
+                x = scatter_image_embeds(x, mm.embeds, mm.spans, pos0 + c0, pos0 + c1)
+                a, b = pos0 + c0, pos0 + c1
+                rope = mrope_cos_sin(mm.slice_positions(a, b), self.inv_freq)
+                layer_ctx = ctx + (rope,)
             for layer in self.layers:
-                x = layer.prefill(x, positions, ctx, tiles)
+                x = layer.prefill(x, positions, layer_ctx, tiles)
             if self.mtp is not None and self.mtp_prefill:
                 # Feed the MTP head chunk by chunk instead of holding every chunk's
                 # hidden state to concatenate at the end: `H` for a 256k prompt is
                 # 1.34 GB bf16 and the cat copy doubles it.  The last prompt token
                 # has no next token, so each chunk stops one short of its end.
+                # Its own attention is a full-attention layer over the same
+                # positions, so an image chunk hands it its own rope slice (it
+                # covers ``m1 - c0`` tokens, a strict prefix of the chunk's).
                 m1 = min(c1, n - 1)
                 if m1 > c0:
                     self.mtp.prefill(x[:m1 - c0], toks[c0 + 1:m1 + 1],
                                      torch.arange(pos0 + c0, pos0 + m1, device="cuda"),
-                                     ctx)
+                                     layer_ctx,
+                                     rope=None if rope is None
+                                     else (rope[0][:m1 - c0], rope[1][:m1 - c0]))
             elif self.batch_spec and self.mtp is not None and spec_row is not None:
                 # Batched spec: same chunk, into that row's paged drafter KV.
                 m1 = min(c1, n - 1)
                 if m1 > c0:
                     self.mtp.prefill_row(
                         spec_row, x[:m1 - c0], toks[c0 + 1:m1 + 1],
-                        torch.arange(pos0 + c0, pos0 + m1, device="cuda"), ctx)
+                        torch.arange(pos0 + c0, pos0 + m1, device="cuda"), layer_ctx,
+                        rope=None if rope is None
+                        else (rope[0][:m1 - c0], rope[1][:m1 - c0]))
             last = x[-1]
         self.pos1.fill_(pos0 + n)
+        # From here on every decode step of this request rotates at
+        # ``token_index + rope_delta``; a text-only prompt (or ``mm=None``) writes
+        # 0, which is the identity the captured graph was built with.
+        self.rope_delta[self.prefill_row] = int(mm.rope_delta) if mm is not None else 0
 
         if self.mtp is not None and self.mtp_prefill and n >= 2:
             self.h_prev.copy_(last)
@@ -446,11 +572,20 @@ class Qwen35:
         ctx = (self.cos_tbl, self.sin_tbl, self.mask_idx)
         bs = self.pool.bs
         suffix = [length - m for length, m in zip(lens, matched)]
-        for s, row, m in zip(seqs, rows, matched):
+        #: Per-sequence image payload, read off the sequence so a multimodal
+        #: request needs no extra argument here (the runner already carries it on
+        #: ``Sequence.mm``).  All-``None`` -- the text-only engine -- takes exactly
+        #: the old code path: no rope pair, no embed overwrite, delta 0.
+        mm_list = [getattr(s, "mm", None) for s in seqs]
+        for s, row, m, mm_i in zip(seqs, rows, matched, mm_list):
             self.pool.assign_table(list(s.block_table), 0, row)
             if m == 0:
                 self.zero_linear_states(row)      # fresh sequence
-            # matched > 0: the caller restored the boundary's state into this row
+                # matched > 0: the caller restored the boundary's state into this
+                # row, and the rope offset with it -- rewriting it here would be
+                # the same value, but a re-used row of a *text* request must go
+                # back to 0, so it is written unconditionally.
+            self.rope_delta[row] = int(mm_i.rope_delta) if mm_i is not None else 0
 
         # Token-major schedule.  With prefix reuse the suffix is split at
         # block-aligned snapshot boundaries: the block-aligned head (the part the
@@ -484,14 +619,24 @@ class Qwen35:
         for chunk in plans:
             parts: list[torch.Tensor] = []
             positions: list[torch.Tensor] = []
+            ropes: list[tuple | None] = []
             tiles: list[list | None] = []
             starts = [0]
             for i, c0, c1 in chunk:
                 length = c1 - c0
                 base = matched[i] + c0
                 ids = list(seqs[i].token_ids[base:base + length])
-                parts.append(self.embed.lookup(torch.as_tensor(
-                    ids, dtype=torch.long, device="cuda")))
+                emb = self.embed.lookup(torch.as_tensor(
+                    ids, dtype=torch.long, device="cuda"))
+                mm_i = mm_list[i]
+                if mm_i is not None:
+                    emb = scatter_image_embeds(emb, mm_i.embeds, mm_i.spans,
+                                               base, base + length)
+                    ropes.append(mrope_cos_sin(mm_i.slice_positions(base, base + length),
+                                               self.inv_freq))
+                else:
+                    ropes.append(None)
+                parts.append(emb)
                 positions.append(torch.arange(base, base + length,
                                               dtype=torch.long, device="cuda"))
                 # Absolute key range: a tile only reads keys up to its own end.
@@ -508,8 +653,13 @@ class Qwen35:
                 for k, (i, _c0, _c1) in enumerate(chunk):
                     sl = slice(starts[k], starts[k + 1])
                     proj_k = tuple(t[sl] for t in proj)
+                    # The rope pair rides on ``ctx`` (the same pass-through style
+                    # ``FullAttn.batch`` uses for ``ctx_lens``): the layer helpers
+                    # forward ``ctx`` untouched, so a sequence with an image gets
+                    # its own 3-D rotation and a text sequence gets the 1-D table.
+                    ctx_k = ctx if ropes[k] is None else ctx + (ropes[k],)
                     pieces.append(layer.prefill_group_state(
-                        mix, proj_k, positions[k], ctx, tiles[k], rows[i]))
+                        mix, proj_k, positions[k], ctx_k, tiles[k], rows[i]))
                 out = layer.prefill_group_out(mix, torch.cat(pieces, dim=0))
                 x = x + out
                 x = x + layer.mlp.prefill(layer.post_ln(x))
@@ -694,6 +844,9 @@ class Qwen35:
                     self.pool.assign(self._scratch_blocks[row], 0, row)
                 self.token_in[row] = self._sentinel_token
                 self.pos[row] = 0
+                # A hole must rotate at a valid table row: row 0 + a stale negative
+                # delta from the previous occupant would index before the table.
+                self.rope_delta[row] = 0
                 if self.ctx_lens is not None:
                     self.ctx_lens[row] = 1
         graph.replay()
@@ -810,7 +963,11 @@ class Qwen35:
         c = self.spec_width
         total = rows * c
         hidden = self.cfg["hidden_size"]
-        ctx = (self.cos_tbl, self.sin_tbl, self.mask_idx)
+        # The 5th entry is the per-row mRoPE offset: every verified token rotates
+        # at ``pos + rope_delta`` while its KV slot stays at ``pos``.  Constant
+        # within a request, so it is a buffer the captured graph reads.
+        ctx = (self.cos_tbl, self.sin_tbl, self.mask_idx, self.ctx_lens,
+               self.rope_delta)
         poss = self.verify_pos_b[:rows]
         x = self.embed.lookup(self.verify_toks_b[:rows].reshape(total))
         multi_q = multi_q_ready()
@@ -902,7 +1059,7 @@ class Qwen35:
         """
         ctx_base = (self.cos_tbl, self.sin_tbl, self.mask_idx)
         c = self.spec_width
-        ctx = ctx_base + (self.ctx_lens,)
+        ctx = ctx_base + (self.ctx_lens, self.rope_delta)
         for j in range(c):
             toks = self.verify_toks_b[:rows, j]
             poss = self.verify_pos_b[:rows, j]
@@ -1004,14 +1161,19 @@ class Qwen35:
             self.token_in[row] = self._sentinel_token
             self.pos[row] = 0
             self.ctx_lens[row] = 1
+            self.rope_delta[row] = 0          # forward-only valid table row
 
         # Stage the drafter: h at the previous accepted token, its token, and the
         # drafter position (main position - 1: the MTP predicts the token after h).
+        # Each row's mRoPE offset is copied across so the drafter rotates exactly
+        # like the main model; a padded row gets 0 (it runs on the sentinel).
         mtp = self.mtp
+        mtp.b_rope_delta.zero_()
         for i, row in enumerate(active_rows):
             mtp.b_tok[row] = int(tokens[i])
             mtp.b_h[row].copy_(self.h_prev_b[row])
             mtp.b_pos[row] = int(positions[i]) - 1
+            mtp.b_rope_delta[row] = self.rope_delta[row]
         for row in sorted(pad):
             mtp.b_tok[row] = 0
             mtp.b_h[row].zero_()
@@ -1050,7 +1212,9 @@ class Qwen35:
 
     def _verify_impl(self) -> None:
         x = self.embed.lookup(self.verify_toks)
-        ctx = (self.cos_tbl, self.sin_tbl, self.mask_idx)
+        # 4th entry: this request's mRoPE offset (a buffer, so the graph replays
+        # unchanged; ``verify_pos`` keeps addressing the KV slots).
+        ctx = (self.cos_tbl, self.sin_tbl, self.mask_idx, self.rope_delta1)
         for layer in self.layers:
             x = layer.verify(x, self.verify_pos, ctx)
         self.verify_hidden.copy_(x)
@@ -1104,8 +1268,11 @@ class Qwen35:
         assert self.mtp is not None and self._verify_graph is not None, "MTP not available"
         assert K + 1 <= self.verify_c, f"K+1={K + 1} exceeds verify width {self.verify_c}"
 
-        # draft: t0 is the main model's own next token, then K chained MTP steps
+        # draft: t0 is the main model's own next token, then K chained MTP steps.
+        # The drafter rotates at the same mRoPE position as the main model, so the
+        # request's offset is copied across before the first replay.
         self.mtp.pos.copy_(self.pos1).sub_(1)
+        self.mtp.rope_delta.copy_(self.rope_delta1)
         t0 = logits_prev.argmax()
         self.mtp.draft(self.h_prev, t0, K, self.verify_toks[:K + 1])
 
@@ -1200,3 +1367,5 @@ class Qwen35:
         self.embed = None
         self.lm_head = None
         self.mtp = None
+        self.vision = None
+        self.vision_sd = {}

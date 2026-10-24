@@ -71,11 +71,19 @@ class PrefixCacheEngine:
         self.n_hit_tokens = 0
 
     @torch.inference_mode()
-    def prefill(self, tokens: list[int]) -> torch.Tensor:
+    def prefill(self, tokens: list[int], mm=None) -> torch.Tensor:
         """Adopt a cached prefix, prefill the rest, insert the result.
 
         Returns exactly what a full prefill of ``tokens`` returns: the logits for
         the next token.
+
+        ``mm`` (``mm_input.MMInput | None``) is the request's image payload.  It
+        does two things: the prefix *match* is salted with the image digest, so a
+        prompt with a different image cannot adopt this image's KV, and the
+        suffix prefill gets it too, so the model splices the image embeddings in
+        and uses the 3-D mRoPE positions.  ``matched`` still only ever lands on a
+        block boundary; it may fall *inside* an image span, which is fine because
+        the embeddings are sliced by absolute prompt index.
         """
         if not tokens:
             raise ValueError("empty prompt")
@@ -83,7 +91,8 @@ class PrefixCacheEngine:
         bs = pool.bs
         bm.reserve((len(tokens) + bs - 1) // bs + 1)         # evict LRU if needed
 
-        blocks, matched, states = bm.match_prefix(tokens[:-1], require_states=True)
+        blocks, matched, states = bm.match_prefix(tokens[:-1], require_states=True,
+                                                  mm=mm)
         if self.seq is not None:
             self.seq.free()
         seq = SeqKV(pool, blocks, matched)
@@ -117,7 +126,7 @@ class PrefixCacheEngine:
         step = max(bs, self.snapshot_interval // bs * bs)
         for c0 in range(0, head_len, step):
             c1 = min(c0 + step, head_len)
-            logits = model.prefill(rest[c0:c1])
+            logits = model.prefill(rest[c0:c1], mm=mm)
             states_at[matched + c1] = model.snapshot_linear_states()
             while len(states_at) > self.keep_states:
                 droppable = [k for k in states_at if k != matched]
@@ -125,7 +134,7 @@ class PrefixCacheEngine:
                     break
                 del states_at[min(droppable)]
         if head_len < len(rest):
-            logits = model.prefill(rest[head_len:])
+            logits = model.prefill(rest[head_len:], mm=mm)
         seq.commit_upto(model.pos1)
 
         self.last_matched = matched
@@ -133,7 +142,7 @@ class PrefixCacheEngine:
         self.n_prompt_tokens += len(tokens)
         self.n_hit_tokens += matched
         radix = self.radix
-        radix.insert(tokens, seq.blocks, states_at)
+        radix.insert(tokens, seq.blocks, states_at, mm=mm)
         return logits
 
     @torch.inference_mode()
@@ -170,10 +179,10 @@ class PrefixCacheEngine:
 
     @torch.inference_mode()
     def generate(self, tokens: list[int], max_new: int, eos: set[int] | None = None,
-                 spec_k: int = 0) -> dict:
+                 spec_k: int = 0, mm=None) -> dict:
         """One full request; returns the tokens and the prefill/decode split."""
         t0 = time.time()
-        logits = self.prefill(tokens)
+        logits = self.prefill(tokens, mm=mm)
         t_pre = time.time() - t0
         t1 = time.time()
         out = self.decode(logits, max_new, eos, spec_k)

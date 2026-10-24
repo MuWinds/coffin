@@ -35,7 +35,9 @@ Chat prompts are rendered with the checkpoint's own jinja template (via
 from __future__ import annotations
 
 import argparse
+import base64
 import importlib
+import io
 import json
 import os
 import queue
@@ -79,6 +81,84 @@ def _eos_ids(tok) -> set[int]:
     return ids
 
 
+# ---------------------------------------------------------------------------
+# Image input: decode -> the checkpoint's own processor -> MMInput
+# ---------------------------------------------------------------------------
+# Everything below runs once per image request, before the prompt is prefilled.
+# The division of labour is the whole design:
+#
+# * PIL (this file) decodes/validates the bytes.  It is the only place that can
+#   put a bound on *decode* memory: a 30k x 30k PNG is a valid PNG, and PIL would
+#   happily expand it to 2.7 GB of RGB before the processor ever downsamples it.
+# * ``Qwen3VLProcessor`` (transformers, already in the container) does the
+#   smart_resize / patchify / merge-block flattening and expands the prompt's
+#   ``<|image_pad|>`` markers to one token per merged visual patch.  Re-implementing
+#   that is the exact "values right, order wrong" risk VISION §3.2 warns about, so
+#   the engine consumes its output verbatim.
+# * ``mm_input`` (Lead-owned) turns the token spans + grids into the 3-D mRoPE
+#   positions and the ``rope_delta`` the decode graph reads.
+#: Hard ceiling on one image's *decoded* pixel count (not the served resolution):
+#: bounds PIL's expand-to-RGB memory.  16 MP admits a 12 MP camera photo, which the
+#: processor then downsamples to ``image_max_pixels``; above it the request is
+#: refused before any large allocation.
+MAX_DECODE_PIXELS = 16 * 1024 * 1024
+
+
+class MMError(Exception):
+    """An image request this server refuses; carries the HTTP status to answer."""
+
+    def __init__(self, message: str, status: int = 400) -> None:
+        super().__init__(message)
+        self.status = int(status)
+
+
+def _decode_image(b64: str, mime: str, max_bytes: int):
+    """A ``data:`` URL's payload -> an RGB ``PIL.Image``, oriented and validated.
+
+    Refused (``MMError`` 400/413, never a traceback) when the payload is not
+    decodable, too large decoded, or bigger than ``MAX_DECODE_PIXELS``.  The
+    ``127``-byte cap PIL puts on a decompression bomb is enforced too: the
+    container's ``MAX_IMAGE_PIXELS`` is the default, so a bomb raises
+    ``DecompressionBombError`` here rather than OOM-killing the server.
+    """
+    from PIL import Image, ImageOps, UnidentifiedImageError
+
+    try:
+        raw = base64.b64decode(b64, validate=True)
+    except Exception as exc:  # noqa: BLE001 - any decode failure is the client's
+        raise MMError(f"image payload is not valid base64: {exc}") from None
+    if not raw:
+        raise MMError("image payload decodes to zero bytes")
+    if len(raw) > max_bytes:
+        raise MMError(f"image is {len(raw):,} bytes decoded, over the "
+                      f"{max_bytes:,}-byte (per-image) limit; downscale it first", 413)
+    try:
+        img = Image.open(io.BytesIO(raw))
+        w, h = img.size
+        if w * h > MAX_DECODE_PIXELS:
+            raise MMError(
+                f"image is {w}x{h} = {w * h / 1e6:.1f} MP; the decoder accepts at most "
+                f"{MAX_DECODE_PIXELS / 1e6:.0f} MP (it is downsampled to the serving "
+                f"size afterwards, but it has to be decoded first)", 413)
+        # JPEGs can be greyscale/CMYK, PNGs paletted or 16-bit; PIL converts all of
+        # them, but a truncated file must fail here rather than inside the
+        # processor, where the traceback would be unreadable to a client.
+        # ``load()`` is what actually decodes.
+        img.load()
+        # EXIF orientation: a phone photo stores "rotate 90" in metadata, and a
+        # model that reads a sideways "SCNET" gets the wrong answer.
+        img = ImageOps.exif_transpose(img)
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+    except MMError:
+        raise
+    except Image.DecompressionBombError as exc:
+        raise MMError(f"image is too large to decode safely: {exc}", 413) from None
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        raise MMError(f"image could not be decoded ({mime}): {exc}") from None
+    return img, raw
+
+
 class Server:
     def __init__(self, model_dir: str, max_seq: int, bench: bool, spec_k: int = 0,
                  int8: bool = True, prefix_cache: bool = True, block_size: int = 64,
@@ -86,7 +166,10 @@ class Server:
                  max_seconds: float = 0.0, max_num_seqs: int = 1,
                  num_blocks: int = 0, spec_batch: bool = False,
                  spec_sparse_k: int = 0, spec_min_ctx: int = 0,
-                 fast_gemv: bool = False) -> None:
+                 fast_gemv: bool = False, vision: bool = True,
+                 vision_int8: bool = False, image_max_pixels: int = 1048576,
+                 image_min_pixels: int = 65536, max_images: int = 4,
+                 max_image_bytes: int = 8388608) -> None:
         from transformers import AutoTokenizer
 
         self.model_dir = model_dir
@@ -105,6 +188,22 @@ class Server:
         self.pc = None
         self.n_req = 0
         self.n_reload = 0
+        # -- images -----------------------------------------------------------
+        self.vision = bool(vision)
+        self.vision_int8 = bool(vision_int8)
+        self.image_max_pixels = int(image_max_pixels)
+        self.image_min_pixels = int(image_min_pixels)
+        self.max_images = int(max_images)
+        self.max_image_bytes = int(max_image_bytes)
+        #: The checkpoint's own processor (``Qwen3VLProcessor``: image processor +
+        #: tokenizer).  Loaded lazily on the first image request, not at startup:
+        #: it costs ~2 s and text-only serving must not pay it -- and a text-only
+        #: container that never sees an image never needs transformers' image stack
+        #: at all.  ``_processor_failed`` remembers a load failure so a broken
+        #: checkpoint does not retry (and stall) on every request.
+        self.processor = None
+        self._processor_failed: str | None = None
+        self.n_image_req = 0
         #: One engine thread drives every forward pass; connections submit requests
         #: and drain a per-request queue, so several can be in flight at once and
         #: the scheduler batches their decode steps.
@@ -153,7 +252,8 @@ class Server:
         t0 = time.time()
         # stays resident; int8 halves it (4.0 GiB instead of 8.1), which is what
         # leaves room for a long-context KV cache on a 16 GB card
-        self.weights = engine_api.load_weights(model_dir, quant=int8)
+        self.weights = engine_api.load_weights(
+            model_dir, quant=int8, **self._load_weight_kwargs())
         self.load_s = time.time() - t0
         self.tok = AutoTokenizer.from_pretrained(model_dir)
         self.eos = _eos_ids(self.tok)
@@ -181,7 +281,178 @@ class Server:
         self.engine.eos = set(self.eos)
         self.engine.build()
         self.pc = self.engine.pc
+        # The tower is built here, after the engine's pools and graphs exist: it is
+        # an eager module that never enters the decode graph, so it can come up last
+        # and still be resident for the first image request.  ``--no-vision`` skips
+        # it, which is the only way to get the 0.62 GiB back.
+        if self.vision and self.model.vision_sd and self.model.vision is None:
+            try:
+                t_v = time.time()
+                self.model.enable_vision(quant=self.vision_int8)
+                print(f"[serve] vision tower ready in {time.time() - t_v:.1f}s "
+                      f"(int8={self.vision_int8}, "
+                      f"{len(self.model.vision_sd)} tensors)", flush=True)
+            except Exception as exc:  # noqa: BLE001 - text serving must still work
+                print(f"[serve] vision tower unavailable: {type(exc).__name__}: {exc}",
+                      flush=True)
+                self.vision = False
+        elif not self.vision:
+            self.model.vision_sd = {}
         self.build_s = time.time() - t0
+
+    def _load_weight_kwargs(self) -> dict:
+        """How to load this server's weights: text quant plus the vision policy.
+
+        The tower is loaded through the same resident dict as the text weights
+        (that is what makes ``reload`` rebuild from VRAM), but it has its own
+        memory policy: fp16 by default, int8 with ``--vision-int8``, and not loaded
+        at all with ``--no-vision``.  Only forwarded when the checkpoint actually
+        declares a vision config, so a text-only checkpoint keeps the old call.
+        """
+        raw = json.loads((Path(self.model_dir) / "config.json").read_text())
+        if not raw.get("vision_config"):
+            return {}
+        return {"vision": self.vision, "vision_quant": self.vision_int8}
+
+    def _vision_ready(self) -> bool:
+        """Is an image request servable at all?"""
+        if not self.vision:
+            return False
+        raw = json.loads((Path(self.model_dir) / "config.json").read_text())
+        return bool(raw.get("vision_config"))
+
+    def _ensure_processor(self):
+        """Load ``Qwen3VLProcessor`` on first use (lazy, ~2 s, text-only pays 0).
+
+        Lazy rather than eager because it is the *only* transformers piece with a
+        heavy import cost besides the tokenizer, and a text-only deployment never
+        touches it.  The cost lands on the first image request, where it is one more
+        second against a prefill that is already hundreds of ms and is reported in
+        the request log, instead of on every cold start.
+        """
+        if self.processor is not None:
+            return self.processor
+        if self._processor_failed is not None:
+            raise MMError(f"the image processor is unavailable on this server: "
+                          f"{self._processor_failed}", 503)
+        try:
+            from transformers import AutoProcessor
+
+            self.processor = AutoProcessor.from_pretrained(self.model_dir)
+        except Exception as exc:  # noqa: BLE001 - reported as a 503, not a crash
+            self._processor_failed = f"{type(exc).__name__}: {exc}"
+            raise MMError(f"could not load the image processor: "
+                          f"{self._processor_failed}", 503) from None
+        print(f"[serve] image processor ready: {type(self.processor).__name__} "
+              f"({type(self.processor.image_processor).__name__})", flush=True)
+        return self.processor
+
+    def _prepare_mm(self, images: list[dict], text: str):
+        """An image request's parts -> ``MMInput`` for the engine.
+
+        Runs the whole image path *before* the prompt is prefilled, so every
+        rejection is a clean 400 instead of a half-generated answer:
+
+        1. PIL decode + orientation + RGB conversion per image (``_decode_image``);
+        2. ``Qwen3VLProcessor`` over ``text`` (the rendered prompt, whose
+           ``{"type": "image"}`` markers already became
+           ``<|vision_start|><|image_pad|><|vision_end|>``) -- it downsamples each
+           image into ``[image_min_pixels, image_max_pixels]``, patchifies it and
+           expands the ``<|image_pad|>`` runs to one token per merged patch;
+        3. a self-check that the expanded count is exactly ``Σ grid.prod() / 4``,
+           which is what turns a processor-version drift into a 400 rather than an
+           index mismatch deep inside the model;
+        4. the vision tower -> embeddings, and ``mm_input`` -> 3-D positions.
+
+        Returns ``(token_ids, mm)``.  ``token_ids`` are the processor's own ids: for
+        an image prompt the tokenizer and the processor agree, but taking them from
+        the processor is what guarantees the placeholders and ``pixel_values`` line
+        up (the count is asserted, so a disagreement cannot pass silently).
+        """
+        from mm_input import (IMAGE_TOKEN_ID, MMInput, find_image_spans,
+                              image_digest, mrope_positions)
+
+        proc = self._ensure_processor()
+        if not self._vision_ready():
+            raise MMError("this server cannot serve images (no vision tower was "
+                          "loaded; see --no-vision)", 503)
+        if not isinstance(images, list) or not images:
+            raise MMError("`images` must be a non-empty array")
+        if len(images) > self.max_images:
+            raise MMError(f"too many images: {len(images)} > --max-images "
+                          f"{self.max_images}")
+
+        pil: list = []
+        chunks: list[bytes] = []
+        for i, item in enumerate(images):
+            if not isinstance(item, dict) or "b64" not in item:
+                raise MMError(f"image {i}: expected {{'b64': ..., 'mime': ...}}")
+            img, raw = _decode_image(str(item["b64"]), str(item.get("mime") or ""),
+                                     self.max_image_bytes)
+            pil.append(img)
+            chunks.append(raw)
+
+        t0 = time.time()
+        try:
+            out = proc(text=[text], images=pil, return_tensors="pt",
+                       size={"shortest_edge": self.image_min_pixels,
+                             "longest_edge": self.image_max_pixels})
+        except MMError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a bad image must not 500 the server
+            raise MMError(f"image preprocessing failed: {type(exc).__name__}: {exc}") from None
+        prep_ms = (time.time() - t0) * 1000
+
+        ids = out["input_ids"][0].tolist()
+        grid = out["image_grid_thw"].long()
+        pixel_values = out["pixel_values"]
+        # One merged visual patch == one prompt token, per image.
+        want = int((grid.prod(-1) // 4).sum())
+
+        # Three checks that together pin the whole alignment, and all are cheap:
+        #
+        # 1. the processor's tokenizer must agree with the one this file renders
+        #    prompts with -- if they were different tokenizers every id here would
+        #    be off and the model would answer something unrelated;
+        # 2. the prompt's expansion must be *exactly* "each image marker becomes
+        #    grid.prod()/4 tokens".  ``tok.encode(text)`` is the unexpanded
+        #    rendering (one ``<|image_pad|>`` per image), so the identity
+        #    ``len(ids) == len(unexpanded) - n_images + Σ grid.prod()/4`` is the
+        #    processor's own contract; a version drift breaks it here instead of
+        #    surfacing as an embedding/KV index mismatch inside the model.
+        # 3. the resulting placeholder runs are what the model will overwrite, and
+        #    their count/order must match the grids the tower is about to encode.
+        plain_ids = self.tok.encode(text)
+        n_plain_pads = sum(1 for t in plain_ids if t == IMAGE_TOKEN_ID)
+        if n_plain_pads != len(images):
+            raise MMError(
+                f"the rendered prompt has {n_plain_pads} image placeholders but the "
+                f"request carries {len(images)} images; the template and the image "
+                f"parts disagree")
+        if len(ids) != len(plain_ids) - len(images) + want:
+            raise MMError(
+                f"image expansion does not match the processor's grid: {len(ids)} "
+                f"prompt tokens vs {len(plain_ids)} unexpanded - {len(images)} "
+                f"placeholders + {want} image tokens")
+        spans = find_image_spans(ids)
+        got = sum(e - s for s, e in spans)
+        if len(spans) != len(images) or got != want:
+            raise MMError(
+                f"image placeholder mismatch: the prompt has {len(spans)} image runs "
+                f"covering {got} tokens, the processor produced {len(images)} images "
+                f"needing {want} tokens (image_pad count must equal "
+                f"sum(grid.prod()/4))")
+
+        embeds = self.model.image_embeds(pixel_values, grid)
+        positions, rope_delta = mrope_positions(spans, grid, len(ids))
+        mm = MMInput(embeds=embeds, grid_thw=grid, positions=positions,
+                     rope_delta=int(rope_delta),
+                     digest=image_digest(chunks), spans=spans)
+        self.n_image_req += 1
+        print(f"[serve] mm: {len(images)} img grid={grid.tolist()} "
+              f"img_tokens={want} n_prompt={len(ids)} rope_delta={rope_delta} "
+              f"prep={prep_ms:.0f}ms ", flush=True)
+        return ids, mm
 
     def _reload(self) -> None:
         """Re-import the engine (and the kernel extension) and rebuild from VRAM.
@@ -212,6 +483,8 @@ class Server:
 
         importlib.reload(hip_ops)
         engine_api.reload()     # every engine module, dependencies first
+        self.processor = None    # re-imported transformers classes: rebuild lazily
+        self._processor_failed = None
         self.n_reload += 1
         self._build()
         _mem("after build")
@@ -270,20 +543,27 @@ class Server:
             out_q.put({"token": None, "done": True, "error": message,
                        "prefill_s": 0.0})
 
-    def _submit(self, ids: list[int], params: SamplingParams):
-        """Queue one request and return its sequence plus the token queue."""
+    def _submit(self, ids: list[int], params: SamplingParams, mm=None):
+        """Queue one request and return its sequence plus the token queue.
+
+        ``mm`` rides on the :class:`~sequence.Sequence` (``seq.mm``), which is what
+        the runner, the block manager and the radix tree all read: the tree salts
+        its block keys with ``mm.digest`` so two different images can never share a
+        cached KV prefix.  It is set *inside* the lock that the engine loop's
+        ``step()`` also takes, so a prefilled sequence always has its payload.
+        """
         out_q: queue.Queue = queue.Queue()
         with self._lock:
-            seq = self.engine.add_request(ids, params)
+            seq = self.engine.add_request(ids, params, mm=mm)
             self._outputs[seq.seq_id] = out_q
             self._cv.notify()
         return seq, out_q
 
     def _blocking_generate(self, prompt_ids: list[int], max_new: int,
-                           temperature: float, deadline: float = 0.0):
+                           temperature: float, deadline: float = 0.0, mm=None):
         """Submit a request and collect its tokens; returns (tokens, pre, dec)."""
         seq, out_q = self._submit(prompt_ids,
-                                  self._sampling(max_new, temperature, deadline))
+                                  self._sampling(max_new, temperature, deadline), mm=mm)
         t0 = time.time()
         out: list[int] = []
         while True:
@@ -337,23 +617,29 @@ class Server:
 
     @torch.inference_mode()
     def _generate(self, prompt_ids: list[int], max_new: int, temperature: float,
-                  deadline: float = 0.0) -> tuple[list[int], float, float]:
-        return self._blocking_generate(prompt_ids, max_new, temperature, deadline)
+                  deadline: float = 0.0, mm=None) -> tuple[list[int], float, float]:
+        return self._blocking_generate(prompt_ids, max_new, temperature, deadline, mm=mm)
 
     @torch.inference_mode()
     def _spec_generate(self, prompt_ids: list[int], max_new: int, k: int,
-                       deadline: float = 0.0) -> tuple[list[int], float, float]:
+                       deadline: float = 0.0,
+                       mm=None) -> tuple[list[int], float, float]:
         """Greedy speculative decode; returns (tokens, prefill_s, decode_s).
 
         Only greedy is supported: the accept/reject test compares the main
         model's argmax against the draft, which is exact for greedy and not for
         sampling. ``decode_s`` covers the spec loop only, so it is directly
         comparable with the plain path's decode time.
+
+        ``mm`` is supported here, not refused: the request's ``rope_delta`` is
+        written by ``prefill(mm=...)`` and both the drafter and the verify graph
+        read it per step (``spec_step`` copies it into ``mtp.rope_delta``), so an
+        image prompt speculates exactly like a text one.
         """
         m = self.model
         m.reset()
         t0 = time.time()
-        logits = m.prefill(prompt_ids)
+        logits = m.prefill(prompt_ids, mm=mm)
         t_pre = time.time() - t0
         m.n_drafted = m.n_accepted = m.n_spec_steps = 0
         out: list[int] = []
@@ -407,6 +693,28 @@ class Server:
             thinking, answer = answer, ""
         return thinking, answer
 
+    def _render_request(self, req: dict, thinking_on: bool, prefix: str):
+        """Render one request's prompt -> ``(token_ids, text, MMInput|None)``.
+
+        The text-only path is exactly what it always was: render, encode, no
+        ``mm``.  A request carrying ``images`` renders the *same* way (the template
+        turns its ``{"type": "image"}`` markers into the vision delimiters) and then
+        hands the rendered text to the processor, which is the only difference --
+        that keeps one rendering rule for both paths, so a text-only prompt can
+        never render differently because of this feature.
+        """
+        messages = req.get("messages", [])
+        images = req.get("images") or []
+        ids, prompt = self._render_with_text(messages, req.get("tools"), thinking_on,
+                                             prefix)
+        if not images:
+            return ids, prompt, None
+        if prefix:
+            raise MMError("tool_choice=required forces the assistant turn to open "
+                          "with a call; it cannot be combined with images")
+        mm_ids, mm = self._prepare_mm(images, prompt)
+        return mm_ids, prompt, mm
+
     @torch.inference_mode()
     def stream_chat(self, req: dict):
         """``chat`` as a generator: one reply line per step, for SSE clients.
@@ -420,25 +728,35 @@ class Server:
         the middle of a multi-byte character, which is never more than a couple),
         so streaming stays linear in the answer length.
 
+        An image request is rejected here with a ``type: "error"`` line carrying the
+        status code, *before* the ``start`` line: SSE has already sent 200 by then,
+        so ``openai_server`` forwards that line's status into the stream event
+        instead of pretending the request succeeded.
+
         Speculative decode is deliberately not used here: the spec loop only
         returns after a whole K+1 verification window, which is the opposite of
         what a stream wants.
         """
-        messages = req.get("messages", [])
         prefix = str(req.get("tool_prefix") or "")
         # A forced call must start the answer, so reasoning is off for that turn:
         # the template would otherwise open ``<think>`` where the call has to go.
         thinking_on = bool(req.get("enable_thinking", False)) and not prefix
-        ids, prompt = self._render_with_text(messages, req.get("tools"), thinking_on,
-                                             prefix)
+        try:
+            ids, prompt, mm = self._render_request(req, thinking_on, prefix)
+        except MMError as exc:
+            yield {"type": "error", "ok": False, "error": str(exc),
+                   "status": exc.status}
+            return
         n, window_full = self._room(len(ids), req.get("max_new"))
         temp = float(req.get("temperature", 0.0))
         deadline = self._deadline(req)
         yield {"type": "start", "n_prompt": len(ids), "max_new": n,
                "prompt_opens_think": prompt.rstrip().endswith("<think>"),
-               "forced_tool": bool(prefix)}
+               "forced_tool": bool(prefix),
+               "n_images": mm.num_images if mm is not None else 0,
+               "image_tokens": len(mm) if mm is not None else 0}
         t0 = time.time()
-        seq, out_q = self._submit(ids, self._sampling(n, temp, deadline))
+        seq, out_q = self._submit(ids, self._sampling(n, temp, deadline), mm=mm)
         out: list[int] = []
         hold: list[int] = []             # token ids held back: partial UTF-8
         t1 = time.time()
@@ -526,7 +844,19 @@ class Server:
                    "hip": hip_ops.available(), "int8": self.int8,
                    "vram_gib": round(torch.cuda.memory_allocated() / 2**30, 2),
                    "batch": bool(self.engine is not None and self.engine.batching),
-                   "decode_capacity": int(getattr(self.model, "decode_capacity", 1))}
+                   "decode_capacity": int(getattr(self.model, "decode_capacity", 1)),
+                   # what image requests this server accepts; the OpenAI shell reads
+                   # ``vision`` to answer 503 up front instead of forwarding a request
+                   # the engine will reject anyway
+                   "vision": bool(self.vision and self.model.vision_sd),
+                   "vision_int8": self.vision_int8,
+                   "image_max_pixels": self.image_max_pixels,
+                   "image_min_pixels": self.image_min_pixels,
+                   "max_images": self.max_images,
+                   "n_image_req": self.n_image_req,
+                   "processor": ("loaded" if self.processor is not None
+                                 else ("failed" if self._processor_failed else "lazy"))}
+
             if self.engine is not None:
                 out["queue"] = {"waiting": len(self.engine.scheduler.waiting),
                                 "running": len(self.engine.scheduler.running)}
@@ -565,20 +895,22 @@ class Server:
                     "stopped": ("deadline" if deadline and time.time() >= deadline else None),
                     "spec_k": k if spec else 0, "spec": spec}
         if op == "chat":
-            messages = req.get("messages", [])
             prefix = str(req.get("tool_prefix") or "")
             thinking_on = bool(req.get("enable_thinking", False)) and not prefix
-            ids = self._render(messages, req.get("tools"), thinking_on, prefix)
+            try:
+                ids, _prompt, mm = self._render_request(req, thinking_on, prefix)
+            except MMError as exc:
+                return {"ok": False, "error": str(exc), "status": exc.status}
             n, window_full = self._room(len(ids), req.get("max_new"))
             temp = float(req.get("temperature", 0.0))
             deadline = self._deadline(req)
             k = int(req.get("spec_k", self.spec_k))
             spec = None
             if k and temp == 0:
-                out, t_pre, t_dec = self._spec_generate(ids, n, k, deadline)
+                out, t_pre, t_dec = self._spec_generate(ids, n, k, deadline, mm=mm)
                 spec = self.model.spec_stats
             else:
-                out, t_pre, t_dec = self._generate(ids, n, temp, deadline)
+                out, t_pre, t_dec = self._generate(ids, n, temp, deadline, mm=mm)
             raw = self.tok.decode(out, skip_special_tokens=False)
             full = prefix + raw
             thinking, answer = self._split(full, thinking_on)
@@ -590,7 +922,10 @@ class Server:
                     "prefill_ms": round(t_pre * 1000, 1),
                     "decode_tok_s": round(len(out) / t_dec, 2) if t_dec else None,
                     "stopped": ("deadline" if deadline and time.time() >= deadline else None),
-                    "spec_k": k if spec else 0, "spec": spec}
+                    "spec_k": k if spec else 0, "spec": spec,
+                    # what the image path actually did, so a probe can report it
+                    "n_images": mm.num_images if mm is not None else 0,
+                    "image_tokens": len(mm) if mm is not None else 0}
         if op == "spec":
             # A/B the two decode paths on the same prompt. Both are warmed before
             # timing, and the spec output is checked against plain greedy, because
@@ -676,10 +1011,14 @@ def serve(model_dir: str, max_seq: int, bench: bool, sock_path: str,
           max_seconds: float = 0.0, max_num_seqs: int = 1,
           num_blocks: int = 0, spec_batch: bool = False,
           spec_sparse_k: int = 0, spec_min_ctx: int = 0,
-          fast_gemv: bool = False) -> None:
+          fast_gemv: bool = False, vision: bool = True, vision_int8: bool = False,
+          image_max_pixels: int = 1048576, image_min_pixels: int = 65536,
+          max_images: int = 4, max_image_bytes: int = 8388608) -> None:
     srv_model = Server(model_dir, max_seq, bench, spec_k, int8, prefix_cache, block_size,
                        snapshots, snapshot_interval, max_seconds, max_num_seqs,
-                       num_blocks, spec_batch, spec_sparse_k, spec_min_ctx, fast_gemv)
+                       num_blocks, spec_batch, spec_sparse_k, spec_min_ctx, fast_gemv,
+                       vision, vision_int8, image_max_pixels, image_min_pixels,
+                       max_images, max_image_bytes)
     info = srv_model.info
     print(f"[serve] model {info['model']} ({info['arch']}) at {info['model_path']}",
           flush=True)
@@ -695,7 +1034,9 @@ def serve(model_dir: str, max_seq: int, bench: bool, sock_path: str,
           f"  blocks={srv_model.cfg.num_blocks}"
           f"  spec_k={srv_model.cfg.spec_k}"
           f"{' (batched)' if srv_model.cfg.spec_batch else ''}"
-          f"  max_seconds={max_seconds or 'none'}",
+          f"  max_seconds={max_seconds or 'none'}"
+          f"  vision={'off' if not srv_model.vision else ('int8' if srv_model.vision_int8 else 'fp16')}"
+          f" (max {srv_model.image_max_pixels} px, {srv_model.max_images} imgs)",
           flush=True)
     if os.path.exists(sock_path):
         os.unlink(sock_path)
@@ -745,8 +1086,14 @@ def _serve_connection(srv_model: "Server", conn: socket.socket) -> None:
         if rep.get("stopping"):
             srv_model.stop()
     except Exception as exc:  # keep the server alive on a bad request
+        # An ``MMError`` that escaped a path which could not answer cleanly (a
+        # stream whose 200 is already committed) is still reported with its status
+        # so the HTTP shell can map it instead of calling everything a 500.
+        rep = {"ok": False, "error": str(exc)}
+        if isinstance(exc, MMError):
+            rep["status"] = exc.status
         try:
-            conn.sendall((json.dumps({"ok": False, "error": str(exc)}) + "\n").encode())
+            conn.sendall((json.dumps(rep) + "\n").encode())
         except Exception:
             pass
         print(f"[serve] error: {exc}", flush=True)
@@ -831,6 +1178,25 @@ def main() -> None:
                     help="KV pool blocks shared by all sequences (0 = "
                          "max_seq/block_size * max_num_seqs). Lower it when the "
                          "window is long: the pool is allocated up front.")
+    # -- images -------------------------------------------------------------
+    ap.add_argument("--no-vision", dest="vision", action="store_false",
+                    help="do not load the vision tower (saves ~0.62 GiB); image "
+                         "requests then answer 503 instead of being served")
+    ap.add_argument("--vision-int8", action="store_true",
+                    help="keep the vision tower's 2-D weights int8 (0.31 GiB instead "
+                         "of 0.62), dequantised one GEMM at a time per request")
+    ap.add_argument("--image-max-pixels", type=int, default=1048576,
+                    help="largest image the processor will serve, in pixels "
+                         "(default 1 MP = ~1024 image tokens). This is the only real "
+                         "VRAM/latency knob: anything bigger is downsampled")
+    ap.add_argument("--image-min-pixels", type=int, default=65536,
+                    help="smallest image after the processor's upscale (official "
+                         "value; an image never costs fewer than 64 tokens)")
+    ap.add_argument("--max-images", type=int, default=4,
+                    help="images accepted in one request (four 1 MP images are "
+                         "already ~4k image tokens)")
+    ap.add_argument("--max-image-bytes", type=int, default=8388608,
+                    help="decoded bytes allowed per image (default 8 MiB)")
     ap.add_argument("--prompt", default="")
     ap.add_argument("--user", default="")
     ap.add_argument("--system", default=None)
@@ -845,7 +1211,9 @@ def main() -> None:
               args.int8, args.prefix_cache, args.block_size, args.snapshots,
               args.snapshot_interval, args.max_seconds, args.max_num_seqs,
               args.num_blocks, args.spec_batch, args.spec_sparse_k,
-              args.spec_min_ctx, args.fast_gemv)
+              args.spec_min_ctx, args.fast_gemv, args.vision, args.vision_int8,
+              args.image_max_pixels, args.image_min_pixels, args.max_images,
+              args.max_image_bytes)
         return
 
     if args.cmd in ("ping", "reload", "reset", "stop"):

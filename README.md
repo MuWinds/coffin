@@ -92,5 +92,32 @@ MKL_THREADING_LAYER=GNU PYTHONPATH=$PWD python3 -m unittest discover -s tests -v
 python3 run_chat.py --bench -n 32
 ```
 
-推文件：`python tools/push_engine.py --verify`（整个 `engine/` 的代码，不含
-`diag/` 与权重；要连 diag 一起推就加 `--with-diag`）。
+推文件：`python tools/push_engine.py --verify`（整个 `coffin/` 的代码，不含
+`diag/` 与权重；要连 diag 一起推就加 `--with-diag`；推到自己的目录用
+`--remote /root/private_data/<你的目录>`）。
+
+## 多模态（图片）
+
+设计见仓库根的 [`../VISION.md`](../VISION.md) §11。落地位置：
+
+| 文件 | 职责 |
+| --- | --- |
+| `mm_input.py` | `MMInput`（图片 embeds / grid / 3-D mRoPE positions / `rope_delta` / digest / spans）、`mrope_positions`、`find_image_spans`、`image_digest` |
+| `models/qwen35/vision.py` | `VisionTower`：patch_embed / pos_embed 重采样 / axial RoPE / 分块非因果 attention / 24 block / merger；fp16 或 int8 |
+| `ops/mrope.py` | `mrope_cos_sin`（stride-3 交错，`[11,11,10]`）、`scatter_image_embeds`（绝对下标注入） |
+| `models/qwen35/model.py` | `enable_vision` / `image_embeds` / `prefill(..., mm=)` / `prefill_group` 读 `seq.mm` / `rope_delta` |
+| `radix_cache.py` | block 级 media signature（图片指纹），纯文本 block 零开销 |
+| `serve.py` / `openai_server.py` | `image_url` data URL → PIL → `Qwen3VLProcessor` → `MMInput` |
+
+新增开关：`--no-vision`、`--vision-int8`、`--image-max-pixels`（默认 1 MP）、
+`--image-min-pixels`、`--max-images`（默认 4）、`--max-image-bytes`。
+
+两条必须遵守的契约（写错会表现为“模型不确定”或“卡死”）：
+
+1. **`enable_paging()` 之后、`capture()`/`prefill()` 之前必须 `assign_table`**
+   （用 `PrefixCacheEngine` 就自动满足）。否则 `pos2slot` 全零，所有位置映射到同一 slot。
+2. **`TORCH_EXTENSIONS_DIR` 按部署目录隔离**（如 `/root/private_data/torch_ext_canon`）。
+   共享目录时每个新目录都会触发 HIP 全量重编译并抢同一个 file baton，多人并发即死等。
+
+视觉相关的回归：`test_vision.py` / `test_mrope.py` / `test_radix_mm.py` / `test_openai_mm.py`。
+整树一次性跑会因多用例重载 9 GB 权重而 OOM（CUDA 缓存未归还），**逐模块跑全绿**。

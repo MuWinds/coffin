@@ -67,15 +67,24 @@ class BlockManager:
         if self.radix is not None:
             self.radix.reserve(blocks_needed)
 
-    def match_prefix(self, token_ids: list[int], require_states: bool = False):
-        """Longest cached block prefix of ``token_ids`` (blocks, length, states)."""
+    def match_prefix(self, token_ids: list[int], require_states: bool = False,
+                     mm=None):
+        """Longest cached block prefix of ``token_ids`` (blocks, length, states).
+
+        ``mm`` (``mm_input.MMInput | None``) is the request's image payload; the
+        radix tree salts its block keys with it so a prompt carrying a *different*
+        image cannot reuse this prefix's KV.  ``None`` is the plain text path and
+        costs nothing extra.
+        """
         if self.radix is None:
             return [], 0, None
-        return self.radix.match_prefix(token_ids, require_states=require_states)
+        return self.radix.match_prefix(token_ids, require_states=require_states,
+                                       mm=mm)
 
-    def insert(self, token_ids: list[int], blocks: list[int], states) -> None:
+    def insert(self, token_ids: list[int], blocks: list[int], states,
+               mm=None) -> None:
         if self.radix is not None:
-            self.radix.insert(token_ids, blocks, states)
+            self.radix.insert(token_ids, blocks, states, mm=mm)
 
     def assign(self, blocks: list[int], row: int = 0) -> None:
         """Point the pool's slot map for ``row`` at ``blocks``."""

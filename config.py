@@ -65,6 +65,27 @@ class EngineConfig:
     #: Hard wall-clock cap of one generation, seconds (0 = none).
     max_seconds: float = 0.0
 
+    # -- multimodal (image) serving -------------------------------------------
+    #: Serve images at all.  ``False`` (``--no-vision``) keeps the vision tower
+    #: unloaded and answers an image request with a readable 503 instead of the
+    #: silent garbage a text-only prefill of image placeholders would produce.
+    vision: bool = True
+    #: Keep the tower's 2-D weights int8 (+ per-row fp32 scale) instead of fp16:
+    #: ~0.31 GiB resident instead of ~0.62 GiB, at a small per-request cost.
+    vision_int8: bool = False
+    #: The only real VRAM/latency knob: the processor downsamples anything larger.
+    #: 1 MP is ~1024 image tokens -- about the same prefill cost as 1k text tokens.
+    image_max_pixels: int = 1048576
+    #: Official floor: a smaller image is *upscaled* to this, so an image never
+    #: costs fewer than 64 tokens.
+    image_min_pixels: int = 65536
+    #: Images per request (four is 4k image tokens, already a large prefill).
+    max_images: int = 4
+    #: Decoded bytes of one image (a base64 part is 4/3 of that in the request).
+    max_image_bytes: int = 8388608
+    #: Base64 characters of all image parts of one request (before decoding).
+    max_image_total_bytes: int = 16777216
+
     def __post_init__(self) -> None:
         if self.num_blocks < 0:
             self.num_blocks = (self.max_seq + self.block_size - 1) // self.block_size
