@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# local / generated
+*.safetensors
+.safetensors/
+.venv/
+.venv*/
+*.log
+*.tmp
+.push_bundle.tmp.py
+
+# local credentials (never commit)
+.scnet.json
+.scnet_login_state.json
