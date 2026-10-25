@@ -47,11 +47,11 @@ if str(ENGINE_DIR) not in sys.path:
 
 import torch
 
-from config import EngineConfig
-from mm_input import MMInput
-from paged_cache import PagedKVCache
-from radix_cache import (RadixCache, TEXT_MEDIA_ID, media_id, media_ids_for,
-                         media_signature)
+from engine.config import EngineConfig
+from utils.mm_input import MMInput
+from cache.paged_cache import PagedKVCache
+from cache.radix_cache import (RadixCache, TEXT_MEDIA_ID, media_id, media_ids_for,
+                               media_signature)
 
 BLOCK = 8
 MAX_SEQ = 512
@@ -125,8 +125,8 @@ class FakeModel:
 
 def make_engine(model: FakeModel):
     """A single-stream ``PrefixCacheEngine`` over a CPU pool."""
-    from block_manager import BlockManager
-    from prefix_engine import PrefixCacheEngine
+    from engine.block_manager import BlockManager
+    from engine.prefix_engine import PrefixCacheEngine
 
     pool = make_pool()
     bm = BlockManager(pool, RadixCache(pool, 4), BLOCK)
@@ -136,8 +136,8 @@ def make_engine(model: FakeModel):
 
 def make_runner(model: FakeModel, pool=None):
     """A batched ``ModelRunner`` with a radix tree attached."""
-    from block_manager import BlockManager
-    from model_runner import ModelRunner
+    from engine.block_manager import BlockManager
+    from engine.model_runner import ModelRunner
 
     pool = pool or make_pool()
     cfg = EngineConfig(model_dir=".", max_seq=MAX_SEQ, bench=False, quant=False,

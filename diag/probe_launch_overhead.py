@@ -23,7 +23,7 @@ Run inside the container from the engine root, on the DCU:
 single chunk covers the whole prompt.
 
 Module: ``coffin/diag``. Standalone probe: inserts the engine root on
-``sys.path`` itself and imports ``qwen35_engine``, so it runs from any directory
+``sys.path`` itself and imports ``models.qwen35``, so it runs from any directory
 inside the container. Nothing under ``coffin/`` imports it.
 
 Constraints:
@@ -46,7 +46,7 @@ sys.path.insert(0, "/root/private_data/engine")
 
 import torch
 
-import qwen35_engine as E
+from models.qwen35 import Qwen35
 
 MODEL = "/root/private_data/models/Qwen3.5-4B"
 BASE = [9707, 11, 1879, 3671, 374, 264, 3449, 315, 9847, 13,
@@ -168,7 +168,7 @@ def main():
     # The same measurement on a real prefill: host time versus device time.
     from torch.profiler import ProfilerActivity, profile
 
-    model = E.Qwen35(MODEL, max_seq=4096, bench=False)
+    model = Qwen35(MODEL, max_seq=4096, bench=False)
     toks = [BASE[i % len(BASE)] for i in range(n)]
     model.reset()
     model.prefill(toks, chunk=n)

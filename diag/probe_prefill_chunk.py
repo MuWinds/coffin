@@ -23,7 +23,7 @@ import sys
 
 import torch
 
-import qwen35_engine as E
+from models.qwen35 import Qwen35
 
 MODEL = "/root/private_data/models/Qwen3.5-4B"
 BASE = [9707, 11, 1879, 3671, 374, 264, 3449, 315, 9847, 13,
@@ -32,7 +32,7 @@ BASE = [9707, 11, 1879, 3671, 374, 264, 3449, 315, 9847, 13,
 
 def main() -> None:
     sizes = [int(a) for a in sys.argv[1:]] or [512, 2048]
-    model = E.Qwen35(MODEL, max_seq=4096, bench=False)
+    model = Qwen35(MODEL, max_seq=4096, bench=False)
     for n in sizes:
         toks = [BASE[i % len(BASE)] for i in range(n)]
         print(f"\n=== n={n} ===")

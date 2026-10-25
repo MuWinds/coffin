@@ -1,20 +1,17 @@
-"""Engine package structure: imports, compatibility shim, architecture dispatch.
+"""Engine package structure, architecture dispatch and reload behavior.
 
-Module: ``coffin/tests``. Imports ``engine_api``, ``qwen35_engine`` and
-``support`` only; it is the one test module that must run with no DCU, so it may
-not import ``hip_ops`` or a model family at module scope.
+Module: ``coffin/tests``. Imports ``engine_api`` and ``support`` only; it is the
+one test module that must run with no DCU, so it may not import ``hip_ops`` or a
+model family at module scope.
 
 Constraints:
     * No weights are read and no kernel runs, so this file is the gate to run
       first after a code change, before paying the model load.
-    * ``LEGACY_NAMES`` is deliberately duplicated from the shim: the test is the
-      contract, so a name silently dropped from ``qwen35_engine`` must fail here
-      rather than disappear with the edit.
-    * Lazy imports are the thing under test (``hip_ops`` loads a compiled
-      extension), so an import at the top of this file would break the no-DCU
-      promise the whole file exists to keep.
+    * Model-family imports stay behind ``engine_api``; importing this test must
+      not load the compiled kernel extension on a CPU-only host.
 
-Port of ``diag/check_modules.py`` (now covered here).
+The tests pin the package registry directly. There is no flat compatibility
+module in the production import graph.
 """
 
 from __future__ import annotations
@@ -25,42 +22,25 @@ import unittest
 import support
 
 import engine_api
-import qwen35_engine
-
-#: Flat names the older code imports from ``qwen35_engine`` (``import
-#: qwen35_engine as E`` then ``E.chunked_delta`` / ``E.Qwen35`` / ...).  Listed
-#: here rather than in the shim so that dropping one is a test failure.
-LEGACY_NAMES = (
-    "D", "WF", "NEG_INF", "CKPT",
-    "PREFILL_ATTN_TILE", "PREFILL_ATTN_KB", "PREFILL_MTP_CHUNK", "ATTN_SPLIT",
-    "GEMV", "GEMVGroup", "TiedEmbedding", "RMSNorm", "RMSNormGated",
-    "make_rope_tables", "rotate_half", "apply_rope",
-    "_upper_mask", "chunked_delta",
-    "MLP", "Layer", "LinearAttn", "FullAttn", "MTP", "Qwen35", "load_weights",
-    "hip_ops",
-)
 
 QWEN_CONFIG = {"architectures": ["Qwen3_5ForConditionalGeneration"],
                "text_config": {"model_type": "qwen3_5_text"}}
 
 
-class ShimTest(unittest.TestCase):
-    """The compatibility module must keep the old flat surface working."""
+class PackageTest(unittest.TestCase):
+    """The registry exposes the model family through the new package layout."""
 
-    def test_legacy_names_are_exported(self):
-        missing = [name for name in LEGACY_NAMES if not hasattr(qwen35_engine, name)]
-        self.assertEqual(missing, [], f"shim is missing {missing}")
+    def test_registered_model_is_the_qwen35_package_model(self):
+        self.assertEqual(engine_api._REGISTRY["qwen3_5"].model.__module__,
+                         "models.qwen35.model")
 
-    def test_hip_ops_module_is_reachable_as_E_hip_ops(self):
-        import hip_ops
-        self.assertIs(qwen35_engine.hip_ops, hip_ops)
-
-    def test_reload_rebinds_shim_to_the_reloaded_registry(self):
-        """``reload`` must re-point the shim at the new registry entry, or a hot reload keeps serving the old class."""
+    def test_reload_rebuilds_the_registered_package_objects(self):
+        """Reloading the package order must leave the registry bound to new classes."""
+        before = engine_api._REGISTRY["qwen3_5"].model
         engine_api.reload()
-        qwen35_engine.reload()
-        self.assertIs(qwen35_engine.Qwen35,
-                      engine_api._REGISTRY["qwen3_5"].model)
+        after = engine_api._REGISTRY["qwen3_5"].model
+        self.assertEqual(after.__module__, "models.qwen35.model")
+        self.assertIsNot(before, after)
 
 
 class RegistryTest(unittest.TestCase):

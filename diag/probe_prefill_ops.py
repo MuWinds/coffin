@@ -28,8 +28,9 @@ sys.path.insert(0, "/root/private_data/engine")
 import torch
 import torch.nn.functional as F
 
-import qwen35_engine as E
-from qwen35_engine import LinearAttn
+from models.qwen35 import Qwen35
+from models.qwen35.linear_attn import LinearAttn
+from ops.dtypes import D
 
 MODEL = "/root/private_data/models/Qwen3.5-4B"
 BASE = [9707, 11, 1879, 3671, 374, 264, 3449, 315, 9847, 13,
@@ -56,7 +57,7 @@ def bench(fn, iters=10, warmup=3):
 def main():
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 2048
     chunk = int(sys.argv[2]) if len(sys.argv) > 2 else 2048
-    model = E.Qwen35(MODEL, max_seq=4096, bench=False)
+    model = Qwen35(MODEL, max_seq=4096, bench=False)
     toks = [BASE[i % len(BASE)] for i in range(n)]
 
     print(f"device={torch.cuda.get_device_name(0)}  n={n} chunk={chunk}")
@@ -116,7 +117,7 @@ def main():
 
     # The causal conv chain at the model's chunk size.
     C = chunk
-    qkv = torch.randn(C, la.conv_dim, dtype=E.D, device="cuda")
+    qkv = torch.randn(C, la.conv_dim, dtype=D, device="cuda")
     print(f"\ncausal conv1d+silu chain, C={C}, conv_dim={la.conv_dim}:")
 
     def chain():

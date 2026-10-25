@@ -8,7 +8,7 @@ so "did it stop itself" is the only thing being measured.
     cd /root/private_data/engine && MKL_THREADING_LAYER=GNU python3 diag/probe_deadline.py
 
 Module: ``coffin/diag``. Drives a real engine over the serve socket, so it needs
-a running server at ``$ENGINE_SOCK`` (see ``serve.py``).
+a running server at ``$ENGINE_SOCK`` (see ``entrypoints.cli.runtime``).
 
 Constraints:
     * The budget is deliberately absurd (8 s, 100k tokens) so the only possible

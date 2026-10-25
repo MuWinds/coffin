@@ -1,4 +1,4 @@
-"""Concurrent-request throughput against a running ``serve.py``.
+"""Concurrent-request throughput against a running runtime CLI.
 
 Answers what the service delivers under concurrent clients, over the real wire.
 Unlike ``bench_batch.py`` (which drives ``LLMEngine`` in-process), this talks to
@@ -6,7 +6,7 @@ the unix socket: it starts ``N`` client threads at the same time and measures ho
 fast the server retires them. That is the number the service is judged on, and
 the one batching is supposed to move.
 
-    python3 serve.py --serve --max-num-seqs 8 --max-seq 4096 --num-blocks 512 \
+    python3 -m entrypoints.cli.runtime --serve --max-num-seqs 8 --max-seq 4096 --num-blocks 512 \
         --sock /tmp/qwen35_batch.sock &
     python3 diag/bench_serve.py --sock /tmp/qwen35_batch.sock --clients 1,2,4,8
     # shared system prompt: per-client unique tails, radix reuses the prefix

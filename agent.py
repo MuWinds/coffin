@@ -10,9 +10,9 @@ round budget is exhausted.
 A tool module exposes ``execute(name, args) -> result``. Without ``--exec`` a small
 built-in weather/multiply executor is used so the loop runs out of the box.
 
-Module: ``coffin/agent.py``. Top of the import graph: it imports ``serve`` for
-the socket client and the default socket path, and nothing imports it back.
-``tool_call.py`` and ``run_chat.py`` are siblings, not dependencies.
+Module: ``coffin/agent.py``. Top of the import graph: it imports the resident
+socket transport and its default socket path, and nothing imports it back.
+``utils.tool_call`` and ``run_chat.py`` are separate entry points.
 
 Constraints:
     * The loop must echo the model's own call structure back, not the parsed
@@ -35,11 +35,10 @@ import importlib.util
 import json
 from pathlib import Path
 
-import serve
+from serving.runtime_support import SOCK
+from serving.runtime_transport import call
 
-#: ``serve.SOCK`` already resolves ``$ENGINE_SOCK``, so reusing it keeps the
-#: agent and the server on one socket default instead of two that can drift.
-SOCK = serve.SOCK
+#: Reusing the runtime default keeps the agent and server on one socket path.
 
 
 def _builtin(name: str, args: dict):
@@ -92,7 +91,7 @@ def main() -> None:
     has to be stopped by something.
 
     Raises:
-        OSError: No server is listening on ``--sock``; start ``serve.py`` first.
+        OSError: No server is listening on ``--sock``; start the runtime CLI first.
     """
     ap = argparse.ArgumentParser()
     ap.add_argument("--sock", default=SOCK)
@@ -114,7 +113,7 @@ def main() -> None:
     messages.append({"role": "user", "content": args.user})
 
     for rnd in range(args.rounds):
-        r = serve.call(args.sock, {"op": "chat", "messages": messages, "tools": tools,
+        r = call(args.sock, {"op": "chat", "messages": messages, "tools": tools,
                                    "enable_thinking": args.think, "max_new": args.max_new})
         if r.get("thinking"):
             print(f"[think] {r['thinking']}")

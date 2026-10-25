@@ -30,12 +30,12 @@ import time
 from collections import deque
 from typing import TYPE_CHECKING
 
-from sequence import SequenceStatus
+from .sequence import SequenceStatus
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from config import EngineConfig
-    from model_runner import ModelRunner
-    from sequence import Sequence
+    from .config import EngineConfig
+    from .model_runner import ModelRunner
+    from .sequence import Sequence
 
 
 class Scheduler:

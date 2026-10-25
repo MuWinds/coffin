@@ -39,7 +39,8 @@ sys.path.insert(0, "/root/private_data/engine")
 
 import torch
 
-from qwen35_engine import NEG_INF, _upper_mask, chunked_delta
+from ops.delta import _upper_mask, chunked_delta
+from ops.dtypes import NEG_INF
 
 H, DK, DV = 32, 128, 128
 

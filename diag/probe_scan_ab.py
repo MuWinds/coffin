@@ -30,17 +30,17 @@ sys.path.insert(0, "/root/private_data/engine")
 
 import torch
 
-import qwen35_engine as E
-from qwen35_engine import LinearAttn
+import models.qwen35.linear_attn as linear_attn_module
+from models.qwen35 import Qwen35
+from models.qwen35.linear_attn import LinearAttn
+from ops.delta import _upper_mask, chunked_delta
+from ops.dtypes import D, NEG_INF
 
 MODEL = "/root/private_data/models/Qwen3.5-4B"
 BASE = [9707, 11, 1879, 3671, 374, 264, 3449, 315, 9847, 13,
         3838, 374, 279, 6722, 315, 9625, 323, 11751, 13]
 
 F = torch.nn.functional
-NEG_INF = E.NEG_INF
-
-
 def chunked_delta_v0(q, k, v, g, beta, state, out_state, chunk=64):
     """The pre-baddbmm-free per-chunk scan: 3 small matmuls plus a store per chunk."""
     H, C, dk = q.shape
@@ -59,7 +59,7 @@ def chunked_delta_v0(q, k, v, g, beta, state, out_state, chunk=64):
     vc = v.reshape(H, nc, L, dv).contiguous()
     cum = g.reshape(H, nc, L).contiguous().cumsum(-1)
     pd = (cum.unsqueeze(-1) - cum.unsqueeze(-2)) \
-        .masked_fill(E._upper_mask(L, q.device), NEG_INF).exp()
+        .masked_fill(_upper_mask(L, q.device), NEG_INF).exp()
     bc = beta.reshape(H, nc, L).contiguous()
     kb = kc * bc.unsqueeze(-1)
     vb = vc * bc.unsqueeze(-1)
@@ -100,12 +100,12 @@ def bench(fn, iters=3, warmup=1):
 
 def main():
     rounds = int(sys.argv[1]) if len(sys.argv) > 1 else 3
-    model = E.Qwen35(MODEL, max_seq=4096, bench=False)
+    model = Qwen35(MODEL, max_seq=4096, bench=False)
     n = 2048
     toks = [BASE[i % len(BASE)] for i in range(n)]
-    affine = E.chunked_delta
+    affine = chunked_delta
     la = next(l.mix for l in model.layers if isinstance(l.mix, LinearAttn))
-    x = torch.randn(n, 2560, dtype=E.D, device="cuda") * 0.1
+    x = torch.randn(n, 2560, dtype=D, device="cuda") * 0.1
 
     def layer_prefill():
         return la.prefill(x)
@@ -113,15 +113,15 @@ def main():
     print(f"n={n}  delta chunk={la.prefill.__defaults__}  rounds={rounds}")
     for rnd in range(rounds):
         for name, impl in (("v0 loop ", chunked_delta_v0), ("affine  ", affine)):
-            E.chunked_delta = impl
-            E.LinearAttn.prefill.__globals__["chunked_delta"] = impl
+            linear_attn_module.chunked_delta = impl
+            LinearAttn.prefill.__globals__["chunked_delta"] = impl
             model.reset()
             ms = bench(lambda: (model.reset(), model.prefill(toks))[1], iters=2, warmup=1)
             la_ms = bench(layer_prefill)
             print(f"  round {rnd} {name} model {ms:8.1f} ms ({n / ms * 1e3:5.0f} tok/s)"
                   f"   one layer {la_ms:6.2f} ms")
-    E.chunked_delta = affine
-    E.LinearAttn.prefill.__globals__["chunked_delta"] = affine
+    linear_attn_module.chunked_delta = affine
+    LinearAttn.prefill.__globals__["chunked_delta"] = affine
 
 
 if __name__ == "__main__":

@@ -27,9 +27,9 @@ import unittest
 
 import support
 
-from config import EngineConfig
-from llm_engine import LLMEngine
-from sequence import SamplingParams
+from engine.config import EngineConfig
+from engine.llm_engine import LLMEngine
+from engine.sequence import SamplingParams
 
 BLOCK = 64
 PREFIX = [1000 + i for i in range(192)]          # three full blocks

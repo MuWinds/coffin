@@ -54,7 +54,7 @@ _ENGINE = None
 def _engine():
     """One paged PrefixCacheEngine for the module, rebuilt if the fixture moved."""
     global _ENGINE
-    from prefix_engine import PrefixCacheEngine
+    from engine.prefix_engine import PrefixCacheEngine
     model = support.ModelFixture.get(quant=False, max_seq=8192, paged=True)
     if _ENGINE is None or _ENGINE.model is not model:
         _ENGINE = PrefixCacheEngine(model, num_blocks=256, block_size=64,
@@ -167,7 +167,7 @@ class CopyOnWriteTest(unittest.TestCase):
 
     def test_shared_block_is_not_overwritten_and_writer_copies(self):
         """Writing a shared block in place would corrupt the tree's copy while still looking correct to the writer."""
-        from paged_cache import PagedKVCache, SeqKV
+        from cache.paged_cache import PagedKVCache, SeqKV
         pool = PagedKVCache(1, 2, 8, num_blocks=4, block_size=4, max_seq=16)
         block = pool.alloc()
         pool.k[0, block * 4:(block + 1) * 4] = 7
@@ -201,8 +201,8 @@ class PoolEvictionTest(unittest.TestCase):
 
     def test_eviction_spares_live_blocks_and_release_returns_them(self):
         """Evicting a live sequence's block is data loss; a leaked refcount is a pool that never grows back."""
-        from paged_cache import PagedKVCache, SeqKV
-        from radix_cache import RadixCache
+        from cache.paged_cache import PagedKVCache, SeqKV
+        from cache.radix_cache import RadixCache
         pool = PagedKVCache(2, 4, 32, num_blocks=4, block_size=8, max_seq=64)
         radix = RadixCache(pool, max_state_snapshots=2)
         live = SeqKV(pool)

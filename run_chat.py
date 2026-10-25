@@ -3,14 +3,16 @@
 This is the debugging front door for one request on one card -- no server, no
 scheduler, no paged cache. It exists to answer "does this build still produce
 text, and how fast", which is the check to run after a kernel change; the
-serving path is ``serve.py`` and is what any real deployment uses.
+serving path is ``entrypoints/cli/runtime.py`` and is what any real deployment
+uses.
 
     python run_chat.py --raw "The capital of France is" -n 32
     python run_chat.py --chat "introduce yourself" -n 64
     python run_chat.py --bench -n 128
 
 Module: ``coffin/run_chat.py``. Top of the import graph, a sibling of
-``serve.py``: it imports ``engine_api`` (the model-facing surface) and reads the
+the runtime CLI: it imports ``engine_api`` (the model-facing surface) and reads
+the
 tokenizer from the checkpoint directory, and no engine module imports it back.
 Model selection is delegated to ``create_model``, so this script never names a
 model family -- the checkpoint's ``config.json`` decides.
@@ -24,7 +26,7 @@ Constraints:
       the output: the decode loop either replays the captured graph or calls
       ``logits`` eagerly, and those are different costs.
     * Nothing here is thread-safe or re-entrant. One process, one model, one
-      request at a time; concurrency is ``serve.py``'s job.
+      request at a time; concurrency is the runtime service's job.
 """
 
 from __future__ import annotations

@@ -36,10 +36,10 @@ from typing import TYPE_CHECKING
 import torch
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from config import EngineConfig
-    from block_manager import BlockManager
-    from prefix_engine import PrefixCacheEngine
-    from sequence import Sequence
+    from .config import EngineConfig
+    from .block_manager import BlockManager
+    from .prefix_engine import PrefixCacheEngine
+    from .sequence import Sequence
 
 
 #: Batch sizes the model captures one graph per; a step runs the smallest bucket

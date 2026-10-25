@@ -42,7 +42,7 @@ from ops.dtypes import D
 from ops.embed import TiedEmbedding
 from ops.gemv import _proj
 from ops.norm import RMSNorm
-from paged_cache import PagedKVCache
+from cache.paged_cache import PagedKVCache
 
 
 class MTP:

@@ -1,6 +1,6 @@
 """Determinism / regression probe on the *supported* serving path.
 
-Answers whether the path ``serve.py`` actually uses is deterministic, which is a
+Answers whether the runtime service path is deterministic, which is a
 narrower and more useful question than probing the model object directly. The
 paged pool's ``pos2slot`` starts as all zeros: a caller that runs
 ``model.prefill()`` without first assigning a block table makes every token
@@ -8,7 +8,7 @@ address slot 0, so successive prefills stomp on each other's KV. That is a
 misuse of the internal API -- the public path is ``PrefixCacheEngine`` (or
 ``LLMEngine``), which allocates blocks and installs the table first.
 
-This probe therefore drives the engine the way ``serve.py`` does, and checks:
+This probe therefore drives the engine through the runtime service path, and checks:
 
   1. a text-only prefill repeated on a fresh engine is bit-identical
   2. warm (prefix hit) == cold for the same prompt
@@ -59,7 +59,7 @@ def main() -> None:
     sys.path.insert(0, str(root))
     import engine_api
     import mm_input
-    from prefix_engine import PrefixCacheEngine
+    from engine.prefix_engine import PrefixCacheEngine
     from transformers import AutoProcessor, AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(args.model)

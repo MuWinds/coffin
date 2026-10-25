@@ -1,7 +1,7 @@
-"""Self-test for ``openai_server.py`` against a fake engine socket (no GPU needed).
+"""Self-test for the OpenAI entry point against a fake engine socket (no GPU needed).
 
 Module: ``coffin/tests``. The only test that speaks HTTP: it imports
-``openai_server`` and ``tool_call``, points them at a stub engine and asserts the
+the OpenAI adapter and ``utils.tool_call``, points them at a stub engine and asserts the
 OpenAI wire format, so it runs on a box with no DCU.
 
 Constraints:
@@ -18,7 +18,7 @@ Constraints:
       hold-back path.
 
 The HTTP/SSE layer is pure protocol code, so it can be checked anywhere: a stub
-engine socket plays the canned token stream, ``openai_server`` is pointed at it,
+engine socket plays the canned token stream, the OpenAI adapter is pointed at it,
 and the OpenAI responses are asserted -- including the two things that are easy to
 get wrong and invisible in a passing generation:
 
@@ -41,8 +41,8 @@ import urllib.request
 # Side-effect import: sets MKL_THREADING_LAYER and puts coffin/ on sys.path.
 import support  # noqa: F401
 
-import openai_server as srv
-from tool_call import parse_tool_calls, split_thinking
+from entrypoints.openai import server as srv
+from utils.tool_call import parse_tool_calls, split_thinking
 
 
 class TcpEngine(srv.EngineClient):
@@ -112,7 +112,7 @@ def _pieces(req: dict) -> tuple[list[str], bool]:
 def _reply(req: dict) -> dict:
     """The non-stream reply the stub engine returns, shaped like the real ``done`` payload.
 
-    ``_reply`` mirrors ``serve.Server._split``'s "prompt opened the thought"
+    ``_reply`` mirrors the runtime chat split's "prompt opened the thought"
     rule, so the test asserts the server's output rather than re-deriving it.
     """
     pieces, opens = _pieces(req)
@@ -121,7 +121,7 @@ def _reply(req: dict) -> dict:
     thinking, answer = split_thinking(raw)
     if (req.get("enable_thinking") and not prefix
             and not thinking and "</think>" not in raw):
-        thinking, answer = answer, ""           # same rule as serve.Server._split
+        thinking, answer = answer, ""           # same rule as the runtime chat split
     return {"ok": True, "text": answer, "thinking": thinking, "raw": raw,
             "tool_calls": [c.to_openai_dict() for c in parse_tool_calls(answer)],
             "forced_tool": bool(prefix),

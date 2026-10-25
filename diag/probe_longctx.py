@@ -37,7 +37,8 @@ import time
 
 import torch
 
-import qwen35_engine as E
+from models.qwen35 import Qwen35, load_weights
+from models.qwen35.full_attn import FullAttn
 
 MODEL = "/root/private_data/models/Qwen3.5-4B"
 
@@ -74,19 +75,19 @@ def main() -> None:
     toks = [random.randrange(1000, 200000) for _ in range(lengths[-1])]
 
     t0 = time.time()
-    w = E.load_weights(args.model, quant=args.int8)
+    w = load_weights(args.model, quant=args.int8)
     print(f"weights {'int8' if args.int8 else 'fp16'}: {time.time() - t0:.1f}s", flush=True)
 
     torch.cuda.reset_peak_memory_stats()
-    m = E.Qwen35(args.model, max_seq=args.max_seq, bench=not args.no_bench, weights=w)
+    m = Qwen35(args.model, max_seq=args.max_seq, bench=not args.no_bench, weights=w)
     m.capture()
     sync()
     print(vram("build+capture"), flush=True)
 
     # KV accounting straight off the live tensors: the 8 full-attn layers plus the
     # MTP head's own full-attention layer, int8 k/v plus the two fp32 row scales.
-    full = [lay.mix for lay in m.layers if isinstance(lay.mix, E.FullAttn)]
-    if m.mtp is not None and isinstance(getattr(m.mtp, "attn", None), E.FullAttn):
+    full = [lay.mix for lay in m.layers if isinstance(lay.mix, FullAttn)]
+    if m.mtp is not None and isinstance(getattr(m.mtp, "attn", None), FullAttn):
         full.append(m.mtp.attn)
     per_tok = sum(f.nkv * f.hd * 2 + 2 * f.nkv * 4 for f in full)
     print(f"full-attn caches {len(full)}, int8 KV {per_tok / 1024:.2f} KiB/token "

@@ -26,7 +26,7 @@ sys.path.insert(0, "/root/private_data/engine")
 
 import torch
 
-import qwen35_engine as E
+from models.qwen35 import Qwen35, load_weights
 
 MODEL = "/root/private_data/models/Qwen3.5-4B"
 D = torch.bfloat16
@@ -65,13 +65,13 @@ def run(model, n, label):
 def main():
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 30
     print(f"device={torch.cuda.get_device_name(0)}")
-    m = E.Qwen35(MODEL, max_seq=2048, bench=True)
+    m = Qwen35(MODEL, max_seq=2048, bench=True)
     run(m, n, "fp16 weights (default)")
     del m
     torch.cuda.empty_cache()
 
-    sd = E.load_weights(MODEL, quant=True)
-    m8 = E.Qwen35(MODEL, max_seq=2048, bench=True, weights=sd)
+    sd = load_weights(MODEL, quant=True)
+    m8 = Qwen35(MODEL, max_seq=2048, bench=True, weights=sd)
     run(m8, n, "int8 weights (W8A16)")
 
 

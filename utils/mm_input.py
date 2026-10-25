@@ -5,10 +5,10 @@ vision tower produced, laid out in the exact order the LLM's ``<|image_pad|>``
 tokens appear in the prompt, plus the 3-D (T,H,W) mRoPE positions of the whole
 prompt and the ``rope_delta`` that maps token index -> mRoPE position.
 
-Module: ``coffin/mm_input.py``. Sits between the vision tower and the text
+Module: ``coffin/utils/mm_input.py``. Sits between the vision tower and the text
 model: ``models/qwen35/vision.py`` produces the embeds, ``models/qwen35/model.py``
-consumes ``MMInput`` on prefill, ``radix_cache.py`` reads ``digest`` to key its
-blocks, and ``serve.py`` / ``openai_server.py`` build one per image request. It
+consumes ``MMInput`` on prefill, ``cache/radix_cache.py`` reads ``digest`` to key
+its blocks, and ``serving/`` builds one per image request. It
 imports ``torch`` only, so both the model and the cache layer can depend on it.
 
 Why the prompt's token ids alone are not enough: text-only mRoPE collapses to

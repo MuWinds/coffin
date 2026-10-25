@@ -19,7 +19,7 @@ the port, default 18080:
 
     cd /root/private_data/engine && MKL_THREADING_LAYER=GNU python3 diag/probe_tool_choice.py
 
-Module: ``coffin/diag``. Standalone probe: drives ``openai_server.py`` over HTTP
+Module: ``coffin/diag``. Standalone probe: drives the OpenAI adapter over HTTP
 and imports nothing from ``coffin/``.
 
 Constraints:

@@ -1,7 +1,7 @@
 """The engine, assembled: model + runner + scheduler + block manager.
 
-Module: ``coffin/`` (top layer). This is what a server talks to; ``serve.py`` is
-left with the socket, the tokenizer and the response protocol. The engine owns
+Module: ``coffin/`` (top layer). This is what the runtime service talks to; the
+entry point owns the socket, tokenizer and response protocol. The engine owns
 the request lifecycle, the block pool and the model's captured graphs.
 
     LLMEngine
@@ -29,14 +29,14 @@ from typing import TYPE_CHECKING, Iterator
 
 import torch
 
-from block_manager import BlockManager
-from config import EngineConfig
-from model_runner import ModelRunner
-from scheduler import Scheduler
-from sequence import SamplingParams, Sequence
+from .block_manager import BlockManager
+from .config import EngineConfig
+from .model_runner import ModelRunner
+from .scheduler import Scheduler
+from .sequence import SamplingParams, Sequence
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from prefix_engine import PrefixCacheEngine
+    from .prefix_engine import PrefixCacheEngine
 
 
 class LLMEngine:
@@ -69,7 +69,7 @@ class LLMEngine:
                 with_radix=cfg.prefix_cache)
             self.runner.attach_blocks(self.bm)
         if cfg.prefix_cache and not self.batching:
-            from prefix_engine import PrefixCacheEngine
+            from .prefix_engine import PrefixCacheEngine
 
             self.pc = PrefixCacheEngine(
                 model, num_blocks=cfg.num_blocks, block_size=cfg.block_size,
@@ -378,11 +378,11 @@ class LLMEngine:
             self.bm.clear_prefix_cache()
 
     def stats(self) -> dict:
-        """Engine and cache counters, as reported by ``serve.py``'s ``ping``.
+        """Engine and cache counters, as reported by the runtime ``ping``.
 
         Returns:
             Request and token totals plus the block/prefix counters when a pool
-            exists. The key names are what ``serve.py`` serialises, so they are
+            exists. The key names are what the runtime serialises, so they are
             part of the API surface rather than free-form labels.
         """
         out = {

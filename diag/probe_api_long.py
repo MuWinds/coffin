@@ -13,7 +13,7 @@ line above exposes. An HTTP error instead of output means the request exceeded
 
     python diag/probe_api_long.py [words] [port]
 
-Module: ``coffin/diag``. Standalone probe: drives ``openai_server.py`` over HTTP
+Module: ``coffin/diag``. Standalone probe: drives the OpenAI adapter over HTTP
 and imports nothing from ``coffin/``.
 
 Constraints:

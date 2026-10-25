@@ -24,8 +24,8 @@ sys.path.insert(0, "/root/private_data/engine")
 import torch
 from transformers import AutoTokenizer
 
-import qwen35_engine as engine
-from prefix_engine import PrefixCacheEngine
+from models.qwen35 import Qwen35, load_weights
+from engine.prefix_engine import PrefixCacheEngine
 
 MODEL = "/root/private_data/models/Qwen3.5-4B"
 
@@ -40,8 +40,8 @@ def timeit(fn, reps=5) -> float:
     return (time.time() - t0) / reps * 1000
 
 
-sd = engine.load_weights(MODEL)
-m = engine.Qwen35(MODEL, max_seq=2048, bench=False, weights=sd)
+sd = load_weights(MODEL)
+m = Qwen35(MODEL, max_seq=2048, bench=False, weights=sd)
 eng = PrefixCacheEngine(m, num_blocks=256, block_size=64)
 m.capture()
 tok = AutoTokenizer.from_pretrained(MODEL)

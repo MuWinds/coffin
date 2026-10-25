@@ -3,7 +3,8 @@
 Module: ``coffin/`` (top level, imports nothing else from the engine). One
 ``EngineConfig`` is built from CLI flags or by a test and passed down to
 ``llm_engine`` / ``scheduler`` / ``model_runner``, so none of them has to know
-how the server was invoked. ``serve.py`` is the only place that parses flags.
+how the server was invoked. ``entrypoints/cli/runtime.py`` is the only place
+that parses runtime flags.
 
 Constraints:
     * Fields are read once at construction by the layers they configure; a few
@@ -25,7 +26,7 @@ class EngineConfig:
 
     The defaults are the ones the benchmark numbers in ``NOTES.md`` were
     measured with; anything tuned for a different card belongs in the CLI layer
-    of ``serve.py`` rather than here.
+    of ``entrypoints/cli/runtime.py`` rather than here.
     """
 
     model_dir: str

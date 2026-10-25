@@ -23,8 +23,8 @@ When thinking is on, the reasoning sits in ``<think>...</think>`` and may preced
 the call; ``split_thinking`` separates the two so the OpenAI shell can return
 ``reasoning_content`` next to the answer.
 
-Module: ``coffin/tool_call.py``. Leaf of the import graph: standard library only,
-so ``serve.py`` and ``tests/test_openai.py`` can both depend on it.
+Module: ``coffin/utils/tool_call.py``. Leaf of the import graph: standard library
+only, so ``serving/`` and ``tests/test_openai.py`` can both depend on it.
 
 Constraints:
     * The tags and the surrounding template are a checkpoint contract. Changing

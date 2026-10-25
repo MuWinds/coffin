@@ -51,7 +51,7 @@ if str(_ENGINE) not in sys.path:
 
 import torch
 
-import mm_input
+import utils.mm_input as mm_input
 from ops.mrope import mrope_cos_sin, scatter_image_embeds
 from ops.rope import make_inv_freq, make_rope_tables
 
@@ -457,8 +457,7 @@ class ModelPlumbingTest(unittest.TestCase):
         self.assertIn("self.rope_delta = torch.zeros(capacity", src)
         self.assertIn("self.rope_delta1 = self.rope_delta[", src)
         # reset() clears it, so a fresh sequence never inherits an image offset.
-        self.assertIn("def reset(self) -> None:\n        self.pos.zero_()\n"
-                      "        self.rope_delta.zero_()", src)
+        self.assertIn("self.pos.zero_()\n        self.rope_delta.zero_()", src)
 
     def test_rope_delta_follows_the_row_state(self):
         """A row's offset must travel with its recurrent state, and clear on reuse."""

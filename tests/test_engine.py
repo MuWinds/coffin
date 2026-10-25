@@ -3,7 +3,8 @@
 Module: ``coffin/tests``. The highest layer of the suite: it drives
 ``llm_engine.LLMEngine`` over ``config`` / ``sequence`` / ``scheduler`` /
 ``block_manager`` / ``model_runner`` and compares the result against the direct
-model loop, so a scheduler or runner bug surfaces here rather than in serve.py.
+model loop, so a scheduler or runner bug surfaces here rather than in the runtime
+entry point.
 
 Constraints:
     * The reference is the pre-refactor model loop (``greedy_reference``), never a
@@ -31,9 +32,9 @@ import unittest
 # Side-effect import: sets MKL_THREADING_LAYER and puts coffin/ on sys.path.
 import support  # noqa: F401
 
-from config import EngineConfig
-from llm_engine import LLMEngine
-from sequence import SamplingParams
+from engine.config import EngineConfig
+from engine.llm_engine import LLMEngine
+from engine.sequence import SamplingParams
 
 #: Any in-vocab ids work: the model only sees embeddings, not text.  Two blocks
 #: long, so the radix tree has a block-aligned prefix to match.

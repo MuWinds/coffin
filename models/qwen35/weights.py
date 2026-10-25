@@ -42,7 +42,6 @@ import json
 from pathlib import Path
 
 import torch
-from safetensors import safe_open
 
 from int8_weights import QWeight, is_quantizable
 from models.qwen35.vision import VISUAL_PREFIX, is_vision_quantizable
@@ -86,6 +85,8 @@ def load_weights(model_dir: str | Path, prefix: str = "model.language_model.",
             ``VISUAL_PREFIX`` tensor was found. Report the mismatched checkpoint
             rather than starting an engine that will fail on its first image.
     """
+    from safetensors import safe_open
+
     model_dir = Path(model_dir)
     with (model_dir / "config.json").open() as f:
         cfg = json.load(f)

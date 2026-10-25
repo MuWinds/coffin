@@ -49,7 +49,7 @@ from ops.embed import TiedEmbedding
 from ops.mrope import mrope_cos_sin, scatter_image_embeds
 from ops.norm import RMSNorm
 from ops.rope import make_inv_freq, make_rope_tables
-from paged_cache import PagedKVCache
+from cache.paged_cache import PagedKVCache
 
 
 class Qwen35:
@@ -248,7 +248,7 @@ class Qwen35:
         caller does not fill (a bucket is padded with sentinel rows). Reserving a
         block per row *before* capture and pointing that row's map at it is what
         stops the capture-time warmup from scribbling over a block a real sequence
-        owns -- the same trick ``serve.py`` uses for its single scratch block. The
+        owns -- the same trick the runtime service uses for its single scratch block. The
         prefill row gets one too, because ``capture()`` warms its prefill path.
         """
         pool = self.pool
@@ -1734,7 +1734,7 @@ class Qwen35:
     def close(self) -> None:
         """Drop the captured graphs and the layer objects.
 
-        ``serve.py`` rebuilds the model after reloading the code; a live
+        runtime service rebuilds the model after reloading the code; a live
         ``CUDAGraph`` pins its private memory pool (about half the model's
         footprint), so dropping the model reference alone is not enough.
         """

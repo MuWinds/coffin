@@ -11,36 +11,34 @@
 
 | 路径 | 职责 |
 | --- | --- |
-| `config.py` | `EngineConfig`：服务/引擎的全部开关（窗口、块大小、批容量、快照预算） |
-| `sequence.py` | `Sequence`（一个请求的状态机 + block table + 批内行号）、`SamplingParams` |
-| `scheduler.py` | 连续批调度：每步最多 admit 一个 prefill，同时解码所有 running；超时退休 |
-| `block_manager.py` | 块池 + 引用计数（可选 radix 树）：`ensure_blocks` / `release` / `assign` |
-| `model_runner.py` | 一步怎么执行：单流 `decode_step` 或静态批 `decode`（行 / 桶 / 采样） |
-| `llm_engine.py` | `LLMEngine`：把 model + runner + scheduler + block manager 装起来，一步一步驱动 |
+| `engine/` | 请求状态、调度、执行、块所有权和 `LLMEngine`；按运行时职责拆分，避免入口脚本承载引擎状态 |
+| `cache/` | 分页 KV 与 radix 前缀缓存；模型无关的存储与复用 |
+| `utils/` | 多模态 prompt 元数据和 tool-call 解析等叶子辅助模块 |
+| `layers/` | 稳定的层/算子导出面；底层实现暂时由 `ops/` 和 `models/` 保持兼容 |
 | `engine_api.py` | 服务侧唯一入口：`Model` / `PagedModel` 协议、`create_model()`（按 `config.json` 的 `model_type` / `architectures` 分发）、`load_weights()`、热重载 `reload()` |
 | `ops/` | 与模型族无关的设备算子：`dtypes.py`、`gemv.py`、`embed.py`、`norm.py`、`rope.py`、`delta.py` |
 | `models/qwen35/` | Qwen3.5-4B 一族：`model.py`、`blocks.py`、`batch.py`（批投影）、`linear_attn.py`、`full_attn.py`、`mtp.py`、`weights.py`、`tuning.py` |
-| `qwen35_engine.py` | 旧扁平导入的兼容壳，`diag/` 的探针还在用；新代码别用 |
 | `hip_ops.py` + `kernels/` | HIP 内核的 host 薄壳与 `.cu` 源码（`batch.cu` 是批核） |
-| `paged_cache.py` / `radix_cache.py` / `prefix_engine.py` | 分页 KV 与 radix 前缀复用（模型无关） |
-| `serve.py` / `openai_server.py` | 常驻服务（engine 线程 + 每连接一个线程）与 OpenAI 兼容外壳 |
-| `tool_call.py` / `agent.py` / `run_chat.py` | tool-call 解析、工具循环、单机入口 |
+| `serving/` | 常驻引擎服务：`runtime_service.py`、运行时 mixin、socket transport；不承载 HTTP 协议和 CLI parser |
+| `entrypoints/openai/` | OpenAI HTTP/SSE 适配：`app.py`、请求规范化、流式 tool-call、engine socket client |
+| `entrypoints/cli/` | 命令行入口：`runtime.py` 启动/控制引擎，`openai.py` 启动 HTTP 适配器 |
+| `utils/tool_call.py` / `agent.py` / `run_chat.py` | tool-call 解析、工具循环、单机入口 |
 | `diag/` | 归因 / 带宽探针与 benchmark（profile、AB、数值对比、`bench_batch.py` 批吞吐） |
 | `tests/` | 功能回归（unittest）：结构、算子、attention、量化、投机、MTP、分页、批 decode、引擎、OpenAI 协议 |
 
 ## 依赖方向
 
 ```
-ops  ←  models/*  ←  engine_api  ←  serve.py / run_chat.py / prefix_engine.py
-                 ↖  config / sequence / scheduler / block_manager / model_runner
-                    ↖  llm_engine  ←  serve.py
+ops / layers  ←  models/*  ←  engine_api  ←  serving/
+cache / utils ←  engine/*  ←  serving/ ← entrypoints/cli/
+                                      ↖ entrypoints/openai/
 ```
 
 - `ops/` 不许 import `models/`，模型族可以 import `ops/`。
 - 同一族内的模块互相 import；跨族只通过 `engine_api`。
 - 只有 `engine_api.py` 知道“有哪些模型族”。
-- `sequence.py` / `config.py` 不 import 其它引擎模块；`llm_engine.py` 是唯一把
-  runner、scheduler、block manager 装到一起的地方。
+- `engine/sequence.py` / `engine/config.py` 不 import 其它引擎模块；
+  `engine/llm_engine.py` 是唯一把 runner、scheduler、block manager 装到一起的地方。
 
 ## 批处理的行布局
 
@@ -67,15 +65,17 @@ ops  ←  models/*  ←  engine_api  ←  serve.py / run_chat.py / prefix_engine
    `enable_paging` / `snapshot_linear_states` / `restore_linear_states`；
 3. 在 `engine_api.py` 末尾 `register((...), ModelClass, load_weights)` 一行。
 
-`serve.py`、`prefix_engine.py`、`openai_server.py` 都不用动。
+模型族接入不需要修改 `serving/` 或 `entrypoints/`；运行时从
+`python -m entrypoints.cli.runtime --serve` 启动，OpenAI 适配器从
+`python -m entrypoints.cli.openai` 启动。
 
 ## 部署默认值
 
 | 变量 / 参数 | 作用 |
 | --- | --- |
 | `ENGINE_MODEL` / `--model` | checkpoint 目录；架构由它的 `config.json` 决定，启动日志会打印 `模型名 (架构族) at 路径` |
-| `ENGINE_SOCK` / `--sock` | 引擎 socket，默认 `/tmp/qwen35.sock`（旧路径保持兼容）；跑第二个模型时换一个 |
-| `--served-model-name` | `openai_server.py` 的 `/v1/models` id；默认取引擎报告的目录名 |
+| `ENGINE_SOCK` / `--sock` | 引擎 socket，默认 `/tmp/qwen35.sock`；跑第二个模型时换一个 |
+| `--served-model-name` | OpenAI 适配器的 `/v1/models` id；默认取引擎报告的目录名 |
 
 ## 改完怎么验
 
@@ -102,12 +102,12 @@ python3 run_chat.py --bench -n 32
 
 | 文件 | 职责 |
 | --- | --- |
-| `mm_input.py` | `MMInput`（图片 embeds / grid / 3-D mRoPE positions / `rope_delta` / digest / spans）、`mrope_positions`、`find_image_spans`、`image_digest` |
+| `utils/mm_input.py` | `MMInput`（图片 embeds / grid / 3-D mRoPE positions / `rope_delta` / digest / spans）、`mrope_positions`、`find_image_spans`、`image_digest` |
 | `models/qwen35/vision.py` | `VisionTower`：patch_embed / pos_embed 重采样 / axial RoPE / 分块非因果 attention / 24 block / merger；fp16 或 int8 |
 | `ops/mrope.py` | `mrope_cos_sin`（stride-3 交错，`[11,11,10]`）、`scatter_image_embeds`（绝对下标注入） |
 | `models/qwen35/model.py` | `enable_vision` / `image_embeds` / `prefill(..., mm=)` / `prefill_group` 读 `seq.mm` / `rope_delta` |
-| `radix_cache.py` | block 级 media signature（图片指纹），纯文本 block 零开销 |
-| `serve.py` / `openai_server.py` | `image_url` data URL → PIL → `Qwen3VLProcessor` → `MMInput` |
+| `cache/radix_cache.py` | block 级 media signature（图片指纹），纯文本 block 零开销 |
+| `serving/runtime_service.py` / `entrypoints/openai/app.py` | `image_url` data URL → PIL → `Qwen3VLProcessor` → `MMInput` |
 
 新增开关：`--no-vision`、`--vision-int8`、`--image-max-pixels`（默认 1 MP）、
 `--image-min-pixels`、`--max-images`（默认 4）、`--max-image-bytes`。

@@ -1,14 +1,14 @@
-"""Self-test for the image (``image_url``) path of ``openai_server.py`` (no GPU).
+"""Self-test for the image (``image_url``) path of the OpenAI adapter (no GPU).
 
 Module: ``coffin/tests``. The multimodal counterpart of ``test_openai.py``: it
-imports ``openai_server`` and reproduces the engine over a stub socket.
+imports the OpenAI adapter and reproduces the engine over a stub socket.
 
 Constraints:
     * This file must not import ``support``: that module calls
       ``torch.cuda.is_available()`` at import time, which blocks while another
       process holds the card, and a protocol test has no reason to queue behind
       the GPU. It therefore sets ``MKL_THREADING_LAYER`` and ``sys.path`` itself.
-      For the same reason ``openai_server`` is imported after ``sys.path`` is
+      For the same reason the adapter is imported after ``sys.path`` is
       prepared -- that ordering is why the import carries a ``# noqa: E402``.
     * The real PNG bytes are decoded, not mocked: the base64 and size-limit path
       is what is under test, and a fake payload would skip it.
@@ -60,7 +60,7 @@ _ENGINE_DIR = Path(__file__).resolve().parent.parent
 if str(_ENGINE_DIR) not in sys.path:
     sys.path.insert(0, str(_ENGINE_DIR))
 
-import openai_server as srv  # noqa: E402  (after sys.path is prepared)
+from entrypoints.openai import server as srv  # noqa: E402  (after sys.path is prepared)
 
 #: A tiny valid PNG (1x1, opaque white).  Real bytes, so the base64/decoding path
 #: is exercised rather than mocked; the *image* content never matters here.

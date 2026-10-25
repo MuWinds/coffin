@@ -28,9 +28,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import engine_api  # noqa: E402
-from config import EngineConfig  # noqa: E402
-from llm_engine import LLMEngine  # noqa: E402
-from sequence import SamplingParams  # noqa: E402
+from engine.config import EngineConfig  # noqa: E402
+from engine.llm_engine import LLMEngine  # noqa: E402
+from engine.sequence import SamplingParams  # noqa: E402
 
 MODEL_DIR = os.environ.get("QWEN_MODEL", "/root/private_data/models/Qwen3.5-4B")
 PROMPTS = [

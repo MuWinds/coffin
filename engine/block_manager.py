@@ -22,11 +22,11 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from paged_cache import PagedKVCache
-    from radix_cache import RadixCache
+    from cache.paged_cache import PagedKVCache
+    from cache.radix_cache import RadixCache
 
 
-#: Default block granularity; ``serve.py`` exposes it as ``--block-size``.
+#: Default block granularity; the runtime CLI exposes it as ``--block-size``.
 #: 64 matches the snapshot interval floor, so a recurrent-state snapshot never
 #: lands mid-block.
 DEFAULT_BLOCK_SIZE = 64
@@ -69,7 +69,7 @@ class BlockManager:
         Returns:
             The manager owning the new pool.
         """
-        from radix_cache import RadixCache
+        from cache.radix_cache import RadixCache
 
         pool = model.enable_paging(num_blocks, block_size)
         radix = RadixCache(pool, snapshots) if with_radix else None
@@ -198,7 +198,7 @@ class BlockManager:
         return self.pool.num_free
 
     def stats(self) -> dict:
-        """Prefix-cache counters, as reported by ``serve.py``'s ``ping``.
+        """Prefix-cache counters, as reported by the runtime ``ping``.
 
         Returns:
             Block totals always; the radix counters only when a tree is

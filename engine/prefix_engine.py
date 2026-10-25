@@ -47,9 +47,9 @@ import time
 
 import torch
 
-from paged_cache import PagedKVCache, SeqKV
-from block_manager import BlockManager
-from radix_cache import RadixCache
+from cache.paged_cache import PagedKVCache, SeqKV
+from .block_manager import BlockManager
+from cache.radix_cache import RadixCache
 
 
 class PrefixCacheEngine:

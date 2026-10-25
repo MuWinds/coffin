@@ -14,8 +14,8 @@ Constraints:
       has to stay loadable, and unit-testable, without a checkpoint.
     * Absolute imports (``from ops.gemv import GEMV``) because the entry points
       put ``coffin/`` itself on ``sys.path``, making ``ops`` a top-level package
-      next to ``hip_ops`` and ``paged_cache`` -- see ``serve.py`` and
-      ``run_chat.py``.
+      next to ``hip_ops`` and the ``cache`` package -- see
+      ``entrypoints/cli/runtime.py`` and ``run_chat.py``.
     * Keep the measured TFLOP/s and GB/s figures in the module docstrings: they
       are the only record of why the current kernel form won on gfx906.
 """

@@ -88,8 +88,8 @@ import hashlib
 import time
 from typing import Any, Optional
 
-from paged_cache import PagedKVCache
-from mm_input import IMAGE_TOKEN_ID
+from .paged_cache import PagedKVCache
+from utils.mm_input import IMAGE_TOKEN_ID
 
 #: A linear-attention snapshot: model layer index -> (recurrent, conv) state.
 LinearStates = dict[int, tuple[Any, Any]]
@@ -144,7 +144,7 @@ def media_ids_for(mm, num_tokens: int) -> Optional[list[int]]:
         ValueError: ``mm`` has image spans but an empty digest. Refusing is the
             safe failure: without a content digest two different images of the
             same size would share block keys and the cache would return one
-            image's KV for the other. ``serve.py`` always fills it in
+            image's KV for the other. The runtime service always fills it in
             (``mm_input.image_digest``), so this is a caller bug.
     """
     if mm is None:

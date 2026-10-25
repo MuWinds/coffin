@@ -20,7 +20,7 @@ strings, which is the incremental decoder's bug rather than the protocol's.
 
     python diag/probe_api_agent.py [port]
 
-Module: ``coffin/diag``. Standalone probe: drives ``openai_server.py`` over HTTP
+Module: ``coffin/diag``. Standalone probe: drives the OpenAI adapter over HTTP
 and imports nothing from ``coffin/``.
 
 Constraints:

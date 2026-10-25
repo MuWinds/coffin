@@ -30,18 +30,16 @@ Run inside the container, from the engine root, on the DCU:
 (default 256), and ``SKIP_E2E=1`` skips the model-level sweep when only the
 per-part table is wanted.
 
-Module: ``coffin/diag``. Standalone probe: imports ``qwen35_engine`` (the legacy
-flat-import compatibility shell) plus torch, and nothing under ``coffin/``
-imports it.
+Module: ``coffin/diag``. Standalone probe: imports the split Qwen3.5 modules plus
+torch, and nothing under ``coffin/`` imports this probe.
 
 Constraints:
     * Reads the real checkpoint from ``MODEL`` and builds a real model, so this
       cannot run on a host without the weights; unlike the hardware probes it is
       not synthetic.
-    * The legacy ``qwen35_engine`` import is deliberate. New engine code must use
-      absolute imports, but this probe reaches into layer internals
-      (``la.conv_state``, ``la.qscale``) that the new module layout does not
-      re-export.
+    * The direct imports are deliberate: this probe reaches into layer internals
+      (``la.conv_state``, ``la.qscale``) that should not be re-exported from the
+      family package.
     * Every part is timed on the same ``n`` and the same layer instance, so a
       part list is only comparable with the ``whole`` measured in that same call.
 """
@@ -54,8 +52,13 @@ import sys
 import torch
 import torch.nn.functional as F
 
-import qwen35_engine as E
-from qwen35_engine import FullAttn, LinearAttn, chunked_delta
+import hip_ops
+from models.qwen35 import Qwen35
+from models.qwen35.full_attn import FullAttn
+from models.qwen35.linear_attn import LinearAttn
+from ops.delta import chunked_delta
+from ops.dtypes import D, NEG_INF
+from ops.rope import apply_rope
 
 MODEL = "/root/private_data/models/Qwen3.5-4B"
 
@@ -107,7 +110,7 @@ def toks(n: int) -> list[int]:
     return [BASE[i % len(BASE)] for i in range(n)]
 
 
-def end_to_end(model: E.Qwen35, sizes) -> dict[int, float]:
+def end_to_end(model: Qwen35, sizes) -> dict[int, float]:
     """Time a full ``model.prefill`` at each prompt length.
 
     Args:
@@ -131,7 +134,7 @@ def end_to_end(model: E.Qwen35, sizes) -> dict[int, float]:
     return out
 
 
-def linear_parts(model: E.Qwen35, n: int) -> dict[str, float]:
+def linear_parts(model: Qwen35, n: int) -> dict[str, float]:
     """Time each stage of one real linear-attention layer at length ``n``.
 
     Args:
@@ -149,7 +152,7 @@ def linear_parts(model: E.Qwen35, n: int) -> dict[str, float]:
     magnitude the real layer produces.
     """
     la = next(l.mix for l in model.layers if isinstance(l.mix, LinearAttn))
-    x = torch.randn(n, 2560, dtype=E.D, device="cuda") * 0.1
+    x = torch.randn(n, 2560, dtype=D, device="cuda") * 0.1
     state = torch.zeros_like(la.state)
     la.reset()
 
@@ -162,7 +165,7 @@ def linear_parts(model: E.Qwen35, n: int) -> dict[str, float]:
     # conv row used to bench the 3.6 ms unfold chain that conv1d_silu_seq
     # deleted, which made the table lie about where the time goes.
     def conv():
-        return E.hip_ops.conv1d_silu_seq(la.conv_w, qkv, la.conv_state)
+        return hip_ops.conv1d_silu_seq(la.conv_w, qkv, la.conv_state)
 
     qkvc = conv()
 
@@ -179,8 +182,8 @@ def linear_parts(model: E.Qwen35, n: int) -> dict[str, float]:
         vt = torch.empty(la.num_v, n, la.dv, dtype=torch.float32, device="cuda")
         bt = torch.empty(la.num_v, n, dtype=torch.float32, device="cuda")
         gt = torch.empty(la.num_v, n, dtype=torch.float32, device="cuda")
-        E.hip_ops.delta_prep_seq(qkvc, b, a, la.neg_expA, la.dt_bias,
-                                 qt, kt, vt, bt, gt, la.qscale, la.rep)
+        hip_ops.delta_prep_seq(qkvc, b, a, la.neg_expA, la.dt_bias,
+                               qt, kt, vt, bt, gt, la.qscale, la.rep)
         return qt, kt, vt, bt, gt
 
     qc, kc, vc, bt, gt = prep()
@@ -211,7 +214,7 @@ def linear_parts(model: E.Qwen35, n: int) -> dict[str, float]:
     }
 
 
-def mlp_parts(model: E.Qwen35, n: int) -> dict[str, float]:
+def mlp_parts(model: Qwen35, n: int) -> dict[str, float]:
     """Time the gate/up projection, the down projection and the whole MLP.
 
     Args:
@@ -224,7 +227,7 @@ def mlp_parts(model: E.Qwen35, n: int) -> dict[str, float]:
         and the extra elementwise pass, not a missing row.
     """
     mlp = model.layers[0].mlp
-    x = torch.randn(n, 2560, dtype=E.D, device="cuda") * 0.1
+    x = torch.randn(n, 2560, dtype=D, device="cuda") * 0.1
     g, u = mlp.gate_up.prefill(x)
     h = F.silu(g) * u
     return {
@@ -234,7 +237,7 @@ def mlp_parts(model: E.Qwen35, n: int) -> dict[str, float]:
     }
 
 
-def fa_parts(model: E.Qwen35, n: int) -> dict[str, float]:
+def fa_parts(model: Qwen35, n: int) -> dict[str, float]:
     """Time each stage of one real full-attention layer at length ``n``.
 
     Args:
@@ -251,7 +254,7 @@ def fa_parts(model: E.Qwen35, n: int) -> dict[str, float]:
     cost and is easy to leave out of the accounting entirely.
     """
     fa = next(l.mix for l in model.layers if isinstance(l.mix, FullAttn))
-    x = torch.randn(n, 2560, dtype=E.D, device="cuda") * 0.1
+    x = torch.randn(n, 2560, dtype=D, device="cuda") * 0.1
     pos = torch.arange(n, device="cuda")
     ctx = (model.cos_tbl, model.sin_tbl, model.mask_idx)
     qg, k, v = fa.qkv.prefill(x)
@@ -261,11 +264,11 @@ def fa_parts(model: E.Qwen35, n: int) -> dict[str, float]:
     vn = v.reshape(n, fa.nkv, fa.hd)
     cos = model.cos_tbl.index_select(0, pos).unsqueeze(1)
     sin = model.sin_tbl.index_select(0, pos).unsqueeze(1)
-    qr, kr = E.apply_rope(q, kn, cos, sin, fa.rot)
+    qr, kr = apply_rope(q, kn, cos, sin, fa.rot)
     qk, sk = fa._quant_seq(kr)                    # [n, nkv, hd]
     qv, sv = fa._quant_seq(vn)
-    kk, kkp = qk.transpose(0, 1).to(E.D), sk.transpose(0, 1)
-    vv, vvp = qv.transpose(0, 1).to(E.D), sv.transpose(0, 1)
+    kk, kkp = qk.transpose(0, 1).to(D), sk.transpose(0, 1)
+    vv, vvp = qv.transpose(0, 1).to(D), sv.transpose(0, 1)
 
     def eins1():
         qe = qr.reshape(n, fa.nkv, fa.rep, fa.hd).permute(1, 2, 0, 3)
@@ -283,17 +286,17 @@ def fa_parts(model: E.Qwen35, n: int) -> dict[str, float]:
         """
         s = sc * kkp[:, None, None, :] * fa.scale
         mask = (model.mask_idx[None, :n] > pos[:, None])[None, None, :, :]
-        return s.masked_fill(mask, E.NEG_INF).softmax(-1).to(E.D)
+        return s.masked_fill(mask, NEG_INF).softmax(-1).to(D)
 
     pr = soft()
 
     def eins2():
-        pv = pr * vvp[:, None, None, :].to(E.D)
+        pv = pr * vvp[:, None, None, :].to(D)
         return torch.einsum("ghcs,gsd->ghcd", pv, vv)
 
     return {
         "fa.qkv": bench(lambda: fa.qkv.prefill(x)),
-        "fa.rope+quant": bench(lambda: fa._quant_seq(E.apply_rope(q, kn, cos, sin, fa.rot)[1])),
+        "fa.rope+quant": bench(lambda: fa._quant_seq(apply_rope(q, kn, cos, sin, fa.rot)[1])),
         "fa.eins1": bench(eins1),
         "fa.softmax": bench(soft),
         "fa.eins2": bench(eins2),
@@ -301,7 +304,7 @@ def fa_parts(model: E.Qwen35, n: int) -> dict[str, float]:
     }
 
 
-def report(model: E.Qwen35, n: int, chunk: int = 256) -> None:
+def report(model: Qwen35, n: int, chunk: int = 256) -> None:
     """Print the layered cost model for one prompt length.
 
     Args:
@@ -351,7 +354,7 @@ def report(model: E.Qwen35, n: int, chunk: int = 256) -> None:
           f"{n_la * parts['la.whole'] + len(model.layers) * parts['mlp.whole'] + n_fa * parts['fa.whole']:.1f} ms")
 
 
-def profile_model(model: E.Qwen35, n: int, top: int = 30) -> None:
+def profile_model(model: Qwen35, n: int, top: int = 30) -> None:
     """Print the kernel-level attribution for one whole prefill.
 
     Args:
@@ -393,8 +396,8 @@ def main() -> None:
     sizes = [int(a) for a in sys.argv[1:]] or [256, 512, 2048]
     chunk = int(os.environ.get("CHUNK", "256"))
     print(f"device={torch.cuda.get_device_name(0)}  torch={torch.__version__}")
-    print(f"hip_ops={E.hip_ops.available()}  {E.hip_ops.last_error() or ''}")
-    model = E.Qwen35(MODEL, max_seq=4096, bench=False)
+    print(f"hip_ops={hip_ops.available()}  {hip_ops.last_error() or ''}")
+    model = Qwen35(MODEL, max_seq=4096, bench=False)
     model.reset()
     model.prefill(toks(256))              # warm every path (rocBLAS handles, TRSM...)
     if not os.environ.get("SKIP_E2E"):

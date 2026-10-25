@@ -18,7 +18,7 @@ Run inside the container from the engine root, on the DCU:
 
 ``n`` is the number of decode tokens per timed run, default 50.
 
-Module: ``coffin/diag``. Standalone probe: imports ``qwen35_engine`` and torch,
+Module: ``coffin/diag``. Standalone probe: imports ``models.qwen35`` and torch,
 and nothing under ``coffin/`` imports it.
 
 Constraints:
@@ -36,7 +36,7 @@ import time
 
 import torch
 
-import qwen35_engine as E
+from models.qwen35 import Qwen35
 
 MODEL = "/root/private_data/models/Qwen3.5-4B"
 
@@ -71,7 +71,7 @@ def main():
     """Print the plain and graph token rates, their ratio, and a trajectory match check."""
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 50
     print(f"device={torch.cuda.get_device_name(0)}")
-    model = E.Qwen35(MODEL, max_seq=2048, bench=True)
+    model = Qwen35(MODEL, max_seq=2048, bench=True)
 
     prompt = [9707, 11, 1879, 3671, 374]      # "Hello, my name is"
     for t in prompt:                          # warm up the plain path

@@ -3,21 +3,18 @@
 Module: ``coffin/`` (top of the dependency graph, model-agnostic). This is the
 only module that knows which model families exist; every other engine module
 talks to a family through the ``Model`` / ``PagedModel`` protocols declared
-here. ``serve.py``, ``run_chat.py`` and ``prefix_engine.py`` therefore never
-import ``models/qwen35`` directly, and a second family is added by one
+here. Runtime and diagnostic code therefore never imports a model family through
+the dispatch layer, and a second family is added by one
 ``register()`` call at the bottom of this file rather than by editing callers.
 
-The engine used to be a single module. It is split by responsibility now:
+The engine is split by responsibility:
 
     ops/                 device primitives shared by any model (GEMV, norms,
                          RoPE, the chunked delta rule, the tied embedding)
     models/<family>/     one architecture family: blocks, MTP head, weight
                          loader, and the model class that owns the graphs
     engine_api.py        this file: the ``Model`` contract, checkpoint -> model
-                         dispatch, and the reload used by ``serve.py``
-
-``qwen35_engine.py`` is only a compatibility shim for the old flat import; the
-``diag/`` probes still use it, new code should not.
+                         dispatch, and the reload used by the runtime service
 
 Dispatch is by checkpoint config, not by a flag: :func:`create_model` reads
 ``config.json`` and matches a registered key against ``model_type`` /
@@ -466,9 +463,11 @@ _RELOAD_ORDER = (
     "models.qwen35.linear_attn",
     "models.qwen35.full_attn", "models.qwen35.blocks", "models.qwen35.mtp",
     "models.qwen35.model", "models.qwen35", "models",
-    "mm_input",
-    "config", "sequence", "paged_cache", "radix_cache", "block_manager",
-    "prefix_engine", "model_runner", "scheduler", "llm_engine",
+    "utils.mm_input", "utils.tool_call", "utils",
+    "cache.paged_cache", "cache.radix_cache", "cache",
+    "engine.config", "engine.sequence", "engine.block_manager",
+    "engine.prefix_engine", "engine.model_runner", "engine.scheduler",
+    "engine.llm_engine", "engine",
     "engine_api",
 )
 
@@ -483,14 +482,18 @@ def _engine_module(name: str) -> bool:
         ``True`` for the engine's own packages, so :func:`reload` can detect a
         module that was added without being added to ``_RELOAD_ORDER``.
     """
-    return name in ("ops", "models") or name.startswith(("ops.", "models.")) or name in _RELOAD_ORDER
+    return (
+        name in ("ops", "models", "engine", "cache", "utils")
+        or name.startswith(("ops.", "models.", "engine.", "cache.", "utils."))
+        or name in _RELOAD_ORDER
+    )
 
 
 def reload() -> None:
     """Re-import every engine module, dependencies first.
 
-    ``serve.py`` used to call ``importlib.reload`` on the single engine module;
-    now that the engine is a package, reloading only the top module would leave
+    The runtime calls this after unloading a model. Reloading only the top module
+    would leave
     the implementation modules stale. The caller's module object is updated in
     place, so ``engine_api.create_model`` is the new function afterwards.
 

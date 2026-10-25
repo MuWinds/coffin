@@ -14,7 +14,7 @@ Run inside the container from the engine root, on the DCU:
 
     python bench_prefill2.py
 
-Module: ``coffin/diag``. Standalone probe: imports ``qwen35_engine`` and torch,
+Module: ``coffin/diag``. Standalone probe: imports ``models.qwen35`` and torch,
 and nothing under ``coffin/`` imports it.
 
 Constraints:
@@ -32,14 +32,14 @@ import time
 
 import torch
 
-import qwen35_engine as E
+from models.qwen35 import Qwen35
 
 MODEL = "/root/private_data/models/Qwen3.5-4B"
 
 
 def main():
     print(f"device={torch.cuda.get_device_name(0)}")
-    model = E.Qwen35(MODEL, max_seq=4096, bench=False)
+    model = Qwen35(MODEL, max_seq=4096, bench=False)
     base = [9707, 11, 1879, 3671, 374, 264, 3449, 315, 9847, 13,
             3838, 374, 279, 6722, 315, 9625, 323, 11751, 13]
 
