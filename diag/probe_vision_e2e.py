@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Lead-side integration probe: how far does the vision path actually run?
 
-Run inside the DCU container (``engine_vision`` deployment):
+Answers which rung of the vision stack is broken, rather than whether the stack as
+a whole works. Run inside the DCU container (``engine_vision`` deployment):
 
     flock /root/private_data/gpu.lock -c 'python3 diag/probe_vision_e2e.py'
 
@@ -15,9 +16,26 @@ names the layer that is wrong instead of dumping one traceback from the top:
     5. real model: image_embeds + prefill(ids, mm=...) + greedy decode
     6. without images: prefill logits must be bit-identical to the baseline file
 
+Read the ``=== n name ===`` banners in order: the last one printed before a
+failure is the rung to investigate, and the ``PASS``/``FAIL`` lines carry their
+own gate so no interpretation is needed. Rung 3 prints ``oracle fixture skipped``
+when the fixture does not match the image or size — that is a skip, not a pass.
+
 The last rung is the regression gate: ``--baseline`` writes the text-only logits
 of a fixed prompt on the *unpatched* engine, and every later run compares
 against it.
+
+Module: ``coffin/diag``. Standalone probe: imports ``engine_api``, ``mm_input``
+and transformers, and nothing under ``coffin/`` imports it.
+
+Constraints:
+    * ``engine_api`` is imported after ``sys.path`` is fixed up inside ``main``,
+      because this script lives in ``diag/`` while the engine modules use
+      absolute imports rooted at ``coffin/``.
+    * ``flock`` is required: the checkpoint, the reference tower and the model
+      will not fit beside a co-tenant on the same card.
+    * Rung 6 needs a baseline written by a run on the *unpatched* tree. Without
+      that file it prints a skip and the regression gate has not run.
 """
 from __future__ import annotations
 
@@ -33,10 +51,17 @@ PROMPT = [5, 6, 7, 8, 9, 10]
 
 
 def _section(name: str) -> None:
+    """Print a rung banner so the last one before a failure names the broken layer.
+
+    Args:
+        name: Rung label. Banners go to stdout with ``flush=True`` so they are
+            not lost when a later rung raises.
+    """
     print(f"\n=== {name} ===", flush=True)
 
 
 def main() -> None:
+    """Walk rungs 1-6 in order and print each verdict."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=MD)
     ap.add_argument("--max-seq", type=int, default=4096)

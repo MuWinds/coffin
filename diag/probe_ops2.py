@@ -5,6 +5,15 @@ every op looks the same size.  Capturing N copies of an op into a graph and
 timing the replay gives the real device time.
 
 Run:  python probe_ops2.py
+
+Module: ``coffin/diag``. Times single ops through the captured-graph replay path;
+the ops come from ``ops/`` and ``hip_ops``.
+
+Constraints:
+    * A plain microbenchmark is CPU-bound on this box (~100 us per dispatch), so
+      every op looks the same size. Only the graph-replay number is device time.
+    * N copies of the same op are captured so the replay is long enough to time;
+      the per-op number is the total divided by N.
 """
 
 from __future__ import annotations

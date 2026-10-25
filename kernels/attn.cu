@@ -1,20 +1,32 @@
-// Fused single-token full attention over the int8 KV cache.
+// @file attn.cu
+// @brief Fused single-token full attention over the int8 KV cache.
 //
-// The eager path materialises the whole KV cache as bf16 (two ``.to(D)`` copies
-// of [nkv, S, hd]), runs two einsums plus the per-token scale fold, the causal
-// mask, the softmax and the output gate as separate kernels. This kernel does the
-// same in one pass: dequantise the int8 k/v on the fly, fold the per-token scale
-// into the scores and probabilities, and apply the gate, so the cache never
-// leaves int8 and no [nkv, S, hd] intermediate is written.
+// Module: coffin/kernels. The B = 1 decode path, loaded by ``hip_ops.py`` as part
+// of the torch extension; the batched counterparts live in ``batch.cu``.
 //
-// One block per query head; the block stages q in shared memory.
+// Why fused: the eager path materialises the whole KV cache as bf16 (two
+// ``.to(D)`` copies of [nkv, S, hd]), runs two einsums plus the per-token scale
+// fold, the causal mask, the softmax and the output gate as separate kernels.
+// This kernel does the same in one pass: dequantise the int8 k/v on the fly, fold
+// the per-token scale into the scores and probabilities, and apply the gate, so
+// the cache never leaves int8 and no [nkv, S, hd] intermediate is written.
 //
-// Key blocking (why the window is streamed and not held)
-// The score vector for the whole window used to live in shared memory -- [S]
-// floats, S = max_seq -- which is 16 KB at 4096 and 1 MB at 262144. gfx906 has
-// 64 KB of LDS per CU, and a dynamic shared allocation above 48 KB needs an
-// opt-in attribute, so anything past ~12k context could not even launch. The
-// window is now walked in blocks of ATTN_KEY_BLOCK with a running max/sum
+// Constraints:
+//   * The key window is streamed in ATTN_KEY_BLOCK keys with an online softmax,
+//     never staged whole: LDS is 64 KB per CU and a [S] score vector is 1 MB at
+//     262144, so a staged window does not launch (see "Key blocking" below).
+//   * One block per query head (times the split count); no cross-block
+//     synchronisation. Slices publish partials and the combine kernel merges them.
+//   * K/V stay int8 with a per-token fp32 scale; only the row id travels
+//     downstream, so the dense and the paged layout share one kernel.
+//   * Window length and position live on the device: the decode step is a
+//     captured graph, so a host-side scalar would freeze at capture time.
+//
+// Key blocking: the score vector for the whole window used to live in shared
+// memory -- [S] floats, S = max_seq -- which is 16 KB at 4096 and 1 MB at 262144.
+// gfx906 has 64 KB of LDS per CU, and a dynamic shared allocation above 48 KB
+// needs an opt-in attribute, so anything past ~12k context could not even launch.
+// The window is now walked in blocks of ATTN_KEY_BLOCK with a running max/sum
 // (online softmax) and a rescaled output accumulator, so the shared cost is
 // constant and 256k fits. The work is unchanged: the old kernel already walked
 // every valid key for the V accumulation, it just did it as one loop over the
@@ -50,7 +62,9 @@ __device__ __forceinline__ unsigned short fbf16(float f) {
     return (unsigned short)(u >> 16);
 }
 
-// Block-wide max / sum via a shared scratch of ``blockDim.x`` floats.
+// Block-wide max / sum via a shared scratch of ``blockDim.x`` floats. Every
+// thread of the block must call it (it ends on a ``__syncthreads()``), and
+// ``red`` is clobbered.
 template <bool IsMax>
 __device__ __forceinline__ float block_reduce(float v, float* red) {
     const int t = threadIdx.x;
@@ -63,15 +77,29 @@ __device__ __forceinline__ float block_reduce(float v, float* red) {
     return red[0];
 }
 
-// Row index of key ``s`` for kv head ``g``. The dense cache is head-major
-// ([nkv, S, hd] -> row = g*S + s) and the paged pool is token-major
-// ([slots, nkv, hd] -> row = slot*nkv + g), so one formula covers both and a null
-// ``pos2slot`` means "dense". Everything downstream (k, v and both scales) is
-// then indexed by that single row id.
+// @brief Row index of key ``s`` for kv head ``g``, dense or paged.
+//
+// The dense cache is head-major ([nkv, S, hd] -> row = g*S + s) and the paged
+// pool is token-major ([slots, nkv, hd] -> row = slot*nkv + g), so one formula
+// covers both and a null ``pos2slot`` means "dense". Everything downstream (k, v
+// and both scales) is then indexed by that single row id.
+//
+// @param pos2slot Device-side absolute position -> pool slot map, or null.
+// @param stride   S for the dense layout, nkv for the paged one.
+// @return The flat row id shared by k, v and both per-token scales.
 __device__ __forceinline__ int attn_row(int s, int g, const int64_t* pos2slot, int stride) {
     return pos2slot ? (int)((long)pos2slot[s] * stride + g) : g * stride + s;
 }
 
+// @brief One block per (query head, key-range slice); split-K pass of the decode
+//        attention.
+//
+// @param pos2slot Device position -> slot map, or null for the dense layout.
+// @param stride   S (dense) or nkv (paged); see ``attn_row``.
+// @param part_acc [nh, split, hd] fp32 online-softmax numerator, one per slice.
+// @param part_ml  [nh, split, 2] fp32 (running max, running sum).
+// @param pos_ptr  Device int64 position; read here because the decode graph
+//                 freezes scalar kernel arguments at capture time.
 __global__ void attn_decode_kernel(const unsigned short* __restrict__ q,
                                    const unsigned short* __restrict__ gate,
                                    const int8_t* __restrict__ kc,
@@ -106,7 +134,7 @@ __global__ void attn_decode_kernel(const unsigned short* __restrict__ q,
     const int per = (nvalid + split - 1) / split;
     const int kfrom = s * per;
     const int kto = min(kfrom + per, nvalid);
-    float m = -1e30f, l = 0.f, acc = 0.f;    // running max, running sum, this thread's dim
+    float m = -1e30f, l = 0.f, acc = 0.f;    // running max, running sum, this dim's acc
     for (int base = kfrom; base < kto; base += ATTN_KEY_BLOCK) {
         const int nb = min(ATTN_KEY_BLOCK, kto - base);
         for (int i = t; i < nb; i += nt) rows[i] = attn_row(base + i, g, pos2slot, stride);
@@ -157,10 +185,16 @@ __global__ void attn_decode_kernel(const unsigned short* __restrict__ q,
     if (t < hd) part_acc[(size_t)(h * split + s) * hd + t] = acc;
 }
 
-// Merges the per-slice partials of one head: the same online-softmax combination,
-// now across slices instead of across key blocks. Every thread recomputes the
-// global max (8 values) rather than staging it in shared memory -- one warp-wide
-// reduction would cost more than the redundant loads.
+// @brief Merges the per-slice partials of one head and applies the output gate.
+//
+// The same online-softmax combination, now across slices instead of across key
+// blocks. Every thread recomputes the global max (``split`` values) rather than
+// staging it in shared memory -- one warp-wide reduction would cost more than the
+// redundant loads.
+//
+// @param gate [nh, hd] bf16 output gate; the sigmoid is folded into the
+//             normalised result.
+// @param out  [nh, hd] bf16, written by the first ``hd`` threads.
 __global__ void attn_combine_kernel(const float* __restrict__ part_acc,
                                     const float* __restrict__ part_ml,
                                     const unsigned short* __restrict__ gate,
@@ -185,6 +219,18 @@ __global__ void attn_combine_kernel(const float* __restrict__ part_acc,
 
 }  // namespace
 
+// @brief Launch the dense decode attention (split pass + combine pass).
+//
+// @param q,gate [nh, hd] bf16 contiguous.
+// @param kcache,vcache [nkv, S, hd] int8 dense cache, head-major.
+// @param kscale,vscale [nkv, S] fp32 per-token dequant scales.
+// @param pos    Device int64 position; only positions 0..pos are visited.
+// @param part_acc,part_ml Caller-owned [nh, split, hd] / [nh, split, 2] fp32;
+//              ``split`` is read from ``part_acc`` so capture sees a fixed shape.
+// @return ``out``, [nh, hd] bf16, written in place for call chaining.
+// @throws c10::Error (TORCH_CHECK) from the kernel launch check when the device
+//         rejects the grid; there is no shape validation here, the caller owns
+//         the layout contract.
 torch::Tensor attn_decode(torch::Tensor q, torch::Tensor gate,
                           torch::Tensor kcache, torch::Tensor vcache,
                           torch::Tensor kscale, torch::Tensor vscale,
@@ -214,16 +260,26 @@ torch::Tensor attn_decode(torch::Tensor q, torch::Tensor gate,
     return out;
 }
 
-// Paged variant: the K/V row of a logical position is indirected through
-// ``pos2slot``, a device-resident map from absolute position to pool slot.
+// @brief Launch the paged decode attention: the K/V row of a logical position is
+//        indirected through ``pos2slot``.
 //
 // That indirection has to live on the *device* because the decode step is a
 // captured graph: a host-side block table would have to be re-baked into the
-// graph every time a sequence appends a block, whereas a device map is simply
-// rewritten before the next replay. The pool is laid out token-major
-// ([slots, nkv, hd], unlike the dense cache's head-major [nkv, S, hd]) so that
-// one block's slots stay contiguous across heads and a copy-on-write of a block
-// is a single contiguous copy.
+// graph every time a sequence appends a block, whereas a device map is rewritten
+// before the next replay with no recapture. The pool is laid out token-major
+// ([slots, nkv, hd], unlike the dense cache's head-major [nkv, S, hd]) so that one
+// block's slots stay contiguous across heads and a copy-on-write of a block is a
+// single contiguous copy.
+//
+// @param kpool,vpool [num_slots, nkv, hd] int8 views of one layer's block pool.
+// @param kscale,vscale [num_slots, nkv] fp32 per-slot scales.
+// @param pos2slot Device int64 [S] map from absolute position to pool slot; it
+//                 must be rewritten before every replay.
+// @param max_pos Unused: the window is streamed and its length comes from
+//                ``pos``. Kept so the caller's signature does not change.
+// @return ``out``, [nh, hd] bf16, written in place for call chaining.
+// @throws c10::Error (TORCH_CHECK) from the kernel launch check when the device
+//         rejects the grid; the caller owns the layout contract.
 torch::Tensor attn_paged_decode(torch::Tensor q, torch::Tensor gate,
                                 torch::Tensor kpool, torch::Tensor vpool,
                                 torch::Tensor kscale, torch::Tensor vscale,
@@ -231,7 +287,7 @@ torch::Tensor attn_paged_decode(torch::Tensor q, torch::Tensor gate,
                                 torch::Tensor pos, int64_t max_pos,
                                 int64_t rep, double scale,
                                 torch::Tensor part_acc, torch::Tensor part_ml) {
-    (void)max_pos;      // the window is streamed, so its length is no longer needed
+    (void)max_pos;      // streamed window: its length is pos + 1 on the device
     const int nh = q.size(0), hd = q.size(1);
     const int nkv = kpool.size(1);           // paged layout: row = slot*nkv + g
     const int split = part_acc.size(1);

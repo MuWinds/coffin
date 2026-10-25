@@ -1,16 +1,35 @@
-// Vector-matrix product for single-token decode, plus a batched small-M variant.
+// @file gemv.cu
+// @brief Vector-matrix product for single-token decode, plus a batched small-M
+//        variant.
 //
-// hipBLAS GEMV at M=1 is useless on this part: 55-296 GB/s against a ~700 GB/s
-// copy ceiling, with the winning kernel changing unpredictably from shape to
-// shape, and Triton has no gfx906 backend. A plain warp-per-row reduce with
-// 128-bit loads reaches 540-680 GB/s, so the engine routes every projection
+// Module: coffin/kernels. The projection kernel every layer routes through, bound
+// as ``gemv_bf16`` / ``gemv_f16`` / ``gemv_bf16_m`` / ``gemv_f16_m``; the int8
+// family lives in ``gemv_int8.cu``.
+//
+// Why not hipBLAS: GEMV at M=1 is useless on this part (55-296 GB/s against a
+// ~700 GB/s copy ceiling), the winning hipBLAS kernel changes unpredictably from
+// shape to shape, and Triton has no gfx906 backend. A plain warp-per-row reduce
+// with 128-bit loads reaches 540-680 GB/s, so the engine routes every projection
 // (and lm_head) through this kernel instead.
 //
-// The batched variant exists for speculative decoding: verifying k drafted
-// tokens must cost about one weight pass, not k. hipBLAS has no hipBLASLt /
-// tensor-core path for gfx906, so its small-M GEMM is ~4x a decode step. Here
-// each warp still owns one weight row, but keeps M accumulators and applies the
-// row to M input vectors, so the weights are read exactly once.
+// The batched variant exists for speculative decoding: verifying k drafted tokens
+// must cost about one weight pass, not k. hipBLAS has no hipBLASLt / tensor-core
+// path for gfx906, so its small-M GEMM is ~4x a decode step. Here each warp still
+// owns one weight row, but keeps M accumulators and applies the row to M input
+// vectors, so the weights are read exactly once.
+//
+// Constraints:
+//   * Weights are row-major [N, K]; the K loop walks 16-byte (8 value) units and
+//     the leftover K % 8 is a scalar tail, so any K is correct but only K % 8 == 0
+//     gets the vector path.
+//   * bf16 activations only: the kernel unpacks bf16 by a shift, so an fp16
+//     activation tensor would silently read the wrong values. Only the weights can
+//     be fp16 (``F16W``).
+//   * The launch must be on the current torch stream; the legacy default stream is
+//     not part of a ``torch.cuda.graph`` capture and a kernel launched there is
+//     dropped from the graph.
+//   * Every (R, U) and (M, U) pair is instantiated at compile time; an unlisted
+//     pair is a TORCH_CHECK failure, not a slow path.
 
 #include "hip_ops.h"
 
@@ -60,6 +79,11 @@ __device__ __forceinline__ void accumulate(float* acc, const uint4& w, const uin
 // R rows per warp amortise the x vector over R rows, and U-way unrolling issues
 // U loads before the first FMA, which is what short-K shapes need to hide
 // memory latency (K=4096 was 158 GB/s at U=1 and 264 GB/s at U=2).
+//
+// @param W [N, K] row-major weights, bf16 or fp16 as ``F16W`` selects.
+// @param x [K] bf16 activation. Must be bf16 even when ``F16W``: only the weight
+//          dtype changes.
+// @param y [N] bf16 output, written by lane 0 of each warp's row.
 template <int R, int U, bool F16W>
 __global__ void gemv_kernel(const uint16_t* __restrict__ W,
                             const uint16_t* __restrict__ x,
@@ -124,6 +148,9 @@ __global__ void gemv_kernel(const uint16_t* __restrict__ W,
 
 // One warp per weight row, M accumulators per lane: the row is read once and
 // applied to M input vectors, so a small-M batch costs ~one weight pass.
+//
+// @param X [M, K] bf16, one activation vector per row of the batch.
+// @param Y [M, N] bf16; lane 0 of the warp writes column ``warp`` of all M rows.
 template <int M, int U, bool F16W>
 __global__ void gemv_m_kernel(const uint16_t* __restrict__ W,
                               const uint16_t* __restrict__ X,
@@ -186,7 +213,9 @@ __global__ void gemv_m_kernel(const uint16_t* __restrict__ W,
 namespace {
 
 // Both weight dtypes share one launch path; only the unpack inside the kernel
-// differs (see ``w_to_float``).
+// differs (see ``w_to_float``). Every shipped (R, U) pair is an explicit
+// instantiation, so a new pair has to be added here and to the Python benchmark
+// list at the same time.
 template <bool F16W>
 void launch_gemv(const uint16_t* wp, const uint16_t* xp, uint16_t* yp, int N, int K,
                  int R, int U, int blocks, int threads, hipStream_t stream) {
@@ -265,18 +294,47 @@ torch::Tensor gemv_m_entry(torch::Tensor W, torch::Tensor X, int64_t U) {
 
 }  // namespace
 
+// @brief Single-token bf16 GEMV: y[n] = dot(W[n, :], x).
+//
+// @param W [N, K] bf16 row-major.
+// @param x [K] bf16; contiguous, like W.
+// @param R Output rows per warp (1, 2 or 4); chosen by the load-time benchmark.
+// @param U K-loop unroll (1, 2 or 4); same choice, and it only affects latency
+//          hiding, not the arithmetic.
+// @return [N] bf16.
+// @throws c10::Error (TORCH_CHECK) on a non-contiguous input, a weight dtype that
+//         is not bf16, or an (R, U) pair with no instantiated kernel.
 torch::Tensor gemv_bf16(torch::Tensor W, torch::Tensor x, int64_t R, int64_t U) {
     return gemv_entry<false>(W, x, R, U);
 }
 
+// @brief Same as ``gemv_bf16`` with fp16 weights; the prefill GEMM reads the same
+//        tensors, so the weights are stored fp16 to keep that path fast.
+//
+// @param W [N, K] fp16 row-major.
+// @return [N] bf16: the activation stream stays bf16 even though the weights do
+//         not.
+// @throws c10::Error (TORCH_CHECK) on a dtype or (R, U) mismatch.
 torch::Tensor gemv_f16(torch::Tensor W, torch::Tensor x, int64_t R, int64_t U) {
     return gemv_entry<true>(W, x, R, U);
 }
 
+// @brief Batched small-M bf16 GEMV: one weight pass serves all M activations.
+//
+// @param X [M, K] bf16; M must be 2, 4 or 8, the instantiated values.
+// @param U K-loop unroll.
+// @return [M, N] bf16.
+// @throws c10::Error (TORCH_CHECK) when M/U has no instantiated kernel or the
+//         shapes do not line up; the caller picks M from the verify batch size.
 torch::Tensor gemv_bf16_m(torch::Tensor W, torch::Tensor X, int64_t U) {
     return gemv_m_entry<false>(W, X, U);
 }
 
+// @brief Batched small-M GEMV with fp16 weights.
+//
+// @param X [M, K] bf16; M must be 2, 4 or 8.
+// @return [M, N] bf16.
+// @throws c10::Error (TORCH_CHECK) when M/U has no instantiated kernel.
 torch::Tensor gemv_f16_m(torch::Tensor W, torch::Tensor X, int64_t U) {
     return gemv_m_entry<true>(W, X, U);
 }

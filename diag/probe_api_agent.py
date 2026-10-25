@@ -1,5 +1,8 @@
 """One request that reproduces both faults the agent clients hit.
 
+Answers whether the two OpenAI-compatibility faults that broke agent clients are
+fixed, in a single request each:
+
 1. a ``developer``-role message (OpenAI's newer system role) used to make the
    checkpoint's template raise *"Unexpected message role."* and fail the request;
 2. a budget sent as ``max_completion_tokens`` used to be ignored, falling back to
@@ -8,7 +11,25 @@
 The prompt asks for a long file of code, so "did it get the whole answer" is
 visible in the completion length and the finish reason.
 
+Read the two boolean lines under the first request: ``role accepted`` must be
+``True`` or the request never reached the model, and ``beyond the old 256
+default`` must be ``True`` or the budget is still being dropped — a completion of
+256 with ``finish=length`` is that failure exactly. The final block compares
+streamed against non-streamed text for the same prompt; a mismatch prints both
+strings, which is the incremental decoder's bug rather than the protocol's.
+
     python diag/probe_api_agent.py [port]
+
+Module: ``coffin/diag``. Standalone probe: drives ``openai_server.py`` over HTTP
+and imports nothing from ``coffin/``.
+
+Constraints:
+    * The port defaults to 18080 because that is the deployment's server port; the
+      optional argument exists so a second instance can be probed.
+    * ``temperature`` is 0 so a truncation is attributable to the budget and not
+      to sampling; a nonzero value makes the length check meaningless.
+    * ``timeout`` is an hour by design: a 1200-token completion on a cold DCU is
+      slow, and a short timeout would read as a protocol failure.
 """
 
 from __future__ import annotations
@@ -24,6 +45,19 @@ ASK = ("Write a complete, self-contained HTML file that animates an SVG bicycle 
 
 
 def post(port: int, body: dict, timeout: float = 3600.0) -> dict:
+    """Send one non-streamed chat-completion request and return the parsed reply.
+
+    Args:
+        port: Server port on localhost.
+        body: OpenAI request body.
+        timeout: Seconds to wait; long by default because a long completion on a
+            cold engine is slow and a timeout would look like a protocol failure.
+
+    Returns:
+        The parsed reply with an extra ``_wall`` key holding the request's wall
+        seconds. ``_wall`` is added here rather than at each call site so the
+        timing is measured the same way for every request.
+    """
     req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions",
                                  data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
@@ -35,6 +69,7 @@ def post(port: int, body: dict, timeout: float = 3600.0) -> dict:
 
 
 def main() -> None:
+    """Send the developer-role request, a plain control, and a stream/plain comparison."""
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 18080
 
     body = {"model": "qwen3.5-4b",

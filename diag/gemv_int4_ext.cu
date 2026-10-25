@@ -1,16 +1,27 @@
-// Standalone probe extension (NOT part of the engine build).
+// @file gemv_int4_ext.cu
+// @brief Standalone probe extension for int4 weights and bandwidth ceilings.
 //
-// Adds three things the engine does not have yet:
-//   1. gemv_w4a16: weight-only int4 GEMV (group-wise symmetric, group 128,
-//      fp16 scale), one warp per output row, 8 nibbles per uint32 load.
-//   2. read_bw: a pure streaming-read kernel, to measure the HBM read ceiling
-//      an int4 GEMV would have to reach.
-//   3. host_read_bw / copy_bw: mapped-pinned-memory read bandwidth (zero-copy)
-//      and pinned H2D/D2H copy bandwidth.
+// Module: coffin/diag. Built and loaded on its own (``build_int4.py``); it is NOT
+// part of the engine extension, so it must not include ``hip_ops.h`` or be added
+// to ``bindings.cpp``.
 //
-// Weight packing: element k lives in byte k/2 (low nibble if k even, high if
-// odd); the stored nibble is u = q + 8 with q in [-8, 7].  Groups of 128
-// elements share one fp16 scale (last axis scaled per group *within a row*).
+// It adds three things the engine does not have:
+//   1. gemv_w4a16: weight-only int4 GEMV (group-wise symmetric, group 128, fp16
+//      scale), one warp per output row, 8 nibbles per uint32 load.
+//   2. read_bw: a pure streaming-read kernel, to measure the HBM read ceiling an
+//      int4 GEMV would have to reach.
+//   3. host_read_bw / copy_bw: mapped-pinned-memory read bandwidth (zero-copy) and
+//      pinned H2D/D2H copy bandwidth.
+//
+// Constraints:
+//   * The packing below is the checkpoint contract: element k lives in byte k/2
+//     (low nibble if k even, high if odd); the stored nibble is u = q + 8 with q in
+//     [-8, 7]. Groups of 128 elements share one fp16 scale (last axis scaled per
+//     group within a row). Reading a differently packed tensor yields plausible
+//     but wrong numbers, which is why the shape checks insist on K % 256 == 0.
+//   * Everything here is diagnostic: no graph capture, no engine state, and the
+//     only consumer is a probe script.
+//
 // The dot product folds the scale per group:
 //     y[n] = sum_g  scale[n,g] * ( sum_{k in g} (u-8) * x[k] )
 // and the activation sub-sums are precomputed once: XS[c] = 8 * sum of the 8
@@ -34,8 +45,18 @@ __device__ __forceinline__ unsigned short fbf16(float f) {
     return (unsigned short)(u >> 16);
 }
 
-// One warp per output row.  A "tile" is 32 chunks = 256 elements = 2 groups of
-// 128, so lane l of tile t is always in group 2t + (l >> 4); no divisions.
+// @brief One warp per output row, 8 int4 weights per 32-bit load.
+//
+// A "tile" is 32 chunks = 256 elements = 2 groups of 128, so lane l of tile t is
+// always in group 2t + (l >> 4); no divisions in the inner loop. The group scale is
+// applied to the tile partial, and the +8 offset is removed by subtracting the
+// precomputed activation sum ``XS`` rather than per element.
+//
+// @param W4 [N, K/2] packed int4 bytes (two nibbles per byte).
+// @param S  [N, K/128] fp16 per-group scales.
+// @param XS [K/8] fp32, ``8 * sum`` of each 8-element activation chunk.
+// @param x  [K] bf16 activation.
+// @param y  [N] bf16 output.
 template <int U>
 __global__ void gemv_w4a16_kernel(const int8_t* __restrict__ W4,
                                   const __half* __restrict__ S,
@@ -90,8 +111,11 @@ __global__ void gemv_w4a16_kernel(const int8_t* __restrict__ W4,
     if (lane == 0) y[warp] = fbf16(acc);
 }
 
-// Pure streaming read: forces every byte through the SM, XOR-folded so the
-// compiler cannot elide the loads.
+// @brief Pure streaming read: the HBM read ceiling an int4 GEMV would have to hit.
+//
+// Every byte goes through the SM and is XOR-folded so the compiler cannot elide the
+// loads; the atomic fires only on a value that never occurs, so the reduction has
+// no measurable cost.
 __global__ void read_bw_kernel(const uint4* __restrict__ p, long n4,
                                unsigned* __restrict__ out) {
     unsigned s = 0;
@@ -105,6 +129,16 @@ __global__ void read_bw_kernel(const uint4* __restrict__ p, long n4,
 
 }  // namespace
 
+// @brief int4 (g128) weight-only GEMV with bf16 activations.
+//
+// @param W4 [N, K/2] packed nibbles; K % 256 == 0 or the tile/group mapping breaks.
+// @param S [N, K/128] fp16 per-group scales.
+// @param XS [K/8] fp32 precomputed activation chunk sums (see the file header).
+// @param U Unroll: 1, 2, 4 or 8.
+// @return [N] bf16.
+// @throws c10::Error (TORCH_CHECK) when a dtype, shape or K alignment does not
+//         match the packing contract; the pattern is repack the checkpoint, not
+//         relax the check.
 torch::Tensor gemv_w4a16(torch::Tensor W4, torch::Tensor S, torch::Tensor XS,
                          torch::Tensor x, int64_t U) {
     TORCH_CHECK(W4.is_contiguous() && S.is_contiguous() && XS.is_contiguous() &&
@@ -138,6 +172,16 @@ torch::Tensor gemv_w4a16(torch::Tensor W4, torch::Tensor S, torch::Tensor XS,
     return y;
 }
 
+// @brief HBM streaming read bandwidth over a device buffer, in GB/s.
+//
+// A fixed 2048x256 grid and 3 untimed warm-up launches, because the first pass
+// pays for TLB and page-table warm-up and would otherwise depress the number.
+//
+// @param nbytes Buffer size; internally rounded down to whole uint4.
+// @param iters Timed launches.
+// @return GB/s, computed from the event delta over all iterations.
+// @throws c10::Error (TORCH_CHECK) when an allocation or memset fails; the run is
+//         then meaningless rather than merely slow.
 double read_bw(int64_t nbytes, int64_t iters) {
     const long n4 = (long)(nbytes / 16);
     void* buf = nullptr;
@@ -167,8 +211,19 @@ double read_bw(int64_t nbytes, int64_t iters) {
     return gb / (ms / 1e3);
 }
 
-// Reads a mapped pinned (zero-copy) host buffer from a device kernel and times
-// it; also measures pinned H2D/D2H copy bandwidth for the same buffer.
+// @brief Mapped-pinned (zero-copy) host read plus pinned H2D/D2H copy bandwidth.
+//
+// The three numbers answer different questions: ``mapped_read_gbps`` is what a
+// device kernel gets reading host RAM over PCIe, while the copy rates are the
+// staging alternative (copy in, compute, copy out) it would be compared against.
+// The host buffer is freed with ``hipHostFree`` and the device buffers with
+// ``hipFree``, so repeated probe runs do not leak pinned memory.
+//
+// @param nbytes Buffer size; internally rounded down to whole uint4.
+// @param iters Timed launches / copies.
+// @return A dict with ``mapped_read_gbps``, ``h2d_gbps`` and ``d2h_gbps``.
+// @throws c10::Error (TORCH_CHECK) when the pinned allocation or the device-pointer
+//         lookup fails; without pinned memory the measurement would be meaningless.
 pybind11::dict host_read_bw(int64_t nbytes, int64_t iters) {
     const long n4 = (long)(nbytes / 16);
     void* h = nullptr;
@@ -225,6 +280,8 @@ pybind11::dict host_read_bw(int64_t nbytes, int64_t iters) {
     return r;
 }
 
+// Probe-only module: it is loaded by ``build_int4.py`` under its own name, so
+// these three names never appear in the engine extension.
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("gemv_w4a16", &gemv_w4a16, "int4 (g128) weight-only GEMV, bf16 activation");
     m.def("read_bw", &read_bw, "HBM streaming read GB/s");

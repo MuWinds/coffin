@@ -1,9 +1,18 @@
 """Weight-format quality: does fp16 storage or int8 quantisation change the model?
 
-Greedy free-running text is the wrong metric here: any perturbation flips one
-argmax eventually and the two continuations then describe different (both valid)
-text.  Teacher forcing is the right one -- feed both models the same ground-truth
-prefix and compare the top-1 agreement and the perplexity of the true next token.
+Module: ``coffin/tests``. Loads two differently-quantised models through
+``support.ModelFixture``, so it must run alone or last: two 4B models plus KV do
+not fit on the card at once.
+
+Constraints:
+    * Teacher forcing, never free-running generation: any perturbation flips one
+      argmax eventually and the two continuations then describe different (both
+      valid) text, so free-running equality is not a property of correctness.
+    * Both models must see the same ground-truth prefix; that is what makes the
+      top-1 agreement and the perplexity of the true next token comparable.
+    * A non-finite logprob is a failure even when the agreement looks fine:
+      fp16 has a narrower exponent than bf16, so the risk of the format is range
+      overflow, and an inf would corrupt the perplexity rather than flag itself.
 
 Port of ``diag/check_int8.py``, ``diag/check_int8_ppl.py`` and
 ``diag/check_f16_ppl.py`` (accuracy halves; the speed halves stay in the probes).
@@ -39,13 +48,26 @@ TEXT = (
 
 @functools.lru_cache(maxsize=1)
 def _text_ids() -> list[int]:
+    """Tokenise the fixed passage once; a per-test tokenisation could differ by a merge."""
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(str(support.MODEL_DIR))
     return tok.encode(TEXT)
 
 
 def _teacher_forced(ids: list[int], *, quant: bool, weight_dtype=None):
-    """Logprob of the true next token and the top-1 pick, position by position."""
+    """Logprob of the true next token and the top-1 pick, position by position.
+
+    Args:
+        ids: Ground-truth token ids both models are fed.
+        quant: Load the model with INT8 weights.
+        weight_dtype: Override the storage dtype; ``None`` keeps the checkpoint's.
+
+    Returns:
+        ``(logprobs, top1)``. ``logprobs[i]`` is the log-softmax of the token that
+        actually comes next, ``top1[i]`` the model's own argmax at that position,
+        so comparing the two across formats separates "stored differently" from
+        "predicts differently".
+    """
     model = support.ModelFixture.get(quant=quant, max_seq=1024,
                                      weight_dtype=weight_dtype)
     support.ensure_captured(model)
@@ -63,6 +85,7 @@ def _teacher_forced(ids: list[int], *, quant: bool, weight_dtype=None):
 
 
 def _report(lp: torch.Tensor) -> tuple[float, float]:
+    """``(mean negative log-likelihood, perplexity)`` over the scored positions."""
     nll = -lp.mean().item()
     return nll, math.exp(nll)
 
@@ -72,6 +95,7 @@ class WeightFormatQualityTest(unittest.TestCase):
     """The fp16/int8 storage choices must not move the model's answers."""
 
     def test_fp16_weights_match_bf16_quality(self):
+        """fp16 stores weights for speed and halves the bytes; it may not change which token the model picks."""
         ids = _text_ids()
         lp16, top16 = _teacher_forced(ids, quant=False, weight_dtype=torch.float16)
         lpbf, topbf = _teacher_forced(ids, quant=False, weight_dtype=torch.bfloat16)
@@ -93,6 +117,7 @@ class WeightFormatQualityTest(unittest.TestCase):
                         f"fp16 ppl {ppl16:.3f} vs bf16 {pplbf:.3f}")
 
     def test_int8_weights_keep_quality(self):
+        """INT8 is the serve default, so its error budget is a product decision: it must stay inside the measured drift."""
         ids = _text_ids()
         # fp16 is the production reference (WG weights), int8 is the serve default.
         lp16, top16 = _teacher_forced(ids, quant=False, weight_dtype=torch.float16)

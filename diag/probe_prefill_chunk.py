@@ -6,6 +6,15 @@ depends on M, and rewriting the weights per chunk costs bandwidth, so this
 sweeps the chunk size with no code change.
 
 Run:  python probe_prefill_chunk.py [n ...]
+
+Module: ``coffin/diag``. Sweeps the ``chunk`` argument of
+``Qwen35.prefill``, which is also ``EngineConfig.chunk``.
+
+Constraints:
+    * No code change: the chunk size is a config knob, so the sweep must not
+      rebuild the weights or re-capture the graph between points.
+    * rocBLAS tops out around M=2048 on this card, so a larger chunk should show
+      no gain -- if it does, the measurement is off.
 """
 
 from __future__ import annotations

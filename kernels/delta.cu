@@ -1,4 +1,9 @@
-// Gated DeltaNet decode step (the 24 linear-attention layers of Qwen3.5).
+// @file delta.cu
+// @brief Gated DeltaNet decode step (the 24 linear-attention layers of Qwen3.5).
+//
+// Module: coffin/kernels. Consumes the fp32 q/k/v/beta/g that ``linear_attn.cu``
+// produces and updates the recurrent state in place; the batched version is in
+// ``batch.cu``.
 //
 // The recurrence per token is
 //     st = st * exp(g)[:, None, None]
@@ -6,10 +11,20 @@
 //     st = st + k[:, :, None] * ((v - kv) * beta)[:, None, :]
 //     out = (st * q[:, :, None]).sum(-2)
 // As a chain of torch ops that is ~140 us per layer, i.e. 3.4 ms/token over 24
-// layers and about a tenth of the whole decode step. Every thread owns one
-// column j of the [dk, dv] state, and a column is only ever read and written by
-// its own thread, so no cross-thread communication is needed and the whole
-// recurrence collapses into a single kernel.
+// layers and about a tenth of the whole decode step. Every thread owns one column
+// j of the [dk, dv] state, and a column is only ever read and written by its own
+// thread, so no cross-thread communication is needed and the whole recurrence
+// collapses into a single kernel.
+//
+// Constraints:
+//   * ``dk`` must be a multiple of DELTA_SPLIT (4): the per-column partial is
+//     combined with three ``__shfl_xor`` steps inside a warp, so a different dk
+//     layout would silently change the fp32 sum order.
+//   * The state is updated in place; the caller must snapshot it with the KV
+//     before prefix reuse, or a later restore pairs shared keys with a state that
+//     has moved on.
+//   * Inputs are fp32 and contiguous: the prologue has already normalised and
+//     scaled q/k, so this kernel does no per-element fix-up.
 
 #include "hip_ops.h"
 
@@ -18,13 +33,20 @@
 
 namespace {
 
-// One block per (head, tile of value columns); DELTA_SPLIT threads share each
-// column, owning one slice of the dk loop, and the per-column partials are
-// combined with two shuffles inside the warp.
+//: dk slices per state column. The per-column partial is combined with
+//: ``__shfl_xor`` steps inside the warp, so this must stay a power of two and
+//: ``dk % DELTA_SPLIT == 0`` must hold or the state layout breaks.
+#define DELTA_SPLIT 4
+
+// @brief One block per (head, tile of value columns); DELTA_SPLIT threads share
+//        each column.
+//
+// Each of the DELTA_SPLIT threads owns one slice of the dk loop and the
+// per-column partials are combined with two shuffles inside the warp.
 //
 // The earlier shape -- one thread per column, blockDim = dv = 128 -- launched 32
 // blocks for 64 CUs (half the card idle) and gave every thread a 2x128-iteration
-// serial walk with only two warps per CU to hide L2 latency.  It measured
+// serial walk with only two warps per CU to hide L2 latency. It measured
 // 2294 us/step on the int8 decode profile, 15.6% of the step; splitting dk four
 // ways cuts the serial chain to dk/4 and the block count up.
 //
@@ -32,8 +54,10 @@ namespace {
 // The first pass deliberately does not write e^g*S back: k^T(e^g S) = e^g(k^T S),
 // so the decay is applied again in the second pass, which removes one
 // read-modify-write of the 2 MB state per layer per token.
-#define DELTA_SPLIT 4
-
+//
+// @param st  [heads, dk, dv] fp32 recurrent state, updated in place.
+// @param out [heads, dv] fp32; written by the lane that owns dk slice 0, so the
+//            four lanes of a column do not race.
 __global__ void delta_kernel(const float* __restrict__ q, const float* __restrict__ k,
                              const float* __restrict__ v, const float* __restrict__ beta,
                              const float* __restrict__ g, float* __restrict__ st,
@@ -87,6 +111,18 @@ __global__ void delta_kernel(const float* __restrict__ q, const float* __restric
 
 }  // namespace
 
+// @brief One gated-delta-rule decode step: advances the recurrent state in place.
+//
+// @param q,k [heads, dk] fp32, already L2-normalised by ``delta_prologue`` (q
+//            additionally scaled), so this kernel applies no per-element fix-up.
+// @param v [heads, dv] fp32.
+// @param beta,g [heads] fp32 rate and decay.
+// @param st [heads, dk, dv] fp32 state, updated in place -- the caller owns the
+//           snapshot discipline that prefix reuse depends on.
+// @return ``out``, [heads, dv] fp32, returned for call chaining.
+// @throws c10::Error (TORCH_CHECK) when a non-beta/g input is non-contiguous, the
+//         head counts disagree with the state, or ``dk`` is not a multiple of
+//         DELTA_SPLIT (the four-lane shuffle cannot split it).
 torch::Tensor delta_step(torch::Tensor q, torch::Tensor k, torch::Tensor v,
                          torch::Tensor beta, torch::Tensor g,
                          torch::Tensor st, torch::Tensor out) {

@@ -1,8 +1,21 @@
 """The MTP head is the speculative drafter: is its acceptance rate worth it?
 
-Runs the drafter in lockstep over a prompt, using the main model's hidden states
-as ground truth, and measures how many of the k chained drafts match the real
-next tokens.  Below ~half at k=1 the whole speculative path is not worth a step.
+Module: ``coffin/tests``. Reaches into ``model.mtp`` and the layer stack through
+``support.ModelTestCase``; it measures the drafter alone, without the verify
+path that ``test_spec.py`` exercises.
+
+Constraints:
+    * The drafter is fed the main model's real hidden states, not its own: it is
+      trained on those, and feeding it its own output would measure drift rather
+      than prediction quality.
+    * The drafter's own KV cache is filled with the real tokens first, then
+      reset; leaving it populated would leak a prefix into the next test.
+    * Deeper drafts can never be accepted more often than shallower ones, which
+      is why the monotonicity check is an assertion and not a comparison against
+      a measured number.
+    * The 0.5 bar at k=1 is the business threshold: below roughly half the
+      speculative path costs more per step than the step it saves, so a drafter
+      under it is not worth keeping regardless of its exact rate.
 
 Port of ``diag/check_mtp.py`` (its GEMV/profile sections stay in that probe; this
 is the functional acceptance test, using the integrated ``model.mtp``).
@@ -27,6 +40,7 @@ TEXT = ("The capital of France is Paris. The capital of Germany is Berlin. "
 
 @functools.lru_cache(maxsize=1)
 def _prompt_ids() -> list[int]:
+    """Tokenise the fixed prompt once; the acceptance sweep compares against these exact ids."""
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(str(support.MODEL_DIR))
     return tok.encode(TEXT)
@@ -34,10 +48,13 @@ def _prompt_ids() -> list[int]:
 
 @support.needs_model
 class MtpDrafterTest(support.ModelTestCase):
+    """The drafter's predictions must be good enough that speculating beats not speculating."""
+
     QUANT = True
     MAX_SEQ = 1024
 
     def setUp(self) -> None:
+        """Cache the prompt ids and the shared RoPE/mask context the drafter expects."""
         super().setUp()
         self.ids = _prompt_ids()
         self.ctx = (self.model.cos_tbl, self.model.sin_tbl, self.model.mask_idx)
@@ -53,6 +70,7 @@ class MtpDrafterTest(support.ModelTestCase):
         return x
 
     def test_chained_acceptance_by_depth(self):
+        """Per-depth acceptance rates must clear the k=1 bar and stay monotone, or the draft chain is wasted work."""
         model = self.model
         ids = self.ids
         assert len(ids) > K + 4, "prompt too short for the acceptance sweep"

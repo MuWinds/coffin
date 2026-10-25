@@ -3,8 +3,22 @@
 Everything that depends only on values inside a chunk -- the decay matrix, the
 UT system, the two triangular solves -- is one batched op over
 ``[H * nchunks]``; only the state scan is sequential, and it is affine in the
-state, so it is one ``baddbmm`` per chunk.  Matches the recurrent form to about
+state, so it is one ``baddbmm`` per chunk. Matches the recurrent form to about
 1e-6 relative error (``diag/check_chunked.py``).
+
+Module: ``coffin/ops``. Pure ``torch``; used by ``models/qwen35/linear_attn.py``
+for prefill and must never import from ``models/``.
+
+Constraints:
+    * The whole kernel exists to stay bandwidth-bound. Splitting the batched
+      phases back into a per-chunk Python loop costs ~25 launch-bound kernels per
+      chunk per layer, which measured 15% of prefill at n=2048 -- do not
+      "simplify" the structure without re-running the probe.
+    * Flattened batches are head-major, so chunk ``i`` lives at batch index
+      ``i, nc+i, 2*nc+i, ...``; the strided slices in the state scan depend on
+      that layout.
+    * ``out_state`` is written in place: the caller keeps the recurrent state
+      tensor across chunks and prefix reuse snapshots it.
 """
 
 from __future__ import annotations
@@ -23,6 +37,17 @@ _UPPER_MASK: dict[tuple[int, int | None], torch.Tensor] = {}
 
 
 def _upper_mask(n: int, device: torch.device) -> torch.Tensor:
+    """Return the cached strictly-upper ``[n, n]`` bool mask for ``device``.
+
+    Args:
+        n: Chunk length; one mask is cached per length and device index because
+            the decay matrix is rebuilt every chunk but the mask never changes.
+        device: Device the mask must live on.
+
+    Returns:
+        A shared ``[n, n]`` bool tensor, ``True`` above the diagonal. Treat it as
+        read-only: every chunk of every layer gets the same object.
+    """
     key = (n, device.index)
     m = _UPPER_MASK.get(key)
     if m is None:
@@ -36,30 +61,43 @@ def chunked_delta(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Te
                   chunk: int = 64) -> torch.Tensor:
     """Chunked form of the gated delta rule, for prefill over many tokens.
 
-    ``q, k, v`` are ``[H, C, d]`` (q, k already L2-normalised; q scaled), ``g``
-    and ``beta`` are ``[H, C]``, ``state`` is the ``[H, dk, dv]`` recurrent state
-    carried in from earlier chunks.  The new state is written to ``out_state``
-    and the outputs are returned as ``[C, H, dv]`` -- token-major, the layout the
-    layers carry their activations in, so the caller needs no transposing copy.
-    Matches the recurrent form to ~1e-6 relative error (see ``diag/check_chunked.py``).
+    The output is token-major -- ``[C, H, dv]``, the layout the layers carry their
+    activations in -- so the caller needs no transposing copy. Sequence padding is
+    absorbed here: chunks are padded to a whole number of chunks with
+    ``g = beta = 0``, which makes a padded row contribute nothing to the state
+    (``v_beta = k_beta = 0``, so its solved values are zero) while leaving
+    ``cum_decay`` untouched.
 
     Two phases, like the reference ``torch_chunk_gated_delta_rule``:
 
     1. everything that depends only on values *inside* a chunk -- the decay
        matrix, the UT system, the two triangular solves, the decayed q/k -- is
        computed for all chunks at once as one batched op over ``[H * nchunks]``;
-    2. a sequential scan over chunks carries the recurrent state.  This step is
+    2. a sequential scan over chunks carries the recurrent state. This step is
        affine in the state (see below), so it is one batched matmul per chunk,
        and the outputs are four batched matmuls over all chunks at once.
 
-    Doing phase 1 per chunk in a Python loop (the earlier shape of this function)
-    issued ~25 small kernels per chunk per layer, all of them launch-bound: at
-    n=2048 that is 19k launches and the whole delta path cost 15% of prefill.
-    Batching lifts the tensors to a size where the same work is bandwidth-bound.
+    Args:
+        q: Queries, ``[H, C, d]``, already L2-normalised and scaled.
+        k: Keys, ``[H, C, d]``, already L2-normalised.
+        v: Values, ``[H, C, dv]``.
+        g: Per-token log decay, ``[H, C]``.
+        beta: Per-token write gate, ``[H, C]``.
+        state: Recurrent state carried in from earlier chunks, ``[H, dk, dv]``.
+        out_state: Destination for the updated state, ``[H, dk, dv]``. Written in
+            place so the caller's state tensor survives, which is what prefix
+            reuse snapshots.
+        chunk: Tokens per chunk. Drives the shape of the batched system; the
+            default is the length the probes were measured at.
 
-    Sequels are padded to a whole number of chunks with ``g = beta = 0``, which
-    makes a padded row contribute nothing to the state (``v_beta = k_beta = 0``,
-    so its solved values are zero) while leaving ``cum_decay`` untouched.
+    Returns:
+        Outputs, ``[C, H, dv]``, truncated back to the real token count when
+        padding was added.
+
+    Raises:
+        RuntimeError: ``state``/``out_state`` disagree with ``q``/``v`` in the
+            head or head-dim axes, surfaced by the matmuls. The caller must size
+            the state from the same heads it feeds here.
     """
     H, C, dk = q.shape
     dv = v.shape[-1]

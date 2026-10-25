@@ -1,19 +1,31 @@
 """Drives one model forward for the scheduler.
 
-Separating this from ``serve.py`` is what makes batching possible: the runner
-owns *how* a step is executed (prefill path, paged write window, graph replay,
-sampling) and the scheduler owns *which* sequences go into the step.
+Module: ``coffin/`` (middle layer), owned by ``llm_engine``. Keeping the runner
+separate is what makes batching possible: the runner owns *how* a step is
+executed (prefill path, paged write window, graph replay, sampling) and the
+scheduler owns *which* sequences go into the step.
 
 Two execution modes live here:
 
-* single stream (``batching=False``) -- the pre-refactor path: one sequence, one
+* single stream (``batching=False``) — the pre-refactor path: one sequence, one
   token, the decode graph captured for one slot map;
-* static batch (``batching=True``) -- up to ``max_num_batched`` sequences share
-  one forward.  The projections are batched (one weight read serves every row)
+* static batch (``batching=True``) — up to ``max_num_batched`` sequences share
+  one forward. The projections are batched (one weight read serves every row)
   while attention and the delta-net recurrence run the existing single-token
-  kernels once per row.  Row 0..k are decode rows; row ``capacity-1`` is the
-  prefill staging row, so interleaving a prefill with running decodes cannot
-  clobber a decode row's recurrent state.
+  kernels once per row.
+
+Constraints:
+    * Row layout is fixed: rows ``0..capacity-2`` are decode rows and row
+      ``capacity-1`` is the prefill staging row. That reserve is why
+      interleaving a prefill with running decodes cannot clobber a decode row's
+      recurrent state.
+    * A sequence keeps its row until it finishes. Rows may therefore have holes,
+      and every batched step runs the smallest bucket above the highest live row
+      with the holes padded by the model's sentinel row. Never compact rows: the
+      saving is not worth permuting recurrent state every step.
+    * ``seq.num_cached_tokens`` is refreshed from ``model.pos1`` after every
+      forward, never incremented locally — a speculative step advances the model
+      by more than one token.
 """
 
 from __future__ import annotations
@@ -31,7 +43,8 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 
 #: Batch sizes the model captures one graph per; a step runs the smallest bucket
-#: that fits (the rest are sentinel rows whose logits are dropped).
+#: that fits (the rest are sentinel rows whose logits are dropped). Powers of two
+#: keep the padding waste under 100% at every bucket boundary.
 BATCH_BUCKETS = (1, 2, 4, 8)
 
 
@@ -39,6 +52,13 @@ class ModelRunner:
     """Execution of one step of the engine's model."""
 
     def __init__(self, model, cfg: "EngineConfig") -> None:
+        """Bind a runner to one loaded model.
+
+        Args:
+            model: A ``engine_api.Model`` / ``PagedModel`` implementation.
+            cfg: Engine configuration; the prefill chunk size and the snapshot
+                budget are read from it.
+        """
         self.model = model
         self.cfg = cfg
         self.pc: "PrefixCacheEngine | None" = None
@@ -49,27 +69,56 @@ class ModelRunner:
         self.spec = False
         self.spec_k = 0
         self.spec_sparse_k = 0
-        #: decode row -> seq_id; a sequence keeps its row until it finishes, so a
-        #: batched step never has to permute recurrent state between rows.
+        #: decode row -> seq_id. Rows are stable for a sequence's lifetime, which
+        #: is what lets a batched step skip permuting recurrent state.
         self._row_owner: dict[int, int] = {}
         #: Set by the engine when a prefix cache is attached; used by ``ping``.
         self.last_prefill_s = 0.0
 
     def attach_prefix_cache(self, pc: "PrefixCacheEngine") -> None:
+        """Drive prefills through a prefix-cache engine.
+
+        Args:
+            pc: The cache engine. It also supplies the block manager, so the
+                two can never disagree about which blocks a sequence holds.
+        """
         self.pc = pc
         self.bm = pc.bm
 
     def attach_blocks(self, bm: "BlockManager") -> None:
+        """Attach a block manager without a prefix cache (batched path).
+
+        Args:
+            bm: Manager built with ``with_radix=False``; blocks are allocated
+                per sequence and never shared.
+        """
         self.bm = bm
 
     def release_row(self, seq: "Sequence") -> None:
-        """Free the batch row a finished sequence held."""
+        """Free the batch row a finished sequence held.
+
+        Args:
+            seq: Finished sequence. Its ``row`` is reset to ``-1`` so a late
+                second call cannot free somebody else's row.
+        """
         if seq.row >= 0:
             self._row_owner.pop(seq.row, None)
             seq.row = -1
 
     def _claim_row(self, seq: "Sequence") -> int:
-        """Give ``seq`` the lowest free decode row for its whole lifetime."""
+        """Give ``seq`` the lowest free decode row for its whole lifetime.
+
+        Args:
+            seq: Sequence being admitted.
+
+        Returns:
+            The claimed row index.
+
+        Raises:
+            RuntimeError: Every row is taken. That means the scheduler admitted
+                past ``max_num_seqs``, and running with a shared row would
+                corrupt recurrent state rather than merely slow down.
+        """
         capacity = int(getattr(self.model, "decode_capacity", 1))
         for row in range(capacity):
             if row not in self._row_owner:
@@ -81,23 +130,35 @@ class ModelRunner:
 
     def enable_batching(self, max_batch: int,
                         buckets: tuple[int, ...] = BATCH_BUCKETS) -> None:
-        """Capture one decode graph per bucket; ``max_batch`` caps the row count.
+        """Capture one decode graph per bucket.
 
-        The model's capacity is ``max_bucket + 1``: the extra row is the prefill
-        staging row (see the module docstring).
+        Args:
+            max_batch: Upper bound on decode rows. Buckets above it are dropped,
+                because a graph larger than the row count can never run.
+            buckets: Candidate bucket sizes. Always includes 1, so a single
+                running sequence still has a graph to replay.
         """
         buckets = tuple(b for b in buckets if b <= max_batch) or (1,)
         self.buckets = buckets
+        # +1 is the prefill staging row; without it a grouped prefill would have
+        # to share a row with a sequence already decoding.
         self.model.enable_batching(max(self.buckets) + 1)
         self.model.capture_batch(self.buckets)
         self.batching = True
 
     def enable_spec(self, k: int, sparse_topk: int = 0) -> None:
-        """Turn on batch-friendly MTP with ``k`` drafts per row (needs batching).
+        """Turn on batch-friendly MTP with ``k`` drafts per row.
 
-        ``sparse_topk > 0`` asks the model to verify against only the top-k
-        historical KV blocks per row (approximate); 0 keeps full attention, which
-        is the exact mode.
+        Args:
+            k: Draft tokens per step.
+            sparse_topk: Verify against only the top-k historical KV blocks per
+                row (approximate). 0 keeps full attention, which is the exact
+                mode; the approximation exists because the batched verify
+                otherwise pays one weight pass per candidate token.
+
+        Raises:
+            RuntimeError: Batching is off. Single-stream spec has its own path
+                (``spec_generate``) and does not go through this switch.
         """
         if not self.batching:
             raise RuntimeError("enable_spec() needs the batched engine")
@@ -109,7 +170,19 @@ class ModelRunner:
 
     @torch.inference_mode()
     def prefill(self, seq: "Sequence") -> torch.Tensor:
-        """Feed the prompt (minus the cached prefix) and return next-token logits."""
+        """Feed the prompt (minus the cached prefix) and return next-token logits.
+
+        Three paths exist because there are three engines, not because the call
+        differs: a prefix cache, the batched runner, and the plain single-stream
+        model. Each keeps its own invariants around the KV write window.
+
+        Args:
+            seq: Sequence to prefill. Its ``num_cached_tokens`` and
+                ``num_scheduled_tokens`` are refreshed from the model afterwards.
+
+        Returns:
+            Logits for the last prompt position, ``[vocab]``.
+        """
         t0 = time.time()
         if self.pc is not None:
             logits = self.pc.prefill(seq.token_ids, mm=seq.mm)
@@ -131,10 +204,19 @@ class ModelRunner:
 
         The sequence owns blocks from the moment it is admitted: the matched
         prefix blocks are refcounted by the radix tree (shared with whoever else
-        holds them) and the suffix gets fresh blocks.  The suffix is prefilled on
+        holds them) and the suffix gets fresh blocks. The suffix is prefilled on
         the staging row with its recurrent state restored from the deepest
-        snapshot the tree has, in ``snapshot_interval`` slices so each block
-        boundary gets a state snapshot the next request can reuse.
+        snapshot the tree has.
+
+        Args:
+            seq: Sequence to prefill; already holds its decode row.
+
+        Returns:
+            Logits for the last prompt position.
+
+        Raises:
+            RuntimeError: No block manager is attached. The batched path cannot
+                run without one, since it must allocate KV before the forward.
         """
         model, bm = self.model, self.bm
         if bm is None:
@@ -145,7 +227,12 @@ class ModelRunner:
 
         matched, states = 0, None
         if radix is not None:
+            # Reserve before matching: eviction can only pick unreferenced
+            # leaves, so once this sequence holds blocks they are no longer
+            # evictable and the pool could come up short mid-prefill.
             bm.reserve((seq.num_tokens + bs - 1) // bs + 1)
+            # Drop the last token: a match including it would leave nothing to
+            # run the forward on and no logits to return.
             blocks, matched, states = bm.match_prefix(seq.token_ids[:-1],
                                                       require_states=True,
                                                       mm=seq.mm)
@@ -163,7 +250,7 @@ class ModelRunner:
 
         # Snapshots are only reusable on block boundaries, so the block-aligned
         # head is prefilled in `snapshot_interval` slices (one snapshot each) and
-        # the tail last (only its logits matter).
+        # the tail last -- only its logits matter, nothing downstream can reuse it.
         states_at: dict = {}
         if states is not None and matched:
             states_at[matched] = states
@@ -172,7 +259,8 @@ class ModelRunner:
         head_len = max(0, (n_total // bs) * bs - matched)
         step = max(bs, self.cfg.snapshot_interval // bs * bs)
         # With MTP on, the prefill also fills that sequence's drafter row so its
-        # first speculative step has context (acceptance rate, not correctness).
+        # first speculative step has context. This affects acceptance rate only,
+        # never correctness.
         spec_row = row if self.spec else None
         logits = None
         for c0 in range(0, head_len, step):
@@ -180,6 +268,9 @@ class ModelRunner:
             logits = model.prefill(rest[c0:c1], chunk=self.cfg.chunk,
                                    spec_row=spec_row, mm=seq.mm)
             states_at[matched + c1] = model.snapshot_linear_states(row=stage)
+            # Budget is enforced deepest-first so the *shallow* boundaries
+            # survive: a request is far likelier to share a short prefix than a
+            # long one, and `matched` itself must never be dropped.
             while len(states_at) > self.cfg.snapshots:
                 droppable = [k for k in states_at if k != matched]
                 if not droppable:
@@ -195,11 +286,24 @@ class ModelRunner:
         return logits
 
     def can_group_prefill(self) -> bool:
-        """True when several prompts can share one prefill forward."""
+        """Whether several prompts can share one prefill forward.
+
+        Returns:
+            ``True`` when batching is on and a block manager is attached; both
+            are prerequisites for a grouped prefill.
+        """
         return self.batching and self.bm is not None
 
     def _match_for_prefill(self, seq: "Sequence") -> tuple[int, dict | None]:
-        """Adopt ``seq``'s longest cached prefix; returns (matched, states)."""
+        """Adopt ``seq``'s longest cached prefix.
+
+        Args:
+            seq: Sequence about to be prefilled; its block table and ``matched``
+                are updated in place.
+
+        Returns:
+            ``(matched, states)``, both zero / ``None`` without a radix tree.
+        """
         bm = self.bm
         if bm is None or bm.radix is None:
             return 0, None
@@ -214,15 +318,21 @@ class ModelRunner:
 
     @torch.inference_mode()
     def prefill_group(self, seqs: list["Sequence"]) -> list[torch.Tensor]:
-        """Prefill several prompts in one forward; returns one logits per sequence.
+        """Prefill several prompts in one forward.
 
         Prefix reuse composes with this: each sequence adopts its matched blocks
         and recurrent state first (into its own row), the group forward starts
         every prompt at its own ``matched`` offset, and the block-boundary
         snapshots it returns are inserted back into the radix tree.
 
-        Image prompts pass their payload on ``seq.mm``; ``model.prefill_group``
-        reads it from the sequences itself, so this path needs no mm argument.
+        Args:
+            seqs: Prompts to prefill. Each gets a row if it has none yet.
+
+        Returns:
+            One logits tensor per sequence, in the same order.
+
+        Raises:
+            RuntimeError: No block manager is attached.
         """
         t0 = time.time()
         bm = self.bm
@@ -239,6 +349,8 @@ class ModelRunner:
                 self.model.restore_linear_states(states, row=seq.row)
             matched_states.append((matched, states))
 
+        # Image prompts pass their payload on ``seq.mm``; ``model.prefill_group``
+        # reads it from the sequences, so this path needs no mm argument.
         logits, snaps = self.model.prefill_group(
             seqs, snapshot_interval=(self.cfg.snapshot_interval
                                      if radix is not None else None))
@@ -265,12 +377,23 @@ class ModelRunner:
         The window has to be opened before the KV write, and a partial tail block
         that is still shared with the radix tree is copied at that point, which is
         what keeps the cached prefix read-only.
+
+        Args:
+            seq: Sequence about to decode one token.
         """
         if self.pc is not None and self.pc.seq is not None:
             self.pc.seq.reserve(1)
 
     def decode_step(self, seq: "Sequence", token: int) -> torch.Tensor:
-        """Advance one token through the captured single-stream decode graph."""
+        """Advance one token through the captured single-stream decode graph.
+
+        Args:
+            seq: Sequence being advanced.
+            token: Token to feed, i.e. the previous output.
+
+        Returns:
+            Logits for the next position.
+        """
         logits = self.model.decode_step(token)
         if self.pc is not None and self.pc.seq is not None:
             self.pc.seq.commit_upto(self.model.pos1)
@@ -279,7 +402,14 @@ class ModelRunner:
 
     @torch.inference_mode()
     def decode(self, seqs: list["Sequence"]) -> list[int]:
-        """Next token for each sequence, batched when more than one is running."""
+        """Next token for each sequence, batched when more than one is running.
+
+        Args:
+            seqs: Running sequences to advance by one token.
+
+        Returns:
+            One sampled token id per sequence, in the same order.
+        """
         if self.batching:
             return self._decode_batch(seqs)
         out: list[int] = []
@@ -291,13 +421,23 @@ class ModelRunner:
 
     @torch.inference_mode()
     def spec_step(self, seqs: list["Sequence"]):
-        """One batch-friendly speculative step; returns ``(accepted, logits)``.
+        """One batch-friendly speculative step.
 
-        ``accepted[i]`` starts with the pending token of sequence ``i`` (already
-        appended by the engine) followed by the drafts the main model accepted, so
-        the caller appends ``accepted[i][1:]``.  ``None`` is returned when the
-        drafter's window cannot cover a row, in which case the caller must fall
-        back to a plain batched decode step.
+        Args:
+            seqs: Running sequences. Each must already have its pending token
+                appended by the engine.
+
+        Returns:
+            ``(accepted, logits)``. ``accepted[i]`` starts with sequence ``i``'s
+            pending token followed by the drafts the main model accepted, so the
+            caller appends ``accepted[i][1:]``. ``None`` when the drafter's
+            window cannot cover a row — the caller must then fall back to a plain
+            batched decode step rather than skip the sequence.
+
+        Raises:
+            RuntimeError: Batching or speculation is off. Falling back is the
+                caller's job, so this is a programming error, not a runtime
+                condition.
         """
         model, bm = self.model, self.bm
         if bm is None or not self.spec:
@@ -310,6 +450,7 @@ class ModelRunner:
         tables: list[list[int]] = []
         for seq in seqs:
             pos = seq.num_cached_tokens
+            # +1 for the pending token, +k for the drafts: all of them get KV.
             bm.ensure_blocks(seq, pos + self.spec_k + 1)
             tokens.append(seq.token_ids[-1])
             positions.append(pos)
@@ -320,12 +461,26 @@ class ModelRunner:
                 row_indices=rows,
                 pad_rows=[r for r in range(bucket) if r not in active])
         except RuntimeError:
+            # The drafter was captured for a fixed window; a row whose context
+            # no longer fits makes it refuse. Signalling the caller is cheaper
+            # than rebuilding the drafter mid-generation.
             return None
         for seq, acc in zip(seqs, accepted):
             seq.num_cached_tokens += len(acc)
         return accepted, logits
 
     def _decode_batch(self, seqs: list["Sequence"]) -> list[int]:
+        """Advance several sequences through one captured decode graph.
+
+        Args:
+            seqs: Running sequences, each with a stable row.
+
+        Returns:
+            One sampled token id per sequence.
+
+        Raises:
+            RuntimeError: No block manager is attached.
+        """
         model, bm = self.model, self.bm
         if bm is None:
             raise RuntimeError("batched decode needs a block manager")
@@ -346,8 +501,6 @@ class ModelRunner:
             tokens.append(seq.token_ids[-1])
             positions.append(pos)
             tables.append(seq.block_table)
-        # Rows are stable and may have holes; the model writes only the live rows
-        # and pads everything else with sentinel state.
         model.set_rows(tokens, positions, tables, row_indices=rows)
         logits = model.decode_batch(bucket, bucket, pad_rows=pad_rows)
         for seq, pos in zip(seqs, positions):
@@ -356,7 +509,17 @@ class ModelRunner:
 
     @staticmethod
     def _sample_rows(logits: torch.Tensor, seqs: list["Sequence"]) -> list[int]:
-        """Sample each sequence from its own row of the batched logits."""
+        """Sample each sequence from its own row of the batched logits.
+
+        Args:
+            logits: Batched logits, ``[bucket, vocab]``.
+            seqs: Sequences in row order.
+
+        Returns:
+            One token id per sequence. A single-row logits tensor is read at
+            index 0 regardless of ``seq.row``, because the bucket-1 graph always
+            writes row 0 even for a sequence that kept a higher row.
+        """
         temps = [s.params.temperature for s in seqs]
         out: list[int] = []
         for seq in seqs:
@@ -371,6 +534,16 @@ class ModelRunner:
 
     @staticmethod
     def sample(logits: torch.Tensor, temperature: float) -> int:
+        """Pick one token from ``logits``.
+
+        Args:
+            logits: ``[vocab]`` logits, possibly bf16.
+            temperature: ``0`` selects the argmax; the sampling path upcasts to
+                fp32 first because bf16 softmax loses too much tail mass.
+
+        Returns:
+            The sampled token id.
+        """
         if temperature > 0:
             p = torch.softmax(logits.float() / temperature, dim=-1)
             return int(torch.multinomial(p, 1))

@@ -1,13 +1,28 @@
 """The radix tree must never hand one image's KV to a different image.
 
+Module: ``coffin/tests``. Drives ``radix_cache`` / ``block_manager`` /
+``prefix_engine`` / ``model_runner`` with a recording model; it is the only test
+that asserts on the cache key itself rather than on generated tokens.
+
+Constraints:
+    * The paged pool is real but allocated on the CPU and the model is a recorder,
+      so this module runs without a DCU. Do not swap in the shared GPU fixture:
+      the assertions are about keys and match lengths, not about numerics.
+    * The block key must stay ``(tokens_block, media_signature)`` so a new kernel
+      or an extra cache layer cannot reintroduce token-only keys. The text-only
+      tests are the guard that this costs the text path nothing.
+    * ``TEXT_MEDIA_ID`` must remain the value a no-image block hashes to; changing
+      it would invalidate every stored text-only block.
+    * Tests patch nothing global, but ``make_runner`` sets ``batching = True``,
+      which is what routes ``prefill`` through ``_prefill_batched``.
+
 A ``<|image_pad|>`` run is the same token ids for every image, so a prefix cache
 keyed on token ids alone would reuse the KV of the *first* image for a prompt
 carrying a *different* one.  That failure is silent and grows with the suffix, so
 the block key is ``(tokens_block, media_signature)`` instead: the set of image
 content ids in the block, ``(0,)`` for a block with no image token.
 
-Four things have to hold, and this module checks them without a DCU (the paged
-pool is real but lives on the CPU, and the model is a recorder):
+Four things have to hold, and this module checks them without a DCU:
 
 1. same tokens + different image digest -> zero match;
 2. same tokens + same digest -> a hit, always on a block boundary;
@@ -44,9 +59,7 @@ NUM_BLOCKS = 64
 IMAGE = 248056                      # <|image_pad|>
 
 
-# --------------------------------------------------------------------------- #
 # fixtures
-# --------------------------------------------------------------------------- #
 def make_pool() -> PagedKVCache:
     """A real paged pool, on the CPU so the suite needs no DCU."""
     return PagedKVCache(1, 1, 4, num_blocks=NUM_BLOCKS, block_size=BLOCK,
@@ -86,7 +99,7 @@ class FakeModel:
         self.calls: list[tuple[list[int], object]] = []
         self.states: dict[int, dict] = {}
 
-    # the two paths' state hooks ------------------------------------------------
+    # the two paths' state hooks
     def reset(self) -> None:
         self.pos1.zero_()
 
@@ -157,11 +170,12 @@ class Seq:
         return len(self.token_ids)
 
 
-# --------------------------------------------------------------------------- #
 # media id / signature helpers
-# --------------------------------------------------------------------------- #
 class MediaIdTest(unittest.TestCase):
+    """The media id is the cache salt, so it must be deterministic and fit a signed 64-bit token slot."""
+
     def test_media_id_is_stable_positive_and_position_salted(self) -> None:
+        """Two runs must agree (an id that changed would miss every warm cache), and the id must salt on both digest and index."""
         a = media_id("deadbeef", 0)
         self.assertEqual(a, media_id("deadbeef", 0), "same image must keep its id")
         self.assertNotEqual(a, media_id("deadbeef", 1), "index must salt the id")
@@ -171,6 +185,7 @@ class MediaIdTest(unittest.TestCase):
         self.assertLess(a, 1 << 63)
 
     def test_media_ids_and_signatures(self) -> None:
+        """Positional salting is what makes the same picture twice two distinct spans, and block signatures must reflect exactly the image tokens a block holds."""
         ids, img_start = prompt_with_image(n_text=4, n_img=12,
                                            prefix_text=2 * BLOCK + 3)
         mm = make_mm("d1", [(img_start, img_start + 12)], len(ids))
@@ -187,6 +202,7 @@ class MediaIdTest(unittest.TestCase):
                          tuple(sorted({TEXT_MEDIA_ID, media_id("d1", 0)})))
 
     def test_text_only_mm_has_no_ids_and_no_signature_work(self) -> None:
+        """``None`` and an empty digest must both mean "no image ids", so the text path allocates no per-token array at all."""
         ids = [1, 2, 3]
         mm = make_mm("", [], len(ids))
         self.assertIsNone(media_ids_for(mm, len(ids)))
@@ -194,17 +210,19 @@ class MediaIdTest(unittest.TestCase):
         self.assertEqual(media_signature(None, 0, BLOCK), (TEXT_MEDIA_ID,))
 
     def test_spans_without_digest_are_rejected(self) -> None:
+        """An image span with no digest would key every image alike, which is the exact bug this module exists to prevent; fail loudly instead."""
         ids, img_start = prompt_with_image(n_text=4, n_img=8)
         mm = make_mm("", [(img_start, img_start + 8)], len(ids))
         with self.assertRaises(ValueError):
             media_ids_for(mm, len(ids))
 
 
-# --------------------------------------------------------------------------- #
 # the core claim: no cross-image KV reuse
-# --------------------------------------------------------------------------- #
 class SaltTest(unittest.TestCase):
+    """The core claim: image KV is never reused across different images, and text KV still is."""
+
     def setUp(self) -> None:
+        """Shared prompt, two digests for the same image position, one CPU pool per test."""
         self.pool = make_pool()
         self.radix = RadixCache(self.pool, max_state_snapshots=4)
         self.ids, self.img_start = prompt_with_image(n_text=9, n_img=12)
@@ -217,6 +235,7 @@ class SaltTest(unittest.TestCase):
         return [self.pool.alloc() for _ in range(n)]
 
     def test_same_tokens_different_digest_matches_nothing(self) -> None:
+        """The failure this prevents is silent: the second image's prompt would decode over the first image's KV."""
         blocks = self._blocks(len(self.ids) // BLOCK)
         self.radix.insert(self.ids, blocks, {}, mm=self.mm_a)
         got, matched, _ = self.radix.match_prefix(self.ids[:-1], mm=self.mm_b)
@@ -224,6 +243,7 @@ class SaltTest(unittest.TestCase):
         self.assertEqual(got, [])
 
     def test_same_tokens_same_digest_hits_on_a_block_boundary(self) -> None:
+        """A hit must be whole blocks: a partial block cannot be refcounted or copied on write."""
         blocks = self._blocks(len(self.ids) // BLOCK)
         self.radix.insert(self.ids, blocks, {}, mm=self.mm_a)
         got, matched, _ = self.radix.match_prefix(self.ids[:-1], mm=self.mm_a)
@@ -233,6 +253,7 @@ class SaltTest(unittest.TestCase):
         self.assertTrue(all(b in blocks for b in got))
 
     def test_text_prefix_before_the_image_is_still_shared(self) -> None:
+        """Salting must not be contagious: text blocks before the image are image-independent and must stay reusable."""
         # An image further along must not throw away the shareable text prefix:
         # the blocks before it hold the same KV whatever the image is.
         ids, img_start = prompt_with_image(n_text=8, n_img=12, prefix_text=3 * BLOCK)
@@ -244,6 +265,7 @@ class SaltTest(unittest.TestCase):
                          "the image-free text prefix should still be reusable")
 
     def test_plain_text_query_cannot_match_an_image_block(self) -> None:
+        """The inverse leak: a text query carrying placeholder ids must not adopt an image branch, which would inject another image's KV."""
         # A text request whose ids happen to contain the placeholder run (no mm
         # set) must not adopt an image branch: its signature is (0,).
         self.radix.insert(self.ids, self._blocks(len(self.ids) // BLOCK), {},
@@ -252,6 +274,7 @@ class SaltTest(unittest.TestCase):
         self.assertEqual(matched, 0)
 
     def test_image_query_reuses_a_text_branch_up_to_the_image(self) -> None:
+        """Reuse must not depend on insert order: text first, then an image request, must still share the image-free head."""
         # The other direction: a *text* insert put the head in the tree (plain
         # keys), then an image request with the same head arrives.  The text KV is
         # correct regardless of the image, so the head must be reused and the
@@ -264,6 +287,7 @@ class SaltTest(unittest.TestCase):
                          "the text head must be reusable, the image part not")
 
     def test_a_no_mm_query_never_looks_up_a_salted_key(self) -> None:
+        """The mechanism behind the two tests above: a salted edge sits under a key a plain lookup cannot construct, so ``mm=None`` costs nothing."""
         # The invariant behind the two tests above: salted edges live under keys a
         # plain-token lookup cannot produce, so ``mm=None`` costs no comparison at
         # all and can never reach image KV.
@@ -277,6 +301,7 @@ class SaltTest(unittest.TestCase):
         self.assertEqual(len(plain_key), BLOCK)
 
     def test_two_images_in_one_prompt_are_position_salted(self) -> None:
+        """The same bytes sent twice are still two different spans; without the index salt the second image would reuse the first's KV."""
         ids, first = prompt_with_image(n_text=4, n_img=8)
         second = len(ids)
         ids += [IMAGE] * 8
@@ -290,6 +315,7 @@ class SaltTest(unittest.TestCase):
         self.assertEqual(matched, len(ids) // BLOCK * BLOCK)
 
     def test_image_span_crossing_a_block_salts_both_blocks(self) -> None:
+        """A span crossing a boundary must salt every block it touches; salting only the first would expose the overlap to reuse."""
         # The span starts mid-block: the block holding its head and the next one
         # must both carry the id, so neither can be shared across images.
         ids, img_start = prompt_with_image(n_text=4, n_img=12, prefix_text=3)
@@ -314,15 +340,17 @@ class SaltTest(unittest.TestCase):
         self.assertEqual(matched, 0)
 
 
-# --------------------------------------------------------------------------- #
 # text-only regression: plain tokens, plain keys, no mm work
-# --------------------------------------------------------------------------- #
 class TextOnlyTest(unittest.TestCase):
+    """The text path predates images and must keep its old keys, lengths and zero per-token cost."""
+
     def setUp(self) -> None:
+        """A fresh CPU pool per test, so match lengths cannot be inherited from a previous case."""
         self.pool = make_pool()
         self.radix = RadixCache(self.pool, max_state_snapshots=4)
 
     def test_keys_stay_plain_token_tuples(self) -> None:
+        """A text-only insert must not start producing salted child keys, or every existing cached block becomes unreachable."""
         ids = [1000 + i for i in range(5 * BLOCK)]
         blocks = [self.pool.alloc() for _ in range(5)]
         self.radix.insert(ids, blocks, {})
@@ -332,6 +360,7 @@ class TextOnlyTest(unittest.TestCase):
         self.assertIsNone(self.radix.root.children[tuple(ids[:BLOCK])].sigs)
 
     def test_match_lengths_are_unchanged(self) -> None:
+        """Match lengths are the old floor-to-block values; a shorter one loses reuse and a longer one hands over unverified KV."""
         ids = [1000 + i for i in range(5 * BLOCK)]
         self.radix.insert(ids, [self.pool.alloc() for _ in range(5)], {})
         for n in (BLOCK, 2 * BLOCK, 5 * BLOCK, 5 * BLOCK - 1):
@@ -339,12 +368,14 @@ class TextOnlyTest(unittest.TestCase):
             self.assertEqual(matched, n // BLOCK * BLOCK)
 
     def test_a_text_query_with_mm_none_matches_a_text_branch(self) -> None:
+        """``mm=None`` is the text request's normal state, so it must take the plain-key path and match."""
         ids = [7 * i % 251 for i in range(4 * BLOCK)]
         self.radix.insert(ids, [self.pool.alloc() for _ in range(4)], {})
         _, matched, _ = self.radix.match_prefix(ids[:-1], mm=None)
         self.assertEqual(matched, 3 * BLOCK)
 
     def test_shared_text_prefix_between_an_image_and_a_text_request(self) -> None:
+        """Reuse must work in both directions across modalities, or a mixed workload loses the prefix sharing entirely."""
         # The cache must still give a text request the text blocks an image
         # request put there, as long as they hold no image token.
         text = [500 + i for i in range(2 * BLOCK)]
@@ -357,11 +388,13 @@ class TextOnlyTest(unittest.TestCase):
         self.assertEqual(matched, 2 * BLOCK)
 
 
-# --------------------------------------------------------------------------- #
 # both prefill paths: insert -> match, with mm forwarded to the model
-# --------------------------------------------------------------------------- #
 class PrefixEnginePathTest(unittest.TestCase):
+    """The single-stream prefill path must insert and match salted keys and forward ``mm``."""
+
     def test_insert_then_match_single_stream(self) -> None:
+        """``mm`` reaching the model is what actually injects the image embeddings; a cache hit without it would silently drop the picture."""
+
         model = FakeModel()
         eng = make_engine(model)
         ids, img_start = prompt_with_image(n_text=9, n_img=12)
@@ -387,6 +420,7 @@ class PrefixEnginePathTest(unittest.TestCase):
         self.assertEqual(eng2.last_matched, 0)
 
     def test_text_only_path_is_unchanged(self) -> None:
+        """A text prefill must pass ``mm=None`` and keep the old match lengths."""
         model = FakeModel()
         eng = make_engine(model)
         ids = [300 + i for i in range(3 * BLOCK)]
@@ -398,6 +432,7 @@ class PrefixEnginePathTest(unittest.TestCase):
         self.assertEqual(matched, eng.last_matched)
 
     def test_mixed_edge_stops_at_the_image_block(self) -> None:
+        """A short prompt puts text and image blocks on one edge; the check must stop exactly at the first image block, not early and not late."""
         # One edge holds text blocks *and* image blocks (a short prompt lives
         # entirely in one node).  The edge gets a signature list, and checking it
         # must stop exactly at the first image block -- not one block early (which
@@ -426,10 +461,14 @@ class PrefixEnginePathTest(unittest.TestCase):
 
 
 class ModelRunnerPathTest(unittest.TestCase):
+    """The batched path must match the single-stream one: same salt, same boundary, same ``mm`` forwarding."""
+
     def _insert(self, runner, seq) -> None:
+        """Prefill one sequence through the runner (the batched path)."""
         runner.prefill(seq)
 
     def test_insert_then_match_batched(self) -> None:
+        """Any divergence from the single-stream path shows up here first, because the scheduler only ever uses this one."""
         model = FakeModel()
         model.enable_batching = lambda capacity: None      # not used by prefill
         runner, bm = make_runner(model)
@@ -452,6 +491,7 @@ class ModelRunnerPathTest(unittest.TestCase):
                          "a different image adopted the first image's KV")
 
     def test_text_only_batched_path_is_unchanged(self) -> None:
+        """The batched text path keeps the old behaviour: no ``mm`` to the model, old match lengths."""
         model = FakeModel()
         runner, bm = make_runner(model)
         ids = [700 + i for i in range(4 * BLOCK)]
@@ -462,6 +502,7 @@ class ModelRunnerPathTest(unittest.TestCase):
         self.assertEqual(warm.matched, (len(ids) - 1) // BLOCK * BLOCK)
 
     def test_group_prefill_matches_what_it_inserted(self) -> None:
+        """A mismatch between the key inserted and the key matched poisons the tree silently, so both are asserted on one prompt."""
         # ``prefill_group`` matches on ``seq.mm`` and inserts on ``seq.mm``; a
         # mismatch there is exactly the bug that would silently poison the tree,
         # so check the tree carries the image branch the match will look for.

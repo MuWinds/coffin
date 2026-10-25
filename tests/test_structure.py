@@ -1,7 +1,18 @@
 """Engine package structure: imports, compatibility shim, architecture dispatch.
 
-No weights are read and no kernel runs, so these tests run on a box without a
-DCU too -- run them first after a code change, before paying the model load.
+Module: ``coffin/tests``. Imports ``engine_api``, ``qwen35_engine`` and
+``support`` only; it is the one test module that must run with no DCU, so it may
+not import ``hip_ops`` or a model family at module scope.
+
+Constraints:
+    * No weights are read and no kernel runs, so this file is the gate to run
+      first after a code change, before paying the model load.
+    * ``LEGACY_NAMES`` is deliberately duplicated from the shim: the test is the
+      contract, so a name silently dropped from ``qwen35_engine`` must fail here
+      rather than disappear with the edit.
+    * Lazy imports are the thing under test (``hip_ops`` loads a compiled
+      extension), so an import at the top of this file would break the no-DCU
+      promise the whole file exists to keep.
 
 Port of ``diag/check_modules.py`` (now covered here).
 """
@@ -45,6 +56,7 @@ class ShimTest(unittest.TestCase):
         self.assertIs(qwen35_engine.hip_ops, hip_ops)
 
     def test_reload_rebinds_shim_to_the_reloaded_registry(self):
+        """``reload`` must re-point the shim at the new registry entry, or a hot reload keeps serving the old class."""
         engine_api.reload()
         qwen35_engine.reload()
         self.assertIs(qwen35_engine.Qwen35,
@@ -66,16 +78,19 @@ class RegistryTest(unittest.TestCase):
             "qwen3_5")
 
     def test_unknown_architecture_raises_instead_of_guessing(self):
+        """Dispatching an unknown family must fail loudly; a silent fallback would load the wrong weights."""
         with self.assertRaises(RuntimeError):
             engine_api.detect_architecture({"model_type": "llama"})
 
     def test_describe_reports_name_and_family(self):
+        """The startup log line and ``/v1/models`` both read ``describe``, so its keys are a small public contract."""
         info = engine_api.describe(support.FIXTURE_MODEL_DIR)
         self.assertEqual(info["model"], "qwen3_5")
         self.assertEqual(info["arch"], "qwen3_5")
         self.assertEqual(info["model_path"], str(support.FIXTURE_MODEL_DIR))
 
     def test_create_model_dispatches_and_forwards_arguments(self):
+        """``create_model`` must pass every knob through to the family constructor, not re-apply its own defaults."""
         seen: dict = {}
 
         class _Dummy:
@@ -94,13 +109,14 @@ class RegistryTest(unittest.TestCase):
         self.assertEqual(seen["ctor"][1:], (8192, False, None, True))
 
     def test_load_weights_dispatches_to_the_family_loader(self):
+        """Pins the loader signature every family must accept: a new kwarg added to the dispatch and not to a family breaks loading, not this test's own call."""
         seen: dict = {}
 
         # The family loader contract: positional ``model_dir`` plus the text
-        # quantisation knobs and the vision ones (defaults so a text-only family
-        # can ignore them).  The vision kwargs are new -- the multimodal work
-        # added them, and this test is what keeps the dispatch and the contract
-        # in step for every family, not just qwen35.
+        # quantisation knobs and the vision ones, with defaults so a text-only
+        # family can ignore them. The vision kwargs came with the multimodal
+        # work, and this test is what keeps the dispatch and the contract in step
+        # for every family, not just qwen35.
         def _fake_loader(model_dir, quant=False, weight_dtype=None,
                          vision=None, vision_quant=False):
             seen["call"] = (model_dir, quant, weight_dtype, vision, vision_quant)
@@ -118,7 +134,10 @@ class RegistryTest(unittest.TestCase):
 
 @unittest.skipUnless(support.has_model(), f"no checkpoint at {support.MODEL_DIR}")
 class RealCheckpointTest(unittest.TestCase):
+    """The checked-in fixture is config-shaped, so one test must read a real ``config.json``."""
+
     def test_dispatch_real_checkpoint(self):
+        """Dispatch must recognise the deployed checkpoint's own metadata, not just the fixture."""
         config = json.loads((support.MODEL_DIR / "config.json").read_text())
         self.assertEqual(engine_api.detect_architecture(config), "qwen3_5")
         self.assertEqual(engine_api.describe(support.MODEL_DIR)["arch"], "qwen3_5")

@@ -1,5 +1,22 @@
 """Group prefill: several prompts in one forward.
 
+Module: ``coffin/tests``. Drives ``Qwen35.prefill_group`` through the batched
+model API (paging, batch capture, per-row decode); the scheduler-level use of the
+same path is covered by ``test_spec_batch.py`` and ``test_prefix_batch.py``.
+
+Constraints:
+    * Agreement is argued in bf16 ULPs, never bit equality across batch sizes: the
+      GEMM's M changed, so the fp32 accumulation order changed too, and
+      bit-identical simply is not on the table. Only the one-sequence case is
+      bitwise, because it takes the same M.
+    * The model has ``capacity = max_bucket + 1`` rows, the last being the prefill
+      staging row; a test that decodes on that row corrupts the next prefill, so
+      states are always moved off it first.
+    * Every block allocated here is freed in a ``finally``; a leak would make the
+      later prefix-reuse assertions pass for the wrong reason (a full pool).
+    * ``_solo`` is the oracle for every test: comparing group prefill against
+      anything else would not separate a batching bug from a model bug.
+
 The batched engine prefills each admitted request on its own, so a burst of k
 requests pays the weight read k times.  ``Qwen35.prefill_group`` concatenates the
 prompts, runs each layer's projection / MLP once over all the tokens, and slices
@@ -10,8 +27,7 @@ recurrent row).  The weights are read once per layer instead of once per prompt.
 The acceptance contract:
 
 1. a group prefill must agree with running the same prompts one at a time:
-   argmax identical and logits within bf16 noise -- the GEMM's M changed, so the
-   fp32 accumulation order changed too, and bit-identical is not on the table;
+   argmax identical and logits within bf16 noise;
 2. with one sequence the group path *is* bit-identical to ``prefill``;
 3. the states are routed to the right rows: after a group prefill each sequence
    keeps decoding into tokens that match its own solo run;
@@ -45,12 +61,15 @@ def _tokens(n: int, off: int = 0) -> list[int]:
 
 @support.needs_model
 class PrefillBatchTest(support.ModelTestCase):
+    """Group prefill must reproduce the per-sequence solo run, states and all."""
+
     QUANT = True
     MAX_SEQ = 2048
     PAGED = True
 
     @classmethod
     def setUpClass(cls) -> None:
+        """Paged, batched and bucketed: the group path only exists in this configuration."""
         super().setUpClass()
         cls.model = support.ModelFixture.get(quant=cls.QUANT, max_seq=cls.MAX_SEQ,
                                              paged=True, bench=False)
@@ -61,13 +80,16 @@ class PrefillBatchTest(support.ModelTestCase):
 
     @classmethod
     def tearDownClass(cls) -> None:
+        """Return the model and its VRAM; the shared fixture outlives this class."""
         support.ModelFixture.close()
 
     def _alloc(self, n_tokens: int, extra: int = STEPS) -> list[int]:
+        """Allocate blocks for ``n_tokens`` plus room for the decode steps that follow."""
         nb = -(-(n_tokens + extra) // BLOCK)
         return [self.pool.alloc() for _ in range(nb)]
 
     def _free(self, blocks: list[int]) -> None:
+        """Return blocks to the pool; every ``_alloc`` has to be paired with this."""
         self.pool.free_blocks(blocks)
 
     def _solo(self, ids: list[int]):
@@ -120,6 +142,7 @@ class PrefillBatchTest(support.ModelTestCase):
 
     def _assert_close(self, got: torch.Tensor, ref: torch.Tensor, label: str,
                       max_ulps: float = 16.0):
+        """Assert argmax equality plus a ULP bound, so a tolerance failure names which one broke."""
         self.assertEqual(tuple(got.shape), tuple(ref.shape), label)
         diff = float((got - ref).abs().max())
         unit = max(float(ref.abs().max()), 1e-6) * 2.0 ** -8    # one bf16 ULP
@@ -131,6 +154,7 @@ class PrefillBatchTest(support.ModelTestCase):
             f"{int((got != ref).sum())} of {got.numel()} differ)")
 
     def test_group_prefill_matches_solo(self):
+        """Every group size must reproduce the solo prefill and the next STEPS decoded tokens."""
         lengths = [37, 53, 71, 44, 89, 64, 102, 47]
         for k in (1, 2, 4, 8):
             with self.subTest(k=k):
@@ -144,6 +168,7 @@ class PrefillBatchTest(support.ModelTestCase):
                                      f"k={k} seq={i}: decode tokens diverged")
 
     def test_same_prompt_grouped(self):
+        """Identical prompts must give identical rows: a row-indexing bug shows up as two rows disagreeing."""
         ids = _tokens(96)
         ref_logits, ref_chain = self._solo(ids)
         logits, chains, _states = self._group([list(ids) for _ in range(DECODE_CAP)])
@@ -152,6 +177,7 @@ class PrefillBatchTest(support.ModelTestCase):
             self.assertEqual(chains[row], ref_chain, f"row={row}: decode tokens diverged")
 
     def test_single_sequence_group_is_bitwise_prefill(self):
+        """With one sequence the GEMM shape is unchanged, so this case can and must be bit-identical."""
         ids = _tokens(88, off=3)
         blocks = self._alloc(len(ids))
         try:

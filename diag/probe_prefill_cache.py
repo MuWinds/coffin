@@ -5,6 +5,16 @@ saving prefill time (1.0x). A prefix hit only pays off if the cost of a prefill
 chunk is roughly proportional to its token count, and at these sizes it is not --
 this times the pieces so the number can be attributed: one ``model.prefill`` call
 per chunk size, the match, the state restore, the reset and the snapshots.
+
+Module: ``coffin/diag``. Times the pieces of a cached prefill through
+``prefix_engine`` and ``radix_cache``.
+
+Constraints:
+    * The finding this exists for: a correct cache hit still only saves ~1.0x,
+      because prefill cost is not proportional to token count at these sizes. The
+      attribution here is what says why.
+    * Each piece is timed separately (match, restore, reset, snapshots); summing
+      kernel rows with torch op rows double counts.
 """
 import sys
 import time

@@ -1,23 +1,35 @@
-// Wide-M int8 W8A16 GEMV for speculative verify (M in {16, 24, 32}).
+// @file gemv_wide.cu
+// @brief Wide-M int8 W8A16 GEMV for speculative verify (M in {16, 24, 32}).
 //
-// Why this exists
-// A verify step projects K+1 activation vectors per sequence row in one weight
-// pass; at B=8, K=1 that is M=16 and at K=3 it is M=32.  The engine has no
-// batched kernel past M=8 (``gemv_w8a16_m`` covers {2,4,8}), so verify either
-// splits into several M=8 passes (the weight bytes are then read again per
-// pass) or falls into the prefill GEMM path (int8 -> fp16 dequant + hipBLAS,
-// 250-290 ms for the projection segment).  This kernel covers M=16/24/32 in one
-// pass, without dequantisation and without hipBLAS.
+// Module: coffin/kernels. Verify-only fast path behind ``hip_ops.py``; it extends
+// the M <= 8 family in ``gemv_int8.cu`` and must stay bit-compatible with it.
 //
-// How it is parallelised
-// M is split into groups of MW activations; one warp owns R output rows and MW
-// activation vectors of those rows.  The MT/MW warps of a row group read the
-// same weight rows, so the extra groups are cache hits rather than extra HBM
-// passes (the group lives inside one block).  ``acc`` is R*MW*8 fp32 values, so
-// register pressure stays bounded for every shipped combo (64 for all of them).
+// Why this exists: a verify step projects K+1 activation vectors per sequence
+// row in one weight pass; at B=8, K=1 that is M=16 and at K=3 it is M=32.  The
+// engine has no batched kernel past M=8 (``gemv_w8a16_m`` covers {2,4,8}), so
+// verify either splits into several M=8 passes (the weight bytes are then read
+// again per pass) or falls into the prefill GEMM path (int8 -> fp16 dequant +
+// hipBLAS, 250-290 ms for the projection segment).  This kernel covers M=16/24/32
+// in one pass, without dequantisation and without hipBLAS.
 //
-// Bit-exactness (the hard acceptance)
-// The kernel keeps the M=8 kernel's *exact* arithmetic per (row, activation):
+// How it is parallelised: M is split into groups of MW activations; one warp
+// owns R output rows and MW activation vectors of those rows.  The MT/MW warps
+// of a row group read the same weight rows, so the extra groups are cache hits
+// rather than extra HBM passes (the group lives inside one block).  ``acc`` is
+// R*MW*8 fp32 values, so register pressure stays bounded for every shipped combo
+// (64 for all of them).
+//
+// Constraints:
+//   * Bit-exactness is the hard acceptance: the arithmetic per (row, activation)
+//     is the M=8 kernel's, token for token. The probe checks a wide call against
+//     the concatenation of M=8 calls, so any arithmetic change fails it.
+//   * Weights are INT8 row-major [N, K] with a per-row fp32 scale; a new
+//     quantisation layout would need both this kernel and its probe updated.
+//   * The block grid must divide evenly into row groups (``wpb % GM == 0``);
+//     the dispatchers reject the rest instead of launching a half-covered grid.
+//
+// Bit-exactness, in detail. The kernel keeps the M=8 kernel's *exact* arithmetic
+// per (row, activation):
 //
 //   * K is walked in 8-int8 chunks and lane l owns chunks l, l+32, l+64, ...
 //     -- the same chunk->lane mapping as ``gemv_w8a16_m_kernel``, so each lane
@@ -29,8 +41,7 @@
 //
 // A row is therefore bit-identical to calling ``gemv_w8a16_m`` on that row's
 // 8-activation slice, whatever U, R or MW is used (U only changes how many
-// chunks are prefetched, not their order).  The probe checks this against the
-// concatenation of M=8 calls.
+// chunks are prefetched, not their order).
 
 #include "hip_ops.h"
 
@@ -92,6 +103,12 @@ __device__ __forceinline__ void fma8(Acc8& acc, const float4& w0, const float4& 
 
 // Grid: warp ``wid`` owns activation group ``wid % GM`` and row group
 // ``blockIdx.x * (wpb / GM) + wid / GM``; a row group is R consecutive rows.
+// The block layout is a function of MT, R, MW and U only -- every shipped combo
+// instantiates it at compile time so ``acc``/``tail`` stay in VGPRs.
+//
+// @param W [N, K] int8 row-major; row ``n`` is scaled by ``S[n]`` afterwards.
+// @param X [M, K] bf16 activations; M is MT, one weight pass serves all of them.
+// @param Y [M, N] bf16 output; row-major, written by lane 0 of each warp.
 template <int MT, int R, int MW, int U>
 __global__ void gemv_w8a16_wide_kernel(const int8_t* __restrict__ W,
                                        const float* __restrict__ S,
@@ -224,7 +241,8 @@ bool dispatch_ru(int U, int threads, const int8_t* wp, const float* sp,
     return false;
 }
 
-// (R, MW) combos per M.  All keep acc = R*MW*8 = 64 floats.
+// (R, MW) combos per M.  All keep acc = R*MW*8 = 64 floats, which is the
+// register budget; an extra combo would spill or fail to launch.
 template <int MT>
 bool dispatch(int rows, int mw, int U, int threads, const int8_t* wp, const float* sp,
               const uint16_t* xp, uint16_t* yp, int N, int K, hipStream_t stream) {
@@ -245,6 +263,21 @@ inline void default_tiling(int M, int& rows, int& mw) {
 
 }  // namespace
 
+// @brief Wide-M int8 W8A16 GEMV: one weight pass for M in {16, 24, 32}.
+//
+// Picks the per-M tiling from ``default_tiling``; use the ``_dbg`` entry to
+// sweep rows/mw from the probe.
+//
+// @param W [N, K] int8 row-major.
+// @param S [N] fp32 per-row scale, applied once after the reduction.
+// @param X [M, K] bf16 contiguous; M must be 16, 24 or 32 and K a multiple of 8.
+// @param U K-loop unroll: 2 or 4 chunks prefetched per lane.
+// @param threads Block size, multiple of 32 in 32..256; the warps must divide
+//                evenly into row groups.
+// @return [M, N] bf16, bit-identical to running ``gemv_w8a16_m`` on each
+//         row's 8-activation slice.
+// @throws c10::Error (TORCH_CHECK) when the shape or tiling is unsupported;
+//         check M, K%8 and the warp count before calling.
 torch::Tensor gemv_w8a16_wide(torch::Tensor W, torch::Tensor S, torch::Tensor X,
                               int64_t U, int64_t threads) {
     TORCH_CHECK(W.is_contiguous() && S.is_contiguous() && X.is_contiguous(),
@@ -259,6 +292,15 @@ torch::Tensor gemv_w8a16_wide(torch::Tensor W, torch::Tensor S, torch::Tensor X,
     return gemv_w8a16_wide_dbg(W, S, X, U, rows, mw, threads);
 }
 
+// @brief A/B entry for ``gemv_w8a16_wide`` with the tiling exposed.
+//
+// @param rows Output rows per warp: 1, 2 or 4.
+// @param mw   Activation vectors per warp: must divide MT and cover all M.
+// @param threads Block size; <= 0 picks the smallest multiple of the group count
+//             that still makes 8 warps when they divide evenly.
+// @return [M, N] bf16, same arithmetic as ``gemv_w8a16_wide`` for any tiling.
+// @throws c10::Error (TORCH_CHECK) when (M, rows, mw, U, threads) has no
+//         instantiated kernel; the message names the entry point.
 torch::Tensor gemv_w8a16_wide_dbg(torch::Tensor W, torch::Tensor S, torch::Tensor X,
                                   int64_t U, int64_t rows, int64_t mw,
                                   int64_t threads) {
@@ -293,12 +335,18 @@ torch::Tensor gemv_w8a16_wide_dbg(torch::Tensor W, torch::Tensor S, torch::Tenso
     return Y;
 }
 
-// packed fp16 variant: V_DOT2_F32_F16 does two fp16 multiplies per instruction
-// with an fp32 accumulator.  int8 weights convert to fp16 exactly (all values
-// in [-127,127] are representable), activations are converted bf16 -> fp16 once
-// per call (exact while |x| <= 65504; clamped above that, fp16 denormals flush
-// only below ~6e-8).  That halves the arithmetic instructions per weight element
-// versus the scalar int8 path, which is where the wide-M kernel was losing.
+// @brief Packed fp16 variant: ``v_dot2_f32_f16`` does two fp16 multiplies per
+//        instruction with an fp32 accumulator.
+//
+// int8 weights convert to fp16 exactly (all values in [-127,127] are
+// representable), activations are converted bf16 -> fp16 once per call (exact
+// while |x| <= 65504; clamped above that, fp16 denormals flush only below
+// ~6e-8).  That halves the arithmetic instructions per weight element versus the
+// scalar int8 path, which is where the wide-M kernel was losing.
+//
+// This variant is *close* to the int8 kernel, not bit-identical: the chains are
+// packed and combined differently. It exists for throughput on the verify path,
+// where the caller accepts a rounding difference.
 namespace {
 
 union H2U {
@@ -325,6 +373,8 @@ __device__ __forceinline__ void i8x4_to_h2(unsigned w, unsigned& o0, unsigned& o
     o1 = b.u;
 }
 
+// One bf16 -> fp16 conversion pass over the activations, clamped to the fp16
+// range so an out-of-range activation cannot become inf and poison the dot.
 __global__ void bf16_to_fp16_kernel(const uint16_t* __restrict__ x,
                                     uint16_t* __restrict__ y, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -339,6 +389,9 @@ __global__ void bf16_to_fp16_kernel(const uint16_t* __restrict__ x,
 // Per warp: R output rows, MW activation vectors, four fp32 dot2 accumulators
 // per (row, activation) pair.  Same row-group/M-group structure as the int8
 // kernel; the arithmetic is packed but the per-row sums stay in fp32.
+//
+// @param Xh [M, K] fp16 activations (converted by ``bf16_to_fp16_kernel``).
+// @param K  Must be a multiple of 16: the loop consumes 16 int8 per lane step.
 template <int MT, int R, int MW, int U>
 __global__ void gemv_w8a16_dot2_kernel(const int8_t* __restrict__ W,
                                        const float* __restrict__ S,
@@ -547,6 +600,15 @@ inline void default_dot2_tiling(int M, int& rows, int& mw) {
 
 }  // namespace
 
+// @brief Wide-M GEMV with packed fp16 math, tiling picked per M.
+//
+// @param X [M, K] bf16 or fp16; a bf16 input is converted once per call, and M
+//          may be anything in 1..32 (not just 16/24/32) and K must be a
+//          multiple of 16.
+// @return [M, N] bf16. Close to the int8 kernel's result, not bit-identical:
+//         same fp32 per-row sum, different rounding.
+// @throws c10::Error (TORCH_CHECK) when the dtype, M or K%16 is unsupported;
+//         fix the caller's shape rather than the kernel.
 torch::Tensor gemv_w8a16_wide_dot2(torch::Tensor W, torch::Tensor S, torch::Tensor X,
                                    int64_t U, int64_t threads) {
     int rows = 1, mw = 16;
@@ -558,6 +620,7 @@ torch::Tensor gemv_w8a16_wide_dot2(torch::Tensor W, torch::Tensor S, torch::Tens
 torch::Tensor gemv_w8a16_wide_dot2_dbg(torch::Tensor W, torch::Tensor S,
                                        torch::Tensor X, int64_t U, int64_t rows,
                                        int64_t mw, int64_t threads) {
+    // A/B entry: same arithmetic for any tiling, so the sweep only measures speed.
     TORCH_CHECK(W.is_contiguous() && S.is_contiguous() && X.is_contiguous(),
                 "contiguous inputs required");
     TORCH_CHECK(W.scalar_type() == at::kChar, "W must be int8");
@@ -570,6 +633,8 @@ torch::Tensor gemv_w8a16_wide_dot2_dbg(torch::Tensor W, torch::Tensor S,
     hipStream_t stream = at::cuda::getCurrentCUDAStream();
 
     // Activations in fp16: exact bf16 -> fp16 conversion, done once per call.
+    // Skipped when the caller already passes fp16, so the arithmetic below is
+    // the same either way.
     torch::Tensor Xh;
     if (X.scalar_type() == at::kHalf) {
         Xh = X;

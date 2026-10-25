@@ -1,6 +1,7 @@
 """End-to-end acceptance for the vision path on the real checkpoint.
 
-Four checks, in the order that isolates failures:
+Answers whether enabling vision left the text path untouched and whether an image
+actually reaches the model. Four checks, in the order that isolates failures:
 
   1. text regression -- the text-only prefill logits must match the baseline the
      *unpatched* tree produced (bit-level: vision must be a no-op without images)
@@ -10,10 +11,31 @@ Four checks, in the order that isolates failures:
      three decoded tokens must differ from the text-only run
   4. cache salt      -- the same ids with image B must not reuse image A's prefix
 
+Read the four numbered lines; ``E2E_DONE`` at the end means the run completed and
+is not itself a verdict. Gate 1 is the regression gate: it needs
+``--write-baseline`` on the pre-vision tree first, then ``--baseline`` here, and
+its 1e-6 threshold is bit-level because a vision change that perturbs text logits
+at all is a bug. Checks 2-4 assert *difference*, not sameness — an image path
+that silently drops the image would make them fail, which is why a failure here
+is usually a placeholder problem rather than a numeric one.
+
 Runs in one process, one model, a few requests: the point is correctness, not
-throughput.  ``--no-vision`` gives the text-only side of the comparison.
+throughput. ``--no-vision`` gives the text-only side of the comparison.
 
     flock /root/private_data/gpu.lock -c 'python3 diag/e2e_vision.py'
+
+Module: ``coffin/diag``. Standalone probe: imports ``engine_api``, ``mm_input``
+and transformers, and nothing under ``coffin/`` imports it.
+
+Constraints:
+    * The image placeholder must come from the chat template. The processor only
+      expands an existing ``<|image_pad|>`` and silently drops an image whose
+      placeholder is missing — no error, prompt length unchanged — which is why
+      the ``image_pads`` assertion below is a hard exit rather than a warning.
+    * ``flock`` is required: the multi-GB checkpoint plus two towers will OOM
+      against a co-tenant on the same card.
+    * One process, one model. Rebuilding per check would make the comparisons
+      allocator-sensitive and defeat the bit-level gate.
 """
 from __future__ import annotations
 
@@ -29,6 +51,18 @@ MD = "/root/private_data/models/Qwen3.5-4B"
 
 
 def image(size: int, seed: int):
+    """Build a striped test image whose row order is visually checkable.
+
+    Args:
+        size: Edge length; the image is square with ``size // 8`` bands.
+        seed: Offsets the alternating band colours so images A and B differ in
+            content while keeping an identical grid, which is what check 4 needs:
+            same tokens, different pixels, so a cache hit would be a real bug.
+
+    Returns:
+        A PIL image. Alternating bands make an accidental transpose or a
+        row-order swap visible to the tower rather than a smooth gradient.
+    """
     from PIL import Image
 
     rng = np.random.default_rng(seed)
@@ -41,6 +75,7 @@ def image(size: int, seed: int):
 
 
 def main() -> None:
+    """Run the four vision acceptance checks in order and print a verdict per check."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=MD)
     ap.add_argument("--max-seq", type=int, default=4096)
@@ -70,6 +105,16 @@ def main() -> None:
     text_ids = tok.encode(rendered)
 
     def encode_with_image(img):
+        """Tokenise the rendered prompt with ``img`` spliced in.
+
+        Args:
+            img: PIL image to attach.
+
+        Returns:
+            ``(input_ids, pixel_values, image_grid_thw)`` for one prompt. The
+            pixel values and grid are kept separate because the model needs the
+            grid to compute RoPE positions and the pad count.
+        """
         out = proc(text=[rendered], images=[img], return_tensors="pt")
         return out["input_ids"][0].tolist(), out["pixel_values"], out["image_grid_thw"]
 
@@ -102,6 +147,23 @@ def main() -> None:
     print("model ready", flush=True)
 
     def mm_for(pv, grid, ids):
+        """Package one image into the ``MMInput`` the model's prefill expects.
+
+        Args:
+            pv: Pixel values from the processor.
+            grid: ``image_grid_thw`` for the image.
+            ids: Token ids the image was spliced into; the spans are recomputed
+                from them so the embeds land at the right absolute offsets.
+
+        Returns:
+            An ``MMInput`` carrying the embeds, grid, mRoPE positions, the
+            ``rope_delta`` text positions must advance by, a digest and the
+            spans.
+
+        The digest is a fixed placeholder here: this probe passes one image per
+        call, so there is no cross-image cache aliasing to guard against. Check 4
+        tests aliasing through separate prefill calls instead.
+        """
         emb = model.image_embeds(pv, grid)
         p, d = mm_input.mrope_positions(mm_input.find_image_spans(ids), grid,
                                         len(ids), device="cuda")

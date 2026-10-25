@@ -1,15 +1,40 @@
 """Where does the one-forward verify's time go?
 
-Decomposes the task-13 verify into device-time segments (projection / attention /
-linear recurrence / MLP / lm_head) with CUDA events, plus the graph replay and
-host bookkeeping, and counts where ``wide_proj`` sent each module.  A healthy
-int8 build at B=8, K=1 is: every projection and the lm_head on the dot2 wide
-kernel (M=16), one ``attn_paged_multi_q`` per full-attention layer, and one
-``verify_batch_step`` per linear layer per token.
+Answers which segment owns the verify step, and whether the wide projection is
+actually being dispatched. Decomposes the task-13 verify into device-time
+segments (projection / attention / linear recurrence / MLP / lm_head) with CUDA
+events, plus the graph replay and host bookkeeping, and counts where
+``wide_proj`` sent each module. A healthy int8 build at B=8, K=1 is: every
+projection and the lm_head on the dot2 wide kernel (M=16), one
+``attn_paged_multi_q`` per full-attention layer, and one ``verify_batch_step``
+per linear layer per token.
+
+Read the segment table first: the five rows must sum to the ``total``, and the
+printout's own closing hint states the expected range (``proj`` around 25-32 ms).
+A ``proj`` well off that range is the signal to look at the ``wide_proj
+dispatch`` line above it — if the counts are not all dot2, the wide kernel never
+ran and the segment number is measuring the fallback. ``host/accept overhead``
+near zero means the step is device-bound; a large value means graph-capture
+coverage or acceptance bookkeeping is the problem, not any kernel.
 
 Run from the engine directory::
 
     python3 diag/probe_spec_segments.py --batch 8 --prompt 96 --k 1
+
+Module: ``coffin/diag``. Standalone probe: imports ``engine_api`` plus
+``models.qwen35.batch``, because segment attribution has to instrument the batch
+module's dispatch counters. Nothing under ``coffin/`` imports it.
+
+Constraints:
+    * Reaches into ``models/qwen35/batch.py`` internals (``WIDE_STATS``,
+      ``_project``, ``wide_proj``) on purpose. That coupling is the measurement:
+      a refactor that renames them breaks this probe, and fixing it is cheaper
+      than losing the attribution.
+    * Silent about what it cannot see: an unprofiled segment reports ``0.00 ms``,
+      so a suspiciously small row means the event tags changed, not that the
+      segment got free.
+    * Needs the real checkpoint, a paged model and a captured verify graph, so
+      the replay rows measure the path production runs.
 """
 
 from __future__ import annotations

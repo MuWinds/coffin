@@ -1,16 +1,32 @@
-"""Compatibility shim for the old single-module engine import.
+"""Legacy flat-name facade over the split engine; new code must not use it.
 
-The engine is split by responsibility now --
+It adds no behaviour. It exists because ~50 ``diag/`` probes still reach the
+engine through the old single-module names (``import qwen35_engine as E``,
+``from qwen35_engine import chunked_delta``), and those probes are compared
+against runs already recorded, so their imports are kept working rather than
+rewritten. Import from ``engine_api``, ``ops`` or ``models.qwen35`` directly.
+
+The split this facade hides:
 
     ops/                  device primitives (GEMV, norms, rope, delta, embed)
     models/qwen35/        blocks, MTP head, weight loader, ``Qwen35``
     engine_api.py         the serving-facing surface: model contract, registry,
                           checkpoint dispatch and reload
 
--- and this module only re-exports the flat names that the ~50 ``diag/`` probes
-and older callers import (``import qwen35_engine as E`` / ``from qwen35_engine
-import chunked_delta``).  It adds no behaviour.  New code should import from
-``engine_api``, ``ops`` or ``models.qwen35`` directly.
+Module: ``coffin/qwen35_engine.py``. Top of the import graph and off it: it
+imports ``engine_api`` / ``ops`` / ``models.qwen35``, and only ``diag/`` probes
+import it, so the engine must never depend on this file.
+
+Constraints:
+    * Each ``__all__`` entry is the real object, re-exported unchanged. Probes
+      compare and monkeypatch through these names, so a wrapper or a copy here
+      would silently split the object the probe patches from the one the engine
+      calls.
+    * ``hip_ops`` is imported although nothing below references it: probes reach
+      the compiled kernels as ``E.hip_ops``.
+    * ``reload()`` must reload ``engine_api`` before this module. The flat names
+      are bound at import time, so reloading the shim alone would leave them
+      pointing at the stale module objects.
 """
 
 from __future__ import annotations
@@ -18,7 +34,9 @@ from __future__ import annotations
 import importlib
 import sys
 
-import hip_ops  # noqa: F401  -- probes reach it as ``E.hip_ops``
+# Probes reach the compiled kernels as ``E.hip_ops``, so the name is re-exported
+# here even though no code below touches it.
+import hip_ops  # noqa: F401
 import torch
 import torch.nn.functional as F
 
@@ -51,7 +69,13 @@ __all__ = [
 
 
 def reload() -> None:
-    """Reload the engine modules, then this shim (see :func:`engine_api.reload`)."""
+    """Reload ``engine_api``, then this shim, so probes see the new modules.
+
+    The order is load-bearing: the re-exports below are plain names bound at
+    import time, so only re-running this module's import statements moves them
+    onto the reloaded classes. Reloading ``engine_api`` first means those
+    statements bind to the new objects instead of the stale ones.
+    """
     from engine_api import reload as _reload
 
     _reload()

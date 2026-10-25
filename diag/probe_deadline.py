@@ -6,6 +6,15 @@ all -- the request runs on the engine socket with a 8 s cap and a 100k-token bud
 so "did it stop itself" is the only thing being measured.
 
     cd /root/private_data/engine && MKL_THREADING_LAYER=GNU python3 diag/probe_deadline.py
+
+Module: ``coffin/diag``. Drives a real engine over the serve socket, so it needs
+a running server at ``$ENGINE_SOCK`` (see ``serve.py``).
+
+Constraints:
+    * The budget is deliberately absurd (8 s, 100k tokens) so the only possible
+      outcome is a self-inflicted stop; a generous budget would pass by accident.
+    * Talks to the engine socket rather than in-process on purpose -- that is the
+      path a silent client actually takes.
 """
 
 from __future__ import annotations

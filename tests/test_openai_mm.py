@@ -1,5 +1,24 @@
 """Self-test for the image (``image_url``) path of ``openai_server.py`` (no GPU).
 
+Module: ``coffin/tests``. The multimodal counterpart of ``test_openai.py``: it
+imports ``openai_server`` and reproduces the engine over a stub socket.
+
+Constraints:
+    * This file must not import ``support``: that module calls
+      ``torch.cuda.is_available()`` at import time, which blocks while another
+      process holds the card, and a protocol test has no reason to queue behind
+      the GPU. It therefore sets ``MKL_THREADING_LAYER`` and ``sys.path`` itself.
+      For the same reason ``openai_server`` is imported after ``sys.path`` is
+      prepared -- that ordering is why the import carries a ``# noqa: E402``.
+    * The real PNG bytes are decoded, not mocked: the base64 and size-limit path
+      is what is under test, and a fake payload would skip it.
+    * Every refusal is asserted to happen before the engine is called: a refused
+      image that still reached the socket would be a resource leak and a 400 that
+      arrives after a generation is a wasted request.
+    * ``srv.STATE`` and the ``MAX_*`` limits are patched in place and restored in
+      ``finally``; the HTTP server runs in a thread of this process, so a leaked
+      patch changes what later tests measure.
+
 Two things are under test and they are deliberately separated:
 
 * **this process's job** -- parsing ``data:`` URLs out of a parts array, replacing
@@ -68,6 +87,7 @@ def _pieces(req: dict) -> tuple[list[str], bool]:
 
 
 def _text_of(req: dict) -> str:
+    """Flatten every text part of the request's messages, both content shapes included."""
     out = []
     for m in req.get("messages") or []:
         content = m.get("content")
@@ -99,6 +119,12 @@ def _reply(req: dict) -> dict:
 
 
 def _fake_engine(port: int, stop: threading.Event) -> None:
+    """Serve the engine's line protocol on ``port`` until ``stop`` is set.
+
+    The 0.5 s accept timeout is what lets the loop observe ``stop``; a blocking
+    accept would hang ``tearDownModule``. A 1 MB recv buffer is enough for the
+    base64 payloads the size-limit tests send.
+    """
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind(("127.0.0.1", port))
@@ -147,6 +173,7 @@ def _fake_engine(port: int, stop: threading.Event) -> None:
 
 
 def post(port: int, body: dict) -> dict:
+    """POST one non-stream request and decode the JSON reply; a 4xx propagates as an exception."""
     req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions",
                                  data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
@@ -167,6 +194,7 @@ def post_status(port: int, body: dict) -> tuple[int, dict]:
 
 
 def sse(port: int, body: dict) -> list[dict]:
+    """POST a streaming request and return the parsed ``data:`` chunks, minus the terminator."""
     req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions",
                                  data=json.dumps({**body, "stream": True}).encode(),
                                  headers={"Content-Type": "application/json"})
@@ -192,6 +220,11 @@ def image_message(text: str = "What does it say?", n: int = 1) -> dict:
 
 
 def setUpModule() -> None:
+    """Start one stub engine and one HTTP server for the module, waiting for the bind.
+
+    ``STATE`` is patched rather than constructed because that dict is the
+    server's process-wide configuration; the tests revert any piece they change.
+    """
     probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     probe.bind(("127.0.0.1", 0))
     engine_port = probe.getsockname()[1]
@@ -217,6 +250,7 @@ def setUpModule() -> None:
 
 
 def tearDownModule() -> None:
+    """Stop the stub engine and close the HTTP server so a rerun can bind cleanly."""
     _MODULE["stop"].set()
     _MODULE["httpd"].shutdown()
     _MODULE["httpd"].server_close()
@@ -236,6 +270,7 @@ class UnitTest(unittest.TestCase):
     """The pure functions, without the socket: what exactly leaves this process."""
 
     def test_data_url_is_split_into_b64_and_the_template_marker(self):
+        """The engine stores bytes, not URLs: a data URL must become ``{"b64", "mime"}`` plus the template's own marker, in place."""
         msgs, images, err = srv._split_messages([image_message("hi")])
         self.assertIsNone(err)
         self.assertEqual(len(images), 1)
@@ -247,6 +282,7 @@ class UnitTest(unittest.TestCase):
         self.assertEqual(content[1]["text"], "hi")
 
     def test_http_url_is_refused_with_a_readable_message(self):
+        """Fetching remote URLs is an SSRF and a latency hole, so the server refuses rather than downloads; the message says so."""
         msgs, images, err = srv._split_messages([{"role": "user", "content": [
             {"type": "image_url",
              "image_url": {"url": "https://example.com/a.png"}}]}])
@@ -256,6 +292,7 @@ class UnitTest(unittest.TestCase):
         self.assertIn("does not fetch", err)
 
     def test_video_parts_are_refused(self):
+        """``video`` and ``video_url`` are valid OpenAI part types but this engine has no video tower, so accepting them would silently drop frames."""
         for kind in ("video", "video_url"):
             with self.subTest(kind=kind):
                 _m, _i, err = srv._split_messages([{"role": "user", "content": [
@@ -264,6 +301,7 @@ class UnitTest(unittest.TestCase):
                 self.assertIn("video", err)
 
     def test_system_message_with_an_image_is_refused(self):
+        """The chat template has no image slot in the system turn; an image there would shift every later placeholder."""
         _m, _i, err = srv._split_messages([
             {"role": "system", "content": [{"type": "image_url",
                                             "image_url": {"url": DATA_URL}}]},
@@ -273,12 +311,14 @@ class UnitTest(unittest.TestCase):
         self.assertIn("template", err)
 
     def test_too_many_images_is_refused(self):
+        """The cap bounds per-request VRAM for the vision tower, so it must be enforced before any image is decoded."""
         n = srv.MAX_IMAGES + 1
         _m, _i, err = srv._split_messages([image_message(n=n)])
         self.assertIsNotNone(err)
         self.assertIn("too many images", err)
 
     def test_oversized_image_is_refused(self):
+        """The per-image byte cap is what stops one request from monopolising the upload path; the limit is patched, not the image."""
         old = srv.MAX_IMAGE_BYTES
         srv.MAX_IMAGE_BYTES = len(PNG_1PX) - 1
         try:
@@ -289,6 +329,7 @@ class UnitTest(unittest.TestCase):
         self.assertIn("per-image limit", err)
 
     def test_total_base64_budget_is_refused(self):
+        """Per-image caps alone would let N legal images add up past the budget, so the request total is checked too."""
         old = srv.MAX_IMAGE_TOTAL_BYTES
         srv.MAX_IMAGE_TOTAL_BYTES = len(DATA_URL) * 2 - 1
         try:
@@ -299,6 +340,7 @@ class UnitTest(unittest.TestCase):
         self.assertIn("per-request limit", err)
 
     def test_invalid_base64_and_unknown_mime_are_refused(self):
+        """Malformed payloads must fail here with a 400; a decode error reaching the engine would surface as a 500 mid-generation."""
         cases = {
             "bad base64": "data:image/png;base64,!!!notbase64!!!",
             "no payload": "data:image/png;base64,",
@@ -312,6 +354,7 @@ class UnitTest(unittest.TestCase):
                 self.assertIsNotNone(err, f"{label} should be refused")
 
     def test_text_only_content_is_untouched(self):
+        """Text requests predate images, so both content shapes must normalise to the same string with no image list."""
         plain = [{"role": "user", "content": "hello"},
                  {"role": "user", "content": [{"type": "text", "text": "hi"}]}]
         msgs, images, err = srv._split_messages(plain)
@@ -321,6 +364,7 @@ class UnitTest(unittest.TestCase):
         self.assertEqual([m["content"] for m in norm], ["hello", "hi"])
 
     def test_template_content_keeps_a_parts_array_only_when_it_has_an_image(self):
+        """The template accepts a plain string for text, and the parts array must survive only when an image marker is in it."""
         self.assertEqual(srv._template_content("hi"), "hi")
         self.assertEqual(srv._template_content([{"type": "text", "text": "a"},
                                                 {"type": "text", "text": "b"}]), "ab")
@@ -337,6 +381,7 @@ class HttpTest(unittest.TestCase):
         return _MODULE["port"]
 
     def test_image_request_reaches_the_engine_with_images(self):
+        """The socket contract: bytes plus mime in ``images``, a marker (never the URL) in the messages, and prompt tokens that include the image."""
         SEEN.clear()
         r = post(self.port, {"model": "qwen3.5-4b",
                              "messages": [image_message("what is in scnetimage?")]})
@@ -370,6 +415,7 @@ class HttpTest(unittest.TestCase):
             "max_new": 5, "temperature": 0.0, "max_seconds": None})
 
     def test_text_parts_array_still_flattens_to_a_string(self):
+        """A parts array with no image is still the old text request; keeping it a list would change the radix block key for no gain."""
         SEEN.clear()
         post(self.port, {"messages": [{"role": "user", "content": [
             {"type": "text", "text": "a"}, {"type": "text", "text": "b"}]}]})
@@ -377,6 +423,7 @@ class HttpTest(unittest.TestCase):
         self.assertNotIn("images", SEEN[-1])
 
     def test_multi_image_order_is_preserved(self):
+        """Images are positional: reordering them against the text silently pairs each question with the wrong picture."""
         SEEN.clear()
         other = base64.b64encode(PNG_1PX + b"\x00").decode()
         body = {"messages": [{"role": "user", "content": [
@@ -397,6 +444,7 @@ class HttpTest(unittest.TestCase):
         self.assertEqual(r["usage"]["prompt_tokens"], 11 + 2 * IMAGE_TOKENS)
 
     def test_image_request_streams(self):
+        """The streaming path must carry the same usage as the non-stream one, or clients that read only the stream under-count the prompt."""
         SEEN.clear()
         chunks = sse(self.port, {"messages": [image_message("scnetimage")]})
         self.assertEqual(content_of(chunks), "The image says SCNET.")
@@ -404,6 +452,7 @@ class HttpTest(unittest.TestCase):
         self.assertEqual(len(SEEN[-1]["images"]), 1)
 
     def test_error_codes_are_400_and_readable(self):
+        """Each refusal must be a 400 the client can show, and nothing may be forwarded: a rejected image must not reach the engine."""
         cases = {
             "http url": {"role": "user", "content": [
                 {"type": "image_url",
@@ -428,12 +477,14 @@ class HttpTest(unittest.TestCase):
                                  f"{label} leaked an image to the engine")
 
     def test_too_many_images_is_400(self):
+        """The unit-level cap must also be reachable over HTTP; a 200 with an error body would break client error handling."""
         status, body = post_status(self.port,
                                    {"messages": [image_message(n=srv.MAX_IMAGES + 1)]})
         self.assertEqual(status, 400, body)
         self.assertIn("too many images", body["error"]["message"])
 
     def test_no_vision_server_answers_503(self):
+        """A server started with ``--no-vision`` must refuse with 503 and name the flag, not fail somewhere inside prefill."""
         srv.STATE["vision"] = False
         try:
             status, body = post_status(self.port,
@@ -444,6 +495,7 @@ class HttpTest(unittest.TestCase):
         self.assertIn("--no-vision", body["error"]["message"])
 
     def test_text_only_request_unchanged_with_vision_enabled(self):
+        """Vision being on must cost the text path nothing: same token counts, same finish reason."""
         r = post(self.port, {"messages": [{"role": "user", "content": "hi"}],
                              "max_tokens": 3})
         self.assertEqual(r["usage"]["prompt_tokens"], 11)
@@ -459,6 +511,7 @@ class EngineErrorTest(unittest.TestCase):
         return _MODULE["port"]
 
     def test_engine_400_is_forwarded_on_the_non_stream_path(self):
+        """The engine's own status and message must reach the client intact; flattening them to 500 hides which component rejected."""
         class _Rejecting(srv.EngineClient):
             def call(self, req):
                 return {"ok": False, "error": "image placeholder mismatch",
@@ -475,6 +528,7 @@ class EngineErrorTest(unittest.TestCase):
         self.assertEqual(body["error"]["type"], "invalid_request_error")
 
     def test_engine_503_is_forwarded_on_the_stream_path(self):
+        """A rejection before ``start`` must be an HTTP status, not a 200 SSE error event: streaming clients ignore the latter."""
         class _Rejecting(srv.EngineClient):
             def stream(self, req):
                 yield {"type": "error", "ok": False, "status": 503,
@@ -524,6 +578,7 @@ class ToolRoleImageTest(unittest.TestCase):
         ]
 
     def test_tool_role_images_are_accepted(self):
+        """This is how an agent client delivers a screenshot, so refusing it breaks the whole tool-loop use case."""
         msgs, images, err = srv._split_messages(self._tool_messages())
 
         self.assertIsNone(err)
@@ -531,6 +586,7 @@ class ToolRoleImageTest(unittest.TestCase):
         self.assertEqual(len(msgs), 3)
 
     def test_system_role_images_are_rejected_with_advice(self):
+        """The refusal must name the system role so the client knows to move the image into the user turn."""
         msgs, images, err = srv._split_messages(
             [{"role": "system",
               "content": [{"type": "image_url", "image_url": {"url": DATA_URL}}]}])
@@ -539,6 +595,7 @@ class ToolRoleImageTest(unittest.TestCase):
         self.assertIn("system", err)
 
     def test_assistant_role_images_are_rejected(self):
+        """An image the model "sent" has no template slot and no vision-tower input, so it must be refused rather than dropped."""
         msgs, images, err = srv._split_messages(
             [{"role": "assistant",
               "content": [{"type": "image_url", "image_url": {"url": DATA_URL}}]}])

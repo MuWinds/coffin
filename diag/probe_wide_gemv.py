@@ -1,10 +1,12 @@
 """Wide-M verify GEMV: packed fp16 (v_dot2_f32_f16) path vs the int8 baseline.
 
-Verify projects c+1 activation vectors per row in one weight pass (M=16 at
-B=8/K=1, M=32 at K=3).  The scalar int8 wide kernel is bit-exact but element-rate
-bound (~85 Gelem/s at M=16 vs 199 for the M=8 kernel), so this probe measures the
-packed-fp16 variant: int8 weights -> fp16 (exact), bf16 activations -> fp16 once
-per call, two MACs per ``v_dot2_f32_f16`` with fp32 accumulation.
+Answers whether the speculative-verify projection should use the packed-fp16
+dot2 kernel instead of the scalar INT8 wide kernel. Verify projects c+1
+activation vectors per row in one weight pass (M=16 at B=8/K=1, M=32 at K=3).
+The scalar int8 wide kernel is bit-exact but element-rate bound (~85 Gelem/s at
+M=16 vs 199 for the M=8 kernel), so this probe measures the packed-fp16 variant:
+int8 weights -> fp16 (exact), bf16 activations -> fp16 once per call, two MACs
+per ``v_dot2_f32_f16`` with fp32 accumulation.
 
 Reports, per shape and M in {16,24,32}:
 
@@ -14,11 +16,35 @@ Reports, per shape and M in {16,24,32}:
 * effective bandwidth and element rate for the best (rows, mw, U, threads);
 * the weighted verify projection segment before (c+1 x M=8) and after (1x wide).
 
-Run from the engine root on the DCU container (GPU lock)::
+Read the output bottom-up. Sections 3 and 4 are the decision: ``speedup`` is the
+whole 129-module projection segment, so anything near 1.00x means the kernel win
+does not survive being summed over the model. Sections 1 and 2 explain why -- a
+high ``Gelem/s`` at one M with no segment speedup points at a small-K shape where
+launch overhead, not element rate, is the limit. ``exact`` below 1.0 in section 1
+is expected, not a bug: accept the dot2 path only if ``max_rel`` stays small
+enough for the verifier's acceptance test to be unaffected.
+
+Run inside the container from the engine root, holding the GPU lock and pinning
+``TORCH_EXTENSIONS_DIR`` to a per-deployment directory so a concurrent run cannot
+fight over the extension build baton::
 
     TORCH_EXTENSIONS_DIR=/root/private_data/torch_ext_kernels \
     flock /root/private_data/gpu.lock -c \
       'cd /root/private_data/engine_kernels && PYTHONPATH=$PWD python3 -u diag/probe_wide_gemv.py'
+
+Module: ``coffin/diag``. Standalone probe: imports ``hip_ops`` and the kernels
+under test, and nothing under ``coffin/`` imports it.
+
+Constraints:
+    * All weight matrices stay INT8 row-major ``[N, K]``; the dot2 path converts
+      a row to fp16 at load time, which is exact, and never reorders K. A probe
+      that pre-transposed the weights would measure a layout production lacks.
+    * The module list is the real 129-projection census of Qwen3.5-4B, and the
+      per-segment totals are weighted by ``count``. An unweighted average over
+      shapes would be dominated by lm_head, which runs once per token.
+    * ``flock`` and the isolated ``TORCH_EXTENSIONS_DIR`` are both required: a
+      co-tenant invalidates the timings, and a shared extensions directory makes
+      two runs rebuild and serialise on the same file baton.
 """
 
 from __future__ import annotations
@@ -46,6 +72,18 @@ TILINGS = ((1, 16), (1, 8), (2, 8), (4, 4))
 
 
 def bench(fn, iters: int, warmup: int = 3, reps: int = 3) -> float:
+    """Time ``fn`` with CUDA events and return milliseconds per call.
+
+    Args:
+        fn: Zero-argument callable to time.
+        iters: Calls per timed region. Callers size this by weight bytes so every
+            region lasts roughly the same wall time.
+        warmup: Untimed calls first, to absorb extension load and first-touch.
+        reps: Timed regions; the fastest is kept.
+
+    Returns:
+        Best region's elapsed time divided by ``iters``, in milliseconds.
+    """
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
@@ -63,10 +101,39 @@ def bench(fn, iters: int, warmup: int = 3, reps: int = 3) -> float:
 
 
 def iters_for(nbytes: float, lo: int = 3, hi: int = 100) -> int:
+    """Choose a repetition count that makes a timed region last about 0.1 s.
+
+    Args:
+        nbytes: Bytes streamed per call; the cost driver for a bandwidth-bound
+            GEMV.
+        lo: Floor. Small matrices would otherwise request thousands of calls and
+            spend the region's time in Python launch overhead.
+        hi: Ceiling. Large matrices would otherwise run once and measure noise.
+
+    Returns:
+        Calls per region, clamped to ``[lo, hi]``.
+    """
     return max(lo, min(hi, int(0.1e9 / max(nbytes, 1.0))))
 
 
 def make_w(N, K, seed):
+    """Build one INT8 row-major weight matrix and its per-row fp32 scales.
+
+    Args:
+        N: Output rows (columns of the projection).
+        K: Reduction length.
+        seed: Torch RNG seed, derived in ``main`` from the module name and N so
+            each shape gets stable but distinct data.
+
+    Returns:
+        ``(w, s)``: INT8 codes ``[N, K]`` and fp32 scales ``[N]``. The scale
+        range mirrors the checkpoint's, which keeps the dequantised products in
+        the range where bf16 output rounding behaves as it does in production.
+
+    The weights are INT8 and row-major because that is the checkpoint layout;
+    the kernel consumes a row at a time along K, so a transposed matrix would be
+    measured at the wrong stride.
+    """
     torch.manual_seed(seed)
     w = torch.randint(-127, 127, (N, K), dtype=torch.int8, device="cuda")
     s = (torch.rand(N, device="cuda") * 0.02 + 1e-3).float()
@@ -74,12 +141,43 @@ def make_w(N, K, seed):
 
 
 def split_ref(w, s, X, M, U=2):
-    """Reference rows: concatenation of consecutive M=8 calls (old kernel)."""
+    """Build the expected wide-M result by concatenating consecutive M=8 calls.
+
+    Args:
+        w: INT8 weights ``[N, K]``.
+        s: Per-row fp32 scales.
+        X: Activations ``[M, K]``, bf16.
+        M: Row count; must be a multiple of 8.
+        U: Unroll factor forwarded to the old kernel.
+
+    Returns:
+        Reference output ``[M, N]`` from the old kernel. This is the oracle the
+        dot2 path is judged against: it defines "same answer" as "same as what
+        the shipped kernel produces", not as some idealised arithmetic.
+    """
     return torch.cat([hip_ops.gemv_w8a16_m(w, s, X[i:i + 8], U)
                       for i in range(0, M, 8)], dim=0)
 
 
 def dot2_cands(w, s, X, M):
+    """Enumerate the dot2 tilings that are legal for this row count.
+
+    Args:
+        w: INT8 weights ``[N, K]``.
+        s: Per-row fp32 scales.
+        X: Activations ``[M, K]``, bf16.
+        M: Row count.
+
+    Returns:
+        ``{label: callable}`` for every (rows-per-warp, vectors-per-warp) tiling
+        crossed with the unroll factors and block sizes whose warp counts divide
+        the row groups.
+
+    The ``wpb % gm`` filter is not a preference: the kernel assigns whole row
+    groups to warps, so a block size whose warp count does not divide the group
+    count leaves a warp with no work and the launch is invalid. Filtering here
+    keeps a config error from looking like a slow kernel.
+    """
     cands = {}
     for rows, mw in TILINGS:
         gm = M // mw
@@ -96,11 +194,31 @@ def dot2_cands(w, s, X, M):
 
 
 def err_stats(got, ref):
+    """Measure the numerical gap between the dot2 path and the INT8 oracle.
+
+    Args:
+        got: Output from the dot2 kernel.
+        ref: Output from the concatenated M=8 oracle.
+
+    Returns:
+        ``(max_abs, exact)``: largest absolute difference and the fraction of
+        elements that match bit for bit. Bit equality is not expected here --
+        fp32 accumulation over a different pairing order rounds differently --
+        so ``exact`` is reported as information, and ``max_abs`` is what the
+        verifier's tolerance has to survive.
+    """
     d = (got.float() - ref.float()).abs()
     return d.max().item(), (got == ref).float().mean().item()
 
 
 def main() -> int:
+    """Run the accuracy/tiling sweep, the element-rate table, and the two segment tables.
+
+    Returns:
+        ``0`` on completion, ``1`` when the HIP extension is unavailable. A
+        missing tiling shows up as a missing row, so read the tables rather than
+        the exit code.
+    """
     if not hip_ops.available():
         print(f"HIP extension unavailable: {hip_ops.last_error()}")
         return 1

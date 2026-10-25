@@ -1,20 +1,27 @@
 """Which sequences run in the next step.
 
-nano-vllm's scheduler has two queues and one job: pack as many sequences as the
-token budget allows into the next forward pass, preferring prefill over decode.
-This module keeps that shape, with the batch row count as the capacity limit.
+Module: ``coffin/`` (top level). Sits between ``llm_engine`` (which drives the
+loop) and ``model_runner`` (which executes one step), so it may only import
+``sequence`` / ``config`` and never the model or kernel layers.
 
-Admission policy (phase 1/2):
+Constraints:
+    * The batch row count is the real capacity limit, not the sequence count:
+      row ``capacity-1`` is reserved for a prefill while the decode rows stay
+      live, so admit against ``max_num_seqs`` and let the runner pick a bucket.
+    * All mutation is single-threaded, driven by the engine's step loop. Nothing
+      here is re-entrant and no lock is taken.
 
-* at most one *new* request is admitted per step, and only while fewer than
-  ``max_num_seqs`` sequences are running -- a prefill is a second, eager forward
-  pass on the staging row and would otherwise double a step's latency;
+Admission policy:
+
+* a prefill is a second, eager forward pass on the staging row, so admitting
+  several at once is only worth it when they share one grouped prefill forward
+  (one weight read instead of one per prompt);
 * every running sequence that already owns KV is decoded in the same step, so a
   prefill does not stall the decode stream (continuous batching);
-* a sequence keeps its batch row until it finishes; the runner re-packs rows
-  before each batched step (moving recurrent state when a hole appears).
+* a sequence keeps its batch row until it finishes (see ``model_runner``).
 
-A finished sequence is retired by :meth:`finish`, which also frees its row.
+A finished sequence is retired by :meth:`Scheduler.finish`, which also drops it
+from the running list.
 """
 
 from __future__ import annotations
@@ -35,6 +42,15 @@ class Scheduler:
     """Admission and retirement of requests."""
 
     def __init__(self, cfg: "EngineConfig", runner: "ModelRunner | None" = None) -> None:
+        """Build an empty scheduler bound to one engine.
+
+        Args:
+            cfg: Engine configuration; ``max_num_seqs`` and
+                ``max_num_batched_tokens`` are the admission limits.
+            runner: Optional back-reference used by the engine to compare the
+                scheduler's view of a row against what the runner actually
+                staged. ``None`` is valid for scheduler-only tests.
+        """
         self.cfg = cfg
         self.runner = runner
         self.waiting: deque["Sequence"] = deque()
@@ -45,6 +61,13 @@ class Scheduler:
         self.n_finished = 0
 
     def add(self, seq: "Sequence") -> None:
+        """Queue a new request.
+
+        Args:
+            seq: Request to admit. If it carries no stop ids of its own it
+                inherits the engine-wide set, which is how the tokenizer's
+                defaults reach requests built by the API layer.
+        """
         args = seq.params
         if not args.eos:
             args.eos = set(self.eos)
@@ -59,21 +82,26 @@ class Scheduler:
     def schedule(self) -> tuple[list["Sequence"], list["Sequence"]]:
         """Pick the next step: ``(decode_seqs, prefill_seqs)``.
 
-        ``decode_seqs`` are the running sequences whose KV already exists and can
-        go through the batched decode.  ``prefill_seqs`` are the new requests
-        admitted this step: several of them share one grouped prefill forward as
-        long as the token budget and the row capacity allow, which is what makes a
-        burst of prompts cost one weight read instead of one per prompt.
+        Grouping the prefills of one step into a single forward is what makes a
+        burst of prompts cost one weight read instead of one per prompt. The
+        token budget stops the group before it turns one cheap prefill into an
+        expensive one.
 
-        A request that was just admitted is not in ``decode_seqs`` for this step
-        (it has no KV before its prefill runs); it joins the decode list next
-        step.
+        A request admitted this step is not in ``decode_seqs``: it has no KV
+        before its prefill runs, so it joins the decode list next step.
+
+        Returns:
+            ``(decode_seqs, prefill_seqs)``. Either list may be empty; both
+            empty means there was nothing runnable.
         """
         prefill: list["Sequence"] = []
         budget = self.max_num_batched_tokens
         while self.waiting and len(self.running) < self.max_num_seqs:
             nxt = self.waiting[0]
             tokens = len(nxt)
+            # The first admission ignores the budget: a prompt longer than the
+            # whole budget must still make progress, or it would deadlock the
+            # queue. Chunked prefill is not implemented on this path yet.
             if prefill and tokens > budget:
                 break
             self.waiting.popleft()
@@ -88,7 +116,15 @@ class Scheduler:
         return decode, prefill
 
     def expire(self, now: float | None = None) -> list["Sequence"]:
-        """Retire every running request whose wall-clock budget ran out."""
+        """Retire every running request whose wall-clock budget ran out.
+
+        Args:
+            now: Instant to judge against; ``None`` reads the clock once so the
+                whole pass is consistent.
+
+        Returns:
+            The retired sequences, already passed to :meth:`finish`.
+        """
         now = time.time() if now is None else now
         expired = [s for s in self.running if s.over_budget(now)]
         for seq in expired:
@@ -96,6 +132,16 @@ class Scheduler:
         return expired
 
     def finish(self, seq: "Sequence", reason: str = "eos") -> None:
+        """Retire one request.
+
+        Idempotent on purpose: the engine retires from both the decode loop and
+        the expiry pass, and a request can be finished twice without corrupting
+        ``n_finished``.
+
+        Args:
+            seq: Request to retire.
+            reason: Value forwarded to the client as ``finish_reason``.
+        """
         seq.finish(reason)
         try:
             self.running.remove(seq)
@@ -103,7 +149,16 @@ class Scheduler:
             pass
         self.n_finished += 1
 
-    # accounting helpers used by the engine's streaming loop
+    # Accounting helpers used by the engine's streaming loop.
     @staticmethod
     def timed_out(seq: "Sequence", now: float | None = None) -> bool:
+        """Whether one sequence has exceeded its deadline.
+
+        Args:
+            seq: Request to judge.
+            now: Instant to judge against; ``None`` reads the clock.
+
+        Returns:
+            ``True`` when the request has a deadline and it has passed.
+        """
         return seq.over_budget(time.time() if now is None else now)

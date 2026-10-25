@@ -1,11 +1,35 @@
 """``tool_choice`` against the *real* model, not the protocol stub.
 
-The definition says ``required`` means "the model **must** call one or more tools"
-and a named choice "forces the model to call that tool".  The interesting cases are
-therefore the ones where the model would rather answer in prose: with ``auto`` it
-talks, with ``required`` the API must hand back a call anyway.
+Answers whether the OpenAI wire semantics of ``tool_choice`` survive contact with
+an actual sampled decode. The definition says ``required`` means "the model
+**must** call one or more tools" and a named choice "forces the model to call
+that tool". The interesting cases are therefore the ones where the model would
+rather answer in prose: with ``auto`` it talks, with ``required`` the API must
+hand back a call anyway. A prompt that begs for a tool would pass every case and
+prove nothing, which is why ``PROSE`` asks for a joke.
+
+Cases A-F must each print ``OK``; ``MISMATCH`` means the server returned the
+wrong shape (no call under ``required``, the wrong function name, or a
+``finish_reason`` that disagrees with whether a call came back). Case G checks
+the streaming usage chunk: ``stream_options.include_usage`` must emit exactly one
+extra chunk, because the OpenAI client reads usage there and nowhere else.
+
+Run inside the container, against a server that is already up; the argument is
+the port, default 18080:
 
     cd /root/private_data/engine && MKL_THREADING_LAYER=GNU python3 diag/probe_tool_choice.py
+
+Module: ``coffin/diag``. Standalone probe: drives ``openai_server.py`` over HTTP
+and imports nothing from ``coffin/``.
+
+Constraints:
+    * Streams every request. The tool-call parser has a separate streaming path
+      that accumulates ``tool_calls`` deltas by index, and a non-streamed probe
+      would never exercise it.
+    * ``temperature`` is 0 so a mismatch is a server bug, not sampling variance;
+      do not raise it to "get more variety", that turns the run unreproducible.
+    * The Chinese strings below are request and sample data, not prose, and are
+      quoted verbatim from the tool schema users send.
 """
 
 from __future__ import annotations
@@ -36,6 +60,25 @@ WEATHER = "北京天气怎么样？"
 
 
 def post(body: dict, timeout: float = 1800.0) -> tuple[dict, float]:
+    """Send one chat-completion request and normalise streamed and unstreamed replies.
+
+    Args:
+        body: OpenAI request body, already fully built.
+        timeout: Seconds to wait. The default is deliberately long because a
+            cold engine may still be loading weights or building graphs; a short
+            timeout would look like a tool-choice failure.
+
+    Returns:
+        ``(result, wall_seconds)``. ``result`` always carries ``finish``,
+        ``content`` and ``calls`` as a list of ``{name, arguments}``, plus
+        ``usage`` for a non-streamed reply or ``reasoning``/``usage_chunks`` for a
+        streamed one.
+
+    A streamed reply is reassembled here: content and reasoning deltas are
+    concatenated, and ``tool_calls`` fragments are merged by their ``index``,
+    because the wire format splits one call across many chunks and the argument
+    JSON is only valid once every fragment has arrived.
+    """
     req = urllib.request.Request(URL, data=json.dumps(body, ensure_ascii=False).encode(),
                                  headers={"Content-Type": "application/json"})
     t0 = time.time()
@@ -78,6 +121,19 @@ def post(body: dict, timeout: float = 1800.0) -> tuple[dict, float]:
 
 
 def run(tag: str, prompt: str, **extra) -> dict:
+    """Send one case with a fixed model, tool set and temperature, and print it.
+
+    Args:
+        tag: Case label printed before the result, e.g. ``B tools + tool_choice=required``.
+        prompt: User message.
+        **extra: Request fields merged last, which is how each case sets
+            ``tool_choice`` or ``stream_options``.
+
+    Returns:
+        The normalised reply from ``post``. ``temperature`` stays 0 and
+        ``max_tokens`` 300 so a run is repeatable and a runaway prose answer
+        cannot push the case past the server's own limit.
+    """
     body = {"model": "qwen3.5-4b", "messages": [{"role": "user", "content": prompt}],
             "tools": TOOLS, "max_tokens": 300, "temperature": 0.0, "stream": True, **extra}
     out, wall = post(body)
@@ -93,9 +149,27 @@ def run(tag: str, prompt: str, **extra) -> dict:
 
 
 def main() -> None:
+    """Run the six tool-choice cases plus the usage-chunk case and print the tally.
+
+    The verdict on the last line, ``n/7 PASS``, is the whole result: a partial
+    pass is not "mostly working", because each case pins a distinct wire
+    guarantee, so read which tags failed rather than the fraction.
+    """
     ok: list[tuple[str, bool]] = []
 
     def expect(tag: str, out: dict, want_call: bool, want_name: str = "") -> None:
+        """Record one expected outcome and print the observed reply beside it.
+
+        Args:
+            tag: Case label, reused in the final PASS/FAIL listing.
+            out: Normalised reply from ``run``.
+            want_call: Whether a tool call is expected at all.
+            want_name: Function that must be called, or empty for "any or none".
+
+        A case counts as passing only when call presence, function name and
+        ``finish_reason`` all agree: a server that emits a call but reports
+        ``stop`` breaks clients that branch on the finish reason.
+        """
         got = bool(out["calls"])
         named = (not want_name) or (out["calls"] and out["calls"][0]["name"] == want_name)
         good = got == want_call and named and out["finish"] == ("tool_calls" if got else "stop")

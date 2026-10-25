@@ -1,9 +1,12 @@
 """Dump the fp32 vision-tower oracle used by tests/test_vision.py.
 
+Answers what the engine's vision tower must reproduce numerically, by pinning an
+independent oracle once so the unit tests do not need transformers or a GPU.
+
 Why fp32: the checkpoint is bf16, and a 24-layer ViT at bf16 drifts ~1e-1 by the
 last block (activations reach ~1e3, and each block adds ~8e-3 relative error).
 That makes a bf16 oracle useless as a numeric gate -- it cannot tell a correct
-implementation from one with a 1e-2 formula error.  fp32 is the reference the
+implementation from one with a 1e-2 formula error. fp32 is the reference the
 engine's tower is compared against (gate 1e-5), and the fp16 tower is then held
 to ~3e-2, which is what fp16 itself costs.
 
@@ -13,6 +16,22 @@ Writes /root/private_data/engine_vision/oracle_fp32.pt with, for a handful of
 images: the processor's pixel_values/grid_thw, and HF's fp32 output embeddings.
 Small on purpose (256² and 512², plus a non-square 384x768) so it can live next
 to the tests; the 1024² case is measured by the probe, not pinned as a fixture.
+
+A successful run ends with ``FIXTURE_DONE`` and a byte count; the tests then
+consume the file, so regenerating it invalidates any stored test expectation.
+
+Module: ``coffin/diag``. Standalone fixture generator: imports transformers,
+safetensors and torch, and nothing under ``coffin/`` imports it. The tests read
+only the ``.pt`` it writes.
+
+Constraints:
+    * fp32 on the oracle, always. The whole point is a reference far tighter than
+      the engine's own precision, so a bf16 fixture would defeat the gate.
+    * ``strict=False`` plus an explicit mismatch check: the reference architecture
+      expects a few buffers the checkpoint omits, and the check still catches a
+      genuinely wrong architecture.
+    * Deterministic image content, not noise. With noise every patch permutation
+      still looks plausible, so a patch-order bug would pass.
 """
 from __future__ import annotations
 
@@ -31,10 +50,20 @@ SIZES = ((256, 256), (512, 512), (384, 768))
 
 
 def pattern(h: int, w: int) -> Image:  # noqa: F821 - imported below
-    """A deterministic, structured image (gradients + blocks), not noise.
+    """Build a deterministic, structured image (gradients + blocks), not noise.
 
-    Random noise would hide a patch-order bug: with noise every permutation still
-    looks "statistically fine".  Blocks and hard edges do not.
+    Args:
+        h: Image height in pixels.
+        w: Image width in pixels.
+
+    Returns:
+        A PIL image with a per-axis gradient plus a checker of hard-edged
+        blocks. Random noise would hide a patch-order bug: with noise every
+        permutation still looks "statistically fine". Blocks and hard edges do
+        not, which is why this pattern is the fixture input.
+
+    The ``Image`` return annotation is resolved only when the local
+    ``from PIL import Image`` runs, hence the ``noqa`` above.
     """
     from PIL import Image as _Image
 
@@ -53,6 +82,7 @@ def pattern(h: int, w: int) -> Image:  # noqa: F821 - imported below
 
 
 def main() -> None:
+    """Build the fp32 oracle for every fixture size and write ``oracle_fp32.pt``."""
     from safetensors import safe_open
     from transformers import AutoProcessor
     from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLVisionConfig

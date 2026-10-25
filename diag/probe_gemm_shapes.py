@@ -14,6 +14,15 @@ not need a new kernel, for every real projection shape:
     which rocBLAS may like better.
 
 Run:  python probe_gemm_shapes.py
+
+Module: ``coffin/diag``. Drives raw hipBLAS/rocBLAS through ``torch.matmul`` for
+the projection shapes the model actually uses.
+
+Constraints:
+    * Only levers that need no new kernel are swept; a shape that is slow here is
+      where a custom kernel would pay off, not something to fix in place.
+    * Results feed the plan in ``NOTES.md``, so the shapes must stay the real
+      ones from ``models/qwen35`` -- a made-up N or K produces a useless table.
 """
 
 from __future__ import annotations

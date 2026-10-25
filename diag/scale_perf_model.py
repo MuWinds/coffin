@@ -10,6 +10,16 @@ exercise is to see which one wins at which context length.
 Usage:
     python3 diag/scale_perf_model.py                    # defaults = measured/assumed
     python3 diag/scale_perf_model.py --pcie 21.5 --w-bw 560
+
+Module: ``coffin/diag``. Pure arithmetic: no model, no DCU, no checkpoint. Every
+constant has a CLI override so the plan can be regenerated after a re-measure.
+
+Constraints:
+    * Constants are measured-or-assumed, marked as such in the code: an assumed
+      value that later gets measured must say so, or the plan looks firmer than it
+      is.
+    * The model is intentionally a max-of-three roofline. A more elaborate model
+      would hide which term dominates, which is the only thing the plan needs.
 """
 
 from __future__ import annotations

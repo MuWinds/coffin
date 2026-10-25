@@ -1,8 +1,9 @@
 """Does a *real agent-shaped* request come back as a tool call?
 
-The minimal case (one tool, one user turn, socket level) already works; agent
-clients differ in three ways, and any of them can be the reason "the model
-doesn't call the tool" while it obviously can:
+Answers whether an agent client's request shape still produces tool calls, as
+opposed to the minimal single-tool socket case that already works. Agent clients
+differ in three ways, and any of them can be the reason "the model doesn't call
+the tool" while it obviously can:
 
 * they **stream** (``stream: true``) and assemble ``tool_calls`` from deltas;
 * they send a **large** tool set and an agent **system prompt**;
@@ -12,7 +13,30 @@ doesn't call the tool" while it obviously can:
 Every scenario here goes over HTTP against the running server (18080), which is the
 path the client actually takes -- no in-process shortcuts.
 
+Read each ``---`` block: ``finish=tool_calls`` with a non-zero ``tool_calls``
+count is the expected shape for A-D. Case B is the one that matters most,
+because its reply was assembled from stream deltas by ``post``, so a client-side
+accumulation bug and a server-side delta bug both surface there. Case C is the
+one that catches a prompt-template fault: the second turn carries an assistant
+``tool_calls`` message and a ``role: tool`` result, and a template that renders
+either one wrongly shows up as prose instead of a call.
+
+Run inside the container, against a server that is already up; the argument is
+the port, default 18080:
+
     cd /root/private_data/engine && MKL_THREADING_LAYER=GNU python3 diag/probe_api_tools.py
+
+Module: ``coffin/diag``. Standalone probe: drives ``openai_server.py`` over HTTP
+and imports nothing from ``coffin/``.
+
+Constraints:
+    * The tool set is padded to 21 entries on purpose. A two-tool prompt changes
+      the model's choice behaviour, so a minimal set would not reproduce the
+      client's actual decoding conditions.
+    * ``temperature`` is 0 throughout, so a missing call is a server-side fault
+      rather than sampling variance.
+    * The Chinese strings are request and sample data quoted from client
+      payloads, not prose.
 """
 
 from __future__ import annotations
@@ -45,13 +69,25 @@ SPECS = [
     ("multiply", "计算两个整数的乘积", {"a": ("integer", "第一个数"),
                                        "b": ("integer", "第二个数")}, ["a", "b"]),
 ]
-# pad to a realistic count
+
+# Pad to a realistic count: the real tool surface is ~20 entries, and a short
+# list would understate the prompt bytes the model has to read before the call.
 for i in range(14):
     SPECS.append((f"helper_{i:02d}", f"辅助工具 {i}，用于外部系统交互",
                   {"query": ("string", "查询串")}, ["query"]))
 
 
 def build_tools() -> list[dict]:
+    """Expand ``SPECS`` into OpenAI tool definitions.
+
+    Returns:
+        One ``{"type": "function", "function": {...}}`` object per spec, with the
+        property descriptions and required list carried through verbatim.
+
+    The nested description strings are what the model actually reads when
+    choosing a tool, so the Chinese auxiliary descriptions stay exactly as a
+    client would send them.
+    """
     out = []
     for name, desc, props, required in SPECS:
         out.append({"type": "function", "function": {
@@ -67,6 +103,23 @@ TOOLS = build_tools()
 
 
 def post(body: dict, timeout: float = 1800.0) -> tuple[dict, float]:
+    """Send one chat-completion request and normalise a streamed reply into a message.
+
+    Args:
+        body: OpenAI request body, already built.
+        timeout: Seconds to wait. The default is long because a cold engine may
+            still be loading weights; a short timeout would read as a tool-call
+            failure.
+
+    Returns:
+        ``(reply, wall_seconds)``, where ``reply`` has the same
+        ``choices[0].message`` shape for both streaming and non-streaming
+        requests, so ``show`` does not need two code paths.
+
+    A streamed reply is reassembled by ``index`` because the wire format splits
+    one ``tool_calls`` entry across many chunks; concatenating name and argument
+    fragments is the only way to recover a parseable call.
+    """
     req = urllib.request.Request(URL, data=json.dumps(body, ensure_ascii=False).encode(),
                                  headers={"Content-Type": "application/json"})
     t0 = time.time()
@@ -104,6 +157,18 @@ def post(body: dict, timeout: float = 1800.0) -> tuple[dict, float]:
 
 
 def show(tag: str, out: dict, wall: float) -> list[dict]:
+    """Print one scenario's reply summary and return its tool calls.
+
+    Args:
+        tag: Scenario label, e.g. ``B stream, same request``.
+        out: Normalised reply from ``post``.
+        wall: Wall seconds for the request, printed so a slow tool call is
+            distinguishable from a wrong one.
+
+    Returns:
+        The ``tool_calls`` list. The caller reuses it to build the next turn's
+        prompt, so an empty list means case C cannot run.
+    """
     ch = out["choices"][0]
     msg = ch["message"]
     tcs = msg.get("tool_calls") or []
@@ -121,6 +186,14 @@ def show(tag: str, out: dict, wall: float) -> list[dict]:
 
 
 def main() -> None:
+    """Run scenarios A-D over HTTP and print each reply.
+
+    A is the non-streamed baseline; B repeats it streamed, which is the delta
+    accumulation path a client uses; C feeds B's call back as an assistant
+    ``tool_calls`` plus a ``role: tool`` result and asks a follow-up that needs a
+    different tool; D turns thinking on, which an agent UI may request and which
+    changes what the deltas carry.
+    """
     print(f"tools sent: {len(TOOLS)}")
 
     msgs = [{"role": "system", "content": SYSTEM},

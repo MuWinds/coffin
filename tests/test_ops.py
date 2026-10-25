@@ -1,12 +1,20 @@
-"""Kernel-level functional checks (no model, no checkpoint).
+"""Kernel-level equivalence: every fused kernel must reproduce the maths it replaced.
 
-Each test is one property the engine depends on, ported from the old
-``diag/check_*.py`` scripts: the fused kernels must reproduce the eager maths
-they replaced, the chunked delta rule must reproduce the recurrent one, and the
-int8/fp16 GEMV kernels must reproduce a float reference.
+Module: ``coffin/tests``. Imports ``ops``, ``hip_ops`` and ``int8_weights``
+directly and never loads a checkpoint, so it is the cheap regression net for the
+kernels themselves; the model-level tests build on top of it.
 
-Thresholds are the ones those scripts used; the REL_* values in the comments are
-what the last vetted run measured.
+Constraints:
+    * Assertions are relative-error bounds against an eager float reference, not
+      bit equality: the kernels accumulate in a different order and emit bf16.
+      The tolerance in each test is the measured error of the last vetted run
+      plus headroom, so tightening it re-litigates a measurement.
+    * Strided inputs are part of the contract, not an edge case: the model feeds
+      these kernels column slices of a wider fused buffer, so a kernel that
+      assumes contiguous rows passes the simple test and corrupts the model.
+    * One shape set per kernel, kept to the model's real dimensions, because the
+      largest GEMV shape (151936 x 2560) is what overruns the card if the buffers
+      are not freed between subtests.
 """
 
 from __future__ import annotations
@@ -22,7 +30,18 @@ NEG_INF = float("-inf")
 
 
 def _depthwise_conv_eager(conv_w, x, state):
-    """The eager chain ``conv1d_silu_seq`` replaces (kernel 4, state = last 3)."""
+    """The eager chain ``conv1d_silu_seq`` replaces (kernel 4, state = last 3).
+
+    Args:
+        conv_w: Per-channel taps, ``[C, 4]``; the fourth tap is the current token.
+        x: Tokens to consume, ``[T, C]``.
+        state: The three previous tokens, ``[C, 3]``, oldest first.
+
+    Returns:
+        ``(output [T, C], new_state [C, 3])``; the new state is the last three
+        rows of ``state`` prepended to ``x``, which is what the kernel carries
+        across a chunk boundary.
+    """
     seq = torch.cat([state.t(), x.float()], dim=0)
     new_state = seq[-3:].t().contiguous()
     win = seq.unfold(0, 4, 1)
@@ -36,6 +55,7 @@ class ChunkedDeltaRuleTest(unittest.TestCase):
     H, DK, DV = 8, 64, 64
 
     def _inputs(self, C, seed=0):
+        """Random delta-rule inputs at the model's head geometry, q pre-scaled."""
         torch.manual_seed(seed)
         q = torch.randn(self.H, C, self.DK, device="cuda")
         k = torch.randn(self.H, C, self.DK, device="cuda")
@@ -49,6 +69,7 @@ class ChunkedDeltaRuleTest(unittest.TestCase):
 
     @staticmethod
     def _recurrent(q, k, v, g, beta, state):
+        """The per-token recurrence: the definition ``chunked_delta`` optimises."""
         outs = []
         for t in range(q.shape[1]):
             st = state * g[:, t].exp()[:, None, None]
@@ -60,9 +81,10 @@ class ChunkedDeltaRuleTest(unittest.TestCase):
         return torch.stack(outs, 1), state
 
     def test_matches_recurrent(self):
+        """Chunking is an optimisation: every output and the final state must match the recurrence."""
         from ops.delta import chunked_delta
 
-        # Measured ~1e-6; 1e-3 leaves room for bf16-free fp32 noise.
+        # Measured ~1e-6; 1e-3 leaves room for the fp32 noise of a reordered sum.
         for C in (256, 200, 64, 65):          # 200/65 exercise the padding path
             q, k, v, g, beta, st0 = self._inputs(C)
             ref, ref_st = self._recurrent(q, k, v, g, beta, st0.clone())
@@ -75,6 +97,7 @@ class ChunkedDeltaRuleTest(unittest.TestCase):
                     self.assertLess(support.rel_err(st_out, ref_st), 1e-3)
 
     def test_zero_state_and_no_decay_is_plain_causal_linear_attention(self):
+        """With g=0 and beta=1 the rule degenerates to causal linear attention, which exposes a sign or mask error the random case can hide."""
         from ops.delta import chunked_delta
 
         q, k, v, _, _, st0 = self._inputs(200)
@@ -94,19 +117,23 @@ class ConvSeqTest(unittest.TestCase):
     C = 8192
 
     def setUp(self):
+        """Fixed weights, so a failure reproduces from the seed alone."""
         torch.manual_seed(0)
         self.conv_w = (torch.randn(self.C, 4, device="cuda") * 0.3).contiguous()
 
     def _check(self, x, st0):
+        """Compare kernel output and carried state against the eager chain."""
         import hip_ops
         ref, ref_st = _depthwise_conv_eager(self.conv_w, x, st0.clone())
         got_st = st0.clone()
         got = hip_ops.conv1d_silu_seq(self.conv_w, x, got_st)
-        # Measured: state bit-identical, output ~1e-7.
+        # Measured: state bit-identical, output ~1e-7. The 1e-5 bound is the bf16
+        # output quantisation, not accumulation error.
         self.assertLess(support.rel_err(got, ref), 1e-5)
         self.assertLess(support.rel_err(got_st, ref_st), 1e-5)
 
     def test_matches_eager(self):
+        """Lengths shorter than the 4-wide window, exactly it, and past a block boundary."""
         for T in (1, 2, 3, 5, 64, 257):
             with self.subTest(T=T):
                 x = (torch.randn(T, self.C, device="cuda") * 0.5).to(torch.bfloat16)
@@ -114,6 +141,7 @@ class ConvSeqTest(unittest.TestCase):
                 self._check(x, st0)
 
     def test_honours_row_pitch_of_a_column_slice(self):
+        """A kernel that assumes contiguous rows passes the plain test and then mis-reads the model's fused buffer."""
         # The model hands over a column slice of the fused GEMV output: rows are
         # pitched wider than C, and the kernel must read ldx, not assume C.
         for T in (7, 200):
@@ -125,6 +153,7 @@ class ConvSeqTest(unittest.TestCase):
                 self._check(xs, torch.randn(self.C, 3, device="cuda"))
 
     def test_chunk_boundaries_carry_state(self):
+        """A chunked prefill must not restart the convolution's 3-token history at a chunk edge."""
         import hip_ops
         T = 300
         x = (torch.randn(T, self.C, device="cuda") * 0.5).to(torch.bfloat16)
@@ -144,6 +173,7 @@ class PrepSeqTest(unittest.TestCase):
     """``hip_ops.delta_prep_seq`` must reproduce q/k norm + head expand + beta/g."""
 
     def test_matches_eager_maths_and_layout(self):
+        """The prep kernel also fixes the layout: a transposed or mis-strided output feeds the delta kernel wrong values silently."""
         import hip_ops
 
         torch.manual_seed(0)
@@ -199,6 +229,7 @@ class F16GemvTest(unittest.TestCase):
               (18432, 2560), (151936, 2560))
 
     def test_single_vector_matches_float_reference(self):
+        """GEMV is the decode hot path, so it is pinned on the model's real weight shapes; 2e-2 covers fp16 storage, not kernel error."""
         import hip_ops
         for N, K in self.SHAPES:
             with self.subTest(N=N, K=K):
@@ -211,10 +242,13 @@ class F16GemvTest(unittest.TestCase):
                 y = hip_ops.gemv(w16, x, 1, 2)
                 self.assertEqual(y.dtype, torch.bfloat16)
                 self.assertLess(support.rel_err(y.float(), ref), 2e-2)
+                # The 151936-wide shape is ~1.5 GB of weights; freeing between
+                # shapes keeps the class inside the card.
                 del wb, w16, x, ref, y
                 torch.cuda.empty_cache()
 
     def test_batched_small_m_shapes(self):
+        """The batched entry point is a separate kernel: same maths, different tiling."""
         import hip_ops
         for N, K in self.SHAPES[:3]:
             wb = (torch.randn(N, K, dtype=torch.float32, device="cuda") * 0.02
@@ -241,6 +275,7 @@ class Int8GemvTest(unittest.TestCase):
               (2560, 4096), (151936, 2560))
 
     def test_single_vector_tracks_dequantised_reference(self):
+        """Two bounds on purpose: 1e-2 against dequantised weights isolates kernel error, 2e-2 against float weights bounds the quantisation itself."""
         import hip_ops
         from int8_weights import QWeight
         for N, K in self.SHAPES:
@@ -258,6 +293,7 @@ class Int8GemvTest(unittest.TestCase):
                 torch.cuda.empty_cache()
 
     def test_batched_small_m_shapes(self):
+        """The batched INT8 path is its own kernel with its own scale broadcast; the single-vector case does not cover it."""
         import hip_ops
         from int8_weights import QWeight
         for N, K in self.SHAPES[:3]:

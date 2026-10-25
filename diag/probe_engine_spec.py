@@ -7,6 +7,15 @@ the tokens are produced, never which ones.
 
     python3 diag/probe_engine_spec.py                     # default model dir
     QWEN_MODEL=/root/private_data/models/Qwen3.5-4B python3 diag/probe_engine_spec.py
+
+Module: ``coffin/diag``. End-to-end check over ``engine_api`` / ``llm_engine``;
+needs the checkpoint and a DCU.
+
+Constraints:
+    * The dense greedy run is the oracle: speculation may only change speed, so
+      any token divergence is a bug in the verify path, not noise.
+    * Both engines run in one process, which is why only one model is resident at
+      a time -- two of them do not fit on the card.
 """
 
 from __future__ import annotations

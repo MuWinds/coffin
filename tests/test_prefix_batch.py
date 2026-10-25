@@ -1,13 +1,22 @@
 """Per-sequence prefix reuse in the batched engine.
 
+Module: ``coffin/tests``. Wraps a paged model in ``llm_engine.LLMEngine`` and
+drives it through ``config`` / ``sequence`` / ``scheduler``; it is the only test
+that asserts on the scheduler-visible ``matched`` count.
+
+Constraints:
+    * The reference for a warm run is the same engine's *cold* run, with the tree
+      cleared in between; comparing against a second model would need two 4B
+      copies on a 16 GB card.
+    * ``add_request`` plus manual ``step`` is used where the admission order is
+      the thing under test, because ``generate`` owns the whole loop and hides it.
+    * ``tearDownClass`` must close the fixture: this class owns an engine, and a
+      leaked block pool keeps the card busy for every later module.
+
 The radix tree is per-sequence state (block hashes + the delta-net recurrent
 snapshot that produced them), so batching must not switch it off: a request is
 admitted, matches the longest cached block prefix, restores that boundary's
 recurrent state, prefills only the suffix and inserts what it computed.
-
-The reference for a warm run is the same engine's *cold* run: the test clears the
-tree in between (``LLMEngine.clear_prefix_cache``), so no second model has to fit
-on the card.
 
     python3 -m unittest discover -s tests -p "test_prefix_batch.py" -v
 """
@@ -29,6 +38,12 @@ TAIL_B = [5000 + i for i in range(24)]
 
 
 def make_engine(model, *, max_seq: int, max_num_seqs: int = 4) -> LLMEngine:
+    """Build an engine whose block size matches the model's snapshot interval.
+
+    ``snapshot_interval=BLOCK`` is not a tuning choice: a recurrent snapshot is
+    only meaningful at a block boundary, so the two constants must agree or a
+    restored state would not correspond to the reused KV.
+    """
     cfg = EngineConfig(model_dir=str(support.MODEL_DIR), max_seq=max_seq,
                        bench=False, quant=True, prefix_cache=True,
                        block_size=BLOCK, snapshot_interval=BLOCK,
@@ -40,25 +55,31 @@ def make_engine(model, *, max_seq: int, max_num_seqs: int = 4) -> LLMEngine:
 
 @support.needs_model
 class BatchedPrefixTest(unittest.TestCase):
+    """Batching must not disable prefix reuse; a reused prefix must not change the answer."""
+
     MAX_SEQ = 1024
 
     @classmethod
     def setUpClass(cls) -> None:
+        """Load the paged model and build the engine all tests in this class share."""
         cls.MODEL = support.ModelFixture.get(quant=True, max_seq=cls.MAX_SEQ,
                                              paged=True, bench=False)
         cls.ENGINE = make_engine(cls.MODEL, max_seq=cls.MAX_SEQ)
 
     @classmethod
     def tearDownClass(cls) -> None:
+        """Release the engine and the model, so the next module starts from an empty card."""
         cls.ENGINE = None
         cls.MODEL = None
         support.ModelFixture.close()
 
     def _generate(self, prompt: list[int], n: int = 4) -> dict:
+        """Greedy-generate through the shared engine; temperature 0 keeps runs comparable."""
         return self.ENGINE.generate(prompt, SamplingParams(max_tokens=n,
                                                            temperature=0.0))
 
     def test_cold_then_warm_identical_prompt(self) -> None:
+        """The second identical request must match a prefix and still emit the cold tokens."""
         engine = self.ENGINE
         engine.clear_prefix_cache()
         cold = self._generate(PREFIX + TAIL_A)
@@ -68,6 +89,7 @@ class BatchedPrefixTest(unittest.TestCase):
         self.assertEqual(warm["tokens"], cold["tokens"])
 
     def test_shared_system_prompt_with_different_tails(self) -> None:
+        """A shared prefix with a different tail must match exactly the prefix, and its own cold answer must agree."""
         engine = self.ENGINE
         engine.clear_prefix_cache()
         cold_a = self._generate(PREFIX + TAIL_A)
@@ -79,6 +101,7 @@ class BatchedPrefixTest(unittest.TestCase):
         self.assertEqual(warm_b["tokens"], cold_b["tokens"])
 
     def test_concurrent_identical_prompts_reuse_the_prefix(self) -> None:
+        """Reuse must work while the first request is still decoding, not only after it retires."""
         engine = self.ENGINE
         engine.clear_prefix_cache()
         prompt = PREFIX + TAIL_A
@@ -105,6 +128,7 @@ class BatchedPrefixTest(unittest.TestCase):
                                 "the second concurrent request should reuse the prefix")
 
     def test_grouped_prefill_populates_the_prefix_cache(self) -> None:
+        """Grouped prefill is a different code path; it must still leave the block-aligned snapshots a warm hit needs."""
         engine = self.ENGINE
         engine.clear_prefix_cache()
         # Two prompts admitted together go through one grouped prefill; it still
@@ -124,6 +148,7 @@ class BatchedPrefixTest(unittest.TestCase):
         self.assertEqual(warm["tokens"], out_a)
 
     def test_prefix_stats_report_cached_blocks(self) -> None:
+        """The stats feed the server's cache metrics, so an empty or missing ``prefix`` block hides a broken tree from operators."""
         engine = self.ENGINE
         engine.clear_prefix_cache()
         self._generate(PREFIX + TAIL_A, 2)

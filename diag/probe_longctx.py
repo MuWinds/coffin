@@ -18,6 +18,15 @@ rather than guessing.
 
     MKL_THREADING_LAYER=GNU python probe_longctx.py --int8 \
         --lengths 4096,16384,65536,262144
+
+Module: ``coffin/diag``. Runs the real engine at several window sizes; the
+arithmetic in the header is the budget it checks.
+
+Constraints:
+    * ``--lengths`` must stay a subset of what the card can hold, or the run OOMs
+      instead of reporting; the numbers in the header say where that edge is.
+    * int8 weights are required for 256k, so a run without ``--int8`` measures a
+      configuration that does not fit and should not be compared.
 """
 
 from __future__ import annotations

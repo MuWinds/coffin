@@ -1,5 +1,20 @@
 """Engine-level regression: ``LLMEngine`` must agree with the paths it wraps.
 
+Module: ``coffin/tests``. The highest layer of the suite: it drives
+``llm_engine.LLMEngine`` over ``config`` / ``sequence`` / ``scheduler`` /
+``block_manager`` / ``model_runner`` and compares the result against the direct
+model loop, so a scheduler or runner bug surfaces here rather than in serve.py.
+
+Constraints:
+    * The reference is the pre-refactor model loop (``greedy_reference``), never a
+      second engine: two engines agreeing would pass with a shared bug.
+    * Temperature 0 everywhere; sampling would make two runs incomparable.
+    * The batch tests tokenise real text instead of using arbitrary ids, because
+      on synthetic ids the logits are near-uniform and a few bf16 ULPs from a
+      different GEMM M flip the argmax, which is not the thing under test.
+    * Each class owns its engine and closes the fixture in ``tearDownClass``; the
+      card cannot hold the dense and paged models at once.
+
 The split into ``LLMEngine`` / ``Scheduler`` / ``ModelRunner`` / ``BlockManager``
 is only worth having if a request still produces exactly the tokens the direct
 model loop produces.  These tests pin that down for both KV modes, plus the
@@ -13,7 +28,8 @@ from __future__ import annotations
 import functools
 import unittest
 
-import support  # noqa: F401  (sets MKL + sys.path)
+# Side-effect import: sets MKL_THREADING_LAYER and puts coffin/ on sys.path.
+import support  # noqa: F401
 
 from config import EngineConfig
 from llm_engine import LLMEngine
@@ -29,16 +45,23 @@ TAIL = [23, 24, 25, 26, 27]
 
 @functools.lru_cache(maxsize=1)
 def _tokenizer():
+    """Load the tokenizer once; the batched tests reuse it for every prompt."""
     from transformers import AutoTokenizer
     return AutoTokenizer.from_pretrained(str(support.MODEL_DIR))
 
 
 def _ids(text: str) -> list[int]:
+    """Token ids of one prompt text."""
     return _tokenizer().encode(text)
 
 
 def make_engine(model, *, prefix_cache: bool, max_seq: int,
                 snapshot_interval: int = 512, max_num_seqs: int = 1) -> LLMEngine:
+    """Build an engine around an already-loaded model.
+
+    ``num_blocks`` is sized from ``max_seq`` so a test cannot run out of KV and
+    pass for the wrong reason; the floor of 64 keeps the smallest case valid.
+    """
     cfg = EngineConfig(model_dir=str(support.MODEL_DIR), max_seq=max_seq,
                        bench=False, quant=True, prefix_cache=prefix_cache,
                        block_size=64, snapshot_interval=snapshot_interval,
@@ -50,7 +73,11 @@ def make_engine(model, *, prefix_cache: bool, max_seq: int,
 
 
 def greedy_reference(model, prompt: list[int], n: int) -> list[int]:
-    """The pre-refactor loop: reset, prefill, then argmax + decode_step."""
+    """The pre-refactor loop: reset, prefill, then argmax + decode_step.
+
+    This is the oracle for every engine test: it is the baseline the engine was
+    refactored out of, so it must stay independent of scheduler and runner code.
+    """
     model.reset()
     logits = model.prefill(prompt)
     out: list[int] = []
@@ -68,6 +95,7 @@ class DenseEngineTest(support.ModelTestCase):
     PAGED = False
 
     def test_generate_matches_the_reference_loop(self) -> None:
+        """With the cache off, engine overhead must be invisible in the token stream."""
         engine = make_engine(self.model, prefix_cache=False, max_seq=self.MAX_SEQ)
         ref = greedy_reference(self.model, PROMPT, 6)
         res = engine.generate(PROMPT, SamplingParams(max_tokens=6, temperature=0.0))
@@ -76,6 +104,7 @@ class DenseEngineTest(support.ModelTestCase):
         self.assertEqual(engine.stats()["generated_tokens"], 6)
 
     def test_streaming_yields_the_same_tokens_as_generate(self) -> None:
+        """``stream`` and ``generate`` share one loop; a divergence means a token is dropped or duplicated at a step boundary."""
         engine = make_engine(self.model, prefix_cache=False, max_seq=self.MAX_SEQ)
         res = engine.generate(PROMPT, SamplingParams(max_tokens=5, temperature=0.0))
 
@@ -84,6 +113,7 @@ class DenseEngineTest(support.ModelTestCase):
         self.assertEqual(streamed, res["tokens"])
 
     def test_max_tokens_and_eos_stop_the_request(self) -> None:
+        """Both stop conditions are protocol: the length cap bounds latency, the EOS cap keeps the EOS token out of the reply."""
         engine = make_engine(self.model, prefix_cache=False, max_seq=self.MAX_SEQ)
         res = engine.generate(PROMPT, SamplingParams(max_tokens=3, temperature=0.0))
         self.assertEqual(len(res["tokens"]), 3)
@@ -111,6 +141,7 @@ class PagedEngineTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
+        """One engine for the class: building it captures graphs, which is the slow part."""
         cls.MODEL = support.ModelFixture.get(quant=True, max_seq=cls.MAX_SEQ,
                                              paged=True, bench=False)
         # The engine attaches the paged pool, so it has to exist before any reset.
@@ -121,11 +152,13 @@ class PagedEngineTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls) -> None:
+        """Drop the engine before closing the model, so the pool is released first."""
         cls.ENGINE = None
         cls.MODEL = None
         support.ModelFixture.close()
 
     def test_engine_matches_the_prefix_engine_api(self) -> None:
+        """The engine must produce the tokens of the raw prefix engine it wraps, not its own variant."""
         engine = self.ENGINE
         pc = engine.pc
         logits = pc.prefill(PROMPT_ALT)
@@ -135,6 +168,7 @@ class PagedEngineTest(unittest.TestCase):
         self.assertEqual(res["tokens"], ref)
 
     def test_second_prompt_hits_the_prefix(self) -> None:
+        """The match must be block-aligned and bounded by the length actually verified, or a reused block would carry unseen KV."""
         engine = self.ENGINE
         first = engine.generate(PROMPT, SamplingParams(max_tokens=3, temperature=0.0))
         second = engine.generate(PROMPT, SamplingParams(max_tokens=3, temperature=0.0))
@@ -168,6 +202,7 @@ class BatchedEngineTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
+        """Tokenise the texts once and build a four-sequence engine with no prefix cache."""
         cls.PROMPTS = [list(_ids(text)) for text in cls.TEXTS]
         cls.MODEL = support.ModelFixture.get(quant=True, max_seq=cls.MAX_SEQ,
                                              paged=True, bench=False)
@@ -176,17 +211,20 @@ class BatchedEngineTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls) -> None:
+        """Drop the engine before closing the model, so the pool is released first."""
         cls.ENGINE = None
         cls.MODEL = None
         support.ModelFixture.close()
 
     def _solo(self, prompt: list[int], budget: int) -> list[int]:
+        """Generate one prompt through the engine alone: the per-row reference."""
         engine = self.ENGINE
         seq = engine.add_request(prompt, SamplingParams(max_tokens=budget,
                                                         temperature=0.0))
         return list(engine.stream(seq))
 
     def _concurrent(self, budgets: list[int]) -> list[list[int]]:
+        """Admit all prompts at once and step the engine until every sequence finishes."""
         engine = self.ENGINE
         seqs = [engine.add_request(p, SamplingParams(max_tokens=b, temperature=0.0))
                 for p, b in zip(self.PROMPTS, budgets)]
@@ -199,11 +237,13 @@ class BatchedEngineTest(unittest.TestCase):
         return out
 
     def test_concurrent_requests_match_their_solo_decode(self) -> None:
+        """Batching must not change any request's tokens, including when a row finishes early."""
         budgets = [5, 2, 4]          # different lengths leave a row hole mid-run
         refs = [self._solo(p, b) for p, b in zip(self.PROMPTS, budgets)]
         self.assertEqual(self._concurrent(budgets), refs)
 
     def test_grouped_prefill_matches_solo_prefill(self) -> None:
+        """Grouped prefill changes the GEMM shape, so this test is the guard that it still lands on the same tokens."""
         budgets = [4, 4, 4]
         refs = [self._solo(p, b) for p, b in zip(self.PROMPTS, budgets)]
         self.assertEqual(self._concurrent(budgets), refs)

@@ -1,12 +1,20 @@
 """Speculative decoding must be exact, and its drafter must predict the next tokens.
 
-Greedy speculation may only change speed: every accepted draft is one the main
-model agrees with and a mismatch falls back to the main model's token, so the
-output has to equal plain greedy token for token.  The drafter is judged by its
-*acceptance rate* -- a quality property of its predictions -- not by wall-clock
-time; the speed numbers live in the probes.  The verify graph is captured at the
-width the step needs (K+1 tokens), because every extra verified token costs a full
-recurrent update in each of the 24 linear-attention layers.
+Module: ``coffin/tests``. Drives ``model.spec_step`` and ``model.mtp`` through
+``support.ModelTestCase``; it is the only test that captures the K+1-wide verify
+graph, so it must run in its own process with the model loaded at this width.
+
+Constraints:
+    * Exactness is the invariant, not speed: greedy speculation may only change
+      wall-clock, so the output must equal plain greedy token for token. A
+      mismatch is a correctness bug in the draft/verify bookkeeping, never an
+      acceptable approximation.
+    * The verify graph is captured at K+1 tokens, the width the step needs,
+      because every extra verified token costs a full recurrent update in each of
+      the 24 linear-attention layers. Capturing wider than needed slows every
+      step; capturing narrower fails at replay.
+    * Acceptance rate is a quality property of the drafter's predictions, not a
+      timing threshold; the speed-up itself is measured by the probes.
 
 Port of ``diag/check_spec.py`` (the timing/cost-breakdown prints stay there).
 """
@@ -25,6 +33,7 @@ N = 64
 
 @functools.lru_cache(maxsize=1)
 def _prompt_ids() -> list[int]:
+    """Tokenise the fixed prompt once, so every subtest starts from the same ids."""
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(str(support.MODEL_DIR))
     return tok.encode(PROMPT)
@@ -32,15 +41,19 @@ def _prompt_ids() -> list[int]:
 
 @support.needs_model
 class SpecDecodeTest(support.ModelTestCase):
+    """Greedy speculation is a speed change only; the token stream must stay identical."""
+
     QUANT = True
     MAX_SEQ = 2048
 
     def setUp(self) -> None:
+        """Share the prompt ids and make sure a verify graph exists before any spec step."""
         super().setUp()
         self.ids = _prompt_ids()
         support.ensure_captured(self.model)
 
     def _plain(self, n: int) -> list[int]:
+        """Greedy baseline: argmax of each step fed back in, one token at a time."""
         model = self.model
         model.reset()
         logits = model.prefill(self.ids)
@@ -52,6 +65,11 @@ class SpecDecodeTest(support.ModelTestCase):
         return out
 
     def _spec(self, n: int, k: int) -> tuple[list[int], dict]:
+        """Run the speculative loop for ``n`` tokens at draft depth ``k``.
+
+        Two warm-up steps are discarded on purpose: the first replays hit
+        unpopulated graph memory and would otherwise be counted in the stats.
+        """
         model = self.model
         model.capture_verify(k + 1)        # pay only for the tokens we verify
         model.reset()
@@ -68,11 +86,13 @@ class SpecDecodeTest(support.ModelTestCase):
         return out[:n], model.spec_stats
 
     def test_capture_builds_the_verify_and_draft_graphs(self):
+        """``spec_step`` replays both graphs, so a missing capture must fail here and not mid-generation."""
         self.assertIsNotNone(self.model._verify_graph)
         self.assertIsNotNone(self.model.mtp)
         self.assertIsNotNone(self.model.mtp._graph)
 
     def test_spec_matches_plain_greedy(self):
+        """At every depth, accepted drafts plus fallbacks must reproduce plain greedy exactly."""
         plain = self._plain(N)
         for k in (1, 3, 7):
             with self.subTest(K=k):

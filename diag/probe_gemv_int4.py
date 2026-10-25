@@ -16,6 +16,15 @@ Run in the pod:
     python3 coffin/diag/probe_gemv_int4.py [--quick]
 
 Output is one machine-parsable block (``KEY value`` lines) plus a human table.
+
+Module: ``coffin/diag``. Builds ``diag/gemv_int4_ext.cu`` through
+``torch.utils.cpp_extension`` with the same flags ``hip_ops.py`` uses.
+
+Constraints:
+    * Synthetic tensors only: the question is achievable bandwidth, and a real
+      checkpoint would add quantisation error to the comparison.
+    * The int8 result must come from ``hip_ops.gemv_w8a16`` itself, so the two
+      sides differ only in weight format.
 """
 
 from __future__ import annotations

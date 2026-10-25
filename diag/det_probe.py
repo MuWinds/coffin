@@ -1,14 +1,40 @@
 """Determinism inside ONE model instance (the real serving shape).
 
-The serving process builds the model exactly once and then prefills many
-requests, so the determinism that matters is: same prompt, same model instance,
-repeated prefill -> identical logits.  Building two models in one process is a
-different (and much less stable) question, because the second build allocates
-against an allocator that already holds the first build's caching artifacts.
+Answers whether the same prompt on the same loaded model yields the same logits,
+which is the property a serving deployment needs. The serving process builds the
+model exactly once and then prefills many requests, so the determinism that
+matters is: same prompt, same model instance, repeated prefill -> identical
+logits. Building two models in one process is a different (and much less stable)
+question, because the second build allocates against an allocator that already
+holds the first build's caching artifacts.
+
+Read the ``PASS``/``FAIL`` on each line: ``rel`` is the relative L2 difference
+against the first run and must stay at or below 1e-6, and ``argmax`` must agree,
+because a bit-level drift that does not move the argmax is still a drift but a
+different argmax changes sampled text. ``--mode single`` is the serving question;
+``--mode multi`` rebuilds per run and is expected to be less stable — treat its
+failures as allocator sensitivity, not as a determinism bug in the model.
 
 Usage (container, from the engine dir):
     flock /root/private_data/gpu.lock -c 'python3 diag/det_probe.py --mode single'
     flock /root/private_data/gpu.lock -c 'python3 diag/det_probe.py --mode single --baseline b.pt'
+
+``--write-baseline`` records a run and a later ``--baseline`` compares against it
+at the looser 1e-3 tolerance, which is what a cross-session regression check can
+hold.
+
+Module: ``coffin/diag``. Standalone probe: imports ``engine_api`` plus
+transformers, and nothing under ``coffin/`` imports it.
+
+Constraints:
+    * ``engine_api`` is imported only after ``sys.path`` is fixed up inside
+      ``main``, because this script runs from ``diag/`` while the engine's own
+      modules use absolute imports rooted at ``coffin/``.
+    * ``flock`` is required: the comparison is a bit-level difference, and a
+      co-tenant's load does not change correctness but does change timings, so
+      the lock keeps a slow run distinguishable from a wrong one.
+    * The prompts mix English, code and Chinese on purpose; the tokenizer's
+      multi-byte paths are where a prefill bug usually appears first.
 """
 from __future__ import annotations
 

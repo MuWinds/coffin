@@ -4,11 +4,28 @@ The server answers one assistant turn (``chat``); this client runs whatever tool
 the model asked for and feeds the results back until it stops calling tools or the
 round budget is exhausted.
 
-    python agent.py --user "北京天气怎么样？再算一下 12 乘 8" --tools tools_demo.json
+    python agent.py --user "Beijing weather? Also 12 times 8" --tools tools_demo.json
     python agent.py --user "..." --tools tools.json --exec my_tools.py
 
 A tool module exposes ``execute(name, args) -> result``. Without ``--exec`` a small
 built-in weather/multiply executor is used so the loop runs out of the box.
+
+Module: ``coffin/agent.py``. Top of the import graph: it imports ``serve`` for
+the socket client and the default socket path, and nothing imports it back.
+``tool_call.py`` and ``run_chat.py`` are siblings, not dependencies.
+
+Constraints:
+    * The loop must echo the model's own call structure back, not the parsed
+      ``ToolCall`` objects. The chat template renders ``content`` *and*
+      ``tool_calls`` from the message dict, so it needs ``arguments`` as a dict
+      (it iterates them with ``|items``) while the wire format carries a JSON
+      string.
+    * The natural-language lead-in has to be truncated at ``<tool_call>``: the
+      template re-renders the calls from the structure, and keeping the raw tags
+      in ``content`` would render every call twice.
+    * Every turn is one request/response on the socket; this client holds no
+      engine state, so it can be killed between rounds without leaking a
+      sequence.
 """
 
 from __future__ import annotations
@@ -20,11 +37,26 @@ from pathlib import Path
 
 import serve
 
-#: Follow serve.py's default, which is $ENGINE_SOCK-aware.
+#: ``serve.SOCK`` already resolves ``$ENGINE_SOCK``, so reusing it keeps the
+#: agent and the server on one socket default instead of two that can drift.
 SOCK = serve.SOCK
 
 
 def _builtin(name: str, args: dict):
+    """Stand-in executor so the loop has something to call on a fresh checkout.
+
+    It is deliberately trivial: it exists to show the loop's shape, not to be a
+    useful tool, and ``--exec`` replaces it.
+
+    Args:
+        name: Tool name the model asked for.
+        args: Parsed arguments for that tool.
+
+    Returns:
+        A JSON-serialisable result, or an ``{"error": ...}`` dict for an unknown
+        name -- an error the model can read and recover from beats an exception
+        that ends the loop.
+    """
     if name == "get_weather":
         return {"city": args.get("city"), "temp": 24,
                 "unit": args.get("unit", "celsius"), "desc": "晴"}
@@ -34,6 +66,18 @@ def _builtin(name: str, args: dict):
 
 
 def _load_executor(path: str):
+    """Import a user tool module and hand back its ``execute`` function.
+
+    Loaded by path rather than by module name: the file is an arbitrary script
+    the user points at, so it is not on ``sys.path``.
+
+    Args:
+        path: Python file exposing ``execute(name, args)``.
+
+    Returns:
+        The module's ``execute`` callable, unwrapped so the loop's call site
+        does not care where it came from.
+    """
     spec = importlib.util.spec_from_file_location("agent_tools", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -41,6 +85,15 @@ def _load_executor(path: str):
 
 
 def main() -> None:
+    """Run the round loop: ask the server, execute the calls, feed results back.
+
+    The budget is a round count, not a token count: each round is one full
+    assistant turn plus its tool results, and a model that keeps calling tools
+    has to be stopped by something.
+
+    Raises:
+        OSError: No server is listening on ``--sock``; start ``serve.py`` first.
+    """
     ap = argparse.ArgumentParser()
     ap.add_argument("--sock", default=SOCK)
     ap.add_argument("--user", required=True)
@@ -70,9 +123,11 @@ def main() -> None:
         calls = r.get("tool_calls") or []
         if not calls:
             break
-        # the template renders ``content`` *and* ``tool_calls``, so keep only the
-        # natural-language lead-in here and let the calls render from the structure.
-        # ``arguments`` must be a dict: the template iterates it with ``|items``.
+
+        # The template renders ``content`` *and* ``tool_calls``, so only the
+        # natural-language lead-in stays in ``content`` and the calls render from
+        # the structure. ``arguments`` must be a dict: the template iterates it
+        # with ``|items``.
         lead = r["text"].split("<tool_call>")[0].strip()
         tcs = [{"function": {"name": c["function"]["name"],
                              "arguments": json.loads(c["function"]["arguments"])}}

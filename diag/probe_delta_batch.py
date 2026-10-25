@@ -1,23 +1,43 @@
 """Parity + timing probe for the batched linear-attn kernels.
 
-Three batched kernels replace the per-row loops of the phase-1 decode path:
+Answers one question before the batched kernels are allowed into the decode
+path: does batching preserve the recurrent state bit-for-bit, and what does it
+buy per step? Three batched kernels replace the per-row loops of the phase-1
+decode path:
 
   conv1d_silu_batch   depthwise causal conv1d (kernel 4) + SiLU
   delta_prologue_batch q/k L2 norm + head expand + beta/g
   delta_batch         gated-delta-rule state update
 
-A row of each must reproduce the matching single-row kernel, and the fp32
-recurrent state must end up identical (the update is the same formula in the
-same order, so bit equality is expected).  Shapes are the real Qwen3.5-4B
-linear-attn shapes: nk=16, nv=32, dk=dv=128, conv_dim=8192, kernel=4.
+Read the output in two parts. In the parity table, ``exact 1.0000`` and ``OK``
+mean the batched row reproduced the single-row kernel exactly; ``BAD`` means the
+row diverged and the kernel must not be shipped — the fp32 recurrent state is
+updated with the same formula in the same order, so bit equality is the
+requirement, not a happy accident. In the latency table, ``batch us`` against
+``loop us`` is the per-step saving; a speedup at or below 1.00x means the batch
+kernel is launch-bound at that B and the loop should stay.
 
-Run from the engine root on the DCU container (GPU lock!)::
+Run inside the container from the engine root, holding the GPU lock so the
+timing rows are not stolen by another tenant::
 
     flock /root/private_data/gpu.lock -c \
       'cd /root/private_data/engine_kernels && export ... PYTHONPATH=$PWD && \
        python3 diag/probe_delta_batch.py'
 
-``--iters N`` changes the timing loop count.
+``--iters N`` changes the timing loop count; it does not affect parity.
+
+Module: ``coffin/diag``. Standalone probe: imports ``hip_ops`` and the kernels
+under test, and nothing under ``coffin/`` imports it.
+
+Constraints:
+    * The shapes are the production ones (nk=16, nv=32, dk=dv=128, conv_dim=8192,
+      kernel=4), so a shape-dependent indexing bug cannot hide behind a toy case.
+    * Parity is judged by bit equality, never by a tolerance. A loose threshold
+      would pass a kernel whose rounding drifts the state over a long context.
+    * The timing loop mutates the state it times and is expected to; only the
+      parity pass reads the result. Do not merge the two.
+    * ``flock`` is not optional: a co-tenant on the DCU invalidates every microsecond
+      in the latency table.
 """
 
 from __future__ import annotations
@@ -36,6 +56,22 @@ ITERS = 200
 
 
 def make_conv(B: int, seed: int = 1):
+    """Build one batch of conv1d_silu inputs with the production shapes and scales.
+
+    Args:
+        B: Batch size, the row count under test.
+        seed: Seed for the torch RNG. Fixed so the parity pass and the timing
+            pass see the same data, and so a divergence is reproducible.
+
+    Returns:
+        ``(w, x, state, out)``: weight ``[conv_dim, 4]``, bf16 input
+        ``[B, conv_dim]``, fp32 rolling state ``[B, conv_dim, 3]`` and a
+        preallocated fp32 output ``[B, conv_dim]``.
+
+    The weights are scaled by 0.1 and the input by 0.5 so the SiLU stays in its
+    non-saturated range; larger draws would push the comparison into the tail
+    where bf16 rounding dominates and bit equality could never hold.
+    """
     torch.manual_seed(seed)
     w = torch.randn(CONV_DIM, 4, dtype=torch.float32, device="cuda") * 0.1
     x = (torch.randn(B, CONV_DIM, dtype=torch.float32, device="cuda") * 0.5).bfloat16()
@@ -45,6 +81,21 @@ def make_conv(B: int, seed: int = 1):
 
 
 def make_prologue(B: int, seed: int = 2):
+    """Build one batch of delta_prologue inputs, including the five outputs.
+
+    Args:
+        B: Batch size.
+        seed: Torch RNG seed, fixed for the same reason as ``make_conv``.
+
+    Returns:
+        ``(q, k, v, b, a, neg_expA, dt_bias, out, qscale)``. ``out`` is a list of
+        five preallocated buffers in kernel order: ``q_pro``, ``k_pro``,
+        ``v_pro``, ``beta``, ``g``.
+
+    ``b`` and ``a`` stay bf16 because the real gate path hands them over in bf16,
+    and ``neg_expA`` is forced strictly negative so the decay term is always in
+    range; a positive value would exercise a branch production never takes.
+    """
     torch.manual_seed(seed)
     q = torch.randn(B, NK, DK, dtype=torch.float32, device="cuda")
     k = torch.randn(B, NK, DK, dtype=torch.float32, device="cuda")
@@ -63,6 +114,21 @@ def make_prologue(B: int, seed: int = 2):
 
 
 def make_delta(B: int, seed: int = 3):
+    """Build one batch of delta_batch inputs with a non-singular recurrent state.
+
+    Args:
+        B: Batch size.
+        seed: Torch RNG seed, fixed for reproducibility.
+
+    Returns:
+        ``(q, k, v, beta, g, st, out)``. ``st`` is the fp32 state
+        ``[B, NV, DK, DV]`` that the parity pass clones and compares; ``out`` is
+        the preallocated ``[B, NV, DV]`` result.
+
+    ``beta`` is offset positive and ``g`` kept small and negative so the
+    gated-delta update does not collapse to zero or diverge, which would make a
+    broken kernel look bit-identical to the reference.
+    """
     torch.manual_seed(seed)
     q = torch.randn(B, NV, DK, dtype=torch.float32, device="cuda") * 0.1
     k = torch.randn(B, NV, DK, dtype=torch.float32, device="cuda") * 0.1
@@ -74,8 +140,21 @@ def make_delta(B: int, seed: int = 3):
     return q, k, v, beta, g, st, out
 
 
-# Reference implementations that call the single-row kernels.
+# Reference implementations that call the single-row kernels. These are the
+# oracle: a batched kernel is correct only when it matches them bit for bit.
 def conv_ref(w, x, state, out):
+    """Run conv1d_silu one row at a time to produce the expected result.
+
+    Args:
+        w: Shared conv weight ``[conv_dim, 4]``.
+        x: Input rows ``[B, conv_dim]``, bf16.
+        state: Rolling state ``[B, conv_dim, 3]``; updated in place, so the
+            caller passes a clone.
+        out: Preallocated output ``[B, conv_dim]``.
+
+    Returns:
+        A new tensor holding the row-by-row reference output.
+    """
     B = x.shape[0]
     ref = torch.empty_like(out)
     for b in range(B):
@@ -84,6 +163,20 @@ def conv_ref(w, x, state, out):
 
 
 def prologue_ref(args):
+    """Run delta_prologue one row at a time to produce the expected result.
+
+    Args:
+        args: The tuple from ``make_prologue``. Its ``out`` list is only used for
+            shape and dtype; the reference writes fresh buffers.
+
+    Returns:
+        A list of five reference tensors matching ``q_pro``, ``k_pro``,
+        ``v_pro``, ``beta``, ``g``.
+
+    Each row is passed ``.contiguous()`` because the single-row kernel takes a
+    packed row; the batched kernel is expected to handle strided slices itself,
+    which the strided case at the end of ``main`` verifies.
+    """
     q, k, v, b_, a_, neg_expA, dt_bias, out, qscale = args
     B = q.shape[0]
     ref = [torch.empty_like(t) for t in out]
@@ -97,6 +190,22 @@ def prologue_ref(args):
 
 
 def delta_ref(q, k, v, beta, g, st, out):
+    """Run delta one row at a time to produce the expected output and state.
+
+    Args:
+        q: Queries ``[B, NV, DK]``.
+        k: Keys ``[B, NV, DK]``.
+        v: Values ``[B, NV, DV]``.
+        beta: Gate ``[B, NV]``.
+        g: Log decay ``[B, NV]``.
+        st: Recurrent state ``[B, NV, DK, DV]``, mutated in place.
+        out: Preallocated output ``[B, NV, DV]``.
+
+    Returns:
+        ``(ref_out, st_ref)``. The state is returned explicitly because the
+        update is in-place: comparing only the output would miss a kernel that
+        computes the right row and stores the wrong state.
+    """
     B = q.shape[0]
     ref = torch.empty_like(out)
     st_ref = st.clone()
@@ -107,11 +216,32 @@ def delta_ref(q, k, v, beta, g, st, out):
 
 # The same operations through the batched entry points.
 def conv_batch(w, x, state, out):
+    """Dispatch conv1d_silu_batch and return the output buffer.
+
+    Args:
+        w: Shared conv weight ``[conv_dim, 4]``.
+        x: Input rows ``[B, conv_dim]``.
+        state: Rolling state ``[B, conv_dim, 3]``, updated in place.
+        out: Preallocated output ``[B, conv_dim]``.
+
+    Returns:
+        ``out``, returned so the caller can hand it straight to ``report``.
+    """
     hip_ops.conv1d_silu_batch(w, x, state, out)
     return out
 
 
 def prologue_batch(args):
+    """Dispatch delta_prologue_batch over the whole batch.
+
+    Args:
+        args: The tuple from ``make_prologue``; its ``out`` buffers are written
+            in place.
+
+    Returns:
+        The list of five output buffers, in the same order as ``prologue_ref``
+        so the two can be zipped.
+    """
     q, k, v, b_, a_, neg_expA, dt_bias, out, qscale = args
     hip_ops.delta_prologue_batch(q, k, v, b_, a_, neg_expA, dt_bias,
                                  out[0], out[1], out[2], out[3], out[4],
@@ -120,11 +250,43 @@ def prologue_batch(args):
 
 
 def delta_batch(q, k, v, beta, g, st, out):
+    """Dispatch delta_batch and return the output buffer.
+
+    Args:
+        q: Queries ``[B, NV, DK]``.
+        k: Keys ``[B, NV, DK]``.
+        v: Values ``[B, NV, DV]``.
+        beta: Gate ``[B, NV]``.
+        g: Log decay ``[B, NV]``.
+        st: Recurrent state ``[B, NV, DK, DV]``, updated in place.
+        out: Preallocated output ``[B, NV, DV]``.
+
+    Returns:
+        ``out``. The caller compares ``st`` separately, since the state is
+        mutated in place.
+    """
     hip_ops.delta_batch(q, k, v, beta, g, st, out)
     return out
 
 
 def bench(fn, iters: int = ITERS):
+    """Time ``fn`` with CUDA events and return the best per-call cost in us.
+
+    Args:
+        fn: Zero-argument callable to time.
+        iters: Calls per timed region. The per-call figure is the elapsed time
+            divided by this count, so launch overhead is amortised but the loop
+            itself stays dominated by real work.
+
+    Returns:
+        Fastest of five timed regions, in microseconds. The minimum rather than
+        the mean: a co-tenant's burst can only ever add time, so the best region
+        is the closest estimate of the kernel's own cost.
+
+    Launch overhead dominates these kernels at small B, which is why the result
+    is reported in microseconds and compared against a row-by-row loop rather
+    than against a theoretical roof.
+    """
     for _ in range(20):
         fn()
     torch.cuda.synchronize()
@@ -142,6 +304,22 @@ def bench(fn, iters: int = ITERS):
 
 
 def errs(got, ref):
+    """Measure the three parity statistics for one output tensor.
+
+    Args:
+        got: Output produced by the batched kernel.
+        ref: Output produced by the single-row oracle.
+
+    Returns:
+        ``(max_abs, max_rel, exact)``: largest absolute difference, that
+        difference relative to the reference's own peak magnitude (so a caller
+        sees whether the error is significant at this output's scale), and the
+        fraction of elements that match bit for bit.
+
+    The reference peak is clamped away from zero because an all-zero reference
+    row would otherwise produce a division by zero instead of the exact-1.0
+    answer it deserves.
+    """
     d = (got.float() - ref.float()).abs()
     denom = ref.float().abs().max().clamp_min(1e-30)
     exact = (got == ref).float().mean().item()
@@ -149,6 +327,18 @@ def errs(got, ref):
 
 
 def report(name, got, ref):
+    """Print one parity row and return whether it is bit-identical.
+
+    Args:
+        name: Row label, e.g. ``q_pro`` or ``state``.
+        got: Batched-kernel output.
+        ref: Single-row oracle output.
+
+    Returns:
+        ``True`` when every element matches exactly. ``main`` ANDs these into
+        ``all_ok`` and uses it as the process exit code, so a single ``BAD`` row
+        fails the run rather than being scrolled past in a table.
+    """
     mx, rel, exact = errs(got, ref)
     tag = "OK " if exact == 1.0 else "BAD"
     print(f"  {name:<34} max_abs {mx:>9.3e}  max_rel {rel:>9.3e}  "
@@ -157,6 +347,13 @@ def report(name, got, ref):
 
 
 def main() -> int:
+    """Run the parity sweep at B in (1, 2, 4, 8), then the strided case, then the timings.
+
+    Returns:
+        ``0`` when every parity row is bit-identical, ``1`` when any row differs
+        or the HIP extension is unavailable. The exit code is the gate: a
+        non-zero result means the batched kernels must not be used.
+    """
     global ITERS
     if "--iters" in sys.argv:
         ITERS = int(sys.argv[sys.argv.index("--iters") + 1])
@@ -193,7 +390,9 @@ def main() -> int:
         all_ok &= report("state", st, st_ref)
 
     # strided prologue inputs: in the model q/k/v are column slices of the
-    # [B, conv_dim] conv output (row pitch conv_dim, not packed).
+    # [B, conv_dim] conv output (row pitch conv_dim, not packed). This is the
+    # layout the batched kernel sees in production, so a packed-only kernel
+    # would pass every row above and still corrupt the model.
     B = 4
     torch.manual_seed(9)
     qkv = torch.randn(B, CONV_DIM, dtype=torch.float32, device="cuda")
@@ -227,6 +426,7 @@ def main() -> int:
         ref_out = torch.empty_like(out)
 
         def conv_loop():
+            """Run the row-by-row conv1d_silu loop this kernel replaces, for timing."""
             for i in range(B):
                 hip_ops.conv1d_silu(w, x[i], state[i], ref_out[i])
 
@@ -239,6 +439,7 @@ def main() -> int:
         bq, kq, vq, bb, aa, ne, db, oq, qs = args
 
         def prologue_loop():
+            """Run the row-by-row delta_prologue loop this kernel replaces, for timing."""
             for i in range(B):
                 hip_ops.delta_prologue(bq[i], kq[i], vq[i], bb[i], aa[i], ne, db,
                                        refq[0][i], refq[1][i], refq[2][i],
@@ -254,6 +455,7 @@ def main() -> int:
         out_loop = torch.empty_like(out)
 
         def delta_loop():
+            """Run the row-by-row delta loop this kernel replaces, for timing."""
             # states diverge across iterations; timing only
             for i in range(B):
                 hip_ops.delta(q[i], k[i], v[i], beta[i], g[i], st_loop[i],

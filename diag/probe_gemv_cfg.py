@@ -2,6 +2,15 @@
 shapes, through the production module. This is the data behind GEMV._HIP_CFGS.
 
 Run:  python probe_gemv_cfg.py
+
+Module: ``coffin/diag``. Measures the launch configs that ``ops/gemv.GEMV``
+picks from at load time, so it runs the production module rather than a copy.
+
+Constraints:
+    * This is the data behind ``GEMV._HIP_CFGS``; re-run it before changing that
+      table, never guess a config.
+    * One shape at a time: the fastest (rows-per-warp, unroll) changes with N, K
+      and M, so an averaged score would pick a config that is bad everywhere.
 """
 
 from __future__ import annotations

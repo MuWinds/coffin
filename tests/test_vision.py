@@ -16,6 +16,16 @@ Run either way::
     PYTHONPATH=coffin python -m unittest coffin/tests/test_vision.py
     # in the container, inside the engine dir:
     python3 -m unittest tests.test_vision -v
+
+Module: ``coffin/tests``. Split by device: the tokeniser/processor and mRoPE
+checks run anywhere, the tower forward needs a DCU and the checkpoint and is
+skipped without them.
+
+Constraints:
+    * Tolerances are 1-ULP-class where the maths is exact and looser only across a
+      dtype change; widening one to make a case pass hides a real regression.
+    * The shared model fixture is closed between weight formats, because two
+      copies do not fit on the card at once.
 """
 
 from __future__ import annotations
@@ -62,9 +72,7 @@ V = _vision_module()
 VisionTower = V.VisionTower
 
 
-# --------------------------------------------------------------------------------------
 # inline reference: the formulas, not the engine
-# --------------------------------------------------------------------------------------
 def ref_pos_embed(table, h, w, merge, t=1):
     """``fast_pos_embed_interpolate``: 48x48 (side=sqrt(n_pos)) -> per-image grid."""
     side = int(round(table.shape[0] ** 0.5))
@@ -171,9 +179,7 @@ def ref_forward(sd, cfg, pixel_values, grid_thw):
     return F.linear(y, sd["merger.linear_fc2.weight"], sd["merger.linear_fc2.bias"])
 
 
-# --------------------------------------------------------------------------------------
 # fixtures
-# --------------------------------------------------------------------------------------
 def tiny_cfg(**over) -> dict:
     cfg = {"depth": 2, "hidden_size": 64, "intermediate_size": 128, "num_heads": 4,
            "in_channels": 3, "patch_size": 2, "spatial_merge_size": 2,
@@ -250,9 +256,7 @@ def blocked_pixels(cfg, grid_thw):
     return torch.randn(int(torch.as_tensor(grid_thw).prod(-1).sum()), patch_dim(cfg))
 
 
-# --------------------------------------------------------------------------------------
 # CPU: the formulas
-# --------------------------------------------------------------------------------------
 class PosEmbedTest(unittest.TestCase):
     """The learned 2304=48x48 table resampling (the silent-failure #1)."""
 
@@ -540,9 +544,7 @@ class VisionQuantPolicyTest(unittest.TestCase):
         self.assertIsInstance(tower.patch_w, torch.Tensor)
 
 
-# --------------------------------------------------------------------------------------
 # DCU + checkpoint: the real weights, against the transformers oracle
-# --------------------------------------------------------------------------------------
 #: Reviewed gates (VISION.md §7).  The primary gate is fp32-vs-fp32, because that is
 #: the only comparison that isolates *formula* error: 24 layers of this tower drive
 #: activations to ~1e3, so bf16 rounds ~8e-3 per step and compounds -- a bf16 oracle

@@ -1,21 +1,37 @@
 """Batched weight reads for the static-batch decode path.
 
-Stage 1 batches exactly one thing: the projections.  A decode step is bound by
+Stage 1 batches exactly one thing: the projections. A decode step is bound by
 reading the weights (4 GB of int8 per step, ~700 GB/s), so applying one weight
 row to B input vectors costs almost the same as applying it to one -- that is
 the whole win of a static batch.
 
 ``GEMV.prefill`` already has the small-M path (``gemv_m``), but it indexes it by
-the autotuned per-M unroll.  For the batched decode we instead replay the
-unroll the *single-stream* kernel chose for that shape, because
-``gemv_kernel`` and ``gemv_m_kernel`` accumulate each output row in exactly the
-same order for the same ``U`` (same per-lane 8 accumulators, same
-``32*U`` K-stride, same warp reduction).  Matching ``U`` therefore keeps every
-row bit-identical to a solo decode -- no bf16 rounding drift, which a different
-unroll would introduce at a handful of values.  The M=8 kernel tops out at U=2,
-so a shape whose single-stream unroll is U=4 is run as two M=4 calls (U=4
-exists there); that only halves the weight-read saving for those projections
-instead of changing the numbers.
+the autotuned per-M unroll. For the batched decode we instead replay the
+unroll the *single-stream* kernel chose for that shape, because ``gemv_kernel``
+and ``gemv_m_kernel`` accumulate each output row in exactly the same order for
+the same ``U`` (same per-lane 8 accumulators, same ``32*U`` K-stride, same warp
+reduction). Matching ``U`` therefore keeps every row bit-identical to a solo
+decode -- no bf16 rounding drift, which a different unroll would introduce at a
+handful of values. The M=8 kernel tops out at U=2, so a shape whose single-stream
+unroll is U=4 is run as two M=4 calls (U=4 exists there); that only halves the
+weight-read saving for those projections instead of changing the numbers.
+
+Module: ``coffin/models/qwen35``. Depends on ``ops/gemv`` and ``hip_ops``; used
+by ``blocks.py`` (every projection in the static-batch path) and by
+``full_attn``/``mtp`` for the verify widths.
+
+Constraints:
+    * Bit-identity with solo decode is the contract: the static batch must
+      produce the same numbers as one-at-a-time decode, or a batched request and
+      an unbatched one disagree. Any new kernel path here has to keep the same
+      accumulation order, or be opt-in behind an env flag.
+    * Every optional kernel is probed with ``hasattr``: a tree built against an
+      older extension must keep working, falling back to the prefill/GEMM path.
+    * ``_M_US`` must stay in sync with the instantiated unrolls in
+      ``kernels/gemv.cu``; a mismatch becomes a wrong-tile launch error rather
+      than a Python exception.
+    * ``WIDE_STATS`` is mutated without locking, which is fine because the engine
+      drives all projection calls single-threaded from ``llm_engine``.
 """
 
 from __future__ import annotations
@@ -40,7 +56,17 @@ _FAST_GEMV = os.environ.get("Q35_FAST_GEMV") == "1"
 
 
 def _fast_project(proj: GEMV, x: torch.Tensor) -> torch.Tensor | None:
-    """dot2 projection for the batched decode widths, or None when unavailable."""
+    """Try the opt-in dot2 projection for a batched decode width.
+
+    Args:
+        proj: The projection to apply.
+        x: Activations, ``[M, K]``, bf16.
+
+    Returns:
+        ``[M, N]`` from the dot2 kernel, or ``None`` when the env flag is off, the
+        extension or symbol is missing, or the shape is outside what it
+        implements -- in which case the caller takes the bit-exact path.
+    """
     if not (_FAST_GEMV and hip_ops.available() and proj.method == "hip"
             and proj.q is not None and 2 <= x.shape[0] <= 32
             and x.shape[1] == proj.K):
@@ -53,7 +79,17 @@ def _fast_project(proj: GEMV, x: torch.Tensor) -> torch.Tensor | None:
 
 
 def _project(proj: GEMV, x: torch.Tensor) -> torch.Tensor:
-    """``x`` [M, K] bf16 -> [M, N] bf16, bit-identical per row to ``proj(x[r])``."""
+    """Apply one projection to a batch of rows, bit-identically to solo calls.
+
+    Args:
+        proj: The projection to apply.
+        x: Activations, ``[M, K]``, bf16.
+
+    Returns:
+        ``[M, N]`` where row ``r`` equals ``proj(x[r])`` exactly. Falls back to
+        ``proj.prefill`` for shapes the batched kernel does not instantiate and
+        for non-HIP builds.
+    """
     M = x.shape[0]
     if M == 1:
         # Bucket 1 is a one-row graph: use the plain single-stream GEMV (the
@@ -78,11 +114,17 @@ def _project(proj: GEMV, x: torch.Tensor) -> torch.Tensor:
 
 
 def batch_proj(proj, x: torch.Tensor):
-    """Batched projection: ``[M, K] -> [M, N]`` (or a list for a fused group).
+    """Batched projection for the static-batch decode widths.
 
-    ``proj`` is a :class:`~ops.gemv.GEMV`, a :class:`~ops.gemv.GEMVGroup` (the
-    fused ``qkv`` / ``in_proj_qkv/z/b/a`` / ``gate_up`` reads) or a
-    :class:`~ops.embed.TiedEmbedding`'s inner GEMV.
+    Args:
+        proj: A :class:`~ops.gemv.GEMV`, a :class:`~ops.gemv.GEMVGroup` (the fused
+            ``qkv`` / ``in_proj_qkv/z/b/a`` / ``gate_up`` reads) or a
+            :class:`~ops.embed.TiedEmbedding`'s inner GEMV.
+        x: Activations, ``[M, K]``, bf16.
+
+    Returns:
+        ``[M, N]``, or a list of per-weight ``[M, N_i]`` tensors when ``proj`` is
+        a fused group, split in the order the weights were concatenated.
     """
     if isinstance(proj, GEMVGroup):
         return _project(proj.g, x).split(proj.sizes, dim=1)
@@ -97,7 +139,15 @@ _WIDE_BF16 = ("gemv_wide", "gemv_bf16_wide", "gemv_m16", "gemv_bf16_mM")
 
 
 def wide_kernel_ready() -> bool:
-    """True when the extension has a wide-M batched GEMV (one pass for M up to 32)."""
+    """Report whether a wide-M batched GEMV (one pass for M up to 32) is loaded.
+
+    Callers use this to choose the one-forward verify at capture time: without the
+    kernel that path is still correct but reads the int8 weights through a
+    dequantising GEMM, which is why it is worth checking before capturing.
+
+    Returns:
+        ``True`` when any known wide-M symbol exists on ``hip_ops``.
+    """
     return any(hasattr(hip_ops, name) for name in _WIDE_W8 + _WIDE_BF16)
 
 
@@ -107,7 +157,12 @@ _MULTI_Q = ("attn_paged_multi_q", "attn_paged_multi_q_batch", "attn_paged_multi_
 
 
 def multi_q_ready() -> bool:
-    """True when the extension has the multi-query paged attention kernel."""
+    """Report whether the multi-query paged attention kernel is loaded.
+
+    Returns:
+        ``True`` when any known symbol exists on ``hip_ops``; ``False`` means
+        verify must fall back to the per-query attention path.
+    """
     return any(hasattr(hip_ops, name) for name in _MULTI_Q)
 
 
@@ -131,6 +186,12 @@ _SPLIT8 = _os.environ.get("Q35_WIDE_SPLIT8", "1") != "0"
 
 
 def _count(kind: str) -> None:
+    """Record that ``wide_proj`` took the ``kind`` path, for later attribution.
+
+    Args:
+        kind: Path label, one of "dot2" / "wide" / "wide_bf16" / "smallM" /
+            "split8" / "prefill"; see :data:`WIDE_STATS` for how it is read.
+    """
     WIDE_STATS[kind] = WIDE_STATS.get(kind, 0) + 1
 
 
@@ -140,8 +201,18 @@ def wide_proj(proj, x: torch.Tensor):
     Uses the task-12 wide-M GEMV when it exists (one weight read for all rows);
     otherwise falls back to ``GEMV.prefill`` (correct, but on int8 weights that
     materialises the fp16 weights, which is why the one-forward verify is slow
-    until the kernel lands).  Like :func:`batch_proj` it accepts a
+    until the kernel lands). Like :func:`batch_proj` it accepts a
     :class:`~ops.gemv.GEMVGroup` and returns a list for it.
+
+    Args:
+        proj: A :class:`~ops.gemv.GEMV` or :class:`~ops.gemv.GEMVGroup`.
+        x: Activations, ``[M, K]``, bf16. ``M`` need not be a power of two, which
+            is the difference from :func:`batch_proj`.
+
+    Returns:
+        ``[M, N]``, or a list of per-weight tensors for a fused group. Rows carry
+        no bit-identity guarantee with solo decode when a wide kernel is used;
+        :data:`WIDE_STATS` records which path ran.
     """
     if isinstance(proj, GEMVGroup):
         return wide_proj(proj.g, x).split(proj.sizes, dim=1)

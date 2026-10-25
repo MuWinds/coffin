@@ -1,11 +1,29 @@
-"""OpenAI-compatible HTTP API in front of the resident engine.
+"""OpenAI-compatible HTTP/SSE face over the engine's unix-socket protocol.
 
-``serve.py`` is a unix-socket JSON server; this is the HTTP/SSE skin that OpenAI
-clients (openai-python, LangChain, Open WebUI, ``curl``) expect.  It is
-deliberately **stdlib-only** so it adds nothing to install inside the container,
-and it never imports torch: it is a pure client of the socket protocol.  The
-served model id and architecture are read from the engine (``ping``), so this
-file names no checkpoint either.
+Module: ``coffin`` top level, a pure client of ``serve.py``. It imports neither
+``torch`` nor any engine module, so the HTTP skin can run anywhere the socket is
+reachable; the served model id and architecture are read from the engine's
+``ping`` reply, which is why this file names no checkpoint.
+
+Constraints:
+    * Standard library only. Every engine dependency lives behind the socket, so
+      a deployment installs nothing to get an HTTP endpoint.
+    * Requests are serialized by the engine, not here: this file opens one
+      connection per request and adds no lock of its own (the engine's scheduler
+      is what batches overlapping requests).
+    * The wire shape is fixed by the OpenAI definition, not by this codebase:
+      ``chat.completion`` / ``chat.completion.chunk`` objects, the
+      ``ChatCompletionToolChoiceOption`` enum, ``tool_calls`` fragmented per
+      index, ``stream_options.include_usage``, and SSE framing terminated by
+      ``data: [DONE]``. Clients parse that literally, so a field's position and
+      name cannot be simplified.
+    * Image parts are only *cheaply* checked here (data-URL shape, decoded byte
+      counts, image count) to answer 400 before a byte reaches the engine. The
+      expensive validation -- PIL decode, decompression-bomb size, the processor's
+      token expansion -- belongs to ``serve.py``, which owns those libraries.
+    * Nothing may be written to an SSE response before the engine's ``start``
+      line has arrived: the engine validates an image request first and can still
+      reject it, and a committed 200 cannot become the 400 the client needs.
 
 Run it next to the engine:
 
@@ -18,21 +36,14 @@ Endpoints:
     GET  /v1/models              the served model id (for client discovery)
     POST /v1/chat/completions    messages, tools, stream (SSE)
 
-Concurrency:
-The engine is **single-stream**: the decode step is one CUDA graph over one
-token and all the state (KV pool, position, recurrent states) belongs to the one
-sequence in flight (see NOTES.md §7).  Every engine call is therefore serialized
-behind one lock -- a second concurrent request waits its turn instead of
-corrupting the first one's state.  Batching is *not* emulated here.
-
 Streaming:
 ``stream: true`` maps onto the engine's ``chat_stream`` op (one reply line per
-token) and is re-emitted as ``chat.completion.chunk`` SSE events.  Two things are
+token) and is re-emitted as ``chat.completion.chunk`` SSE events. Two things are
 filtered on the way out:
 
 * the reasoning block -- with thinking on, the template opens ``<think>`` in the
   prompt, so the generated text starts inside the reasoning; content is held back
-  until ``</think>`` (the engine reports whether the prompt opened it).  If
+  until ``</think>`` (the engine reports whether the prompt opened it). If
   generation stops *inside* the block (``max_tokens`` before ``</think>``), the
   text is delivered as ``reasoning_content`` instead of being passed off as the
   answer;
@@ -40,11 +51,12 @@ filtered on the way out:
   parsed calls are delivered structured (OpenAI ``tool_calls``) in a final delta,
   so clients never see the XML.
 
-Known gaps (kept honest, not silently ignored): ``top_p`` / ``n`` / penalties /
-``stop`` are accepted and ignored (the engine samples with temperature only, and
-greedy when temperature is 0); a client that hangs up leaves the engine
-generating to the end (no cancel path in the socket protocol yet); ``max_tokens``
-beyond ``--max-seq`` is truncated by the engine rather than rejected here.
+Known gaps, kept honest rather than silently ignored: ``top_p`` / ``n`` /
+penalties / ``stop`` are accepted and ignored (the engine samples with
+temperature only, and greedy when temperature is 0); a client that hangs up
+leaves the engine generating to the end (no cancel path in the socket protocol
+yet); ``max_tokens`` beyond ``--max-seq`` is truncated by the engine rather than
+rejected here.
 
 Tool calling follows the definition's ``ChatCompletionToolChoiceOption`` rather
 than only passing ``tools`` through: ``none`` drops the tools, ``auto`` (the
@@ -79,25 +91,23 @@ SOCK = os.environ.get("ENGINE_SOCK", "/tmp/qwen35.sock")
 TOOL_OPEN = "<tool_call>"
 STATE: dict = {}
 
-# ---------------------------------------------------------------------------
-# Image parts: what this process validates, and what it deliberately does not
-# ---------------------------------------------------------------------------
+# Image parts: what this process validates, and what it deliberately does not.
+#
 # This file is stdlib-only on purpose (no torch, no PIL) so the HTTP skin can run
-# anywhere the engine socket is reachable.  Everything here is therefore a *cheap*
+# anywhere the engine socket is reachable. Everything here is therefore a *cheap*
 # check -- the shape of the data URL, the decoded byte counts, the image count --
-# and it exists to answer 400 before a byte reaches the engine.  The expensive
+# and it exists to answer 400 before a byte reaches the engine. The expensive
 # checks (PIL decode, decompression-bomb size, the processor's token expansion)
 # belong to serve.py, which owns those libraries and re-validates authoritatively
 # against its own configured limits.
-#
-#: Decoded bytes of one image.  A 1 MP PNG is ~1-3 MB, so 8 MiB is generous and
+#: Decoded bytes of one image. A 1 MP PNG is ~1-3 MB, so 8 MiB is generous and
 #: still bounded; base64 inflates it 4/3 on the wire.
 MAX_IMAGE_BYTES = int(os.environ.get("ENGINE_MAX_IMAGE_BYTES", 8 * 1024 * 1024))
-#: Images per request.  Four 1 MP images are already ~4k image tokens.
+#: Images per request. Four 1 MP images are already ~4k image tokens.
 MAX_IMAGES = int(os.environ.get("ENGINE_MAX_IMAGES", 4))
 #: Base64 characters of all image parts of one request, before decoding.
 MAX_IMAGE_TOTAL_BYTES = int(os.environ.get("ENGINE_MAX_IMAGE_TOTAL_BYTES", 16 * 1024 * 1024))
-#: MIME types accepted on the data URL.  The processor decodes with PIL, so the
+#: MIME types accepted on the data URL. The processor decodes with PIL, so the
 #: set is "what PIL opens reliably and the model was trained on".
 IMAGE_MIMES = ("image/png", "image/jpeg", "image/jpg", "image/webp", "image/bmp",
                "image/gif")
@@ -106,7 +116,12 @@ _DATA_URL = re.compile(r"^data:(?P<mime>[-\w.+]+/[-\w.+]+)?(?P<params>[^,]*),"
 
 
 class ImagePartError(ValueError):
-    """A client-supplied image part this process refuses (-> HTTP 400)."""
+    """A client-supplied image part this process refuses.
+
+    Subclasses ``ValueError`` so a caller that only catches broad request errors
+    still handles it; the handler maps it to HTTP 400, because every trigger is
+    something the client sent wrong and can fix by rewriting the request.
+    """
 
 
 def _decode_data_url(url: str) -> tuple[bytes, str]:
@@ -115,6 +130,21 @@ def _decode_data_url(url: str) -> tuple[bytes, str]:
     Only base64 data URLs are accepted: v1 does not fetch ``http(s)`` URLs (the
     container has no egress and a fetch would be an SSRF surface), and a URL that
     would make the *server* do the I/O is exactly the thing a caller cannot audit.
+
+    Args:
+        url: The ``image_url.url`` value as the client sent it.
+
+    Returns:
+        ``(raw, mime)``: the decoded bytes and the normalised media type. There
+        is no need to re-encode here beyond what the engine expects -- the caller
+        base64s the raw bytes for the socket request.
+
+    Raises:
+        ImagePartError: The value is empty, is not a ``data:`` URL (a remote
+            ``http(s)`` URL names the supported form in the message), carries an
+            unsupported media type, is not base64, decodes to nothing, or exceeds
+            ``MAX_IMAGE_BYTES``. All are request errors: report 400 and let the
+            client resend a smaller or correctly encoded image.
     """
     if not isinstance(url, str) or not url:
         raise ImagePartError("image_url.url must be a non-empty string")
@@ -156,22 +186,31 @@ def _split_parts(content, budget: dict) -> tuple[object, list[dict]]:
     """Split one message's ``content`` into (template-safe content, image payloads).
 
     An OpenAI vision message is a *parts* array in which one part carries the
-    image bytes and the rest carry text.  The checkpoint's chat template knows only
+    image bytes and the rest carry text. The checkpoint's chat template knows only
     two things: text, and a ``{"type": "image"}`` marker that it renders as
     ``<|vision_start|><|image_pad|><|vision_end|>`` (the placeholders the engine's
-    processor later expands to one token per visual patch).  So the image parts are
+    processor later expands to one token per visual patch). So the image parts are
     lifted out of the array -- their bytes become ``images[]`` on the engine
     request -- and replaced in place by that marker, which keeps the *order* of
     text and images exactly as the client wrote it.
 
-    ``budget`` is a mutable per-request dict (``{"images": n, "b64": chars}``) so
-    the count and total-size limits apply to the whole request, not per message.
-    ``b64`` counts the *data URL* characters the client sent (what has to travel
-    over the wire and be held in memory), not just the payload.
+    Args:
+        content: The message's ``content``: a string, a parts array, or ``None``.
+        budget: Mutable per-request accumulator ``{"images": n, "b64": chars}``, so
+            the limits apply to the whole request rather than per message. ``b64``
+            counts the *data URL* characters the client sent -- what travels over
+            the wire and is held in memory -- not just the payload.
 
-    Returns ``(content, images)``: ``content`` is the untouched value when the
-    message has no image part, which is what keeps the text-only request path
-    byte-for-byte what it was.
+    Returns:
+        ``(content, images)``. ``content`` is the untouched value when the message
+        has no image part, which is what keeps the text-only request path
+        byte-for-byte what it was.
+
+    Raises:
+        ImagePartError: A part is not an object, is a video or audio part (this
+            build cannot bound their token count), is an unknown type, carries no
+            usable ``image_url.url``, or the request is over its image count or
+            total-size budget. The handler turns it into 400.
     """
     if not isinstance(content, list):
         return content, []
@@ -211,8 +250,8 @@ def _split_parts(content, budget: dict) -> tuple[object, list[dict]]:
                 f"`{kind}` part has no `image_url.url`; send "
                 "{{\"type\": \"image_url\", \"image_url\": {{\"url\": "
                 "\"data:image/png;base64,...\"}}}}")
-        # Count and total-size limits are checked before the decode: a request that
-        # already has too many images should not pay to base64-decode one more.
+        # Checked before the decode: a request that already has too many images
+        # should not pay to base64-decode one more.
         if budget.get("images", 0) >= MAX_IMAGES:
             raise ImagePartError(
                 f"too many images: {MAX_IMAGES} per request is the limit")
@@ -232,14 +271,21 @@ def _split_parts(content, budget: dict) -> tuple[object, list[dict]]:
 def _split_messages(messages: list) -> tuple[list, list[dict], str | None]:
     """Pull every image out of a request's ``messages``.
 
-    ``-> (messages, images, error)``.  ``error`` is a human-readable 400 message,
-    or ``None``.  The three rules that cannot be deferred to the engine:
+    The three rules that cannot be deferred to the engine, because the engine
+    would surface them as an opaque failure:
 
     * a ``system`` message may not carry an image -- the template raises on it, so
-      the client would otherwise get an opaque 500 from a generation it cannot
-      debug;
-    * the per-request count/size budget (see ``_split_parts``);
+      the client would otherwise get a 500 from a generation it cannot debug;
+    * the per-request count and size budget (see ``_split_parts``);
     * an image part in a role whose content the template never renders as media.
+
+    Args:
+        messages: The request's raw ``messages`` array, unvalidated.
+
+    Returns:
+        ``(messages, images, error)``. ``error`` is a human-readable 400 message
+        or ``None``; when it is set the other two are empty. ``images`` are the
+        engine-request payloads (``{"b64", "mime"}``), in prompt order.
     """
     budget: dict = {"images": 0, "b64": 0}
     out: list = []
@@ -266,10 +312,10 @@ def _split_messages(messages: list) -> tuple[list, list[dict], str | None]:
                                 "image in a user or tool message")
             # ``tool`` IS accepted: an agent that calls a screenshot tool gets the
             # capture back as the tool result, and that is the single most common
-            # way images enter this server.  The template renders it exactly like a
-            # user image (vision_start/image_pad/vision_end inside the message), and
-            # the processor expands it in prompt order, so no special case is
-            # needed beyond collecting the payload here.
+            # way images enter this server. The template renders it exactly like a
+            # user image (vision_start/image_pad/vision_end inside the message),
+            # and the processor expands it in prompt order, so collecting the
+            # payload here is the only special case needed.
             images.extend(found)
         m["content"] = content
         out.append(m)
@@ -282,6 +328,10 @@ class EngineClient:
     Each request opens its own connection: the engine accepts connections
     concurrently and batches whatever requests are in flight, so a lock here
     would serialize exactly the work the batch scheduler is supposed to overlap.
+
+    The timeout is per socket, not per token stream: a long generation holds the
+    connection open for its whole duration, which is why the default is 900 s
+    rather than something that would cut a legitimate long answer.
     """
 
     def __init__(self, sock_path: str, timeout: float = 900.0) -> None:
@@ -289,6 +339,13 @@ class EngineClient:
         self.timeout = timeout
 
     def _open(self):
+        """Open one connection and its buffered reader.
+
+        Returns:
+            ``(socket, file)``; the caller closes both through ``_close``. The
+            reader is what turns ``readline`` into a proper line read -- reading
+            the socket directly could split a JSON line across two ``recv`` calls.
+        """
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(self.timeout)
         s.connect(self.sock_path)
@@ -296,6 +353,16 @@ class EngineClient:
 
     @staticmethod
     def _close(s, f) -> None:
+        """Close the socket and its file object, ignoring whatever already failed.
+
+        Both have to be attempted: closing the file object alone can leave the
+        descriptor open when the read side already errored, and the server leaks a
+        thread per leaked connection.
+
+        Args:
+            s: The socket returned by ``_open``.
+            f: The buffered reader paired with it.
+        """
         for c in (f, s):
             try:
                 c.close()
@@ -306,7 +373,23 @@ class EngineClient:
         s.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode())
 
     def call(self, req: dict) -> dict:
-        """One request, one reply."""
+        """One request, one reply.
+
+        Args:
+            req: The engine request dict; ``op`` selects the handler.
+
+        Returns:
+            The decoded reply dictionary. It may carry ``ok: False``; the caller
+            decides the HTTP status, because only it knows the context.
+
+        Raises:
+            RuntimeError: The engine closed the connection without a reply line.
+                The engine is down or restarting; the caller should map this to a
+                503 rather than a request error.
+            json.JSONDecodeError: The reply line was not JSON, which means the
+                socket speakers agree on nothing -- a version mismatch, not a
+                client problem.
+        """
         s, f = self._open()
         try:
             self._send(s, req)
@@ -318,7 +401,21 @@ class EngineClient:
             self._close(s, f)
 
     def stream(self, req: dict):
-        """Yield reply lines until the terminal one (``type: done`` / an error)."""
+        """Yield reply lines until the terminal one (``type: done`` / an error).
+
+        Args:
+            req: The engine request dict; this is the ``chat_stream`` op.
+
+        Yields:
+            Each decoded line in order: ``start``, one ``token`` per piece, then
+            ``done``. An error line is yielded too, then iteration stops.
+
+        Raises:
+            RuntimeError: The engine closed the connection before the terminal
+                line. The stream cannot be resumed; the caller closes the SSE
+                response and reports the failure into the log.
+            json.JSONDecodeError: A line was not JSON.
+        """
         s, f = self._open()
         try:
             self._send(s, req)
@@ -335,7 +432,17 @@ class EngineClient:
 
 
 def _text_of(content) -> str:
-    """Flatten OpenAI's string-or-parts content into the plain string the template wants."""
+    """Flatten OpenAI's string-or-parts content into the plain string the template wants.
+
+    Args:
+        content: A string, a parts array, ``None``, or anything else a client sent.
+
+    Returns:
+        The concatenated text. Image parts contribute nothing here -- the caller
+        only reaches this for a message with no image (see ``_template_content``).
+        A value that is neither a string nor a list is stringified rather than
+        dropped, so an odd client shape still renders something.
+    """
     if content is None:
         return ""
     if isinstance(content, str):
@@ -352,6 +459,15 @@ def _text_of(content) -> str:
 
 
 def _has_image_part(content) -> bool:
+    """Whether a ``content`` parts array carries an image marker.
+
+    Args:
+        content: The message's ``content``.
+
+    Returns:
+        ``True`` for a parts array with at least one image part. Drives the
+        string-vs-parts decision in ``_template_content``.
+    """
     return isinstance(content, list) and any(
         isinstance(p, dict) and p.get("type") in ("image", "image_url") for p in content)
 
@@ -359,12 +475,19 @@ def _has_image_part(content) -> bool:
 def _template_content(content):
     """What the chat template should receive for one message's ``content``.
 
-    Text-only content is flattened to a string (exactly as before, so a text-only
-    request renders byte-for-byte what it used to).  A message that carries an
-    image keeps its *parts array*, because that is the only shape the template
+    Text-only content is flattened to a string, exactly as before, so a text-only
+    request renders byte-for-byte what it used to. A message that carries an image
+    keeps its *parts array*, because that is the only shape the template
     understands for media: each ``{"type": "image"}`` marker becomes
     ``<|vision_start|><|image_pad|><|vision_end|>`` in place, preserving the
     interleaving of text and images the client wrote.
+
+    Args:
+        content: The message's ``content``.
+
+    Returns:
+        A plain string for text-only content, or a rewritten parts array for
+        content with an image.
     """
     if not _has_image_part(content):
         return _text_of(content)
@@ -398,6 +521,16 @@ def _norm_messages(messages: list) -> list[dict]:
 
     A parts array that carries images is *not* flattened: the template renders
     ``{"type": "image"}`` itself (see ``_template_content``).
+
+    Args:
+        messages: The request's messages, after ``_split_messages`` removed the
+            image payloads.
+
+    Returns:
+        The normalised messages in the template's expected shape. A non-dict entry
+        is dropped rather than raising, because a partial request is still worth
+        answering. The template also requires a user turn and a leading system
+        turn, so those are synthesised when the client left them out.
     """
     out: list[dict] = []
     for msg in messages:
@@ -454,6 +587,14 @@ def _max_tokens(body: dict) -> int:
     than "the whole window": the engine is single-stream, so an unbounded request
     that nobody is waiting for any more keeps every later request queued until it
     finishes on its own (measured: a 117 s generation with no client attached).
+
+    Args:
+        body: The request body.
+
+    Returns:
+        The budget in tokens. ``-1`` means "the whole window", and the engine
+        clamps it to the room the prompt leaves. An unparsable value falls through
+        to the next spelling rather than failing the request.
     """
     for key in ("max_completion_tokens", "max_tokens", "max_new_tokens"):
         val = body.get(key)
@@ -465,7 +606,6 @@ def _max_tokens(body: dict) -> int:
     return int(STATE.get("default_max_tokens", -1))
 
 
-
 def _thinking_flag(body: dict, default: bool) -> bool:
     """Does this request want the model's reasoning block?
 
@@ -473,6 +613,18 @@ def _thinking_flag(body: dict, default: bool) -> bool:
     ``enable_thinking`` (vLLM/Qwen), ``chat_template_kwargs.enable_thinking``,
     ``thinking`` as a bool/string/``{"type": "enabled"}``, and ``reasoning_effort``
     (anything but none/off, which is how the newer OpenAI-style agents ask).
+
+    The precedence is fixed by the order of the checks below: an explicit
+    ``enable_thinking`` or ``thinking`` wins over the ``reasoning_effort``
+    approximation, so setting both gives the specific field.
+
+    Args:
+        body: The request body.
+        default: The server-wide ``--enable-thinking`` choice, used when the
+            request says nothing.
+
+    Returns:
+        Whether the template should open the reasoning block.
     """
     for key in ("enable_thinking", "thinking"):
         val = body.get(key)
@@ -508,8 +660,18 @@ def _tool_plan(body: dict) -> tuple[list | None, str]:
     ``required`` is honoured by *forcing the opener*: the engine appends the
     template's call header to the prompt, so the turn can only continue as a call
     (a 4B model otherwise often answers in prose while tools are attached -- which
-    is exactly the reported symptom).  With a named choice the function name is
+    is exactly the reported symptom). With a named choice the function name is
     forced too.
+
+    Args:
+        body: The request body.
+
+    Returns:
+        ``(tools, opener)``. ``tools`` is ``None`` when the choice is ``none``, so
+        the template renders no tool schemas at all. ``opener`` is the template
+        text appended to the assistant header, empty when nothing is forced. An
+        unrecognised choice string is treated as ``auto``: that is what a client
+        means when it sends a value this build does not know.
     """
     tools = body.get("tools")
     legacy = body.get("functions")
@@ -531,7 +693,7 @@ def _tool_plan(body: dict) -> tuple[list | None, str]:
             return None, ""
         if mode in ("required", "any"):
             return tools, TOOL_OPEN + "\n"
-        return tools, ""                       # "auto" (and anything unrecognised)
+        return tools, ""                       # "auto", and anything unrecognised
     if isinstance(choice, dict):
         kind = str(choice.get("type") or "").lower()
         if kind == "none":
@@ -551,7 +713,16 @@ def _tool_plan(body: dict) -> tuple[list | None, str]:
 
 
 def _include_usage(body: dict) -> bool:
-    """``stream_options.include_usage``: one extra chunk with ``choices: []``."""
+    """``stream_options.include_usage``: one extra chunk with ``choices: []``.
+
+    Args:
+        body: The request body.
+
+    Returns:
+        Whether the client asked for the definition's separate usage chunk. It
+        is absent by default because the definition says usage is omitted unless
+        requested.
+    """
     opts = body.get("stream_options")
     return bool(isinstance(opts, dict) and opts.get("include_usage"))
 
@@ -562,16 +733,28 @@ class AnswerFilter:
     Two things are handled here and both are load-bearing for a thinking model:
 
     * the reasoning block -- with thinking on the *prompt* opens ``<think>``, so
-      the generated text starts inside it.  The reasoning is handed out as
+      the generated text starts inside it. The reasoning is handed out as
       ``reasoning_content`` deltas while it is being produced, and ``content``
-      starts only after ``</think>``.  (Dropping it, or replaying it at the end,
-      is what left an agent UI's thinking pane empty.)
+      starts only after ``</think>``. Dropping it, or replaying it at the end, is
+      what left an agent UI's thinking pane empty.
     * ``<tool_call>`` markup -- once it appears, content stops and the call is
       delivered structured instead; a partial marker is held back so it cannot
       leak, and ``finish`` releases that tail at end of stream.
+
+    Deliberately incremental: each ``push`` only scans the newly appended text,
+    so the filter costs O(tokens) rather than rescanning the whole answer.
     """
 
     def __init__(self, prompt_opens_think: bool, marker: str = TOOL_OPEN) -> None:
+        """Start a filter for one reply.
+
+        Args:
+            prompt_opens_think: Whether the rendered prompt already ended inside
+                an open ``<think>``, which the engine reports on its ``start``
+                line. When it did not, the whole answer is content from the first
+                token.
+            marker: The tool-call opener to cut content at.
+        """
         self.raw = ""
         self.marker = marker
         self.past_think = not prompt_opens_think
@@ -580,6 +763,13 @@ class AnswerFilter:
         self.done_tools = False
 
     def _content(self) -> str:
+        """Next content increment, holding back a possible partial tool marker.
+
+        Returns:
+            The content text that is safe to emit now. Empty while the tail could
+            still become the marker: emitting it and finding out later would leak
+            markup into the answer.
+        """
         if self.done_tools:
             return ""
         body = self.raw[self.emitted:]
@@ -596,7 +786,15 @@ class AnswerFilter:
         return out
 
     def push(self, piece: str) -> tuple[str, str]:
-        """-> ``(reasoning_delta, content_delta)`` for this piece of text."""
+        """Split one streamed piece into its reasoning and content increments.
+
+        Args:
+            piece: The engine's incremental text for one token.
+
+        Returns:
+            ``(reasoning_delta, content_delta)``. Either may be empty; the caller
+            emits only the non-empty one as its own SSE delta.
+        """
         self.raw += piece
         if self.past_think:
             return "", self._content()
@@ -612,12 +810,18 @@ class AnswerFilter:
         return reasoning, self._content()
 
     def finish(self, has_tools: bool) -> tuple[str, str]:
-        """Flush the tails at end of stream: ``(reasoning, content)``.
+        """Flush the tails at end of stream.
 
         The content hold-back exists so a partial ``<tool_call>`` never reaches the
-        client; at end of stream it must be released, or the last few characters of
-        every answer would be lost.  With tool calls the tail *is* markup (already
-        delivered structured), so it is dropped.
+        client; at end of stream it has to be released, or the last few characters
+        of every answer would be lost. With tool calls the tail *is* markup
+        (already delivered structured), so it is dropped.
+
+        Args:
+            has_tools: Whether the final engine reply carried parsed tool calls.
+
+        Returns:
+            ``(reasoning_tail, content_tail)``; either may be empty.
         """
         if not self.past_think:              # the reasoning never closed
             out = self.raw[self.think_pos:]
@@ -633,7 +837,8 @@ class AnswerFilter:
         return "", body
 
 
-# streaming tool calls
+# Streaming tool calls. The markup is the checkpoint's own tool-call template:
+# <tool_call><function=NAME><parameter=KEY>VALUE</parameter></function></tool_call>.
 _CALL_OPEN = "<tool_call>"
 _FN_OPEN = re.compile(r"<function=([^>\n]+)>")
 _PARAM_OPEN = re.compile(r"<parameter=([^>\n]+)>")
@@ -647,9 +852,16 @@ _SHORT_ESCAPE = {"\n": "\\n", "\r": "\\r", "\t": "\\t", "\b": "\\b", "\f": "\\f"
 def _json_escape(text: str) -> str:
     """Escape a fragment exactly the way ``json.dumps(ensure_ascii=False)`` does.
 
-    Byte-for-byte agreement matters: the fragments a client concatenates have to be
-    the same string the non-streaming path returns, or a client that falls back to
-    the non-stream JSON of the same call would see two different argument strings.
+    Byte-for-byte agreement matters: the fragments a client concatenates have to
+    be the same string the non-streaming path returns, or a client that falls back
+    to the non-stream JSON of the same call would see two different argument
+    strings.
+
+    Args:
+        text: Raw value text from the tool-call markup.
+
+    Returns:
+        The escaped fragment, without the enclosing quotes.
     """
     out = []
     for ch in text:
@@ -665,7 +877,19 @@ def _json_escape(text: str) -> str:
 
 
 def _coerce_value(value: str):
-    """Keep the value typed like ``tool_call._coerce`` (the non-streaming path)."""
+    """Keep the value typed like ``tool_call._coerce`` (the non-streaming path).
+
+    The two paths must agree on the type, or the same call would arrive as
+    ``{"n": 3}`` when streamed and ``{"n": "3"}`` when not.
+
+    Args:
+        value: The raw text between ``<parameter=...>`` and ``</parameter>``.
+
+    Returns:
+        The parsed JSON value when the text is a JSON literal (including nested
+        objects and arrays), else the stripped string. Text that looks numeric but
+        does not parse -- ``1.2.3`` -- stays a string rather than failing the call.
+    """
     s = value.strip()
     if s in ("true", "false", "null"):
         return json.loads(s)
@@ -678,12 +902,12 @@ def _coerce_value(value: str):
 
 
 class ToolStream:
-    """Turn the Qwen ``<tool_call>`` markup into OpenAI ``tool_calls`` deltas *as it
-    is generated* -- the shape vLLM's streaming tool parsers emit.
+    """Turn the Qwen ``<tool_call>`` markup into OpenAI ``tool_calls`` deltas as it
+    is generated, in the shape vLLM's streaming tool parsers emit.
 
     The engine streams the call token by token, but parsing only at the end (what
     this server used to do) means a client gets one fat delta after the whole call
-    is complete: no progress for a long argument, and a UI that looks hung.  So the
+    is complete: no progress for a long argument, and a UI that looks hung. So the
     same state machine vLLM runs per choice lives here instead:
 
     * the first fragment of a call carries ``index``/``id``/``type``/``function.name``
@@ -698,10 +922,25 @@ class ToolStream:
 
     ``arguments`` accumulates to exactly ``json.dumps(parsed_arguments)`` -- the same
     string the non-streaming reply carries -- so a client can use either path.
+
+    The buffer is append-only and ``pos`` only ever moves forward past text that is
+    already decided, which is what lets a token that splits a marker across two
+    pieces still parse: an incomplete marker is not matched until its last
+    character arrives.
     """
 
     def __init__(self, seed: str = "", max_calls: int | None = None,
                  marker: str = _CALL_OPEN) -> None:
+        """Start a parser for one reply.
+
+        Args:
+            seed: Text to parse before any generated piece. Used to inject the
+                forced ``tool_choice: required`` opener, which lives in the prompt
+                rather than in the generated text.
+            max_calls: Stop emitting after this many calls, for
+                ``parallel_tool_calls: false``. ``None`` emits every call.
+            marker: The tool-call opener to look for.
+        """
         self.buf = seed or ""
         self.pos = 0
         self.marker = marker
@@ -720,6 +959,19 @@ class ToolStream:
         self.emitted_any = False
 
     def _delta(self, arguments: str, name: str | None = None) -> dict | None:
+        """Build one ``tool_calls`` delta, or ``None`` when it must be suppressed.
+
+        Args:
+            arguments: The ``function.arguments`` fragment for this delta.
+            name: The function name on the fragment that introduces the call;
+                ``None`` for every following fragment, which is what tells the
+                client whether to expect a new ``id``/``type`` pair.
+
+        Returns:
+            A ``{"tool_calls": [...]}`` payload, or ``None`` once
+            ``parallel_tool_calls: false`` has been satisfied -- the caller then
+            emits nothing for the extra call.
+        """
         if self.max_calls is not None and self.index >= self.max_calls:
             return None                     # parallel_tool_calls: false -> drop it
         fn: dict = {"arguments": arguments}
@@ -733,6 +985,22 @@ class ToolStream:
         return {"tool_calls": [tc]}
 
     def _value_fragment(self, text: str) -> list[dict]:
+        """Feed raw value text and emit whatever argument fragment is now final.
+
+        A string value can stream as it arrives; a JSON literal cannot, because a
+        number read as a string cannot be turned back into a number once the client
+        has already received the quotes. So the first character decides the mode
+        once and the value follows it to the end: ``hold`` buffers the text and
+        dumps it coerced at the closing tag, ``stream`` escapes and forwards it.
+
+        Args:
+            text: Newly available value text, without its closing tag.
+
+        Returns:
+            Zero or more ``tool_calls`` deltas. Trailing whitespace is held back
+            instead of emitted, so the value of ``"1 "`` loses its pad and matches
+            what ``_coerce`` produces on the non-streaming path.
+        """
         if not text:
             return []
         if not self.value_started:
@@ -762,6 +1030,13 @@ class ToolStream:
         return [d] if d else []
 
     def _close_param(self) -> list[dict]:
+        """Emit the fragment that terminates the current parameter's value.
+
+        Returns:
+            Zero or one delta. A ``hold`` value is coerced and dumped whole so the
+            argument stream ends exactly like ``json.dumps`` would; a ``stream``
+            value just closes its quote.
+        """
         out: list[dict] = []
         if self.mode == "hold":
             d = self._delta(json.dumps(_coerce_value(self.hold), ensure_ascii=False))
@@ -779,13 +1054,38 @@ class ToolStream:
         return out
 
     def push(self, piece: str) -> list[dict]:
+        """Parse one streamed text piece.
+
+        Args:
+            piece: The engine's incremental text for one token.
+
+        Returns:
+            The ``tool_calls`` deltas that became final with this piece; empty
+            while a marker or a held JSON literal is still incomplete.
+        """
         self.buf += piece
         return self._drain(final=False)
 
     def finish(self) -> list[dict]:
+        """Flush a truncated call at end of stream.
+
+        Returns:
+            The remaining deltas, including the closing fragment for a call whose
+            markup ended early. Without this a call cut off by ``max_tokens`` would
+            reach the client with an unterminated ``arguments`` string.
+        """
         return self._drain(final=True)
 
     def _drain(self, final: bool) -> list[dict]:
+        """Advance the state machine over whatever the buffer now holds.
+
+        Args:
+            final: ``True`` at end of stream, which closes a truncated parameter
+                instead of waiting for its closing tag.
+
+        Returns:
+            The deltas produced by this pass, in emission order.
+        """
         out: list[dict] = []
         while True:
             if not self.in_call:
@@ -872,6 +1172,16 @@ class ToolStream:
 
 
 class Handler(BaseHTTPRequestHandler):
+    """One HTTP request; the OpenAI wire shapes live in this class.
+
+    ``ThreadingHTTPServer`` gives each request its own thread, and the engine,
+    not this class, is what serializes the actual generations.
+
+    The response shapes are fixed by the OpenAI definition: a JSON
+    ``chat.completion`` object, ``chat.completion.chunk`` objects for SSE, and an
+    ``{"error": {...}}`` body with the status code the client will branch on.
+    """
+
     protocol_version = "HTTP/1.1"
     server_version = "dcu-engine/0.1"
 
@@ -879,6 +1189,17 @@ class Handler(BaseHTTPRequestHandler):
         print(f"[http] {self.address_string()} {fmt % args}", flush=True)
 
     def _json(self, code: int, obj) -> None:
+        """Write one JSON response with an explicit ``Content-Length``.
+
+        The length matters: the connection is HTTP/1.1 keep-alive, and a missing
+        length would leave the client waiting on a body that never ends.
+        ``Access-Control-Allow-Origin`` is open because the usual client is a
+        browser UI on another origin.
+
+        Args:
+            code: HTTP status.
+            obj: The JSON-serialisable body.
+        """
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -888,9 +1209,25 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _error(self, code: int, message: str, err_type: str = "invalid_request_error") -> None:
+        """Write the OpenAI error envelope, which clients parse field by field.
+
+        Args:
+            code: HTTP status.
+            message: Human-readable cause; it is shown to the user, so it names
+                what the client should change.
+            err_type: ``invalid_request_error`` for a fixable request,
+                ``server_error`` when the failure is ours.
+        """
         self._json(code, {"error": {"message": message, "type": err_type, "code": code}})
 
     def _sse_start(self) -> None:
+        """Commit the 200 and the SSE headers for a streaming reply.
+
+        Called only after the engine's first line proved the request was accepted:
+        once these headers are out, a rejection can no longer be a 400.
+        ``close_connection`` is set because SSE ends at EOF -- there is no length
+        to send up front.
+        """
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
@@ -900,10 +1237,23 @@ class Handler(BaseHTTPRequestHandler):
         self.close_connection = True         # SSE ends at EOF: no Content-Length
 
     def _sse(self, obj) -> None:
+        """Write one SSE frame and flush it.
+
+        Args:
+            obj: The chunk object to serialise as the frame's ``data:`` payload.
+                The double newline is what terminates a frame, and the flush is
+                what makes a token arrive before the next one is generated.
+        """
         self.wfile.write(f"data: {json.dumps(obj, ensure_ascii=False)}\n\n".encode("utf-8"))
         self.wfile.flush()
 
     def _body(self) -> dict | None:
+        """Read and parse the request body.
+
+        Returns:
+            The parsed dict, or ``None`` when a 400 has already been written -- the
+            caller then returns, because the error reply is complete.
+        """
         try:
             n = int(self.headers.get("Content-Length") or 0)
             return json.loads(self.rfile.read(n) or b"{}")
@@ -912,6 +1262,7 @@ class Handler(BaseHTTPRequestHandler):
             return None
 
     def do_OPTIONS(self):  # noqa: N802
+        """Answer the CORS preflight a browser client sends before the POST."""
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Headers", "content-type, authorization")
@@ -920,10 +1271,17 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):  # noqa: N802
+        """Serve the two discovery/liveness routes a client polls.
+
+        ``/health`` reports engine state by forwarding ``ping``; ``/v1/models``
+        is what client libraries call before anything else, so it must answer from
+        the cached state rather than touching the engine.
+        """
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
         if path in ("/health", "/healthz"):
             try:
                 rep = STATE["engine"].call({"op": "ping"})
+
                 # ``rep`` already carries model / model_path / arch from the engine
                 self._json(200, {"status": "ok",
                                  "served_model_name": STATE["served_name"], **rep})
@@ -937,6 +1295,11 @@ class Handler(BaseHTTPRequestHandler):
             self._error(404, f"no route {self.path}")
 
     def do_POST(self):  # noqa: N802
+        """Route the single POST endpoint and keep the server alive on any failure.
+
+        A client that hangs up mid-stream is not an error to log as a server fault:
+        it is the expected consequence of an SSE client being closed.
+        """
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
         if path != "/v1/chat/completions":
             self._error(404, f"no route {self.path}")
@@ -956,6 +1319,15 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
     def _chat(self, body: dict) -> None:
+        """Validate one chat-completions request and hand it to a reply path.
+
+        Validation happens here and in ``_split_messages`` so that everything the
+        client got wrong is a 400 before the engine sees the request. The engine
+        would otherwise answer late, after a prefill, with the same problem.
+
+        Args:
+            body: The parsed request body.
+        """
         raw_messages, images, err = _split_messages(body.get("messages") or [])
         if err:
             self._error(400, err)
@@ -988,11 +1360,13 @@ class Handler(BaseHTTPRequestHandler):
         req = {"op": "chat_stream" if stream else "chat",
                "messages": messages, "tools": tools,
                "tool_prefix": forced or None,
+
                # a forced call has to open the answer, so it cannot be reasoning first
                "enable_thinking": think and not forced,
                "max_new": max_new, "temperature": temperature,
-               # the engine's own wall-clock cap: the only cutoff that also fires when
-               # the client goes quiet without closing its socket
+
+               # the engine's own wall-clock cap: the only cutoff that also fires
+               # when the client goes quiet without closing its socket
                "max_seconds": STATE.get("max_decode_seconds") or None}
         if images:
             # Base64 (already validated and re-encoded here) travels on the socket
@@ -1009,12 +1383,21 @@ class Handler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _finish_reason(out: dict) -> str:
-        """``length`` when the *effective* budget (after the window clamp) ran out."""
+        """Map the engine's stop reason onto the definition's enum.
+
+        Args:
+            out: The engine's reply (or ``done`` line).
+
+        Returns:
+            ``tool_calls`` when a call was parsed, ``length`` when the effective
+            budget (after the window clamp) ran out, else ``stop``. A server-side
+            deadline also maps to ``length``: the definition has no "deadline"
+            value, and ``length`` is the one that means "cut short" rather than
+            "the model finished".
+        """
         if out.get("tool_calls"):
             return "tool_calls"
         if out.get("stopped") == "deadline":
-            # the definition has no "deadline" value; ``length`` is the one that
-            # means "cut short by the server" rather than "the model finished"
             return "length"
         n_new = int(out.get("n_new") or 0)
         n_max = int(out.get("max_new") or 0)
@@ -1022,19 +1405,37 @@ class Handler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _usage(out: dict) -> dict:
+        """Build the definition's ``usage`` object from the engine's counters.
+
+        Args:
+            out: The engine's reply (or ``done`` line).
+
+        Returns:
+            ``prompt_tokens`` / ``completion_tokens`` / ``total_tokens``, plus the
+            ``prompt_tokens_details.cached_tokens`` extension that reports how much
+            of the prompt the radix prefix cache had already computed.
+        """
         pt = int(out.get("n_prompt") or 0)
         ct = int(out.get("n_new") or 0)
         return {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct,
-                # how much of the prompt the radix prefix cache had already computed
                 "prompt_tokens_details": {"cached_tokens":
                                           int(out.get("cached_tokens") or 0)}}
 
     def _chat_once(self, req: dict, cid: str, created: int, model: str,
                    single_call: bool = False) -> None:
+        """Answer a non-streaming request with one ``chat.completion`` object.
+
+        Args:
+            req: The engine request.
+            cid: The ``chatcmpl-`` id for this reply.
+            created: Epoch seconds reported as the completion's creation time.
+            model: The model id the client asked for (or the served default).
+            single_call: Honour ``parallel_tool_calls: false`` by keeping one call.
+        """
         out = STATE["engine"].call(req)
         if not out.get("ok", True):
             # The engine says *why* and with which status: a bad image is a 400, a
-            # server without a vision tower a 503.  Collapsing all of them into 500
+            # server without a vision tower a 503. Collapsing all of them into 500
             # would tell a client to retry a request that can never succeed.
             self._error(int(out.get("status") or 500),
                         f"engine: {out.get('error')}",
@@ -1063,8 +1464,27 @@ class Handler(BaseHTTPRequestHandler):
 
     def _chat_stream(self, req: dict, cid: str, created: int, model: str,
                      single_call: bool = False, include_usage: bool = False) -> None:
+        """Answer a ``stream: true`` request as ``chat.completion.chunk`` SSE frames.
+
+        The chunks are the definition's: a role-only opening delta, one delta per
+        reasoning/content/tool-call fragment, then a final empty delta carrying
+        ``finish_reason``, then optionally the usage chunk, then ``data: [DONE]``.
+        Every frame repeats ``id``/``object``/``created``/``model`` because clients
+        treat each chunk as a standalone object.
+
+        Args:
+            req: The engine request; its ``tool_prefix`` seeds the streaming
+                parser so a forced call fragments exactly like a natural one.
+            cid: The ``chatcmpl-`` id shared by every chunk.
+            created: Epoch seconds reported in every chunk.
+            model: The model id reported in every chunk.
+            single_call: Honour ``parallel_tool_calls: false`` by capping the
+                parser at one call.
+            include_usage: Emit the definition's extra ``choices: []`` usage chunk.
+        """
         base = {"id": cid, "object": "chat.completion.chunk", "created": created,
                 "model": model}
+
         # The definition says: with ``stream_options.include_usage`` every other
         # chunk carries ``usage: null`` and one extra chunk with ``choices: []``
         # carries the real numbers just before ``[DONE]``.
@@ -1073,6 +1493,13 @@ class Handler(BaseHTTPRequestHandler):
         sent = 0
 
         def emit(choices: list, **extra) -> None:
+            """Write one chunk, tracking how many choices have gone out.
+
+            Args:
+                choices: The chunk's ``choices`` array.
+                **extra: Additional top-level fields (an ``error`` object on the
+                    failure path).
+            """
             nonlocal sent
             sent += len(choices)
             self._sse({**base, "choices": choices, **marker, **extra})
@@ -1086,10 +1513,10 @@ class Handler(BaseHTTPRequestHandler):
                              max_calls=1 if single_call else None)
         # The engine validates the request (image decode, processor expansion, the
         # placeholder self-check) *before* its ``start`` line, so its first line can
-        # still be a rejection.  Nothing is written before that line arrives: an
-        # image request that is refused then gets a real 400/503 with the JSON error
-        # body an OpenAI client expects, instead of a 200 SSE stream carrying an
-        # error event -- which no client retries or reports usefully.
+        # still be a rejection. Nothing is written before that line arrives: an
+        # image request that is refused then gets a real 400/503 with the JSON
+        # error body an OpenAI client expects, instead of a 200 SSE stream carrying
+        # an error event -- which no client retries or reports usefully.
         lines = STATE["engine"].stream(req)
         try:
             first = next(lines)
@@ -1132,9 +1559,10 @@ class Handler(BaseHTTPRequestHandler):
                            "finish_reason": None}])
         except Exception as exc:  # noqa: BLE001 - report into the stream, then close it
             traceback.print_exc()
-            # ``client_hung_up`` is the fact that decides who cut the stream: if this
-            # is False the engine itself stopped early, if it is True the answer the
-            # client lost was cut on the way out (client, relay), not by the model.
+
+            # ``client_hung_up`` decides who cut the stream: when it is False the
+            # engine stopped early, when it is True the answer was lost on the way
+            # out (client or relay), not by the model.
             print(f"[http] stream aborted id={cid} sent={sent} "
                   f"wall={time.time() - t_start:.1f}s "
                   f"client_hung_up={isinstance(exc, (BrokenPipeError, ConnectionResetError))}",
@@ -1165,10 +1593,10 @@ class Handler(BaseHTTPRequestHandler):
         if single_call and len(calls) > 1:       # parallel_tool_calls: false
             calls = calls[:1]
         if calls and not tstream.emitted_any:
-            # Fallback for a call the streaming parser did not see (it would be a
-            # bug in it): deliver the whole call in one delta, as before.  When the
-            # fragments went out, repeating the complete call here would make the
-            # client concatenate the arguments twice.
+            # Fallback for a call the streaming parser did not see (which would be
+            # a bug in it): deliver the whole call in one delta. When the fragments
+            # did go out, repeating the complete call here would make the client
+            # concatenate the arguments twice.
             emit([{"index": 0, "delta": {
                 "tool_calls": [{"index": i, **c} for i, c in enumerate(calls)]},
                 "finish_reason": None}])
@@ -1180,7 +1608,8 @@ class Handler(BaseHTTPRequestHandler):
         else:
             # OpenAI omits usage unless it is asked for; keeping it on the last
             # chunk is the lenient behaviour existing clients (the bridge, the
-            # probes) already read, so it stays when nobody asked for the extra chunk.
+            # probes) already read, so it stays when nobody asked for the extra
+            # chunk.
             self._sse({**base, "choices": [last], "usage": self._usage(done)})
         print(f"[http] stream done id={cid} n_new={done.get('n_new')} "
               f"finish={last['finish_reason']} stopped={done.get('stopped')} "
@@ -1191,6 +1620,16 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    """Parse the flags, wait for the engine, then serve HTTP until killed.
+
+    The startup handshake is the only part that can fail: an OpenAI client cannot
+    be told "the engine is not up", so this process refuses to start without one.
+
+    Raises:
+        SystemExit: The engine socket did not answer after three tries. Starting
+            anyway would leave a server whose every request fails, so report the
+            socket path and exit instead.
+    """
     global MAX_IMAGES, MAX_IMAGE_BYTES, MAX_IMAGE_TOTAL_BYTES
 
     ap = argparse.ArgumentParser(description="OpenAI-compatible HTTP API in front of "
@@ -1220,11 +1659,11 @@ def main() -> None:
                          "every later request queues behind it")
     ap.add_argument("--timeout", type=float, default=900.0,
                     help="per-request engine timeout, seconds")
-    # -- image limits -------------------------------------------------------
-    # These mirror the defaults serve.py starts with; they are *this* process's
-    # cheap pre-check, and serve.py re-validates against its own configured limits
-    # (whatever --image-max-pixels / --max-images it was actually started with).
-    # Raising one here without raising it there just moves the 400 to the engine.
+    # Image limits. These mirror the defaults serve.py starts with; they are *this*
+    # process's cheap pre-check, and serve.py re-validates against its own
+    # configured limits (whatever --image-max-pixels / --max-images it was actually
+    # started with). Raising one here without raising it there just moves the 400
+    # to the engine.
     ap.add_argument("--max-images", type=int, default=MAX_IMAGES,
                     help=f"images per request (default {MAX_IMAGES}); serve.py "
                          f"re-checks against its own --max-images")
@@ -1241,6 +1680,10 @@ def main() -> None:
     MAX_IMAGE_BYTES = int(args.max_image_bytes)
     MAX_IMAGE_TOTAL_BYTES = int(args.max_image_total_bytes)
 
+    # Three tries, two seconds apart. This is not long enough to wait out a cold
+    # engine start (the 9 GB weight load takes ~1 min); it only absorbs a socket
+    # that is a moment from accepting, and fails fast when the engine was never
+    # started at all.
     engine = EngineClient(args.sock, timeout=args.timeout)
     for _ in range(3):
         try:

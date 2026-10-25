@@ -1,20 +1,30 @@
-// Batched decode kernels: one launch for B sequences instead of B launches.
+// @file batch.cu
+// @brief Batched decode kernels: one launch for B sequences instead of B launches.
 //
-// The single-stream decode step runs four kernels per layer per sequence
-// (paged attention, conv1d, delta prologue, delta update).  With a static batch
-// of B sequences the *work* is B times larger but the step should still cost
-// about one launch per kernel, because at decode sizes the step is
-// latency/launch-bound: the per-row kernels launched 2-4 blocks per layer and
-// the grid never came close to filling the card.
+// Module: coffin/kernels. The batch half of the decode path; ``hip_ops.py``
+// loads it into the same torch extension as ``attn.cu`` / ``linear_attn.cu`` /
+// ``delta.cu``, which keep the B = 1 and speculative-verify entry points.
 //
-// This file adds batch dims to those kernels.  Nothing here replaces or
-// changes the single-row entry points in ``attn.cu`` / ``linear_attn.cu`` /
-// ``delta.cu``: those stay the ``B = 1`` path (and the speculative-verify one),
-// and the batch kernels are written so that a row of width 1 reproduces them
-// bit for bit -- same key blocking, same online-softmax partials, same fp32
-// state update order.  Where a kernel's inputs are column slices of a fused
-// projection output (q | k | v), the strides are taken from the tensor instead
-// of assuming contiguity.
+// Why this file exists: the single-stream decode step runs four kernels per
+// layer per sequence (paged attention, conv1d, delta prologue, delta update).
+// With a static batch of B sequences the *work* is B times larger but the step
+// should still cost about one launch per kernel, because at decode sizes the
+// step is latency/launch-bound: the per-row kernels launched 2-4 blocks per
+// layer and the grid never came close to filling the card.
+//
+// Constraints:
+//   * A row of width 1 must reproduce the single-row kernel bit for bit -- same
+//     key blocking, same online-softmax partials, same fp32 state update order.
+//     The two paths are A/B-compared, so a divergence is a bug on one side.
+//   * Rows never share state: one block (or warp) owns a row, and there is no
+//     cross-block synchronisation.
+//   * q/k/v column slices of the fused projection output take their strides
+//     from the tensor; assuming contiguity there reads the wrong third.
+//   * The per-row key loop is bounded by ``context_lens[b]``, that row's own
+//     window, never by ``max_seq``: a batch of short sequences must not pay for
+//     the longest one, which is the whole point of batching at mixed positions.
+//   * LDS budget is 64 KB per CU, so the attention row window is streamed in
+//     ATTN_KEY_BLOCK keys and never staged whole.
 //
 // Row-major batch layout, all read-only except the caller-owned outputs:
 //
@@ -27,11 +37,6 @@
 //                  q_pro/k_pro [B, nv, dk], v_pro [B, nv, dv],
 //                  beta/g [B, nv] fp32
 //   delta update   state [B, nv, dk, dv], out [B, nv, dv] fp32
-//
-// The per-row key loop of the attention kernel is bounded by
-// ``context_lens[b]`` (that row's own window), not by ``max_seq``: a batch of
-// short sequences must not pay for the longest one, which is the whole point of
-// continuously batching sequences at different positions.
 
 #include "hip_ops.h"
 
@@ -41,13 +46,18 @@
 
 namespace {
 
-//: Keys per streamed block, same bound as ``attn.cu`` (LDS is ~10 KB per block).
+//: Keys per streamed block, same bound as ``attn.cu``: 1024 keys is ~10 KB of
+//: LDS, and the block size is what fixes the online-softmax rescale points.
 constexpr int ATTN_KEY_BLOCK = 1024;
 
-//: Key-range splits per query head, same as the single-row attention.
+//: Key-range splits per query head, same as the single-row attention. The
+//: single-row kernel uses 8 because one block per head is only ~16 blocks; with
+//: B rows the grid is already (nh, split, B), so this only bounds the partial
+//: buffer the caller allocates.
 constexpr int ATTN_SPLIT_MAX = 64;
 
-//: dk slices per state column in the delta update (matches ``DELTA_SPLIT``).
+//: dk slices per state column in the delta update (matches ``DELTA_SPLIT`` in
+//: ``delta.cu``; a mismatch would silently change the fp32 sum order).
 constexpr int DELTA_SPLIT = 4;
 
 __device__ __forceinline__ float bf16f(unsigned short h) {
@@ -61,6 +71,8 @@ __device__ __forceinline__ unsigned short fbf16(float f) {
 }
 
 // Block-wide max / sum via a shared scratch of ``blockDim.x`` floats.
+// ``red`` must hold blockDim.x entries and is clobbered; every thread of the
+// block must call this, since it ends on a ``__syncthreads()``.
 template <bool IsMax>
 __device__ __forceinline__ float block_reduce(float v, float* red) {
     const int t = threadIdx.x;
@@ -73,7 +85,7 @@ __device__ __forceinline__ float block_reduce(float v, float* red) {
     return red[0];
 }
 
-// Batched paged decode attention.
+// @brief Batched paged decode attention; one (head, slice, row) per block.
 //
 // Identity to the single-row kernel: block (h, s, b) owns the same slice
 // ``[s*per, min((s+1)*per, nvalid))`` of head ``h``'s key range, where now
@@ -82,6 +94,15 @@ __device__ __forceinline__ float block_reduce(float v, float* red) {
 // published per (b, h, s) and merged by the combine kernel, which also applies
 // the output gate.  So the arithmetic per (b, h) is exactly the single-row
 // arithmetic, only the grid is (nh, split, B) instead of (nh, split).
+//
+// @param q            Query vectors, [B, nh, hd] bf16, row pitch ``qb`` and
+//                     head pitch ``qh`` (a column slice of the fused projection
+//                     output is not contiguous).
+// @param slots        [B, smax] int64 slot map; ``smax`` is its row stride.
+// @param context_lens [B] int32; the key loop of row b stops at its own value.
+// @param part_acc     [B, nh, split, hd] fp32 online-softmax numerator.
+// @param part_ml      [B, nh, split, 2] fp32 (running max, running sum).
+// @param split        Key-range slices per head; the caller sizes the partials.
 __global__ void attn_paged_batch_kernel(
         const unsigned short* __restrict__ q, int qb, int qh,
         const int8_t* __restrict__ kpool, const int8_t* __restrict__ vpool,
@@ -96,7 +117,7 @@ __global__ void attn_paged_batch_kernel(
     const int g = h / rep;
     const int t = threadIdx.x;
     const int nt = blockDim.x;
-    const int nvalid = context_lens[b];              // this row's own window
+    const int nvalid = context_lens[b];              // that row's window, not the max
     const int64_t* row_slots = slots + (size_t)b * smax;
 
     extern __shared__ float sh[];
@@ -108,7 +129,7 @@ __global__ void attn_paged_batch_kernel(
     const unsigned short* qp = q + (size_t)b * qb + (size_t)h * qh;
     for (int d = t; d < hd; d += nt) qs[d] = bf16f(qp[d]);
 
-    float m = -1e30f, l = 0.f, acc = 0.f;    // running max, sum, this thread's dim
+    float m = -1e30f, l = 0.f, acc = 0.f;    // running max, running sum, this dim's acc
     if (nvalid > 0) {
         const int per = (nvalid + split - 1) / split;
         const int kfrom = s * per;
@@ -164,8 +185,16 @@ __global__ void attn_paged_batch_kernel(
     }
 }
 
-// Merges the per-slice partials of one (b, head) and applies the output gate.
-// Same combination as the single-row combine kernel, just indexed by batch.
+// @brief Merges the per-slice partials of one (b, head) and applies the gate.
+//
+// Same combination as the single-row combine kernel, indexed by batch. Every
+// thread recomputes the global max (``split`` values) instead of staging it in
+// shared memory: one warp-wide reduction would cost more than the redundant
+// loads.
+//
+// @param gate Gate vectors, [B, nh, hd] bf16 with row pitch ``gb``, head pitch
+//             ``gh``; the sigmoid is folded into the normalised output.
+// @param out  [B, nh, hd] bf16 with row pitch ``ob``, head pitch ``oh``.
 __global__ void attn_paged_batch_combine_kernel(
         const float* __restrict__ part_acc, const float* __restrict__ part_ml,
         const unsigned short* __restrict__ gate, int gb, int gh,
@@ -189,10 +218,17 @@ __global__ void attn_paged_batch_combine_kernel(
     out[(size_t)b * ob + (size_t)h * oh + t] = fbf16(a / l / (1.f + __expf(-gv)));
 }
 
-// Batched depthwise causal conv1d (kernel 4) + SiLU.
+// @brief Batched depthwise causal conv1d (kernel 4) + SiLU.
 //
 // Same per-channel recurrence as ``conv1d_silu_kernel``; the grid's y axis is
 // the row, so every (b, c) pair has its own state ring and no cross-row traffic.
+// The state shift is read-then-write inside one thread, so it needs no barrier.
+//
+// @param state [B, C, 3] fp32 ring of the previous three inputs, shifted in
+//              place with row pitch ``lds``.
+// @param ldx   Row pitch of ``x``; the conv output is a column slice of the
+//              fused projection, so rows are not packed.
+// @param ldo   Row pitch of ``out``.
 __global__ void conv1d_silu_batch_kernel(const float* __restrict__ w,
                                          const unsigned short* __restrict__ x,
                                          float* __restrict__ state,
@@ -211,9 +247,8 @@ __global__ void conv1d_silu_batch_kernel(const float* __restrict__ w,
     s[2] = x3;
 }
 
-// Batched gated-delta prologue: per-value-head q/k L2 norm, q scale, head
-// expansion and beta/g.  Block (vh, b) does one value head of row b, exactly as
-// the single-row kernel does one value head of the only row.
+// Block-wide sum of two values at once -- q and k share one reduction pass
+// because they are always normalised together.
 __device__ __forceinline__ float2 block_sum2(float a, float b, float2* red) {
     const int t = threadIdx.x;
     red[t] = make_float2(a, b);
@@ -228,6 +263,18 @@ __device__ __forceinline__ float2 block_sum2(float a, float b, float2* red) {
     return red[0];
 }
 
+// @brief Batched gated-delta prologue: per-value-head q/k L2 norm, q scale,
+//        head expansion and beta/g.
+//
+// Block (vh, b) does one value head of row b, exactly as the single-row kernel
+// does one value head of the only row; ``rep`` maps value head vh to key head
+// ``vh / rep`` (repeat_interleave order).
+//
+// @param q_raw,k_raw fp32 [B, nk, dk] with row pitches ``ldq`` / ``ldk``; they
+//                    are column slices of the conv output, so a value head's k
+//                    head may be re-read ``rep`` times.
+// @param qscale     Scale folded into the normalised q (softmax scale * 1/sqrt).
+// @param rep        Value heads per key head.
 __global__ void delta_prologue_batch_kernel(
         const float* __restrict__ q_raw, int ldq,
         const float* __restrict__ k_raw, int ldk,
@@ -263,18 +310,22 @@ __global__ void delta_prologue_batch_kernel(
         const size_t idx = (size_t)bb * nv + vh;
         beta[idx] = 1.f / (1.f + __expf(-bf16f(b_raw[idx])));
         const float av = bf16f(a_raw[idx]) + dt_bias[vh];
-        const float sp = av > 20.f ? av : __logf(1.f + __expf(av));   // softplus
+        const float sp = av > 20.f ? av : __logf(1.f + __expf(av));   // softplus, no overflow
         g[idx] = neg_expA[vh] * sp;
     }
 }
 
-// Batched gated-delta state update.
+// @brief Batched gated-delta state update.
 //
 // Copy of ``delta_kernel``'s slice logic with the state offset by the row: one
 // block per (head, column tile, row).  A thread owns column ``j`` of row ``b``
 // and one quarter of the dk loop; nothing is shared across rows, so the only
 // change is the base pointer of the state.  ``decay = exp(g)`` and ``rate =
-// beta`` are per (row, head) and staged in shared memory as before.
+// beta`` are per (row, head), staged in shared memory as in the single-row
+// kernel.
+//
+// @param st  [B, nv, dk, dv] fp32 recurrent state, updated in place.
+// @param out [B, nv, dv] fp32; written by the lane that owns dk slice 0.
 __global__ void delta_batch_kernel(const float* __restrict__ q,
                                    const float* __restrict__ k,
                                    const float* __restrict__ v,
@@ -334,6 +385,22 @@ __global__ void delta_batch_kernel(const float* __restrict__ q,
 
 }  // namespace
 
+// @brief Launch the batched paged attention (split pass + combine pass).
+//
+// @param q,gate     [B, nh, hd] bf16; inner stride must be 1 but the row/head
+//                   pitches are honoured (fused-projection column slices).
+// @param slots      [B, smax] int64 contiguous; smax comes from its row stride.
+// @param context_lens [B] int32 contiguous, one window per row.
+// @param max_seq    Unused: the window is streamed, so its length is no longer
+//                   needed on the device. Kept so the caller's signature does
+//                   not change.
+// @param part_acc,part_ml Caller-owned fp32 partials [B, nh, split, hd] and
+//                   [B, nh, split, 2]; ``split`` is read from ``part_acc``, so
+//                   the shapes stay static across graph capture.
+// @return ``out``, written in place and returned for call chaining.
+// @throws c10::Error (TORCH_CHECK) when a shape, dtype or stride breaks the
+//         kernel's indexing contract; the message names the offending tensor,
+//         so fix the caller rather than the kernel.
 torch::Tensor attn_paged_batch(torch::Tensor q, torch::Tensor gate,
                                torch::Tensor kpool, torch::Tensor vpool,
                                torch::Tensor kscale, torch::Tensor vscale,
@@ -341,7 +408,7 @@ torch::Tensor attn_paged_batch(torch::Tensor q, torch::Tensor gate,
                                torch::Tensor out, int64_t max_seq,
                                int64_t rep, double scale,
                                torch::Tensor part_acc, torch::Tensor part_ml) {
-    (void)max_seq;      // kept so the caller's signature matches the contract
+    (void)max_seq;      // streamed window: the per-row length lives in context_lens
     TORCH_CHECK(q.dim() == 3 && gate.dim() == 3 && out.dim() == 3,
                 "q/gate/out must be [B, nh, hd]");
     TORCH_CHECK(q.stride(2) == 1 && gate.stride(2) == 1 && out.stride(2) == 1,
@@ -392,6 +459,14 @@ torch::Tensor attn_paged_batch(torch::Tensor q, torch::Tensor gate,
     return out;
 }
 
+// @brief Launch the batched depthwise causal conv1d + SiLU.
+//
+// @param conv_w     [C, 4] fp32 taps (three history taps plus the current one).
+// @param x          [B, C] bf16, unit inner stride.
+// @param conv_state [B, C, 3] fp32 ring, shifted in place.
+// @return ``out``, [B, C] fp32, written in place.
+// @throws c10::Error (TORCH_CHECK) when a shape or inner stride breaks the
+//         indexing contract; fix the caller.
 torch::Tensor conv1d_silu_batch(torch::Tensor conv_w, torch::Tensor x,
                                 torch::Tensor conv_state, torch::Tensor out) {
     TORCH_CHECK(x.dim() == 2 && x.stride(1) == 1, "x must be [B, C] with unit inner stride");
@@ -411,6 +486,17 @@ torch::Tensor conv1d_silu_batch(torch::Tensor conv_w, torch::Tensor x,
     return out;
 }
 
+// @brief Launch the batched gated-delta prologue.
+//
+// @param q_raw,k_raw [B, nk, dk] fp32 with row strides honoured: they are column
+//                   slices of the fused conv output, so the rows are not packed.
+// @param v_raw      [B, nv, dv] fp32 with row stride honoured.
+// @param b,a        [B, nv] bf16 raw projection outputs; ``beta = sigmoid(b)``
+//                   and ``g = -exp(A) * softplus(a + dt_bias)``.
+// @param q_out,k_out [B, nv, dk] fp32 contiguous, L2-normalised, q scaled.
+// @param beta,g     [B, nv] fp32 contiguous, consumed by ``delta_batch``.
+// @throws c10::Error (TORCH_CHECK) when a shape, dtype or stride breaks the
+//         indexing contract; fix the caller.
 void delta_prologue_batch(torch::Tensor q_raw, torch::Tensor k_raw, torch::Tensor v_raw,
                           torch::Tensor b, torch::Tensor a,
                           torch::Tensor neg_expA, torch::Tensor dt_bias,
@@ -448,6 +534,14 @@ void delta_prologue_batch(torch::Tensor q_raw, torch::Tensor k_raw, torch::Tenso
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+// @brief Launch the batched gated-delta state update.
+//
+// @param st  [B, heads, dk, dv] fp32 recurrent state, updated in place.
+// @param q,k [B, heads, dk] fp32 contiguous, already normalised by the prologue.
+// @param beta,g [B, heads] fp32 per-row decay and rate.
+// @return ``out``, [B, heads, dv] fp32, written in place.
+// @throws c10::Error (TORCH_CHECK) when an input is non-contiguous or ``dk`` is
+//         not a multiple of DELTA_SPLIT (the 4-lane shuffle needs it).
 torch::Tensor delta_batch(torch::Tensor q, torch::Tensor k, torch::Tensor v,
                           torch::Tensor beta, torch::Tensor g,
                           torch::Tensor st, torch::Tensor out) {
@@ -473,21 +567,27 @@ torch::Tensor delta_batch(torch::Tensor q, torch::Tensor k, torch::Tensor v,
     return out;
 }
 
-// Multi-query verify attention: c draft queries per row share one KV history.
+// @brief Multi-query verify attention: c draft queries per row share one KV
+//        history.
 //
-// ``attn_paged_multi_q`` runs the *same* arithmetic as ``attn_paged_batch`` for
-// every (row, query) pair -- identical split-K slices, identical key-block
-// online softmax, identical combine -- so each query's output is bit-identical
-// to calling the decode kernel for that token.  What is new is only the grid:
-// the c queries of a row are adjacent ``blockIdx.z`` values, so the blocks that
-// walk the same (b, head, slice) key range are launched together and the c
-// passes over the history hit L2 instead of re-reading it from HBM.  At long
-// context that turns c HBM passes into one, which is the verify win.
+// Runs the *same* arithmetic as ``attn_paged_batch`` for every (row, query)
+// pair -- identical split-K slices, identical key-block online softmax,
+// identical combine -- so each query's output is bit-identical to calling the
+// decode kernel for that token.  What is new is only the grid: the c queries of
+// a row are adjacent ``blockIdx.z`` values, so the blocks that walk the same
+// (b, head, slice) key range are launched together and the c passes over the
+// history hit L2 instead of re-reading it from HBM. At long context that turns
+// c HBM passes into one, which is the verify win.
 //
-// ``block_mask`` (optional uint8 [B, n_blocks], 1 = keep) skips keys whose
-// ``pos / mask_block`` block is deselected; an empty tensor means exact full
-// attention.  Masked keys get score -inf (weight exactly 0), the same sparsity
-// semantics a sparse-decode caller wants.
+// @param block_mask Optional uint8 [B, nblocks] keep-mask, 1 = keep; an
+//                   undefined/empty tensor means exact full attention. Masked
+//                   keys get score -inf (weight exactly 0), the sparsity
+//                   semantics a sparse-decode caller wants -- and because the
+//                   weight is 0 the V pass can skip their load.
+// @param mask_block Tokens per mask block. 64 takes a shift, other values a
+//                   divide, so both are specialised inside the key loop.
+// @param ctx_lens   [B] int32 history length; query j sees ctx_lens[b] + j + 1
+//                   keys, which is the nvalid the per-token kernel would get.
 __global__ void attn_paged_multi_q_kernel(
         const unsigned short* __restrict__ q, int qb, int qh,
         const int8_t* __restrict__ kpool, const int8_t* __restrict__ vpool,
@@ -590,6 +690,24 @@ __global__ void attn_paged_multi_q_kernel(
     }
 }
 
+// @brief Launch the multi-query verify attention (one history pass for c
+//        queries).
+//
+// @param q,gate,out [B, c, nh, hd] bf16 contiguous; the c decode rows of a
+//                   sequence are packed next to each other.
+// @param slots      [B, smax] int64 contiguous slot map, shared by the c queries
+//                   of a row.
+// @param ctx_lens   [B] int32 contiguous history length per row.
+// @param max_seq    Unused, same reason as ``attn_paged_batch``: the window is
+//                   streamed and the length comes from ``ctx_lens``.
+// @param part_acc,part_ml [B*c, nh, split, hd] / [..., 2] fp32 caller-owned, so
+//                   the shape is static for graph capture.
+// @param block_mask Optional uint8 [B, nblocks] keep-mask; an undefined or empty
+//                   tensor means exact attention. Must be contiguous.
+// @param mask_block Tokens per mask block, >= 1.
+// @return ``out``, written in place for call chaining.
+// @throws c10::Error (TORCH_CHECK) when a shape or dtype breaks the indexing
+//         contract; fix the caller.
 torch::Tensor attn_paged_multi_q(torch::Tensor q, torch::Tensor gate,
                                  torch::Tensor kpool, torch::Tensor vpool,
                                  torch::Tensor kscale, torch::Tensor vscale,
@@ -598,7 +716,7 @@ torch::Tensor attn_paged_multi_q(torch::Tensor q, torch::Tensor gate,
                                  int64_t rep, double scale,
                                  torch::Tensor part_acc, torch::Tensor part_ml,
                                  torch::Tensor block_mask, int64_t mask_block) {
-    (void)max_seq;
+    (void)max_seq;      // streamed window: the length is ctx_lens[b] + j + 1
     TORCH_CHECK(q.dim() == 4 && gate.dim() == 4 && out.dim() == 4,
                 "q/gate/out must be [B, c, nh, hd]");
     TORCH_CHECK(q.is_contiguous() && gate.is_contiguous() && out.is_contiguous(),

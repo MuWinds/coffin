@@ -1,8 +1,9 @@
 """Batched speculative decoding: per-step cost across prompt lengths.
 
-Two things to watch:
+Answers where speculative decoding starts to pay on a batch: two effects compete,
+and the probe exists to find the length at which they cross.
 
-* short prompt (96): the step is projection-bound.  Greedy reads the weights once
+* short prompt (96): the step is projection-bound. Greedy reads the weights once
   per step; the token verify reads them ``c`` times unless the one-forward verify
   (``--once``) lands the wide-M projection; the acceptance rate sets how many
   tokens that buy.
@@ -11,11 +12,30 @@ Two things to watch:
   The crossing point between "projection fixed cost" and "KV read" is the point
   of this probe.
 
+Read the ``x`` multiplier at the end of each report line: it is speculative tok/s
+against greedy tok/s, and above ``1.00x`` the spec step is winning. The
+``accept`` figure explains why -- a low acceptance rate means the drafter is
+guessing badly and no kernel work will recover it, so fix the drafter before the
+step. Run both prompt-length families to see the crossover; a single length
+cannot tell a projection-bound result from a KV-bound one.
+
 Run (inside the container, from the engine directory)::
 
     python3 diag/probe_spec_batch.py --lengths 96 --batch 8 --steps 16
     python3 diag/probe_spec_batch.py --lengths 96,4096 --batch 2 --steps 8
     python3 diag/probe_spec_batch.py --lengths 4096 --batch 1 --once
+
+Module: ``coffin/diag``. Standalone probe: imports ``engine_api`` (the public
+model entry point) plus torch, and nothing under ``coffin/`` imports it.
+
+Constraints:
+    * Goes through ``engine_api.create_model`` / ``load_weights`` rather than
+      reaching into a model class, so it keeps working when a model family is
+      refactored; the layer-internal probes are the ones that import the shell.
+    * Needs the real checkpoint and a paged, batched, graph-captured model, so
+      the timings include the graph replay path production actually runs.
+    * The pool is sized from the requested lengths and freed per length; a run
+      that skips the free leaks blocks and skews a later length.
 """
 
 from __future__ import annotations
@@ -40,14 +60,46 @@ BASE = [9707, 11, 1879, 3671, 374, 264, 3449, 315, 9847, 13,
 
 
 def tokens(n: int, off: int = 0) -> list[int]:
+    """Build ``n`` tokens from the fixed prompt fragment at rotation ``off``.
+
+    Args:
+        n: Prompt length.
+        off: Rotation into ``BASE``. Each batch row uses a different offset so
+            the rows hold distinct text; identical rows would share a radix
+            prefix and turn a batched prefill into a single shared one.
+
+    Returns:
+        Token ids of length ``n``.
+    """
     return [BASE[(i + off) % len(BASE)] for i in range(n)]
 
 
 def alloc(pool, n_tokens: int) -> list[int]:
+    """Allocate enough blocks to hold ``n_tokens`` plus the run's headroom.
+
+    Args:
+        pool: The paged block pool from ``model.enable_paging``.
+        n_tokens: Prompt length. The extra ``2 * 16`` covers the draft tokens and
+            the KV the verify appends within one step; sizing exactly to the
+            prompt would fail mid-run instead of at allocation.
+
+    Returns:
+        The list of block ids assigned to this sequence.
+    """
     return [pool.alloc() for _ in range(-(-(n_tokens + 2 * 16) // BLOCK))]
 
 
 def main() -> None:
+    """Run the greedy and speculative paths over each length and print both rates.
+
+    The two paths are timed by the same wall-clock pattern (reset, prefill, then
+    ``--steps`` steps, all behind one sync), so the ``x`` multiplier compares
+    like with like rather than a graph-replay figure against an eager one.
+
+    ``--once`` switches the verify to the one-forward path and additionally
+    re-runs the same step through the per-token verify, which is the only way to
+    attribute the difference to the verify mode rather than to the prompt.
+    """
     ap = argparse.ArgumentParser()
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--lengths", default="96")
@@ -113,6 +165,17 @@ def main() -> None:
 
         # Speculative run, timed the same way.
         def spec_run():
+            """Run the speculative path for ``--steps`` steps and time it.
+
+            Returns:
+                ``(seconds, produced, accepted, drafted)``: wall time for the
+                whole run, tokens emitted, draft tokens the model accepted, and
+                draft tokens offered. The caller divides the last two into the
+                acceptance rate.
+
+            The prefill is inside the timed region, matching the greedy loop's
+            accounting so the two rates are comparable.
+            """
             model.reset()
             lg = torch.stack([t.float() for t in
                               model.prefill_group(seqs, snapshot_interval=snap)[0]])
@@ -137,6 +200,19 @@ def main() -> None:
         t_spec, produced, accepted, drafted = spec_run()
 
         def report(name, t, prod, acc, dr):
+            """Print one row of per-step rate, acceptance and speedup.
+
+            Args:
+                name: Verify mode label (``once`` or ``token``).
+                t: Wall seconds for the run.
+                prod: Tokens produced.
+                acc: Draft tokens accepted.
+                dr: Draft tokens offered; the acceptance denominator, clamped up
+                    in the caller so a zero offers value cannot divide by zero.
+
+            Returns:
+                Tokens per second for this row.
+            """
             tps = prod / t
             print(f"  {name:6s}: {t*1e3/args.steps:8.2f} ms/step  {tps:8.1f} tok/s  "
                   f"({prod/(args.steps*cap):.3f} tok/row/step, "

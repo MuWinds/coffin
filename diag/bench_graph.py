@@ -1,6 +1,32 @@
 """A/B the static-shape engine: plain step vs CUDA-graph replay.
 
-Run:  python bench_graph.py [n]
+Answers what graph capture buys a single-sequence decode step, and whether it
+buys it without changing the output. That second half is the reason this is an
+A/B and not just a timing run: capture replays fixed addresses, so a stale
+buffer or a pointer captured before a reset shows up as a diverging token
+trajectory rather than a crash.
+
+Read in this order. ``match: True`` first — if the graph and plain trajectories
+differ, the ``speedup`` below it is a speedup of doing the wrong thing and the
+number should be ignored. Then ``speedup``: the gap is the host submission time
+removed by capture, so a small gap means this step is already device-bound and
+the graph is not the lever.
+
+Run inside the container from the engine root, on the DCU:
+
+    python bench_graph.py [n]
+
+``n`` is the number of decode tokens per timed run, default 50.
+
+Module: ``coffin/diag``. Standalone probe: imports ``qwen35_engine`` and torch,
+and nothing under ``coffin/`` imports it.
+
+Constraints:
+    * ``model.capture()`` must run before the graph measurement; an uncaptured
+      model would silently re-time the plain path and report a 1.00x speedup.
+    * Both paths are warmed before timing, because the plain path's first call
+      pays rocBLAS handle creation and would make capture look better than it is.
+    * Needs the real checkpoint, so it runs only where the weights are.
 """
 
 from __future__ import annotations
@@ -16,6 +42,18 @@ MODEL = "/root/private_data/models/Qwen3.5-4B"
 
 
 def timed(model, n, tokens, use_graph):
+    """Decode ``n`` tokens through one path and return milliseconds per token.
+
+    Args:
+        model: A loaded model, already captured when ``use_graph`` is set.
+        n: Token count to decode; the wall span is divided by this.
+        tokens: Seed prompt; the method appends each generated token, so the
+            run advances a real greedy trajectory instead of repeating one id.
+        use_graph: Replay the captured step instead of the eager path.
+
+    Returns:
+        Mean milliseconds per token over the whole run, including host time.
+    """
     model.reset()
     t0 = time.perf_counter()
     for i in range(n):
@@ -30,6 +68,7 @@ def timed(model, n, tokens, use_graph):
 
 
 def main():
+    """Print the plain and graph token rates, their ratio, and a trajectory match check."""
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 50
     print(f"device={torch.cuda.get_device_name(0)}")
     model = E.Qwen35(MODEL, max_seq=2048, bench=True)

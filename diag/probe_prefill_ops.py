@@ -8,6 +8,15 @@ filters to kernel rows only, names the host-side dispatcher hotspots, attributes
 points at: the delta scan's strided per-chunk store, and the causal conv chain.
 
 Run:  python probe_prefill_ops.py [n] [chunk]
+
+Module: ``coffin/diag``. Filters a profiler table down to kernel rows; the host
+side belongs to ``aten`` dispatch in ``ops/``.
+
+Constraints:
+    * Kernel rows only. Mixing in torch op rows double counts the same device
+      time, which is the error this probe exists to correct.
+    * The strided-store question is measured here rather than argued about: the
+      store pattern is what decides whether a fusion is worth writing.
 """
 
 from __future__ import annotations

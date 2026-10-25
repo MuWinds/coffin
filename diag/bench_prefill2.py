@@ -1,6 +1,29 @@
 """Prefill throughput: batched path vs the one-token path, across prompt sizes.
 
-Run:  python bench_prefill2.py
+Answers how much the batched prefill kernel is worth over feeding tokens through
+the single-token path one at a time — the phase-1 fallback. This is the
+end-to-end number that ``probe_prefill_split.py`` then attributes to parts.
+
+Read the ``speedup`` column as a function of ``n``: it grows with prompt length
+because the one-token path pays its per-call fixed cost n times, so a flat
+speedup across sizes means the fixed cost is not what the batch path is saving.
+``batch tok/s`` is the throughput to quote; it is the figure a serving decision
+should use.
+
+Run inside the container from the engine root, on the DCU:
+
+    python bench_prefill2.py
+
+Module: ``coffin/diag``. Standalone probe: imports ``qwen35_engine`` and torch,
+and nothing under ``coffin/`` imports it.
+
+Constraints:
+    * Every path is warmed once before timing (rocBLAS handles, the memory pool,
+      the solver), because a cold first call would otherwise land in the ``n=32``
+      row and make the smallest prompt look the slowest.
+    * The timed regions include the prefill only, with ``reset`` outside the
+      timer where possible, so the column measures prefill and not teardown.
+    * Needs the real checkpoint, so it runs only where the weights are.
 """
 
 from __future__ import annotations

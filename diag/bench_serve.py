@@ -1,8 +1,9 @@
 """Concurrent-request throughput against a running ``serve.py``.
 
+Answers what the service delivers under concurrent clients, over the real wire.
 Unlike ``bench_batch.py`` (which drives ``LLMEngine`` in-process), this talks to
 the unix socket: it starts ``N`` client threads at the same time and measures how
-fast the server retires them.  That is the number the service is judged on, and
+fast the server retires them. That is the number the service is judged on, and
 the one batching is supposed to move.
 
     python3 serve.py --serve --max-num-seqs 8 --max-seq 4096 --num-blocks 512 \
@@ -14,6 +15,25 @@ the one batching is supposed to move.
 ``--tokens N`` sends N raw token ids (use a small N to measure decode rather than
 prefill); ``--prefix-tokens P`` sends a P-token shared prefix plus a 16-token
 per-client tail, which is what prefix reuse is supposed to make cheap.
+
+Read ``tok/s`` across the ``clients=`` rows for the batching payoff, and the
+``latency p50``/``max`` pair for what a single client experiences: a rising
+throughput with a flat p50 means the clients are being served concurrently, while
+a p50 that grows with ``clients`` means they are queueing behind the scheduler.
+The ``max`` lagging p50 badly is the tail a real user times out on.
+
+Module: ``coffin/diag``. Standalone benchmark: speaks the server's newline-JSON
+protocol over a unix socket and imports nothing from ``coffin/``.
+
+Constraints:
+    * The server must already be running with a matching ``--sock`` and a
+      ``--max-num-seqs`` large enough for the client count; otherwise the extra
+      clients queue and the run measures the limit, not the throughput.
+    * ``threading.Barrier`` is what makes the clients concurrent. Starting them
+      in a loop without it would serialise the first requests and understate the
+      result at high ``clients``.
+    * Each sweep does an untimed warmup at ``max_new=8`` so graph capture and
+      radix population are not charged to the measured run.
 """
 
 from __future__ import annotations
@@ -62,6 +82,14 @@ def run_clients(sock_path: str, prompts: list[list[int]], max_new: int
     results: list[tuple[int, float]] = [None] * n  # type: ignore[list-item]
 
     def worker(i: int) -> None:
+        """Send client ``i``'s request once the barrier releases all of them.
+
+        Args:
+            i: Client index, used to pick the prompt and the result slot.
+
+        Latency is recorded per client rather than derived from the wall time, so
+        the p50/max pair reflects individual requests instead of the whole sweep.
+        """
         barrier.wait()
         t0 = time.time()
         rep = _call(sock_path, {"op": "generate", "tokens": prompts[i],

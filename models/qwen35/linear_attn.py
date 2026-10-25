@@ -1,10 +1,35 @@
 """Gated DeltaNet linear attention: the mixer of 24 of the 32 layers.
 
+Module: ``coffin/models/qwen35``. The other per-layer attention kind
+(``full_attn`` is the 8 paged-KV layers); ``blocks.Layer`` picks one per layer
+index and ``model.py`` builds all 32. Depends downward on ``hip_ops`` for the
+kernels, ``ops.delta`` for the chunked prefill scan and ``ops`` for dtypes /
+proj / norm, plus ``models/qwen35/batch`` and ``tuning``. Nothing outside this
+family may import it directly.
+
 All state (conv window, fp32 recurrent state) lives in fixed buffers updated in
 place, so the decode step is graph-capturable.  Decode runs the fused prologue
 and delta kernels; prefill uses the chunked form in ``ops.delta``; verify runs
 the decode kernels per token and copies the state after each one, because a
 rejected draft has to be rolled back.
+
+Constraints:
+    * The recurrent state ``[num_v, dk, dv]`` is 2 MB per layer in fp32 and has
+      no closed-form rewind. Every path that can be rolled back (single-stream
+      verify, batched verify) therefore copies the state before/after each
+      token into ``ckpt_*``; without that copy a rejected draft leaves the mixer
+      permanently ahead of the KV.
+    * State must be snapshotted *together* with the full-attention KV when the
+      prefix engine exports a snapshot, or a reused prefix pairs keys from one
+      request with a recurrence that never saw them.
+    * Buffers are capacity-sized with the batch row leading, and ``prefill_row``
+      (the last row) is where the single-stream prefill/verify runs -- so a
+      prefill between decode steps cannot clobber a decode row's state.
+    * fp32 throughout the recurrence: the delta rule accumulates outer products
+      across the whole context, and bf16 state diverges over a few thousand
+      tokens.
+    * All mutation is single-threaded, driven by ``llm_engine``; there is no
+      locking and none may be added.
 """
 
 from __future__ import annotations
@@ -29,6 +54,16 @@ class LinearAttn:
     """
 
     def __init__(self, sd: dict, p: str, cfg: dict, bench: bool) -> None:
+        """Load one layer's DeltaNet weights and allocate its recurrent state.
+
+        Args:
+            sd: Full state dict; this layer reads the ``{p}.*`` keys only.
+            p: Checkpoint prefix of the layer, e.g. ``model.layers.0.linear_attn``.
+            cfg: Model config. The head split (32 value heads, 16 key heads),
+                ``linear_key_head_dim`` / ``linear_value_head_dim`` (128 each)
+                and ``linear_conv_kernel_dim`` (4) come from here.
+            bench: Threaded into ``_proj`` to select the benchmark weight layout.
+        """
         self.num_v = cfg["linear_num_value_heads"]      # 32
         self.num_k = cfg["linear_num_key_heads"]        # 16
         self.dk = cfg["linear_key_head_dim"]            # 128
@@ -43,7 +78,11 @@ class LinearAttn:
                                   f"{p}.in_proj_b", f"{p}.in_proj_a"], bench)
         self.out_proj = _proj(sd, [f"{p}.out_proj"], bench)
         self.norm = RMSNormGated(sd[f"{p}.norm.weight"])
+        # The conv kernel arrives as [conv_dim, 1, 4]; the last dim stays last so
+        # the fused kernel can read the four taps as a contiguous stride-1 run.
         self.conv_w = sd[f"{p}.conv1d.weight"].reshape(self.conv_dim, self.kernel).float()
+        # ``A_log`` / ``dt_bias`` are stored in fp32 by the checkpoint and are
+        # exponentiated here: doing that in a low dtype loses the decay rate.
         self.A_log = sd[f"{p}.A_log"].float()
         self.dt_bias = sd[f"{p}.dt_bias"].float()
         self.neg_expA = -self.A_log.exp()
@@ -69,8 +108,9 @@ class LinearAttn:
         self.beta = torch.zeros(rows, self.num_v, dtype=torch.float32, device="cuda")
         self.g = torch.zeros(rows, self.num_v, dtype=torch.float32, device="cuda")
 
-        # per-token state snapshots for speculative-verify rollback (one slot per
+        # Per-token state snapshots for speculative-verify rollback (one slot per
         # verified token; the recurrent state cannot be rewound otherwise).
+        # ``CKPT`` bounds the verify width for the same reason.
         self.ckpt_state = torch.zeros(CKPT, self.num_v, self.dk, self.dv, dtype=torch.float32, device="cuda")
         self.ckpt_conv = torch.zeros(CKPT, self.conv_dim, self.kernel - 1, dtype=torch.float32, device="cuda")
         # Batched speculative verify keeps one snapshot per (row, verified token);
@@ -80,7 +120,17 @@ class LinearAttn:
         self.ckpt_conv_b: torch.Tensor | None = None
 
     def enable_verify_batch(self, capacity: int, width: int) -> None:
-        """Room for ``width`` rollback snapshots of every batch row."""
+        """Room for ``width`` rollback snapshots of every batch row.
+
+        Args:
+            capacity: Decode rows.
+            width: Verified tokens per row, i.e. snapshot slots. Must not exceed
+                ``CKPT`` when the single-stream path also has to hold them.
+
+        Returns:
+            Nothing. Idempotent for an unchanged shape, so a second call after
+            the first ``enable_verify_batch`` does not reallocate under a graph.
+        """
         if self.ckpt_state_b is not None and self.ckpt_state_b.shape[:2] == (capacity, width):
             return
         self.ckpt_state_b = torch.zeros(capacity, width, self.num_v, self.dk, self.dv,
@@ -89,6 +139,19 @@ class LinearAttn:
                                        dtype=torch.float32, device="cuda")
 
     def snapshot_batch(self, rows: int, slot: int) -> None:
+        """Save the live recurrent (and conv) state of ``rows`` into one slot.
+
+        Args:
+            rows: Leading rows to copy; the rest are untouched, so a partially
+                filled bucket does not pay for idle rows.
+            slot: Snapshot index inside the verify width, i.e. how many drafted
+                tokens have been accepted at this point.
+
+        Returns:
+            Nothing. This is the only way the batched verify can rewind, so the
+            call has to happen after every verified token, before the next one
+            mutates the state in place.
+        """
         self.ckpt_state_b[:rows, slot].copy_(self.state[:rows])
         self.ckpt_conv_b[:rows, slot].copy_(self.conv_state[:rows])
 
@@ -101,6 +164,17 @@ class LinearAttn:
         the recurrent state after the token -- ``slot`` is its index inside the
         verify width, i.e. the rollback point if the drafts up to here are
         accepted.
+
+        Args:
+            qkv: Fused q/k/v projection for the token, ``[B, conv_dim]``.
+            z: Gate projection, ``[B, vdim]``.
+            b: Beta logits, ``[B, num_v]``.
+            a: Decay logits, ``[B, num_v]``.
+            slot: Snapshot index, ``0 <= slot < width``.
+
+        Returns:
+            ``[B, vdim]`` pre-``out_proj`` output, so the caller runs that weight
+            read once for the whole bucket.
         """
         rows = qkv.shape[0]
         hip_ops.conv1d_silu_batch(self.conv_w, qkv, self.conv_state[:rows],
@@ -126,11 +200,33 @@ class LinearAttn:
         return proj_in.reshape(rows, self.vdim)
 
     def restore_batch(self, row: int, slot: int) -> None:
+        """Rewind one row's recurrent state to a snapshot taken during verify.
+
+        Args:
+            row: Decode row to restore.
+            slot: Snapshot index that was accepted; everything after it is
+                dropped by moving the state back, which is why the verify loop
+                snapshots unconditionally rather than on accept.
+
+        Returns:
+            Nothing. Only the state and conv window move -- the KV cache is
+            position-indexed and rewound by the position counter.
+        """
         self.state[row].copy_(self.ckpt_state_b[row, slot])
         self.conv_state[row].copy_(self.ckpt_conv_b[row, slot])
 
     def enable_batching(self, capacity: int, prefill_row: int) -> None:
-        """Give the recurrent state and scratch one row per batch entry."""
+        """Give the recurrent state and scratch one row per batch entry.
+
+        Args:
+            capacity: Rows the batch needs, including the prefill row.
+            prefill_row: Row reserved for single-stream prefill and verify, so a
+                prefill between decode steps never clobbers a decode row's state.
+
+        Returns:
+            Nothing. A no-op when the geometry already matches, which keeps the
+            captured graph's buffer addresses valid.
+        """
         capacity = max(int(capacity), 1)
         if capacity == 1 and self.prefill_row == 0:
             return
@@ -159,6 +255,19 @@ class LinearAttn:
         update) instead of B, each row carrying its own state/conv row.  Without
         them this falls back to calling the single-row kernels once per row; both
         paths must stay bit-identical per row.
+
+        Args:
+            x: Decode-row inputs, ``[B, hidden]``.
+            *_: Absorbed layer-argument placeholder, so ``Layer.batch`` can call
+                every mixer with the same signature.
+
+        Returns:
+            ``[B, hidden]`` layer output after the batched ``out_proj``.
+
+        Raises:
+            RuntimeError: ``hip_ops`` is unavailable. The linear mixer has no
+                eager fallback in the batched path because the chunked scan is
+                the only implementation that keeps rows independent.
         """
         B = x.shape[0]
         if not hip_ops.available():
@@ -185,6 +294,9 @@ class LinearAttn:
             hip_ops.delta_batch(self.q_pro[:B], self.k_pro[:B], self.v_pro[:B],
                                 self.beta[:B], self.g[:B], self.state[:B],
                                 self.delta_out[:B])
+            # The gated norm is per (row, value head) and its weight is [dv], so
+            # it cannot be folded into the batched kernels -- this loop is one
+            # launch per row, not per head.
             for i in range(B):
                 proj_in[i] = self.norm(self.delta_out[i],
                                        z[i].reshape(self.num_v, self.dv)).reshape(self.vdim)
@@ -207,13 +319,23 @@ class LinearAttn:
         return batch_proj(self.out_proj, proj_in)
 
     def __call__(self, x: torch.Tensor, *_) -> torch.Tensor:
+        """Single-token decode step, state updated in place.
+
+        Args:
+            x: The layer input for this token, ``[hidden]``.
+            *_: Absorbed layer-argument placeholder, so ``Layer.__call__`` can
+                call both mixer kinds with the same signature.
+
+        Returns:
+            ``[hidden]`` layer output after ``out_proj``.
+        """
         qkv, z, b, a = self.qkvzb_a(x)
         z = z.reshape(self.num_v, self.dv)
         pr = self.prefill_row
         conv_state, conv_out = self.conv_state[pr], self.conv_out[pr]
 
-        # depthwise causal conv1d (kernel 4) over the last 3 states + current,
-        # fused with the SiLU into one kernel (was cat + copy_ + mul + sum + silu)
+        # Depthwise causal conv1d (kernel 4) over the last 3 states plus current,
+        # fused with the SiLU into one kernel (was cat + copy_ + mul + sum + silu).
         if hip_ops.available():
             hip_ops.conv1d_silu(self.conv_w, qkv, conv_state, conv_out)
             qkv = conv_out
@@ -227,8 +349,9 @@ class LinearAttn:
         k = k.reshape(self.num_k, self.dk)
         v = v.reshape(self.num_v, self.dv)
 
-        # fused q/k norm + head expand + beta/g: one kernel instead of ~16 small
-        # elementwise ops (mul, sum, rsqrt, sigmoid, softplus, add, repeat_interleave).
+        # Fused q/k norm + head expand + beta/g: one kernel instead of ~16 small
+        # elementwise ops (mul, sum, rsqrt, sigmoid, softplus, add,
+        # repeat_interleave).
         q_pro, k_pro, v_pro = self.q_pro[pr], self.k_pro[pr], self.v_pro[pr]
         beta, g = self.beta[pr], self.g[pr]
         if hip_ops.available():
@@ -238,11 +361,14 @@ class LinearAttn:
             out = hip_ops.delta(q_pro, k_pro, v_pro, beta, g,
                                 self.state[pr], self.delta_out[pr])
         else:
+            # Eager reference of the same prologue, kept because the numeric
+            # tests run with the extension absent.
             if self.rep > 1:
                 q = q.repeat_interleave(self.rep, dim=0)
                 k = k.repeat_interleave(self.rep, dim=0)
             beta = b.sigmoid().float()
-            g = self.neg_expA * F.softplus(a.float() + self.dt_bias)  # <= 0
+            # g <= 0 by construction: a decay per step, never a growth.
+            g = self.neg_expA * F.softplus(a.float() + self.dt_bias)
             q = q.float(); k = k.float()
             q = q * torch.rsqrt((q * q).sum(-1, keepdim=True) + 1e-6) * self.qscale
             k = k * torch.rsqrt((k * k).sum(-1, keepdim=True) + 1e-6)
@@ -259,9 +385,18 @@ class LinearAttn:
         state after each token can be copied into ``ckpt_state``/``ckpt_conv``
         and restored when a draft is rejected. The projections are batched
         (``gemv_m``), so C tokens cost about one weight pass.
+
+        Args:
+            x: The drafted tokens' inputs, ``[C, hidden]``, ``C <= CKPT``.
+
+        Returns:
+            ``[C, hidden]`` layer output after ``out_proj``. The snapshot in
+            ``ckpt_state[i]`` is the state *after* token ``i``, so it doubles as
+            the resume point if the first ``i+1`` drafts are accepted.
         """
         C = x.shape[0]
-        qkv, z, b, a = self.qkvzb_a.prefill(x)          # [C, conv_dim], [C, vdim], [C, nv]x2
+        # [C, conv_dim], [C, vdim], [C, nv]x2
+        qkv, z, b, a = self.qkvzb_a.prefill(x)
         # The recurrent part is per-token, but ``out_proj`` is a weight read: batch
         # it, otherwise C tokens re-read the projection C times.
         proj_in = torch.empty(C, self.vdim, dtype=D, device="cuda")
@@ -293,6 +428,14 @@ class LinearAttn:
 
         Split out so a group prefill can run one GEMM over the concatenated
         prompts of several sequences and slice the result afterwards.
+
+        Args:
+            x: Prefill inputs, ``[C, hidden]``.
+
+        Returns:
+            ``(qkv, z, b, a)`` before the conv and the delta prep, i.e. what
+            :meth:`prefill_state` consumes after the caller's optional
+            concatenation and slicing.
         """
         return self.qkvzb_a.prefill(x)
 
@@ -304,6 +447,18 @@ class LinearAttn:
         Runs the causal conv, the fused head prep and the chunked delta scan
         against ``row``'s conv/recurrent state, so several sequences can share one
         batched projection and still keep independent state.
+
+        Args:
+            qkv: Fused q/k/v projection, ``[C, conv_dim]``.
+            z: Gate projection, ``[C, vdim]``.
+            b: Beta logits, ``[C, num_v]``.
+            a: Decay logits, ``[C, num_v]``.
+            row: State row to advance; ``None`` uses the staging row.
+            chunk: Tokens per chunk in the delta scan. The scan is exact for any
+                split, so this trades scratch size against launch count.
+
+        Returns:
+            ``[C, vdim]`` gated-norm output, before ``out_proj``.
         """
         if row is None:
             row = self.prefill_row
@@ -323,7 +478,9 @@ class LinearAttn:
             hip_ops.delta_prep_seq(qkv, b, a, self.neg_expA, self.dt_bias,
                                    qt, kt, vt, bt, gt, self.qscale, self.rep)
         else:
-            # depthwise causal conv1d over the sequence, carrying the last 3 tokens
+            # Eager reference: the same conv window carried across chunks, then
+            # the same head prep, so the numeric tests can run without the
+            # extension.
             seq = torch.cat([conv_state.t(), qkv.float()], dim=0)  # [3+C, conv_dim]
             conv_state.copy_(seq[-self.kernel + 1:].t())
             win = seq.unfold(0, self.kernel, 1)                        # [C, conv_dim, k]
@@ -339,7 +496,8 @@ class LinearAttn:
             q = q * torch.rsqrt((q * q).sum(-1, keepdim=True) + 1e-6) * self.qscale
             k = k * torch.rsqrt((k * k).sum(-1, keepdim=True) + 1e-6)
             qt, kt, vt = q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1)
-            bt = b.sigmoid().float().transpose(0, 1)                   # [Hv, C]
+            # [Hv, C]: the chunked scan is laid out head-major.
+            bt = b.sigmoid().float().transpose(0, 1)
             gt = (self.neg_expA * F.softplus(a.float() + self.dt_bias)).transpose(0, 1)
 
         out = chunked_delta(qt, kt, vt, gt, bt, self.state[row], self.state[row], chunk)
@@ -348,11 +506,31 @@ class LinearAttn:
 
     def prefill(self, x: torch.Tensor, _positions=None, _ctx=None, _tiles=None,
                 chunk: int = 64) -> torch.Tensor:
-        """``x`` [C, hidden] -> [C, hidden]; updates conv state and delta state."""
+        """``x`` [C, hidden] -> [C, hidden]; updates conv state and delta state.
+
+        Args:
+            x: Prefill inputs, ``[C, hidden]``.
+            _positions: Ignored. Present because ``Layer.prefill`` calls both
+                mixer kinds with one signature; the linear mixer is causal by
+                construction and needs no position table.
+            _ctx: Ignored, same reason.
+            _tiles: Ignored, same reason.
+            chunk: Tokens per chunk in the delta scan.
+
+        Returns:
+            ``[C, hidden]`` layer output after ``out_proj``, in ``x`` order.
+        """
         proj = self.prefill_project(x)
         out = self.prefill_state(*proj, row=self.prefill_row, chunk=chunk)
         return self.out_proj.prefill(out)
 
     def reset(self) -> None:
+        """Clear the recurrence between requests.
+
+        Returns:
+            Nothing. Both buffers must go back to zero: a leftover conv window
+            would let the next request's first tokens see the previous request's
+            tail, which no position counter can undo.
+        """
         self.conv_state.zero_()
         self.state.zero_()

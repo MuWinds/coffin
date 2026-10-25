@@ -1,8 +1,10 @@
 """Determinism / regression probe on the *supported* serving path.
 
-The paged pool's ``pos2slot`` starts as all zeros: a caller that runs
+Answers whether the path ``serve.py`` actually uses is deterministic, which is a
+narrower and more useful question than probing the model object directly. The
+paged pool's ``pos2slot`` starts as all zeros: a caller that runs
 ``model.prefill()`` without first assigning a block table makes every token
-address slot 0, so successive prefills stomp on each other's KV.  That is a
+address slot 0, so successive prefills stomp on each other's KV. That is a
 misuse of the internal API -- the public path is ``PrefixCacheEngine`` (or
 ``LLMEngine``), which allocates blocks and installs the table first.
 
@@ -12,7 +14,28 @@ This probe therefore drives the engine the way ``serve.py`` does, and checks:
   2. warm (prefix hit) == cold for the same prompt
   3. optionally, the same prompt with an image differs from text-only
 
+Read the three numbered blocks. Check 2 is the one that guards prefix reuse:
+warm must equal cold, because the radix cache hands the second request the first
+one's KV, and any mismatch means reused blocks do not carry the state the prompt
+needs. Check 3 asserts the *opposite* direction — an image prompt must differ
+from the text-only one by more than 1e-2 — so a vision path that silently drops
+the image fails here instead of passing quietly.
+
     flock /root/private_data/gpu.lock -c 'python3 diag/engine_path_probe.py'
+
+Module: ``coffin/diag``. Standalone probe: imports ``engine_api``,
+``prefix_engine``, ``mm_input`` and transformers, and nothing under ``coffin/``
+imports it.
+
+Constraints:
+    * ``PrefixCacheEngine`` must be constructed before ``capture()``. It assigns
+      the block table, and a paged model captured with ``pos2slot`` still all
+      zeros maps every position to slot 0 — that caller error is what made an
+      earlier version of this probe report false non-determinism.
+    * ``flock`` is required: a pinned, deterministic comparison still needs the
+      whole card, and a co-tenant can push a run past its timeout.
+    * ``pc.release()`` runs before each measured prefill so "cold" means cold;
+      skipping it turns check 1 into a warm-cache test.
 """
 from __future__ import annotations
 

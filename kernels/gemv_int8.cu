@@ -1,17 +1,29 @@
-// Weight-only int8 GEMV (W8A16) for decode.
+// @file gemv_int8.cu
+// @brief Weight-only int8 GEMV (W8A16) for decode.
 //
-// Decode on this part is bandwidth-bound: the projections run at 540-680 GB/s
+// Module: coffin/kernels. The quantised half of the projection path; the fp16/bf16
+// family is ``gemv.cu`` and the M in {16, 24, 32} verify variant is
+// ``gemv_wide.cu``, which must stay bit-identical to the M=8 kernel here.
+//
+// Why: decode on this part is bandwidth-bound. The projections run at 540-680 GB/s
 // against a ~700 GB/s copy ceiling and are ~48% of the step, hipBLAS GEMV at M=1
 // is unusable and Triton has no gfx906 backend. The only remaining lever on that
-// 48% is reading fewer bytes per weight, so the weights are stored as int8 with
-// a per-row scale and read once per decode step. Activations stay bf16: the
-// kernel is memory-bound, so the int8 -> float conversion is hidden, and keeping
-// A in bf16 avoids a second quantiser and its error.
+// 48% is reading fewer bytes per weight, so the weights are stored as int8 with a
+// per-row scale and read once per decode step. Activations stay bf16: the kernel
+// is memory-bound, so the int8 -> float conversion is hidden, and keeping A in
+// bf16 avoids a second quantiser and its error.
 //
-// The structure is deliberately identical to gemv_kernel (one warp per output
-// row, R rows per warp, U-way K unroll, 8 accumulators per lane): only the
-// weight load changes, from one uint4 (8 bf16, 16 B) to one uint2 (8 int8, 8 B),
-// and the row scale is applied once at the end instead of per element.
+// Constraints:
+//   * Weights are INT8 row-major [N, K] with a per-row fp32 scale; a column-major
+//     or per-group layout would break both this kernel and every prepacked
+//     checkpoint.
+//   * The structure is deliberately identical to ``gemv_kernel`` (one warp per
+//     output row, R rows per warp, U-way K unroll, 8 accumulators per lane): only
+//     the weight load changes, from one uint4 (8 bf16, 16 B) to one uint2 (8 int8,
+//     8 B), and the row scale is applied once at the end instead of per element.
+//   * Only the listed (R, U) / (M, U) pairs are instantiated; anything else is a
+//     TORCH_CHECK failure.
+//   * ``dk``-style tails: K % 8 is handled by a scalar tail, so any K is correct.
 
 #include "hip_ops.h"
 
@@ -31,9 +43,10 @@ __device__ __forceinline__ unsigned short float_to_bf16(float f) {
     return (unsigned short)(u >> 16);
 }
 
-// Eight int8 (one uint2) against eight bf16 (one uint4). Extracting the bytes by
-// shift keeps the packed weight in registers; a reinterpret_cast to char* would
-// force it to local memory.
+// @brief Eight int8 (one uint2) against eight bf16 (one uint4).
+//
+// Extracting the bytes by shift keeps the packed weight in registers; a
+// reinterpret_cast to char* would force it to local memory.
 __device__ __forceinline__ void accumulate_i8(float* acc, const uint2& w, const uint4& x) {
     const unsigned short* xh = reinterpret_cast<const unsigned short*>(&x);
     const unsigned lo = w.x, hi = w.y;
@@ -45,6 +58,11 @@ __device__ __forceinline__ void accumulate_i8(float* acc, const uint2& w, const 
     }
 }
 
+// @brief One warp per output row, R rows per warp, 8 FMA chains per lane.
+//
+// @param S [N] fp32 per-row dequant scale, applied once after the reduction.
+// @param x [K] bf16 activation.
+// @param y [N] bf16 output; lane 0 writes the row's scaled sum.
 template <int R, int U>
 __global__ void gemv_w8a16_kernel(const int8_t* __restrict__ W,
                                   const float* __restrict__ S,
@@ -111,8 +129,13 @@ __global__ void gemv_w8a16_kernel(const int8_t* __restrict__ W,
     }
 }
 
-// Batched small-M variant: the row (and its scale) is read once for M input
-// vectors, which is what keeps speculative verification at ~one weight pass.
+// @brief Batched small-M variant: the row (and its scale) is read once for M
+//        input vectors.
+//
+// That is what keeps speculative verification at ~one weight pass.
+//
+// @param X [M, K] bf16; M is the instantiated template parameter.
+// @param Y [M, N] bf16; the scale is applied per row after the reduction.
 template <int M, int U>
 __global__ void gemv_w8a16_m_kernel(const int8_t* __restrict__ W,
                                     const float* __restrict__ S,
@@ -174,6 +197,16 @@ __global__ void gemv_w8a16_m_kernel(const int8_t* __restrict__ W,
 
 }  // namespace
 
+// @brief Weight-only int8 GEMV for a single decode token.
+//
+// @param W [N, K] int8 row-major, contiguous.
+// @param S [N] fp32 per-row scale, contiguous.
+// @param x [K] bf16 activation, contiguous.
+// @param R Output rows per warp (1, 2 or 4); picked by the load-time benchmark.
+// @param U K-loop unroll; only affects latency hiding, not the arithmetic.
+// @return [N] bf16.
+// @throws c10::Error (TORCH_CHECK) on a non-contiguous input or a weight dtype
+//         that is not int8.
 torch::Tensor gemv_w8a16(torch::Tensor W, torch::Tensor S, torch::Tensor x,
                          int64_t R, int64_t U) {
     TORCH_CHECK(W.is_contiguous() && x.is_contiguous() && S.is_contiguous(),
@@ -202,6 +235,13 @@ torch::Tensor gemv_w8a16(torch::Tensor W, torch::Tensor S, torch::Tensor x,
     return y;
 }
 
+// @brief Batched small-M int8 GEMV: one weight pass for M activation vectors.
+//
+// @param X [M, K] bf16; M must be 2, 4 or 8, the instantiated values. The verify
+//          path with M in {16, 24, 32} is ``gemv_wide.cu`` instead.
+// @param U K-loop unroll.
+// @return [M, N] bf16, bit-identical to calling ``gemv_w8a16`` on each row.
+// @throws c10::Error (TORCH_CHECK) when M/U has no instantiated kernel.
 torch::Tensor gemv_w8a16_m(torch::Tensor W, torch::Tensor S, torch::Tensor X, int64_t U) {
     TORCH_CHECK(W.is_contiguous() && X.is_contiguous() && S.is_contiguous(),
                 "contiguous inputs required");

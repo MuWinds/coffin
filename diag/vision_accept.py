@@ -1,17 +1,38 @@
 """Canonical vision-tower acceptance: formula parity + clean performance.
 
-Runs the engine's tower against the fp32 transformers oracle and reports the
-three gates agreed with the implementation owner:
+Answers whether the engine's vision tower computes the same function as the
+reference implementation, and what the quantised path costs. Runs the engine's
+tower against the fp32 transformers oracle and reports the three gates agreed
+with the implementation owner:
 
   A. engine fp32 vs HF fp32   rel <= 2e-5   (formula correctness)
   B. engine fp16 vs HF fp32   rel <= 3e-2   (what fp16 itself costs)
   C. engine fp16 vs HF bf16   rel <= 1.5e-1 (smoke: the bf16 oracle's own noise)
+
+The three gates are ordered so a failure localises: A failing means the formula
+is wrong and B/C are meaningless; A passing with B failing is an expected
+precision cost unless it exceeds 3e-2; C is deliberately loose and only catches a
+gross error, because the bf16 oracle carries its own rounding. The final line,
+``VISION_ACCEPT PASS/FAIL``, is the aggregate of A-C over every size.
 
 Deliberately measures performance *after* dropping the text weights, so the
 reported peak belongs to the tower and not to the resident model.
 
     flock /root/private_data/gpu.lock -c 'python3 diag/vision_accept.py'
     ... --sizes 256 512 1024 --vision-int8
+
+Module: ``coffin/diag``. Standalone probe: imports ``engine_api`` and
+``models.qwen35/vision.py`` directly, plus transformers for the oracle.
+
+Constraints:
+    * The checkpoint keys are prefixed ``model.visual.`` while ``VisionTower``
+      wants them without, so the host copy is kept short-named and a prefixed
+      copy is built for the tower. Mixing the two silently loads nothing.
+    * The oracle is constructed per size and deleted before timing, with
+      ``empty_cache`` and a reset peak counter. Leaving it resident would charge
+      the tower's peak-memory figure for the oracle's weights.
+    * ``flock`` is required: two towers plus an oracle will not fit beside a
+      co-tenant on this card.
 """
 from __future__ import annotations
 
@@ -48,6 +69,28 @@ def make_image(h: int, w: int):
 
 
 def build_oracle(model_dir: str, dtype: torch.dtype, sd_cpu: dict):
+    """Instantiate the reference vision model from transformers at one precision.
+
+    Args:
+        model_dir: Checkpoint directory holding ``config.json``.
+        dtype: Precision to build and cast the oracle to. fp32 is the formula
+            oracle; bf16 exists only to show the reference's own noise floor.
+        sd_cpu: Vision tensors keyed by short module name, as loaded from the
+            shards.
+
+    Returns:
+        An eval-mode ``Qwen3VLVisionModel`` on the DCU.
+
+    Raises:
+        RuntimeError: The state dict does not match the reference architecture.
+            The message lists the missing and unexpected keys; a mismatch means
+            the checkpoint and the installed transformers disagree, so the
+            comparison would be against the wrong formula and must not be used.
+
+    ``strict=False`` plus an explicit check is deliberate: the reference module
+    names a few buffers the checkpoint omits, and a hard failure on those would
+    block the probe. The check still catches a genuinely wrong architecture.
+    """
     from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLVisionConfig
     from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
 
@@ -64,6 +107,7 @@ def build_oracle(model_dir: str, dtype: torch.dtype, sd_cpu: dict):
 
 
 def main() -> None:
+    """Run the three gates per image size, then time the fp16 tower with only its own weights resident."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=MD)
     ap.add_argument("--sizes", type=int, nargs="*", default=[256, 512])
@@ -129,6 +173,13 @@ def main() -> None:
         torch.cuda.empty_cache()
 
         def rel(a, b):
+            """Relative L2 error of ``a`` against ``b``, as a plain float.
+
+            Args:
+                a: Engine output.
+                b: Oracle output, the denominator; it is the reference magnitude,
+                    so the ratio is scale-free and comparable across sizes.
+            """
             return ((a.float().cpu() - b.float().cpu()).norm()
                     / b.float().cpu().norm()).item()
 

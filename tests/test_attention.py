@@ -1,5 +1,20 @@
 """Blocked attention paths must agree with the unblocked ones.
 
+Module: ``coffin/tests``. Loads the model and the HIP extension, then swaps the
+attention entry point under the running model; nothing else in the suite may
+monkey-patch ``hip_ops`` like this.
+
+Constraints:
+    * Agreement is judged in bf16 ULPs, not fp32 relative error: everything this
+      engine emits is bf16, so two identical fp32 computations that differ only
+      in accumulation order still land on different bf16 values at rounding
+      boundaries. A tighter bound would fail on rounding, not on a bug.
+    * The kernel globals patched here are module state, so every patch is undone
+      in a ``finally``; a leaked patch would silently redefine what the later
+      tests measure.
+    * The prompt must exceed the largest block under test, otherwise the block
+      sweep never crosses a boundary and proves nothing.
+
 Long context needed two restructurings, and neither may move a single number:
 
 * prefill streams keys in blocks of ``PREFILL_ATTN_KB`` with a running max
@@ -8,13 +23,9 @@ Long context needed two restructurings, and neither may move a single number:
   online softmax -- it used to hold the whole window in ``[S]`` floats in shared
   memory, which does not fit past ~15k.
 
-So this is an A/B on the same model and the same prompt.  Port of
+So this is an A/B on the same model and the same prompt. Port of
 ``diag/check_attn_block.py``; the batched-vs-sequential prefill check is the
 port of ``diag/check_prefill.py``.
-
-Agreement is judged in bf16 ULPs, not fp32 relative error: everything this
-engine emits is bf16, so two identical fp32 computations that differ only in
-accumulation order still land on different bf16 values at rounding boundaries.
 """
 
 from __future__ import annotations
@@ -56,10 +67,13 @@ def _compare(a: torch.Tensor, b: torch.Tensor, max_ulps: float = 4.0):
 @support.needs_hip
 @support.needs_model
 class AttnBlockTest(support.ModelTestCase):
+    """A block width is a performance knob: changing it must not move one bf16 value."""
+
     QUANT = False
     MAX_SEQ = 4096
 
     def test_prefill_key_block_width_is_a_no_op(self):
+        """The online-softmax prefill must land on the same logits at every block width."""
         from models.qwen35 import full_attn
 
         toks = _tokens(PREFILL_TOKENS)
@@ -144,6 +158,7 @@ class PrefillEquivalenceTest(support.ModelTestCase):
     MAX_SEQ = 4096
 
     def test_batched_matches_token_by_token(self):
+        """Batched prefill must pick the same next token as walking the prompt one call at a time."""
         for n in (5, 100, 700):
             with self.subTest(n=n):
                 toks = _tokens(n)

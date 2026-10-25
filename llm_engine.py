@@ -1,21 +1,25 @@
 """The engine, assembled: model + runner + scheduler + block manager.
 
-This is the module a server talks to.  It owns the request lifecycle, the block
-pool and the model's captured graphs; ``serve.py`` is left with the socket, the
-tokenizer and the response protocol.
+Module: ``coffin/`` (top layer). This is what a server talks to; ``serve.py`` is
+left with the socket, the tokenizer and the response protocol. The engine owns
+the request lifecycle, the block pool and the model's captured graphs.
 
     LLMEngine
       ├── ModelRunner      how one step executes (graph replay / paged write)
       ├── Scheduler        which sequences are in the next step
       └── BlockManager     the paged pool, its refcounts (and the radix tree
-                           when single-stream prefix reuse is on)
+                           when prefix reuse is on)
 
-One :meth:`step` is one iteration of the serving loop: at most one new request
-is prefilled (on the staging row) and every running sequence with KV is decoded
-in the same batched forward.  ``step`` returns the tokens it produced, so both
-the blocking :meth:`generate` and the streaming :meth:`stream` are thin loops
-around it, and a serving thread can interleave several requests by calling
-:meth:`add_request` while stepping.
+Constraints:
+    * One :meth:`step` is one iteration of the serving loop: new requests are
+      prefilled (on the staging row) and every running sequence with KV is
+      decoded in the same batched forward. :meth:`generate` and :meth:`stream`
+      are thin loops around it, so the loop itself holds no request state.
+    * A serving thread may call :meth:`add_request` between steps, never during
+      one: ``step`` mutates the scheduler's running list and no lock is taken.
+    * A finished sequence is released by whoever detects the finish
+      (:meth:`_commit`, :meth:`_spec_commit`, the expiry pass). Missing one call
+      leaks a batch row, and the next admission then fails outright.
 """
 
 from __future__ import annotations
@@ -39,6 +43,14 @@ class LLMEngine:
     """One loaded checkpoint, driven request by request."""
 
     def __init__(self, cfg: EngineConfig, model) -> None:
+        """Assemble the layers and provision the KV pool.
+
+        Args:
+            cfg: Engine configuration; decides batching, prefix caching and the
+                pool size.
+            model: Loaded ``engine_api`` model. Paging is enabled on it here, so
+                the caller must not allocate KV before this returns.
+        """
         self.cfg = cfg
         self.model = model
         self.runner = ModelRunner(model, cfg)
@@ -47,10 +59,10 @@ class LLMEngine:
         self.pc: "PrefixCacheEngine | None" = None
         self.bm: "BlockManager | None" = None
 
-        # One pool serves both modes.  The radix tree is per-sequence state, so it
-        # is attached whenever prefix caching is on -- including the batched mode,
-        # where the runner matches a prefix when it admits a sequence and inserts
-        # it back after its prefill.
+        # One pool serves both modes. The radix tree is attached whenever prefix
+        # caching is on, including the batched mode, where the runner matches a
+        # prefix when it admits a sequence and inserts it back after its prefill.
+        # Two pools would give the two modes separate block id spaces.
         if cfg.prefix_cache or self.batching:
             self.bm = BlockManager.attach(
                 model, cfg.num_blocks, cfg.block_size, cfg.snapshots,
@@ -64,9 +76,10 @@ class LLMEngine:
                 max_state_snapshots=cfg.snapshots,
                 snapshot_interval=cfg.snapshot_interval, bm=self.bm)
             self.runner.attach_prefix_cache(self.pc)
-            # ``capture()`` warms the batched prefill path, which writes KV through
-            # the slot map.  Reserve a block the pool can never hand out, so a
-            # later capture cannot scribble over a cached prefix.
+            # ``capture()`` warms the batched prefill path, which writes KV
+            # through the slot map. Reserving a block the pool can never hand out
+            # keeps that warm-up from scribbling over a cached prefix: the write
+            # needs a slot, and this one is not part of any prefix.
             self._scratch = self.pc.pool.alloc()
             self.pc.pool.assign(self._scratch, 0)
         else:
@@ -82,7 +95,16 @@ class LLMEngine:
         self.last_matched = 0
 
     def build(self) -> None:
-        """Capture the decode graph(s) and warm up the paths a step will use."""
+        """Capture the decode graph(s) and warm up the paths a step will use.
+
+        Must run once before the first :meth:`step`; the captured graphs are what
+        make a decode step a replay instead of a re-trace.
+
+        Raises:
+            RuntimeError: Speculative decoding is configured but the checkpoint
+                has no MTP head. Failing at build time beats producing subtly
+                different tokens later.
+        """
         t0 = time.time()
         if self.batching:
             self.runner.enable_batching(self.cfg.max_num_seqs)
@@ -96,6 +118,8 @@ class LLMEngine:
             if self.cfg.spec_k:
                 if self.model.mtp is None:
                     raise RuntimeError("--spec-k needs the MTP head in the checkpoint")
+                # The verify graph is captured for k+1 tokens: the pending token
+                # plus the k drafts the drafter proposes.
                 self.model.capture_verify(self.cfg.spec_k + 1)
             self.model.reset()
         self.build_s = time.time() - t0
@@ -103,11 +127,23 @@ class LLMEngine:
     def add_request(self, token_ids: list[int],
                     params: SamplingParams | None = None,
                     mm=None) -> Sequence:
-        """Queue one prompt; ``mm`` is its image payload (``mm_input.MMInput``).
+        """Queue one prompt.
 
-        The payload rides on the sequence so the runner, the block manager and the
-        radix tree all read the same object: the tree needs ``mm.digest``/``spans``
-        to salt its block keys, and the model needs the embeddings.
+        The image payload rides on the sequence so the runner, the block manager
+        and the radix tree all read the same object: the tree needs
+        ``mm.digest`` / ``mm.spans`` to salt its block keys, and the model needs
+        the embeddings. A parallel side table would have to be kept in sync
+        across three layers for no benefit.
+
+        Args:
+            token_ids: Prompt tokens, already rendered by the chat template.
+            params: Decoding policy; ``None`` uses greedy defaults with the
+                engine-wide stop ids.
+            mm: ``mm_input.MMInput`` for an image prompt, ``None`` for text.
+
+        Returns:
+            The queued sequence. The caller keeps it to observe completion and
+            to read ``stop_reason`` afterwards.
         """
         params = params or SamplingParams()
         if not params.eos:
@@ -120,11 +156,14 @@ class LLMEngine:
         return seq
 
     def step(self) -> list[tuple[Sequence, int | None, bool]]:
-        """One serving iteration; returns ``(seq, token, finished)`` events.
+        """Run one serving iteration.
 
-        The token is ``None`` when the event only reports retirement (deadline).
-        A finishing step still reports the token it produced, so a stream client
-        sees the last token before the done line.
+        Returns:
+            ``(seq, token, finished)`` events. The token is ``None`` when the
+            event only reports retirement, which happens on a deadline — there
+            is no token to report. A finishing step still reports the token it
+            produced, so a stream client sees the last token before the done
+            line rather than an empty tail.
         """
         expired = self.scheduler.expire()
         events: list[tuple[Sequence, int | None, bool]] = [
@@ -134,8 +173,9 @@ class LLMEngine:
         decode, prefill = self.scheduler.schedule()
         if prefill:
             # Several prompts admitted in one step share a grouped prefill when
-            # there is no radix tree to populate; with prefix caching on they run
-            # one by one so each can be matched/inserted (phase 2b).
+            # there is no radix tree to populate. With prefix caching on they run
+            # one by one, because the grouped forward would still have to match
+            # and insert each sequence separately.
             if len(prefill) > 1 and self.runner.can_group_prefill():
                 logits_list = self.runner.prefill_group(prefill)
                 group_s = self.runner.last_prefill_s
@@ -154,9 +194,10 @@ class LLMEngine:
             use_spec = (self.runner.spec
                         and all(s.params.temperature == 0 for s in decode))
             if use_spec:
-                # Speculation only pays once the KV read dominates: below the
-                # context threshold a plain batched decode step is cheaper, so the
-                # step can mix both paths (rows are independent).
+                # Speculation only pays once the KV read dominates. Below the
+                # context threshold a plain batched step is cheaper, so one step
+                # can mix both paths: rows are independent, and a mixed step
+                # costs no more than the two paths run back to back.
                 thr = self.cfg.spec_min_ctx
                 spec_seqs = ([s for s in decode if s.num_cached_tokens >= thr]
                              if thr else list(decode))
@@ -176,9 +217,16 @@ class LLMEngine:
     def _spec_commit(self, seqs: list[Sequence]) -> list[tuple[Sequence, int | None, bool]]:
         """Commit one batch-friendly MTP step and sample the next token per row.
 
-        Speculation only changes speed: the model accepts a draft only when it
-        equals its own argmax, so the tokens emitted here are exactly the greedy
+        Speculation only changes speed: a draft is accepted only when it equals
+        the model's own argmax, so the tokens emitted here are exactly the greedy
         tokens a plain decode step would have produced.
+
+        Args:
+            seqs: Sequences to advance. All must decode at temperature 0; a
+                stochastic request cannot be verified against an argmax.
+
+        Returns:
+            ``(seq, token, finished)`` events, in the engine's usual shape.
         """
         result = self.runner.spec_step(seqs)
         if result is None:                     # drafter window exceeded: plain step
@@ -215,6 +263,16 @@ class LLMEngine:
         return events
 
     def _commit(self, seq: Sequence, tok: int) -> list[tuple[Sequence, int | None, bool]]:
+        """Append one sampled token and apply the stop conditions.
+
+        Args:
+            seq: Sequence that produced ``tok``.
+            tok: Sampled token id.
+
+        Returns:
+            Events for the caller. On a stop the sequence is finished and
+            released here, so no caller has to remember to do it.
+        """
         params = seq.params
         if tok in params.eos and not params.ignore_eos:
             self.scheduler.finish(seq, "eos")
@@ -229,14 +287,32 @@ class LLMEngine:
         return [(seq, tok, False)]
 
     def _release(self, seq: Sequence) -> None:
-        """Return a finished batched sequence's blocks and its batch row."""
+        """Return a finished batched sequence's blocks and its batch row.
+
+        Single-stream and prefix-cache engines own their blocks through
+        ``PrefixCacheEngine``, so this is a no-op for them; only the batched path
+        allocates per sequence.
+
+        Args:
+            seq: Finished sequence. Its row must come back before the next
+                admission looks for a free one.
+        """
         if self.batching and self.bm is not None:
             self.bm.release(seq)
             self.runner.release_row(seq)
 
-    # convenience loops (single request at a time, used by tests and run_chat)
+    # Convenience loops: one request at a time, used by tests and run_chat.
     def stream(self, seq: Sequence) -> Iterator[int]:
-        """Yield the tokens ``seq`` generates while stepping the engine."""
+        """Yield the tokens ``seq`` generates while stepping the engine.
+
+        Args:
+            seq: Request previously queued with :meth:`add_request`.
+
+        Yields:
+            Token ids as they are produced. Events for other sequences are
+            filtered out, so a caller driving several requests still sees only
+            its own stream.
+        """
         while not seq.is_finished:
             for other, tok, _done in self.step():
                 if other is seq and tok is not None:
@@ -248,7 +324,19 @@ class LLMEngine:
     def generate(self, token_ids: list[int],
                  params: SamplingParams | None = None,
                  mm=None) -> dict:
-        """One full request; returns tokens plus the prefill/decode split."""
+        """Run one request to completion.
+
+        Args:
+            token_ids: Prompt tokens.
+            params: Decoding policy; ``None`` uses greedy defaults.
+            mm: ``mm_input.MMInput`` for an image prompt.
+
+        Returns:
+            ``{"tokens", "prefill_s", "decode_s", "matched", "stop_reason"}``.
+            The time split is computed here because it is what the benchmark
+            numbers in ``NOTES.md`` report; each caller would otherwise redo it
+            slightly differently.
+        """
         seq = self.add_request(token_ids, params, mm=mm)
         t0 = time.time()
         out = list(self.stream(seq))
@@ -258,23 +346,45 @@ class LLMEngine:
                 "matched": seq.matched, "stop_reason": seq.stop_reason}
 
     def reset(self) -> None:
-        """Drop the active sequence's blocks and rewind every piece of state."""
+        """Drop the active sequence's blocks and rewind every piece of state.
+
+        Single-stream reuse: the model keeps its position and KV between
+        requests, so a new request must clear both or it would read the previous
+        prompt's prefix.
+        """
         if self.pc is not None:
             self.pc.release()
         self.model.reset()
 
     def release(self) -> None:
+        """Drop the prefix cache's reference on the engine's live sequence."""
         if self.pc is not None:
             self.pc.release()
 
     def clear_prefix_cache(self) -> None:
-        """Drop every cached prefix; only valid while the engine is idle."""
+        """Drop every cached prefix.
+
+        Only valid while the engine is idle: the radix tree refcounts blocks that
+        running sequences are actively writing into.
+
+        Raises:
+            RuntimeError: A sequence is waiting or running. Clearing then would
+                free blocks still in use, so this refuses instead of corrupting
+                the pool.
+        """
         if self.scheduler.running or self.scheduler.waiting:
             raise RuntimeError("clear_prefix_cache() needs an idle engine")
         if self.bm is not None:
             self.bm.clear_prefix_cache()
 
     def stats(self) -> dict:
+        """Engine and cache counters, as reported by ``serve.py``'s ``ping``.
+
+        Returns:
+            Request and token totals plus the block/prefix counters when a pool
+            exists. The key names are what ``serve.py`` serialises, so they are
+            part of the API surface rather than free-form labels.
+        """
         out = {
             "requests": self.n_requests,
             "prompt_tokens": self.n_prompt_tokens,

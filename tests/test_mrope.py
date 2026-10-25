@@ -18,6 +18,16 @@ Everything here runs without a DCU.  The three properties that must hold are:
 The assertions are exact (``torch.equal``) where the maths is exact and 1-ULP
 tolerant where a different (but mathematically identical) float order is
 unavoidable.
+
+Module: ``coffin/tests``. Runs on CPU only, no checkpoint: the whole point is
+that this half of the vision path is checkable without a DCU.
+
+Constraints:
+    * The reference ``get_rope_index`` is re-implemented inline rather than
+      imported from ``.tmp_dsh``, so the test does not depend on a scratch tree.
+    * ``scatter_image_embeds`` mutates the buffer it is given; every test that
+      checks a non-image row must build its own input, or the previous case's
+      writes leak into it.
 """
 
 from __future__ import annotations
@@ -54,9 +64,7 @@ MROPE_SECTION = (11, 11, 10)
 IMAGE_TOKEN_ID = mm_input.IMAGE_TOKEN_ID
 
 
-# ---------------------------------------------------------------------------
 # reference implementations (inline: the tests must not import .tmp_dsh)
-# ---------------------------------------------------------------------------
 
 def _ref_recompose(position_ids: torch.Tensor, inv_freq: torch.Tensor,
                    section=(11, 11, 10), dtype=None):
@@ -143,9 +151,7 @@ def _prompt_with_image(text_head: int, text_tail: int, grid, n_images: int = 1,
     return ids, grids
 
 
-# ---------------------------------------------------------------------------
 # 1. cos/sin layout
-# ---------------------------------------------------------------------------
 
 class MRopeLayoutTest(unittest.TestCase):
     """``mrope_cos_sin`` must be the reference composition, bit for bit."""
@@ -210,9 +216,7 @@ class MRopeLayoutTest(unittest.TestCase):
         self.assertTrue(torch.equal(sin, sin_tbl.index_select(0, t + delta)))
 
 
-# ---------------------------------------------------------------------------
 # 2. positions / rope_delta against get_rope_index
-# ---------------------------------------------------------------------------
 
 class RopeIndexTest(unittest.TestCase):
     """``mm_input.mrope_positions`` must equal the reference ``get_rope_index``.
@@ -300,9 +304,7 @@ class RopeIndexTest(unittest.TestCase):
         self.assertLess(delta, 0)
 
 
-# ---------------------------------------------------------------------------
 # 3. injection
-# ---------------------------------------------------------------------------
 
 class ScatterInjectTest(unittest.TestCase):
     """``scatter_image_embeds`` must hit exactly the image rows of a chunk."""
@@ -432,9 +434,7 @@ class ChunkedPrefillEquivalenceTest(unittest.TestCase):
         self.assertNotEqual(delta, 0, "this prompt must actually shift the positions")
 
 
-# ---------------------------------------------------------------------------
 # 4. the model-side plumbing
-# ---------------------------------------------------------------------------
 
 class ModelPlumbingTest(unittest.TestCase):
     """``Qwen35``/``MTP`` must own a ``rope_delta`` buffer with the right shape.

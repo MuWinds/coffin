@@ -14,6 +14,18 @@ Measures, on the real model and real weights:
 Run (inside the container, from the engine directory)::
 
     python3 diag/probe_batch_decode.py --steps 30
+
+Module: ``coffin/diag``. Reads the batched path in ``model_runner`` and
+``models/qwen35/batch``; imports the model, so it needs a DCU and the
+checkpoint.
+
+Constraints:
+    * Pure measurement: no assertion, no failure mode. A number that looks wrong
+      means re-measure, not "the test broke".
+    * Sampling is excluded from the step time on purpose, so the buckets are
+      comparable; including it would mix in the host-side argmax/multinomial.
+    * Run on an otherwise idle card: a 16 GB device holding the pool, the
+      weights and the graph pool will start swapping if anything else is resident.
 """
 
 from __future__ import annotations

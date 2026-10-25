@@ -3,8 +3,29 @@
 The assembly point of the family: it owns the layer list, the rope tables, the
 fixed graph buffers and the three execution paths -- decode (one graph replay),
 prefill (batched GEMMs with tiled causal attention) and verify (a captured
-C-token forward for speculative decoding).  The primitives it is built from
-live in ``ops/``; the per-layer blocks are next to this module.
+C-token forward for speculative decoding). The primitives it is built from live
+in ``ops/``; the per-layer blocks are next to this module.
+
+Module: ``coffin/models/qwen35``. Top of the family and the class
+``engine_api`` registers; it imports ``ops`` and every sibling module, and must
+not import ``engine_api``, ``model_runner`` or anything above the family.
+
+Constraints:
+    * Graphs are captured once and then replayed, so every buffer a captured
+      path writes must exist with a stable address before ``capture()`` /
+      ``capture_batch()``. Reallocating ``pos``, ``token_in`` or ``rope_delta``
+      after capture silently makes the graph write into a dead tensor.
+    * ``pos`` addresses KV slots and the context window, while rotation reads
+      ``pos + rope_delta``; keeping the two separate is what lets decode stay one
+      replay after an image prompt.
+    * The linear-attention recurrent state travels with the KV, never without
+      it: prefix reuse, snapshot/restore and row moves all have to carry both or
+      the model continues from a state that never saw the shared keys.
+    * Rows: decode rows are ``0 .. capacity-2`` and ``capacity-1`` is the prefill
+      staging row. A hole in the middle is filled with a sentinel rather than
+      compacted, so state never has to be moved off its row.
+    * No locking. ``llm_engine`` drives all mutation single-threaded, which is
+      why the row bookkeeping is plain dicts and lists.
 """
 
 from __future__ import annotations
@@ -32,12 +53,36 @@ from paged_cache import PagedKVCache
 
 
 class Qwen35:
+    """The Qwen3.5-4B model: layers, rope tables, graph buffers and execution paths."""
+
     def __init__(self, model_dir: str | Path, max_seq: int = 4096, bench: bool = True,
                  weights: dict | None = None, paged: bool = False) -> None:
-        """``paged=True`` builds the full-attention layers without their private
-        dense KV caches, for the caller that is going to call
-        :meth:`enable_paging` (PrefixCacheEngine does). The MTP layer is not paged
-        -- its cache is not part of a prefix snapshot -- so it keeps its own."""
+        """Load the checkpoint and allocate everything the execution paths need.
+
+        Args:
+            model_dir: Checkpoint directory; its ``config.json`` decides the
+                layer count, the layer-type interleaving and the rope parameters.
+            max_seq: Longest sequence the engine will run. Sizes the RoPE tables
+                and the mask index, so it bounds ``prefill`` past the end of the
+                table.
+            bench: Autotune the projections on arrival. ``False`` takes the
+                default kernel config, which is what structural tests need to run
+                without paying for the sweeps.
+            weights: Pre-loaded state dict to reuse instead of reading from disk,
+                so a model can be rebuilt after a code change without a reload.
+                The caller keeps ownership; this instance does not clear it.
+            paged: Build the full-attention layers without their private dense KV
+                caches, for the caller that is going to call
+                :meth:`enable_paging` (PrefixCacheEngine does). The MTP layer is
+                not paged -- its cache is not part of a prefix snapshot -- so it
+                keeps its own.
+
+        Raises:
+            ValueError: ``model_dir`` has no ``config.json`` or no
+                ``text_config``, surfaced by the JSON/config access.
+            FileNotFoundError: No safetensors shard for the expected prefix.
+                Report the mismatched checkpoint; the engine cannot start.
+        """
         model_dir = Path(model_dir)
         self.raw_cfg = json.loads((model_dir / "config.json").read_text())
         self.cfg = self.raw_cfg["text_config"]
@@ -71,12 +116,12 @@ class Qwen35:
             self.cfg["head_dim"], self.rot, rp["rope_theta"], max_seq, "cuda",
             inv_freq=self.inv_freq)
 
-        # graph-friendly fixed buffers.  ``pos``/``token_in``/``logits_out`` grow a
-        # leading row dim when ``enable_batching`` is used; with the default
-        # capacity of 1 they keep their single-stream shapes exactly.  When batching
-        # is on, row ``prefill_row`` (the last one) is reserved for the single-stream
-        # prefill / verify paths, so prefilling a new request never touches a decode
-        # row (see ``enable_batching``).
+        # Fixed buffers the captured graphs address.  ``pos``/``token_in``/
+        # ``logits_out`` grow a leading row dim when ``enable_batching`` is used;
+        # with the default capacity of 1 they keep their single-stream shapes
+        # exactly.  When batching is on, row ``prefill_row`` (the last one) is
+        # reserved for the single-stream prefill / verify paths, so prefilling a
+        # new request never touches a decode row (see ``enable_batching``).
         self.batch_capacity = 1
         self.decode_capacity = 1
         self.prefill_row = 0
@@ -107,9 +152,9 @@ class Qwen35:
         self.logits_single = self.logits_out
         self._graph = None
 
-        # batched speculative decoding (per-row drafter + per-row verify), all
-        # allocated by ``enable_spec_batch``; off by default so the single-stream
-        # spec path and the plain batched path are untouched.
+        # Batched speculative decoding (per-row drafter + per-row verify); all of
+        # it is allocated by ``enable_spec_batch`` and stays off by default so the
+        # single-stream spec path and the plain batched path are untouched.
         self.batch_spec = False
         self.spec_width = 0
         self.spec_buckets: tuple[int, ...] = ()
@@ -124,7 +169,8 @@ class Qwen35:
         self.h_prev_b = None
         self._verify_batch_graphs: dict[int, torch.cuda.CUDAGraph] = {}
 
-        # speculative-verify state (graph captured by ``capture_verify``)
+        # Speculative-verify state; the graph over it is captured by
+        # ``capture_verify`` at whatever width ``verify_c`` ends up with.
         hidden = self.cfg["hidden_size"]
         self.h_prev = torch.zeros(hidden, dtype=D, device="cuda")
         self.verify_c = 4
@@ -135,7 +181,7 @@ class Qwen35:
         self.verify_logits = torch.zeros(self.verify_c, self.embed.shape[0], dtype=D, device="cuda")
         self._verify_graph = None
 
-        # acceptance statistics of the last ``spec_generate``
+        # Acceptance statistics of the last ``spec_generate``, read by ``spec_stats``.
         self.n_drafted = 0
         self.n_accepted = 0
         self.n_spec_steps = 0
@@ -146,17 +192,24 @@ class Qwen35:
         Stage 1 runs ``B`` sequences through one forward: the projections are
         batched (one weight read for all rows, see ``models/qwen35/batch.py``)
         while the stateful mixers keep calling the single-stream kernels once per
-        row on row slices.  Every buffer the captured graph writes therefore has
+        row on row slices. Every buffer the captured graph writes therefore has
         to exist -- with a stable address -- before capture.
 
-        ``capacity`` *includes* the single-stream staging row: decode rows are
-        ``0 .. capacity-2`` and row ``capacity-1`` is the row ``prefill`` writes
-        (``prefill_row``, also what ``pos1`` points at).  That split is what lets
-        continuous batching prefill a new request between decode steps without
-        clobbering a live decode row's recurrent state.  ``capacity=1`` keeps the
-        single-stream buffers untouched, so the default path is unchanged.
+        Args:
+            capacity: Rows to allocate, *including* the single-stream staging row.
+                Decode rows are ``0 .. capacity-2``; row ``capacity-1`` is the row
+                ``prefill`` writes (``prefill_row``, also what ``pos1`` points
+                at). That split is what lets continuous batching prefill a new
+                request between decode steps without clobbering a live decode
+                row's recurrent state. ``capacity=1`` keeps the single-stream
+                buffers untouched, so the default path is unchanged.
 
-        Must run before ``capture()``/``capture_batch()``.
+        Raises:
+            ValueError: ``capacity < 1``. The engine must not build a zero-row
+                batch; reject it at the caller.
+            RuntimeError: A graph was already captured. Call this before
+                ``capture()``/``capture_batch()``, because the graphs bake in the
+                buffer addresses this allocates.
         """
         capacity = int(capacity)
         if capacity < 1:
@@ -180,7 +233,7 @@ class Qwen35:
         self.logits_out = torch.zeros(capacity, self.embed.shape[0], dtype=D, device="cuda")
         self.logits_single = self.logits_out[self.prefill_row]
         # Per-row attention window length (``pos+1``) for the stage-3 batched
-        # attention kernel; [B] int32 because the kernel reads it on the device.
+        # attention kernel; int32 because the kernel reads it on the device.
         self.ctx_lens = torch.ones(capacity, dtype=torch.int32, device="cuda")
         for layer in self.layers:
             layer.mix.enable_batching(capacity, self.prefill_row)
@@ -192,10 +245,10 @@ class Qwen35:
         """Grow the slot map and reserve one scratch block per row.
 
         The captured graphs run every row of their bucket, including rows the
-        caller does not fill (a bucket is padded with sentinel rows).  Reserve a
-        block per row *before* capture and point that row's map at it, so the
-        capture-time warmup cannot scribble over a block a real sequence owns --
-        the same trick ``serve.py`` uses for its single scratch block.  The
+        caller does not fill (a bucket is padded with sentinel rows). Reserving a
+        block per row *before* capture and pointing that row's map at it is what
+        stops the capture-time warmup from scribbling over a block a real sequence
+        owns -- the same trick ``serve.py`` uses for its single scratch block. The
         prefill row gets one too, because ``capture()`` warms its prefill path.
         """
         pool = self.pool
@@ -214,15 +267,31 @@ class Qwen35:
 
         Must run before :meth:`capture`: the captured decode step bakes in the pool
         tensors (and the device-resident slot map), so switching afterwards would
-        leave a graph writing somewhere else. Returns the pool, which the caller
-        drives through a :class:`~radix_cache.RadixCache`.
+        leave a graph writing somewhere else.
 
         Caller contract: **assign a block table before any prefill or capture**.
         ``pos2slot`` starts as all zeros, so running ``prefill()``/``capture()``
         on a freshly paged model makes every position address pool slot 0 and
-        successive prefills read each other's KV.  The symptom looks like a
+        successive prefills read each other's KV. The symptom looks like a
         non-deterministic model but is a caller error; ``PrefixCacheEngine``
         satisfies the contract by allocating blocks and calling ``assign_table``.
+
+        Args:
+            num_blocks: Blocks in the pool. The pool is the KV budget for every
+                live request combined, so a short pool shows up as a scheduling
+                stall rather than an error.
+            block_size: Tokens per block; also the granularity at which the radix
+                tree can share a prefix.
+
+        Returns:
+            The pool, which the caller drives through a
+            :class:`~radix_cache.RadixCache`.
+
+        Raises:
+            RuntimeError: A graph was already captured; the pool tensors must be
+                in place before capture.
+            ValueError: From :class:`~paged_cache.PagedKVCache` when the requested
+                block count cannot cover ``max_seq``; give the pool more blocks.
         """
         if self._graph is not None:
             raise RuntimeError("enable_paging() must be called before capture()")
@@ -250,8 +319,22 @@ class Qwen35:
 
         The tower is not part of the decode graph: an image is encoded once per
         request, before its tokens are prefilled, so it can be a plain eager
-        module.  Its weights live in the same resident dict as the text ones and
+        module. Its weights live in the same resident dict as the text ones and
         are released by :meth:`close`.
+
+        Args:
+            quant: Store the tower's GEMM weights as int8 + per-row scale. Worth
+                it only when the fp16 tower is what does not fit in VRAM.
+            dtype: Compute dtype for the tower's activations and weights.
+
+        Returns:
+            The tower, which :meth:`image_embeds` then calls once per image batch.
+
+        Raises:
+            RuntimeError: The model was not built paged, or its checkpoint has no
+                ``vision_config``. Only the serve path supports vision, so reject
+                the request rather than prefilling image tokens with no
+                embeddings.
         """
         from models.qwen35.vision import VisionTower
 
@@ -268,11 +351,24 @@ class Qwen35:
     def image_embeds(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
         """Encode a batch of images into LLM token embeddings ``[Σtokens, hidden]``.
 
-        ``pixel_values`` is the processor's flattened patch tensor
-        ``[Σ t*h*w, C*tps*p*p]`` and ``grid_thw`` its ``(t, h, w)`` patch grids, in
-        prompt order.  The result is in that same order, which is exactly the order
-        of the prompt's ``<|image_pad|>`` tokens, so the caller can splice it in
-        without permuting anything.
+        The result is in prompt order, which is exactly the order of the prompt's
+        ``<|image_pad|>`` tokens, so the caller can splice it in without permuting
+        anything: that alignment is what lets ``scatter_image_embeds`` work off
+        absolute spans alone.
+
+        Args:
+            pixel_values: The processor's flattened patch tensor,
+                ``[Σ t*h*w, C*tps*p*p]``.
+            grid_thw: The ``(t, h, w)`` patch grids, one row per image, in prompt
+                order.
+
+        Returns:
+            ``[Σtokens, hidden]`` bf16 embeddings, ready to overwrite the image
+            rows of the prefill gather buffer.
+
+        Raises:
+            RuntimeError: The tower was never attached. Call :meth:`enable_vision`
+                first; a text-only server reaches this only on a caller bug.
         """
         if self.vision is None:
             raise RuntimeError("vision tower not enabled (enable_vision())")
@@ -286,9 +382,16 @@ class Qwen35:
 
         Prefix sharing needs this: a cached KV prefix is only reusable together
         with the recurrent state that produced it, because those 24 layers carry
-        the prefix forward as a fixed-size state rather than as KV.  ``row``
-        defaults to 0; a batched caller passes the row whose sequence it wants to
-        snapshot (the prefill row, or a decode row).
+        the prefix forward as a fixed-size state rather than as KV.
+
+        Args:
+            row: Which row's sequence to snapshot; the prefill row or a decode
+                row. A batched caller passes the row it wants, not the default.
+
+        Returns:
+            ``{layer index: (recurrent state, conv state)}``, holding only the
+            linear-attention layers. The clones are independent, so the caller can
+            keep them past the next prefill.
         """
         out: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         for i, layer in enumerate(self.layers):
@@ -298,7 +401,19 @@ class Qwen35:
         return out
 
     def restore_linear_states(self, states, row: int = 0) -> None:
-        """Adopt a snapshot taken by :meth:`snapshot_linear_states` into ``row``."""
+        """Adopt a snapshot taken by :meth:`snapshot_linear_states` into ``row``.
+
+        Args:
+            states: A dict as returned by :meth:`snapshot_linear_states`; its keys
+                must be this model's linear-attention layer indices.
+            row: Row to install the state into, normally the sequence's own decode
+                row.
+
+        Raises:
+            KeyError: ``states`` names a layer index this model does not have --
+                i.e. a snapshot from a different architecture. Reject it rather
+                than restoring a partial state.
+        """
         for i, (st, conv) in states.items():
             mix = self.layers[i].mix
             mix.state[row].copy_(st)
@@ -309,10 +424,15 @@ class Qwen35:
 
         The bridge between the two halves of a batched step: a new request is
         prefilled on the staging row (``prefill_row``), then its recurrent state
-        is moved into the free decode row that will carry on generating.  The
+        is moved into the free decode row that will carry on generating. The
         row's :attr:`rope_delta` travels with it -- it belongs to the sequence,
-        not to the row, and losing it would rotate the next tokens of an
-        image prompt at the wrong angle.
+        not to the row, and losing it would rotate the next tokens of an image
+        prompt at the wrong angle.
+
+        Args:
+            src_row: Row holding the state to move, normally ``prefill_row``.
+            dst_row: Destination decode row. A no-op when the two are equal, which
+                is the single-stream case.
         """
         if src_row == dst_row:
             return
@@ -324,7 +444,13 @@ class Qwen35:
         self.rope_delta[dst_row].copy_(self.rope_delta[src_row])
 
     def zero_linear_states(self, row: int) -> None:
-        """Clear one row's recurrent state (before a fresh sequence occupies it)."""
+        """Clear one row's recurrent state before a fresh sequence occupies it.
+
+        Args:
+            row: Decode row being handed to a new request. The row's
+                ``rope_delta`` is cleared with the state: a stale offset from the
+                previous occupant would rotate the new request wrongly.
+        """
         for layer in self.layers:
             mix = layer.mix
             if isinstance(mix, LinearAttn):
@@ -354,16 +480,20 @@ class Qwen35:
         self.pos1.add_(1)
 
     def _forward_batch(self, rows: int) -> None:
-        """One token for each of ``rows`` sequences in a single forward.
+        """Run one token for each of ``rows`` sequences in a single forward.
 
         Projections take the M=rows batched GEMV path (the row count is static in
         a captured graph); attention and the delta-net recurrence call the
         existing single-token kernels once per row, on row slices of their
         per-row buffers, so each row's numbers match a solo decode exactly.
-
         ``positions`` stays the raw token index (it addresses the KV slot and the
         context window); the 5th ``ctx`` entry carries the per-row ``rope_delta``
         so only the rotation is shifted (mRoPE after an image).
+
+        Args:
+            rows: Rows this graph runs, i.e. the bucket size. It must equal the
+                width the graph was captured for; the buffers it touches are
+                fixtures of capture, not parameters.
         """
         x = self.embed.lookup(self.token_in[:rows])           # [rows, hidden]
         positions = self.pos[:rows]
@@ -376,6 +506,12 @@ class Qwen35:
         self.pos[:rows].add_(1)
 
     def reset(self) -> None:
+        """Zero every per-row position and recurrent state.
+
+        Called between requests and before each capture warmup, so a graph is
+        recorded against a known state rather than whatever the previous request
+        left behind.
+        """
         self.pos.zero_()
         self.rope_delta.zero_()
         for layer in self.layers:
@@ -387,7 +523,19 @@ class Qwen35:
             self.mtp.b_pos.zero_()
 
     def logits(self, token: int) -> torch.Tensor:
-        """Un-captured single step (prefill / debugging)."""
+        """Feed one token through the un-captured forward and return its logits.
+
+        The eager reference for the captured decode path, and what ``prefill``
+        uses for prompts too short to batch.
+
+        Args:
+            token: Next token id to feed; it is staged on the prefill row, whose
+                position advances by one.
+
+        Returns:
+            ``[vocab]`` bf16 logits of the staged position. This is the live
+            buffer, not a copy -- the next call overwrites it.
+        """
         pr = self.prefill_row
         self.token_in[pr:pr + 1].fill_(token)
         self._forward()
@@ -401,30 +549,45 @@ class Qwen35:
 
         ``chunk`` is the GEMM's M, and it is worth a lot: rocBLAS on fp16 reaches
         ~13 TFLOP/s at M=256 and ~20 at M>=1024, and a bigger chunk also means
-        fewer 4-3-token-sized elementwise ops per token.  Measured at n=2048:
-        865 tok/s at 256, 1035 at 512, 1094 at 2048.  It only costs activation
-        memory (attention scores are [nkv, rep, C, p1] fp32), which is why this
-        is not simply ``max_seq``.
+        fewer 4-3-token-sized elementwise ops per token. Measured at n=2048: 865
+        tok/s at 256, 1035 at 512, 1094 at 2048. It only costs activation memory
+        (attention scores are [nkv, rep, C, p1] fp32), which is why this is not
+        ``max_seq``.
 
-        Falls back to the one-token path for very short prompts, where the fixed
-        setup cost outweighs the batching win.
+        Args:
+            tokens: The whole prompt, in order. Position starts from the current
+                ``pos1``, so a chunked prefill continues where the last call
+                stopped.
+            chunk: Tokens per GEMM pass; see the measurements above.
+            spec_row: Decode row whose paged drafter KV receives this prompt's
+                hidden states. Only used when batched speculative decoding is
+                enabled; ``None`` leaves the MTP head untouched.
+            mm: The request's image payload as an
+                :class:`mm_input.MMInput`, or ``None`` for text-only. It changes
+                exactly two things, both per chunk and both in *absolute* prompt
+                coordinates (``tokens`` is the whole prompt, so chunk ``[c0, c1)``
+                is prompt ``[pos0+c0, pos0+c1)``): the gather buffer's image rows
+                are overwritten with the tower's embeddings (``mm.spans`` overlap,
+                so a chunk that starts inside an image copies only its own rows --
+                no chunk-boundary assumption), and the full-attention layers
+                rotate with the explicit 3-D cos/sin of those tokens
+                (``ops.mrope.mrope_cos_sin`` over ``mm.slice_positions``) instead
+                of the 1-D table.
 
-        ``mm`` (an :class:`mm_input.MMInput`) is the request's image payload.  It
-        changes exactly two things, both per chunk and both in *absolute* prompt
-        coordinates (``tokens`` is the whole prompt, so chunk ``[c0, c1)`` is
-        prompt ``[pos0+c0, pos0+c1)``):
+                What it deliberately does *not* change: the causal mask, the KV
+                slot and the context window keep using the token index, which is
+                why decode afterwards only needs the scalar ``rope_delta``.
+                ``mm=None`` is the old path, bit for bit.
 
-        * the gather buffer's image rows are overwritten with the tower's
-          embeddings (``mm.spans`` overlap, so a chunk that starts inside an image
-          copies only its own rows -- no chunk-boundary assumption);
-        * the full-attention layers rotate with the explicit 3-D cos/sin of those
-          tokens (``ops.mrope.mrope_cos_sin`` over ``mm.slice_positions``) instead
-          of the 1-D table.
+        Returns:
+            ``[vocab]`` logits of the prompt's last token, from which the first
+            generated token is sampled. For a prompt shorter than 4 tokens this is
+            the decode path's last output rather than a batched one.
 
-        What it deliberately does *not* change: the causal mask, the KV slot and
-        the context window keep using the token index, which is why decode
-        afterwards only needs the scalar ``rope_delta``.  ``mm=None`` is the old
-        path, bit for bit.
+        Raises:
+            ValueError: ``tokens`` is empty, or it does not fit between the
+                current position and ``max_seq``. Reject the request at the
+                scheduler, which is the only layer that can shorten or refuse it.
         """
         n = len(tokens)
         pos0 = int(self.pos1)
@@ -433,8 +596,8 @@ class Qwen35:
         if n > self.max_seq - pos0:
             raise ValueError(f"prompt of {n} exceeds max_seq={self.max_seq}")
         if n < 4:
-            # tiny prompts are memory-bound: hipBLAS at M<4 is slower than the
-            # dedicated GEMV kernel, so just walk them through the decode path.
+            # Tiny prompts are memory-bound: hipBLAS at M<4 is slower than the
+            # dedicated GEMV kernel, so walk them through the decode path.
             # ``rope_delta`` is a decode-graph input, so it has to be in place
             # before the first ``logits`` call.
             if mm is not None:
@@ -452,9 +615,9 @@ class Qwen35:
             c1 = min(c0 + chunk, n)
             x = self.embed.lookup(toks[c0:c1])
             positions = torch.arange(pos0 + c0, pos0 + c1, device="cuda")
-            # Query tiles for the causal attention: each tile only reads keys up to
+            # Query tiles for the causal attention: each tile reads keys only up to
             # its own last position, so the masked-out half of the score block is
-            # never built.  Host-side ints, so no device sync per layer.  The key
+            # never built. Host-side ints, so no device sync per layer. The key
             # range and the query range are both *absolute* positions, which is
             # what the cache slice and mask_idx are indexed with.
             n_loc, base = c1 - c0, pos0 + c0
@@ -473,11 +636,11 @@ class Qwen35:
             if self.mtp is not None and self.mtp_prefill:
                 # Feed the MTP head chunk by chunk instead of holding every chunk's
                 # hidden state to concatenate at the end: `H` for a 256k prompt is
-                # 1.34 GB bf16 and the cat copy doubles it.  The last prompt token
-                # has no next token, so each chunk stops one short of its end.
-                # Its own attention is a full-attention layer over the same
-                # positions, so an image chunk hands it its own rope slice (it
-                # covers ``m1 - c0`` tokens, a strict prefix of the chunk's).
+                # 1.34 GB bf16 and the cat copy doubles it. The last prompt token
+                # has no next token, so each chunk stops one short of its end. Its
+                # own attention is a full-attention layer over the same positions,
+                # so an image chunk hands it its own rope slice (it covers
+                # ``m1 - c0`` tokens, a strict prefix of the chunk's).
                 m1 = min(c1, n - 1)
                 if m1 > c0:
                     self.mtp.prefill(x[:m1 - c0], toks[c0 + 1:m1 + 1],
@@ -512,42 +675,61 @@ class Qwen35:
     def prefill_group(self, seqs: list, snapshot_interval: int | None = None):
         """Prefill several prompts in one forward.
 
-        Returns ``(logits_list, states_at_list)``: one next-token logits tensor per
-        sequence and, per sequence, the block-boundary recurrent snapshots taken
-        while prefilling (``{absolute_position: snapshot_linear_states(row)}``) for
-        the radix tree to insert.  ``states_at_list[i]`` is empty when
-        ``snapshot_interval`` is ``None``.
-
-        ``seqs`` are duck-typed: each needs ``token_ids`` (the whole prompt),
-        ``matched`` (how many leading prompt tokens the radix tree already holds;
-        default 0), ``row`` (the decode row it keeps for its lifetime) and
-        ``block_table`` (its KV blocks, already allocated -- matched blocks shared
-        with the tree, suffix blocks fresh).  The caller is responsible for having
-        restored the matched boundary's recurrent state into ``row`` already; this
-        method only clears the row when ``matched == 0``.  Nothing is staged on the
-        prefill row: KV and recurrent state land directly in each sequence's decode
-        row, so no state has to be moved afterwards.
-
         Only the projection/MLP stages are shared: at every layer all sequences'
         hidden states are concatenated, the projection runs once over ``C_total``
         tokens (a bigger GEMM, and one weight dequant per layer instead of one per
         sequence), the result is sliced per sequence for the stateful attention /
         delta scan on that sequence's own positions and rows, and the output
-        projections plus the MLP run batched again.  Prefill is eager (no captured
+        projections plus the MLP run batched again. Prefill is eager (no captured
         graph), so the dynamic ``C_total`` costs nothing.
 
         With ``snapshot_interval`` set, the suffix of each sequence is walked in
         block-aligned ``snapshot_interval`` chunks (token-major: every chunk goes
         through *all* layers before the next chunk starts) so the recurrent state
         can be snapshotted at block boundaries, exactly like the single-sequence
-        prefix path.  Without it the whole suffix is one chunk, which also keeps
+        prefix path. Without it the whole suffix is one chunk, which also keeps
         ``k == 1`` bit-identical to ``prefill``.
 
         This buys the latency of a *batch* of prompts rather than their sum: the
-        weights are read once per layer.  It is not bit-identical to running the
+        weights are read once per layer. It is not bit-identical to running the
         prompts one by one -- a different GEMM M changes the fp32 accumulation
         order -- so the contract is "same argmax, logits within a few bf16 ULPs"
         (the single-sequence ``prefill`` path is unchanged and stays exact).
+
+        Args:
+            seqs: Duck-typed sequences, each needing ``token_ids`` (the whole
+                prompt), ``matched`` (how many leading prompt tokens the radix
+                tree already holds; default 0), ``row`` (the decode row it keeps
+                for its lifetime) and ``block_table`` (its KV blocks, already
+                allocated -- matched blocks shared with the tree, suffix blocks
+                fresh). A ``mm`` attribute is read when present.
+
+                The caller is responsible for having restored the matched
+                boundary's recurrent state into ``row`` already; this method only
+                clears the row when ``matched == 0``. Nothing is staged on the
+                prefill row: KV and recurrent state land directly in each
+                sequence's decode row, so no state has to be moved afterwards.
+            snapshot_interval: Record a recurrent-state snapshot every this many
+                tokens, rounded up to a whole block. ``None`` records none, which
+                is the right choice when the caller does not intend to insert the
+                prefix into a radix tree.
+
+        Returns:
+            ``(logits_list, states_at_list)``: one next-token logits tensor per
+            sequence, and per sequence the block-boundary snapshots taken while
+            prefilling (``{absolute_position: snapshot_linear_states(row)}``) for
+            the radix tree to insert. ``states_at_list[i]`` is empty when
+            ``snapshot_interval`` is ``None``.
+
+        Raises:
+            RuntimeError: The model has no paged pool. Group prefill writes
+                straight into per-row block tables, so call
+                :meth:`enable_paging` first.
+            ValueError: A prompt is empty or longer than ``max_seq``,
+                ``matched`` is outside the prompt, two sequences claim the same
+                decode row, or a row is outside ``0 .. decode_capacity-1``.
+                Reject the batch at the scheduler; these are request-shape bugs
+                that would otherwise corrupt another sequence's row.
         """
         if self.pool is None:
             raise RuntimeError("prefill_group needs a paged pool (enable_paging())")
@@ -572,10 +754,10 @@ class Qwen35:
         ctx = (self.cos_tbl, self.sin_tbl, self.mask_idx)
         bs = self.pool.bs
         suffix = [length - m for length, m in zip(lens, matched)]
-        #: Per-sequence image payload, read off the sequence so a multimodal
-        #: request needs no extra argument here (the runner already carries it on
-        #: ``Sequence.mm``).  All-``None`` -- the text-only engine -- takes exactly
-        #: the old code path: no rope pair, no embed overwrite, delta 0.
+        # Per-sequence image payload, read off the sequence so a multimodal
+        # request needs no extra argument here (the runner already carries it on
+        # ``Sequence.mm``). All-``None`` -- the text-only engine -- takes exactly
+        # the old code path: no rope pair, no embed overwrite, delta 0.
         mm_list = [getattr(s, "mm", None) for s in seqs]
         for s, row, m, mm_i in zip(seqs, rows, matched, mm_list):
             self.pool.assign_table(list(s.block_table), 0, row)
@@ -587,7 +769,7 @@ class Qwen35:
                 # back to 0, so it is written unconditionally.
             self.rope_delta[row] = int(mm_i.rope_delta) if mm_i is not None else 0
 
-        # Token-major schedule.  With prefix reuse the suffix is split at
+        # Token-major schedule. With prefix reuse the suffix is split at
         # block-aligned snapshot boundaries: the block-aligned head (the part the
         # tree can reuse) is walked in ``snapshot_interval`` chunks with one
         # snapshot each; the sub-block tail goes last and only its logits matter.
@@ -689,7 +871,7 @@ class Qwen35:
                     states_at[i][matched[i] + c1] = \
                         self.snapshot_linear_states(row=rows[i])
 
-        # One lm_head read for every sequence: [n, hidden] -> [n, vocab].  The
+        # One lm_head read for every sequence: [n, hidden] -> [n, vocab]. The
         # batched GEMV path handles n in 2/4/8; other counts use the single GEMV
         # per row (the usual bucket sizes are what matter here).
         last = torch.stack([self.norm(h) for h in last_hidden])
@@ -701,7 +883,18 @@ class Qwen35:
         return out, states_at
 
     def capture(self, warmup: int = 3) -> None:
-        """Capture ``_forward`` into a CUDA graph for one-launch decode steps."""
+        """Capture ``_forward`` into a CUDA graph for one-launch decode steps.
+
+        Args:
+            warmup: Eager iterations before the capture, to settle the allocator
+                and every lazy kernel handle. Capturing without them records the
+                setup work into the graph instead of the steady state.
+
+        Raises:
+            RuntimeError: Raised by torch's graph machinery when the stream is
+                busy or a graph is already active; capture must run on a fresh
+                stream before the engine starts serving.
+        """
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
@@ -727,14 +920,29 @@ class Qwen35:
     def set_rows(self, tokens, positions, slot_rows=None, row_indices=None) -> None:
         """Stage one decode step of the active sequences.
 
-        ``tokens``/``positions`` are the per-row input token and absolute
-        position; by default they fill rows ``0..n-1``.  A continuous-batching
-        caller whose live sequences sit on non-contiguous rows passes
-        ``row_indices`` with the same length, so a finished sequence's row can be
-        left as a hole (``decode_batch(pad_rows=...)`` fills holes with the
-        sentinel).  ``slot_rows`` optionally gives each row's block table, which
-        is copied into that row's ``pos2slot`` map (unchanged tables are skipped).
-        Everything here is an eager host/device write outside the captured graph.
+        Everything here is an eager host/device write outside the captured graph,
+        because the captured decode reads these buffers rather than taking them as
+        arguments.
+
+        Args:
+            tokens: Per-row input token id, in the order of ``row_indices``.
+            positions: Per-row absolute position; it addresses both the KV slot
+                and the context window.
+            slot_rows: Optional per-row block table. Each is copied into that
+                row's ``pos2slot`` map, and unchanged tables are skipped so a
+                steady-state step writes nothing here.
+            row_indices: Decode row for each entry, when the live sequences are not
+                the contiguous rows ``0..n-1``. Only the listed rows are touched,
+                so a finished sequence's row can be left as a hole for
+                ``decode_batch(pad_rows=...)`` to fill with the sentinel.
+
+        Raises:
+            RuntimeError: ``enable_batching`` was never called on this model; the
+                single-stream buffers have no row dim to write.
+            ValueError: ``tokens`` and ``positions`` differ in length,
+                ``row_indices`` differs from them too, or a row falls outside
+                ``0 .. decode_capacity-1`` and would overwrite the staging row or
+                another sequence's state. Reject the step at the runner.
         """
         if self.batch_capacity <= 1:
             raise RuntimeError("set_rows() needs enable_batching(capacity>1)")
@@ -778,14 +986,26 @@ class Qwen35:
 
         Each graph is a fixed-``rows`` forward, so the projection shapes and every
         kernel launch inside it are static -- which is what makes the batched
-        weight reads possible in the first place.  The graphs share a single
-        CUDA graph memory pool: they are mutually exclusive (one replay at a
-        time), so the pool only has to be as large as the largest bucket rather
-        than the sum over buckets.
+        weight reads possible in the first place. The graphs share a single CUDA
+        graph memory pool: they are mutually exclusive (one replay at a time), so
+        the pool only has to be as large as the largest bucket rather than the sum
+        over buckets. Bucket 1 is captured through the *batched* path as well (a
+        decode row), not through ``_forward``; ``_forward`` belongs to the
+        single-stream engine (``capture()``/``decode_step``) and writes the
+        staging row.
 
-        Bucket 1 is captured through the *batched* path as well (a decode row),
-        not through ``_forward``; ``_forward`` belongs to the single-stream
-        engine (``capture()``/``decode_step``) and writes the staging row.
+        Args:
+            buckets: Bucket sizes to capture. Each must be one of (1, 2, 4, 8),
+                the widths the batched kernels instantiate; bucket 1 is always
+                captured so a single live sequence never falls back.
+            warmup: Eager iterations per bucket before its capture.
+
+        Raises:
+            RuntimeError: Batching was not enabled or the model is not paged.
+                Copy-on-write blocks are what keep the capture warmup from
+                overwriting a real sequence, so both preconditions are required.
+            ValueError: A bucket is outside (1, 2, 4, 8). Pick a supported width;
+                the kernels have no other instantiation.
         """
         if self.batch_capacity <= 1:
             raise RuntimeError("capture_batch() needs enable_batching(capacity>1)")
@@ -822,12 +1042,27 @@ class Qwen35:
         """Replay ``bucket``'s graph; returns the logits of all ``bucket`` rows.
 
         The runner keeps each sequence on a fixed decode row, so the live rows of
-        a bucket need not be contiguous.  ``rows`` is the high-water mark (active
-        rows are ``< rows``); ``pad_rows`` lists the holes inside it, and rows
-        ``rows..bucket-1`` are always holes.  Every hole is filled with the
-        sentinel sequence (its own scratch block + slot-map row, token 0, position
-        0, context length 1); its logits are computed and discarded.  The caller
-        samples by ``seq.row`` from the returned ``[bucket, vocab]`` view.
+        a bucket need not be contiguous. Every hole is filled with the sentinel
+        sequence (its own scratch block + slot-map row, token 0, position 0,
+        context length 1); its logits are computed and then discarded.
+
+        Args:
+            rows: High-water mark of the live rows: everything below it is
+                occupied except the rows in ``pad_rows``.
+            bucket: Which captured graph to replay. It also fixes the row count,
+                so rows ``rows..bucket-1`` always run as sentinels.
+            pad_rows: Holes inside ``0 .. rows-1``, i.e. rows whose sequence
+                finished while later rows stayed live.
+
+        Returns:
+            ``[bucket, vocab]`` view of the logits. The caller samples by
+            ``seq.row``; the returned buffer is live, not a copy, so it is only
+            valid until the next replay.
+
+        Raises:
+            ValueError: No graph was captured for ``bucket``, ``rows`` is outside
+                ``1..bucket``, or a pad row is outside the bucket. The runner
+                should size the bucket from the live row count instead of retrying.
         """
         graph = self._batch_graphs.get(bucket)
         if graph is None:
@@ -859,7 +1094,7 @@ class Qwen35:
                           verify_mode: str | None = None) -> None:
         """Allocate the per-row drafter/verify state and capture their graphs.
 
-        ``K`` drafts per step means verifying ``c = K + 1`` tokens per row.  The
+        ``K`` drafts per step means verifying ``c = K + 1`` tokens per row. The
         drafter gets its own small paged KV pool (one identity block table per
         decode row) and a bucket graph that advances every row once per replay.
 
@@ -871,15 +1106,37 @@ class Qwen35:
         * ``"token"`` -- ``c`` sequential batched-decode forwards; slower, but it
           only needs the stage-3 kernels and stays as the fallback.
 
-        ``verify_mode=None`` picks ``"once"`` only when the wide-M GEMV and the
-        multi-query attention kernel are both present.  ``sparse_topk > 0`` is the
-        opt-in selective-KV verify; it needs the masked multi-query kernel and is
-        not wired yet.
-
         The ``c`` rollback snapshots per row are the expensive part (24 layers x
         2 MB fp32 per snapshot); ``enable_verify_batch`` sizes them for exactly
-        this width.  Contexts beyond the drafter pool length raise from
-        :meth:`MTP.check_len`, so the caller can fall back to plain decode.
+        this width.
+
+        Args:
+            K: Drafts per speculative step. The verify width is ``K + 1`` because
+                the main model's own next token is always verified too.
+            buckets: Batch widths to capture verify graphs for; those above the
+                decode capacity are dropped.
+            block_size: Drafter pool block size; ``None`` reuses the main pool's.
+            max_drafter_len: Contexts the drafter pool can cover. Beyond it
+                :meth:`MTP.check_len` raises so the caller can fall back to plain
+                decode.
+            sparse_topk: Opt-in selective-KV verify. Must be 0 until the masked
+                multi-query kernel lands.
+            verify_mode: ``"once"`` or ``"token"``; ``None`` reads
+                ``Q35_SPEC_VERIFY`` and falls back to ``"token"`` when the
+                required kernels are absent. The default stays the c-token verify
+                because at B=8 even 4k context measured below greedy (task-13
+                conclusion); the one-forward form is kept as the reference path
+                until a wide-M kernel beats the M=8 one per element.
+
+        Raises:
+            RuntimeError: Batching was not enabled, the model is not paged, or the
+                checkpoint has no MTP head. Speculative decoding needs all three;
+                the engine should start without it instead.
+            ValueError: ``K`` outside ``1..CKPT-1`` (the verify graph and the
+                rollback snapshots are sized by ``CKPT``), no bucket fits the
+                decode capacity, or ``verify_mode`` is not one of the two names.
+            NotImplementedError: ``sparse_topk > 0``; the masked kernel does not
+                exist yet.
         """
         if self.batch_capacity <= 1:
             raise RuntimeError("enable_spec_batch() needs enable_batching(capacity>1)")
@@ -892,7 +1149,7 @@ class Qwen35:
                 "sparse Top-K verify needs the masked attn_paged_multi_q kernel "
                 "(task-12); pass sparse_topk=0 for now")
         if verify_mode is None:
-            # Default stays the c-token verify.  The one-forward verify is opt-in
+            # Default stays the c-token verify. The one-forward verify is opt-in
             # (``Q35_SPEC_VERIFY=once``): at B=8 even 4k context measured below
             # greedy (task-13 conclusion), so it is kept as the reference path
             # until a wide-M kernel that beats the M=8 one per element exists.
@@ -945,13 +1202,13 @@ class Qwen35:
         """One forward for every row's ``c`` tokens (task-13 fast path).
 
         Layout: ``x`` is row-major ``[rows*c, hidden]`` (a row's c verified tokens
-        are contiguous).  Per layer, the projection and the MLP run once with the
+        are contiguous). Per layer, the projection and the MLP run once with the
         wide-M kernels over all rows*c tokens; the two stateful halves keep the
         greedy-decode kernels:
 
         * full attention -- all c K/V rows are written first, then one
           multi-query paged-attention call serves all c queries from that row's
-          history (kernels task-12).  Writing all of them before the call is safe:
+          history (kernels task-12). Writing all of them before the call is safe:
           the kernel masks each query at its own position;
         * linear attention -- the conv/delta recurrence is sequential over the c
           tokens (state dependency), one batch launch per token, and the state is
@@ -959,12 +1216,18 @@ class Qwen35:
 
         When the multi-query kernel is missing this falls back to the per-token
         attention entry (correct, just not the point of this path).
+
+        Args:
+            rows: Rows this graph runs, i.e. the verify bucket size.
+            prof: Optional ``{tag: [(start_event, end_event), ...]}`` accumulator.
+                When given, each segment is timed with CUDA events for attribution;
+                ``None`` skips the events so the captured graph stays lean.
         """
         c = self.spec_width
         total = rows * c
         hidden = self.cfg["hidden_size"]
         # The 5th entry is the per-row mRoPE offset: every verified token rotates
-        # at ``pos + rope_delta`` while its KV slot stays at ``pos``.  Constant
+        # at ``pos + rope_delta`` while its KV slot stays at ``pos``. Constant
         # within a request, so it is a buffer the captured graph reads.
         ctx = (self.cos_tbl, self.sin_tbl, self.mask_idx, self.ctx_lens,
                self.rope_delta)
@@ -974,6 +1237,19 @@ class Qwen35:
         prof = prof if prof is not None else None
 
         def lap(tag, start):
+            """Close the open timing segment ``tag`` and return the next start.
+
+            Args:
+                tag: Segment name, e.g. "proj" / "recur" / "attn" / "mlp" /
+                    "lmhead"; it becomes a key in ``prof``.
+                start: CUDA event recorded before the segment, or ``None`` when
+                    profiling is off, in which case nothing is recorded.
+
+            Returns:
+                ``start`` unchanged. The caller's pattern is
+                ``s = ...; s.record(); lap(tag, s); s = ...``, so this value is
+                only meaningful as a placeholder before the next event is created.
+            """
             if prof is not None:
                 end = torch.cuda.Event(enable_timing=True)
                 end.record()
@@ -1053,9 +1329,12 @@ class Qwen35:
         -- was implemented and measured, but at ``M = B*c = 16`` the projection
         falls back to the prefill path with its full int8->fp16 dequant (~250-290
         ms fixed cost on this part), 6.9x *slower* than these ``c`` batched-decode
-        steps.  A wide-M batched GEMV (one weight pass for M=16/32) is what would
+        steps. A wide-M batched GEMV (one weight pass for M=16/32) is what would
         make the single-pass verify worthwhile; until that kernel exists this is
         the faster form.)
+
+        Args:
+            rows: Rows this graph runs, i.e. the verify bucket size.
         """
         ctx_base = (self.cos_tbl, self.sin_tbl, self.mask_idx)
         c = self.spec_width
@@ -1079,8 +1358,18 @@ class Qwen35:
         """Switch the captured verify implementation (``"once"`` / ``"token"``).
 
         Both use the same buffers and the same ``spec_step_batch`` interface, so
-        the graphs can simply be re-captured; used for A/B measurement and by the
-        engine when it wants the cheap fallback.
+        the graphs can be re-captured on the spot; used for A/B measurement and by
+        the engine when it wants the cheap fallback.
+
+        Args:
+            mode: The implementation to capture from now on. Setting the mode
+                already in use is a no-op, so a repeated request does not pay for
+                another capture.
+
+        Raises:
+            ValueError: ``mode`` is not one of the two names.
+            RuntimeError: Batched speculative decoding was never enabled; there is
+                nothing to capture.
         """
         if mode not in ("once", "token"):
             raise ValueError(f"verify_mode must be 'once' or 'token' (got {mode!r})")
@@ -1090,10 +1379,18 @@ class Qwen35:
         self.capture_verify_batch()
 
     def capture_verify_batch(self, warmup: int = 2) -> None:
-        """One verify graph per bucket (all share a graph memory pool).
+        """Capture one verify graph per bucket, all sharing a graph memory pool.
 
         The graph records whichever implementation ``verify_mode`` selected; the
         per-step interface and the rollback buffers are identical for both.
+
+        Args:
+            warmup: Eager iterations per bucket before its capture, to settle the
+                allocator and the kernel handles.
+
+        Raises:
+            RuntimeError: ``enable_spec_batch`` was never called, so there are no
+                buffers to capture over.
         """
         if not self.batch_spec:
             raise RuntimeError("enable_spec_batch() first")
@@ -1121,19 +1418,33 @@ class Qwen35:
                         pad_rows=()) -> tuple[list[list[int]], list[torch.Tensor], list[int]]:
         """One batched speculative step over ``tokens``/``positions``.
 
-        ``tokens[i]`` is the token already sampled for sequence ``i`` (the one the
-        drafter starts from) and ``positions[i]`` its absolute position;
-        ``slot_rows`` are the main model's block tables for those rows (the same
-        arguments :meth:`set_rows` takes).  ``row_indices`` places entry ``i`` on
-        its fixed decode row (default ``i``) and ``pad_rows`` marks holes inside
-        ``0..bucket-1``; ``bucket`` selects the captured graphs and every row of
-        it runs, the unused rows as sentinels.
+        Args:
+            tokens: The token already sampled for each sequence -- the one the
+                drafter starts from.
+            positions: Each sequence's absolute position of that token.
+            slot_rows: The main model's block tables for those rows, the same
+                arguments :meth:`set_rows` takes.
+            bucket: Which captured graphs to replay. Every row of the bucket runs,
+                the unused ones as sentinels, so the bucket must be one that was
+                captured.
+            K: Drafts to make per sequence this step; must fit ``spec_width``.
+            row_indices: Fixed decode row for each entry; defaults to ``i``, which
+                is only correct when the live rows are contiguous.
+            pad_rows: Holes inside the bucket, i.e. rows whose sequence is not part
+                of this step.
 
-        Returns ``(accepted_tokens, logits_next, accepted_counts)``: per input
-        sequence the accepted tokens *including* ``tokens[i]``, the logits that
-        follow the accepted prefix (sample the next token from those), and how
-        many draft tokens were accepted.  The caller advances the sequence by
-        ``len(accepted_tokens[i])`` and stages the next step.
+        Returns:
+            ``(accepted_tokens, logits_next, accepted_counts)``: per input
+            sequence the accepted tokens *including* ``tokens[i]``, the logits
+            that follow the accepted prefix (sample the next token from those),
+            and how many draft tokens were accepted. The caller advances the
+            sequence by ``len(accepted_tokens[i])`` and stages the next step.
+
+        Raises:
+            RuntimeError: Batched speculative decoding was never enabled.
+            ValueError: Row indices mismatch the token count or repeat, the bucket
+                was not captured, ``K`` exceeds the captured verify width, or the
+                context would run past the drafter pool.
         """
         if not self.batch_spec:
             raise RuntimeError("enable_spec_batch() first")
@@ -1161,7 +1472,9 @@ class Qwen35:
             self.token_in[row] = self._sentinel_token
             self.pos[row] = 0
             self.ctx_lens[row] = 1
-            self.rope_delta[row] = 0          # forward-only valid table row
+            # 0 keeps the rotation inside the table: a stale negative delta from
+            # the previous occupant would index before its first row.
+            self.rope_delta[row] = 0
 
         # Stage the drafter: h at the previous accepted token, its token, and the
         # drafter position (main position - 1: the MTP predicts the token after h).
@@ -1211,6 +1524,12 @@ class Qwen35:
         return accepted_tokens, logits_next, accepted_counts
 
     def _verify_impl(self) -> None:
+        """Verify the staged ``c`` tokens in one eager forward over the layers.
+
+        The body ``capture_verify`` records; it reads the fixed verify buffers and
+        writes ``verify_hidden``/``verify_logits`` in place, so the graph needs no
+        arguments and no allocations at replay time.
+        """
         x = self.embed.lookup(self.verify_toks)
         # 4th entry: this request's mRoPE offset (a buffer, so the graph replays
         # unchanged; ``verify_pos`` keeps addressing the KV slots).
@@ -1226,10 +1545,18 @@ class Qwen35:
         Verifying k drafts has to cost about one weight pass. Eagerly it costs
         ~k decode steps, mostly CPU launch overhead from the per-token recurrent
         update, so the whole forward is captured once and replayed per step.
-        ``c`` is also the draft width, so ``K = c - 1`` drafts are verified per
-        replay. The batched GEMV accepts only M in {2, 4, 8}, and the linear-attn
-        layers keep ``CKPT`` state snapshots for the rollback, so ``c`` must be one
-        of those widths.
+
+        Args:
+            c: Verify width, which is also the draft width: ``K = c - 1`` drafts
+                are verified per replay. The batched GEMV accepts only M in
+                {2, 4, 8}, and the linear-attn layers keep ``CKPT`` state
+                snapshots for the rollback, so ``c`` must be one of those widths.
+            warmup: Eager iterations before the capture.
+
+        Raises:
+            ValueError: ``c`` is not 2, 4 or 8, or exceeds ``CKPT``. The rollback
+                snapshot ring is sized by ``CKPT``, so a wider verify could not be
+                rewound.
         """
         if c not in (2, 4, 8) or c > CKPT:
             raise ValueError(f"verify width must be 2, 4 or 8 (got {c})")
@@ -1258,12 +1585,25 @@ class Qwen35:
         """Draft K tokens with the MTP, verify all K+1 at once, accept the
         matching prefix and rewind the recurrent state to it.
 
-        Returns ``(accepted_token_ids, logits_after_prefix)``. The main model's
-        own next token is always accepted, so at least one token advances.
-
         Both halves are graph replays and every position/payload stays on the
         device, so the only host round trip per step is the acceptance test --
         which the caller needs anyway to emit the tokens.
+
+        Args:
+            logits_prev: The main model's logits for the last committed token;
+                its argmax seeds the drafter.
+            K: Drafts to make. ``K + 1`` tokens are then verified in one replay,
+                so ``K + 1`` must fit the captured verify width.
+
+        Returns:
+            ``(accepted_token_ids, logits_after_prefix)``. The main model's own
+            next token is always accepted, so at least one token advances, and the
+            returned logits are the ones to sample the following token from.
+
+        Raises:
+            AssertionError: No MTP head or no verify graph, or ``K + 1`` exceeds
+                ``verify_c``. Both are configuration errors: enable the MTP head
+                and capture at the widest ``K`` the engine will use.
         """
         assert self.mtp is not None and self._verify_graph is not None, "MTP not available"
         assert K + 1 <= self.verify_c, f"K+1={K + 1} exceeds verify width {self.verify_c}"
@@ -1303,7 +1643,26 @@ class Qwen35:
     @torch.inference_mode()
     def spec_generate(self, prompt: list[int], max_new: int, K: int = 3,
                       eos: set[int] | None = None) -> list[int]:
-        """Greedy speculative decode; returns up to ``max_new`` new token ids."""
+        """Greedy speculative decode; returns up to ``max_new`` new token ids.
+
+        A convenience entry point for benchmarks and single-request use; the
+        serving engine drives :meth:`spec_step` itself so it can interleave
+        requests.
+
+        Args:
+            prompt: Prompt token ids, prefilled before the first step.
+            max_new: Stop after this many generated tokens.
+            K: Drafts per step; forwarded to :meth:`spec_step`.
+            eos: Token ids that end the request; ``None`` means none.
+
+        Returns:
+            The generated tokens in order, possibly fewer than ``max_new`` when an
+            EOS token or the ``max_seq`` bound stops the loop first.
+
+        Raises:
+            ValueError: The prompt is empty or longer than ``max_seq``; see
+                :meth:`prefill`.
+        """
         eos = eos or set()
         self.n_drafted = self.n_accepted = self.n_spec_steps = 0
         logits = self.prefill(prompt)
@@ -1324,9 +1683,12 @@ class Qwen35:
     def spec_stats(self) -> dict:
         """Acceptance report for the last :meth:`spec_generate` run.
 
-        ``accept_rate`` is the fraction of *drafted* tokens the main model
-        agreed with; ``tokens_per_step`` is what the speedup is proportional to,
-        since every step costs about one verify pass.
+        Returns:
+            Per-run counters: ``steps``, ``drafted``, ``accepted``, ``tokens``,
+            plus ``accept_rate`` (the fraction of *drafted* tokens the main model
+            agreed with) and ``tokens_per_step``. The latter two are the
+            speedup-relevant figures, since every step costs about one verify
+            pass.
         """
         steps = max(self.n_spec_steps, 1)
         tokens = self.n_accepted + self.n_spec_steps      # drafts + one bonus each
@@ -1340,7 +1702,20 @@ class Qwen35:
         }
 
     def decode_step(self, token: int) -> torch.Tensor:
-        """Set the input token, replay the single-stream graph, return its logits."""
+        """Feed one token to the captured single-stream graph and return its logits.
+
+        Args:
+            token: The token to append; it is staged on the prefill row, whose
+                position then advances.
+
+        Returns:
+            ``[vocab]`` logits buffer of that row. Live, not a copy: the next
+            replay overwrites it, so sample before calling again.
+
+        Raises:
+            AttributeError: ``capture()`` was never called; there is no graph to
+                replay. Start the engine through its normal bring-up path.
+        """
         pr = self.prefill_row
         self.token_in[pr:pr + 1].fill_(token)
         self._graph.replay()
@@ -1348,6 +1723,12 @@ class Qwen35:
 
     @property
     def graph_ready(self) -> bool:
+        """Report whether the single-stream decode graph has been captured.
+
+        Returns:
+            ``True`` once :meth:`capture` succeeded, which is the point from which
+            :meth:`decode_step` may be called.
+        """
         return self._graph is not None
 
     def close(self) -> None:
@@ -1355,7 +1736,7 @@ class Qwen35:
 
         ``serve.py`` rebuilds the model after reloading the code; a live
         ``CUDAGraph`` pins its private memory pool (about half the model's
-        footprint), so simply dropping the model reference is not enough.
+        footprint), so dropping the model reference alone is not enough.
         """
         self._graph = None
         self._verify_graph = None

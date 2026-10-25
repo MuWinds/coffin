@@ -9,6 +9,17 @@ It also times one layer's whole prefill and the model, so the delta's real share
 is visible rather than assumed.
 
 Run:  python probe_scan_ab.py [rounds]
+
+Module: ``coffin/diag``. A/Bs the two scan implementations inside one process,
+end to end, through ``llm_engine`` / ``bench_prefill2``.
+
+Constraints:
+    * Same process, same weights, same warmup, alternating rounds: cross-run
+      noise on this box is 1-2%, which is larger than the effect being measured, so
+      a two-process comparison would not resolve it.
+    * The standalone win (2.3x in ``probe_delta_scan_struct``) does not show up
+      end to end; this probe is what proves that, so do not "fix" it by re-running
+      the microbenchmark.
 """
 
 from __future__ import annotations

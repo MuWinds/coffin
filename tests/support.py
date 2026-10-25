@@ -1,4 +1,22 @@
-"""Shared fixtures for the engine test suite.
+"""Shared fixtures, skip gates and path setup for the engine test suite.
+
+Module: ``coffin/tests``. Imported first by every other test module, so it may
+not import any of them; it is the only test file that touches ``sys.path`` and
+the only one that loads a checkpoint.
+
+Constraints:
+    * ``MKL_THREADING_LAYER=GNU`` has to be exported before torch initialises
+      MKL, hence it is set between the imports rather than in a fixture.
+    * ``support`` is imported by flat name, so every test module must be run
+      through the ``discover -s tests`` layout that puts ``tests/`` on
+      ``sys.path``; ``coffin/`` is then added here so ``ops`` / ``models`` /
+      ``engine_api`` import as top-level packages.
+    * At most one model is resident at a time: the card is 16 GB and a second
+      copy of the 4B weights plus both KV caches does not fit, so a test
+      requests its configuration through the fixture instead of building its
+      own model.
+    * The skip gates are evaluated at import time, so a test module that needs
+      the checkpoint must import ``support`` before decorating its classes.
 
 The suite runs in two places, and the skip rules are what make that work:
 
@@ -12,10 +30,6 @@ Run it with::
     cd /root/private_data/engine
     MKL_THREADING_LAYER=GNU PYTHONPATH=/root/private_data/engine \
         python3 -m unittest discover -s tests -t . -v
-
-One model load is shared by the whole run (``ModelFixture``).  A test that needs
-a different weight format or window asks for it; the fixture closes the previous
-model first, so two of them never have to share the 16 GB card.
 """
 
 from __future__ import annotations
@@ -50,11 +64,16 @@ FIXTURE_MODEL_DIR = Path(__file__).resolve().parent / "fixtures" / "qwen3_5"
 
 
 def has_cuda() -> bool:
+    """Whether a DCU is visible; the skip gates are built from this at import time."""
     return torch.cuda.is_available()
 
 
 def has_hip() -> bool:
-    """True when the HIP extension is built/loadable (never builds on a CPU box)."""
+    """True when the HIP extension is built/loadable (never builds on a CPU box).
+
+    The import is deferred inside the function: importing ``hip_ops`` loads the
+    compiled extension, which aborts on a box with no DCU driver.
+    """
     if not torch.cuda.is_available():
         return False
     import hip_ops
@@ -62,6 +81,7 @@ def has_hip() -> bool:
 
 
 def has_model() -> bool:
+    """Whether the checkpoint exists on disk; cheap enough to call at import time."""
     return (MODEL_DIR / "config.json").is_file()
 
 
@@ -75,12 +95,22 @@ needs_model = unittest.skipUnless(
 
 
 def rel_err(got: torch.Tensor, ref: torch.Tensor) -> float:
-    """Max relative error against ``ref`` (same metric the old probes printed)."""
+    """Max relative error against ``ref`` (same metric the old probes printed).
+
+    Normalised by ``ref``'s largest magnitude so a tolerance reads the same at
+    every layer depth; an absolute tolerance would have to be re-tuned per layer.
+    """
     return ((got - ref).abs().max() / ref.abs().max()).item()
 
 
 class ModelFixture:
-    """Shared model, rebuilt only when the requested configuration changes."""
+    """The one resident model, rebuilt only when the requested configuration changes.
+
+    Rebuilding is expensive (weights load, graph capture), so the key is the full
+    constructor tuple: two tests sharing a configuration share the model, and a
+    test that changes one knob pays one reload rather than running against a
+    model configured for somebody else.
+    """
 
     _key: tuple | None = None
     _model = None
@@ -89,6 +119,22 @@ class ModelFixture:
     @classmethod
     def get(cls, *, quant: bool = True, max_seq: int = 2048,
             paged: bool = False, bench: bool = False, weight_dtype=None):
+        """Return the shared model, reloading it first if the configuration differs.
+
+        Args:
+            quant: Store weights as INT8 (W8A16) rather than the checkpoint dtype.
+            max_seq: KV capacity; a longer request than this is truncated by the
+                model, so a test that probes a long context must raise it.
+            paged: Enable the paged KV cache. The paged and flat paths allocate
+                differently, so they cannot share one instance.
+            bench: Allocate the benchmark-shaped buffers.
+            weight_dtype: Override the weight storage dtype (``torch.float16`` /
+                ``torch.bfloat16``); ``None`` keeps the checkpoint's own dtype.
+
+        Returns:
+            The live model. It is owned by this class, not by the caller: do not
+            close it, call :meth:`close` only when you need the VRAM back.
+        """
         key = (quant, max_seq, paged, bench, weight_dtype)
         if cls._key != key:
             cls.close()
@@ -103,6 +149,11 @@ class ModelFixture:
 
     @classmethod
     def close(cls) -> None:
+        """Drop the model and return its VRAM, so the next :meth:`get` reloads.
+
+        Skipping this between differently-configured models would leave the
+        previous one resident and the 16 GB card over-subscribed.
+        """
         if cls._model is not None:
             try:
                 cls._model.close()
@@ -142,14 +193,17 @@ class ModelTestCase(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
+        """Skip the class with a readable reason instead of failing in ``setUp``."""
         if not (has_cuda() and has_model()):
             raise unittest.SkipTest(f"needs a DCU and the checkpoint at {MODEL_DIR}")
 
     def setUp(self) -> None:
+        """Take the shared model and rewind its context to empty."""
         self.model = ModelFixture.get(quant=self.QUANT, max_seq=self.MAX_SEQ,
                                       paged=self.PAGED,
                                       weight_dtype=self.WEIGHT_DTYPE)
         self.model.reset()
 
     def tearDown(self) -> None:
+        """Rewind the context so the next test cannot inherit this request's state."""
         self.model.reset()

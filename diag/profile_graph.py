@@ -1,7 +1,34 @@
 """Profile CUDA-graph decode replays: which kernels own the GPU now that the
 CPU is out of the loop.
 
-Run:  python profile_graph.py [n]
+Answers what the decode step is device-bound on once launch overhead and Python
+have been removed by graph capture. That distinction is the whole point: in an
+eager step a large host share hides the kernel mix, so the graph replay is the
+only place the real GPU cost distribution is visible.
+
+Read the table as ``us/step`` per kernel against the ``TOTAL`` line, and take
+``calls`` as a shape hint — a kernel with many calls per step but little time is
+a fusion candidate, while one with few calls and a large share is the bandwidth
+target. The ``ms/token`` line above the table is the end-to-end figure those
+kernels have to explain; if the table's total is well under it, time is still
+going somewhere capture did not cover.
+
+Run inside the container from the engine root, on the DCU:
+
+    python profile_graph.py [n]
+
+``n`` is the number of decode tokens to replay, default 30.
+
+Module: ``coffin/diag``. Standalone probe: imports ``qwen35_engine`` and torch,
+and nothing under ``coffin/`` imports it.
+
+Constraints:
+    * ``capture()`` must run before the timed loop; an uncaptured model would
+      measure the eager path and report a different kernel mix entirely.
+    * The same token id is fed ``n`` times deliberately. The measurement is the
+      per-step kernel mix, and repeated input keeps the branch pattern fixed so
+      two runs compare like with like.
+    * Needs the real checkpoint, so it runs only where the weights are.
 """
 
 from __future__ import annotations

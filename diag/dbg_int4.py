@@ -1,4 +1,34 @@
-"""Tiny correctness debug for the int4 probe kernel (K=256, N=2)."""
+"""Tiny correctness debug for the int4 probe kernel (K=256, N=2).
+
+Answers whether the int4 GEMV probe kernel's packing and scale convention match
+the Python reference, on a matrix small enough to print in full. This is the
+first thing to run when ``probe_gemv_int4.py`` shows a bandwidth-plausible but
+numerically wrong result: with K=256, N=2 every intermediate fits on screen, so
+a packing or scale-layout error is visible by eye instead of inferred from a
+tolerance.
+
+Read it by comparing the printed rows: ``kernel`` must equal ``ref``. If they
+differ only by a constant factor, the scale placement is wrong (a per-row scale
+applied where the kernel expects a per-128-group one); if ``ref`` matches
+``no-scale ref``, the scales themselves were quantised away. Both rows are
+printed precisely so the failure mode can be told apart.
+
+Run inside the container, on the DCU, after ``build_int4.py`` has populated the
+extension cache:
+
+    python3 diag/dbg_int4.py
+
+Module: ``coffin/diag``. Standalone probe: builds and imports ``gemv_int4_ext``
+and reaches into it directly, importing nothing from ``coffin/``.
+
+Constraints:
+    * The input is deterministic arithmetic, not random, so the same mismatch
+      reproduces every run and the printed tables can be compared across hosts.
+    * ``gfx906`` and the extensions directory are defaulted before torch imports,
+      for the same reasons as ``build_int4.py``.
+    * K=256 is two 128-element quantisation groups on purpose: one group would
+      not show a group-indexing error at all.
+"""
 import os
 import sys
 

@@ -1,11 +1,34 @@
 """GQA full attention with an output gate, partial RoPE and an int8 KV cache.
 
+Module: ``coffin/models/qwen35``. One of the two per-layer attention kinds the
+family composes (the other is ``linear_attn``); ``blocks.Layer`` picks one per
+layer index and ``model.py`` builds all 32. Depends downward on ``hip_ops`` for
+the kernels, ``ops`` for dtypes/rope/norm/proj, and ``models/qwen35/batch`` and
+``tuning`` for the batched projections and split counts. Nothing outside this
+family may import it directly.
+
 Eight of the 32 layers are this kind.  The decode step always spans the whole
 ``max_seq`` window and masks entries past a device-side position counter, so
 its shape never changes and the graph is captured once; prefill uses online
 softmax over key blocks so the score block stays ~34 MB whatever the context
 length.  The split-K partial buffers live here because the captured graph needs
 stable addresses.
+
+Constraints:
+    * The KV cache is int8 with a separate fp32 per-(head, token) scale. The
+      quantiser is ``_quant`` for one token and ``_quant_rows`` /
+      ``_quant_seq`` for a batch; all three must stay bit-identical, because
+      the kernel dequantises with the same scale the writer stored.
+    * Decode buffers have static shapes and stable addresses. Anything the
+      captured graph writes must be allocated before ``capture()`` and never
+      reassigned afterwards; ``enable_batching`` and ``attach_pool`` are the
+      only resizers, and both must run pre-capture.
+    * Recurrent state does not exist here -- the KV is position-indexed, so
+      rollback is a position counter -- but the cache must still be snapshotted
+      and restored with it for prefix reuse, or a shared KV pairs a restored
+      position counter with someone else's tail.
+    * All mutation is single-threaded, driven by ``llm_engine``; there is no
+      locking and none may be added.
 """
 
 from __future__ import annotations
@@ -30,6 +53,22 @@ class FullAttn:
 
     def __init__(self, sd: dict, p: str, cfg: dict, bench: bool, max_seq: int,
                  paged: bool = False) -> None:
+        """Load one layer's attention weights and size its KV buffers.
+
+        Args:
+            sd: Full state dict; this layer reads the ``{p}.*`` keys only.
+            p: Checkpoint prefix of the layer, e.g. ``model.layers.3.self_attn``.
+            cfg: Model config; ``num_attention_heads`` (16),
+                ``num_key_value_heads`` (4), ``head_dim`` (256) and
+                ``rope_parameters.partial_rotary_factor`` (0.25 -> 64 rotated
+                dims) come from here.
+            bench: Thread the flag into ``_proj``, which selects the benchmark
+                weight layout.
+            max_seq: Window in tokens; the dense cache is ``[nkv, max_seq, hd]``.
+            paged: Skip the dense cache entirely because a pool will own the KV.
+                See the comment on the allocation below -- this is a memory
+                decision, not a mode switch.
+        """
         self.nh = cfg["num_attention_heads"]        # 16
         self.nkv = cfg["num_key_value_heads"]       # 4
         self.hd = cfg["head_dim"]                   # 256
@@ -66,8 +105,9 @@ class FullAttn:
         self._bcap = 1
         self.prefill_row = 0
         self.attn_out = torch.zeros(1, self.nh, self.hd, dtype=D, device="cuda")
-        # per-key-slice partials for the split decode attention (see attn.cu); kept
-        # here because the decode step is a captured graph and needs fixed buffers
+        # Per-key-slice partials for the split decode attention (see attn.cu);
+        # kept here because the decode step is a captured graph and needs fixed
+        # buffers.
         self.part_acc = torch.zeros(1, self.nh, ATTN_SPLIT, self.hd, dtype=torch.float32,
                                     device="cuda")
         self.part_ml = torch.zeros(1, self.nh, ATTN_SPLIT, 2, dtype=torch.float32,
@@ -77,14 +117,31 @@ class FullAttn:
         self.pidx = 0
 
     def _bind_single_views(self) -> None:
-        """Row views the single-stream (prefill / verify) path writes."""
+        """Row views the single-stream (prefill / verify) path writes.
+
+        Re-bound, never reallocated: the captured decode/prefill graphs were
+        recorded against these exact addresses, so ``enable_batching`` calls
+        this after resizing the parents instead of binding views per call.
+        """
         pr = self.prefill_row
         self.attn_out1 = self.attn_out[pr]
         self.part_acc1 = self.part_acc[pr]
         self.part_ml1 = self.part_ml[pr]
 
     def enable_batching(self, capacity: int, prefill_row: int) -> None:
-        """Give the attention buffers one row per batch entry (before capture)."""
+        """Give the attention buffers one row per batch entry (before capture).
+
+        Args:
+            capacity: Rows the batch needs, already including the prefill row.
+            prefill_row: Row reserved for single-stream prefill and verify. The
+                batched decode must never write it, so the model keeps it out of
+                the row pool.
+
+        Returns:
+            Nothing. A no-op when the buffers already have this capacity and the
+            staging row is unchanged, which keeps the captured graph addresses
+            valid across an engine that runs both modes.
+        """
         capacity = max(int(capacity), 1)
         if capacity == 1 and self.prefill_row == 0:
             return
@@ -103,6 +160,17 @@ class FullAttn:
         Called before any graph is captured: the captured decode step bakes in the
         pool tensors, so switching afterwards would leave a graph writing to the
         wrong place. The private dense buffers are released.
+
+        Args:
+            pool: The paged KV pool (``paged_cache``); its slot maps are read on
+                every step, its tensors are written in place.
+            idx: This layer's slot inside the pool, i.e. its position in the
+                per-layer dimension of ``pool.k`` / ``pool.v``.
+
+        Returns:
+            Nothing. After this call the dense cache attributes are ``None``;
+            any code path that still reads them will fail loudly rather than
+            quietly write to a stale buffer.
         """
         self.pool = pool
         self.pidx = idx
@@ -112,18 +180,52 @@ class FullAttn:
         self.vscale = None
 
     def _pool_views(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """This layer's slices of the pool, in the order the kernels take them.
+
+        Returns:
+            ``(k, v, kscale, vscale)`` views, already indexed by ``pidx``. They
+            point into the pool, so writing through them is the cache write.
+        """
         p = self.pool
         return p.k[self.pidx], p.v[self.pidx], p.kscale[self.pidx], p.vscale[self.pidx]
 
     @staticmethod
     def _quant(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """[nkv, hd] bf16 -> (int8, per-head scale)."""
+        """[nkv, hd] bf16 -> (int8, per-head scale).
+
+        The ``1e-5`` floor on the abs-max stops an all-zero K/V row from
+        dividing by zero; it costs under one int8 step, so it cannot move the
+        value past what int8 already rounds to.
+
+        Args:
+            x: One token's K or V, ``[nkv, hd]``, in the compute dtype.
+
+        Returns:
+            ``(q, s)``: int8 codes in ``[-127, 127]`` and the positive fp32 scale
+            per head that the kernel multiplies back.
+        """
         s = x.float().abs().amax(-1).clamp_min(1e-5) / 127.0
         q = (x.float() / s[:, None]).round().clamp_(-127, 127).to(torch.int8)
         return q, s
 
     def __call__(self, x: torch.Tensor, pos1, cos_tbl, sin_tbl, mask_idx,
                  rope_delta=None) -> torch.Tensor:
+        """Single-token decode step for one row.
+
+        Args:
+            x: The layer input for this token, ``[hidden]``.
+            pos1: 1-element long tensor with the token index. It addresses the KV
+                slot and the cache write, and the mask is ``> pos1``.
+            cos_tbl: RoPE cos table, indexed by position.
+            sin_tbl: RoPE sin table, indexed by position.
+            mask_idx: Device-side position counter used by the CPU fallback mask.
+            rope_delta: Optional mRoPE offset added to ``pos1`` for the rotation
+                only. Zero (``None``) for text, so the text path stays bit for
+                bit what it was before images existed.
+
+        Returns:
+            ``[hidden]`` the gated attention output after ``o_proj``.
+        """
         qg, k, v = self.qkv(x)
         qg = qg.reshape(self.nh, 2 * self.hd)
         q, gate = qg[:, :self.hd], qg[:, self.hd:]
@@ -151,7 +253,9 @@ class FullAttn:
             self.kscale.index_copy_(1, pos1, sk.unsqueeze(1))
             self.vscale.index_copy_(1, pos1, sv.unsqueeze(1))
 
-        # fused: dequant k/v, scale fold, causal mask, softmax, gate, PV
+        # One fused kernel per path: dequant k/v, fold the scales, apply the
+        # causal mask, softmax, gate, PV. The fallbacks below only run without
+        # the extension and must produce the same numbers.
         if self.pool is not None and hip_ops.available():
             kp, vp, kps, vps = self._pool_views()
             out = hip_ops.attn_paged(q.contiguous(), gate.contiguous(), kp, vp, kps, vps,
@@ -182,7 +286,16 @@ class FullAttn:
 
     @staticmethod
     def _quant_rows(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """[B, nkv, hd] bf16 -> (int8, per-(row, head) scale), row-wise == ``_quant``."""
+        """[B, nkv, hd] bf16 -> (int8, per-(row, head) scale), row-wise == ``_quant``.
+
+        Args:
+            x: One token per batch row, ``[B, nkv, hd]``.
+
+        Returns:
+            ``(q, s)``: int8 codes ``[B, nkv, hd]`` and fp32 scales ``[B, nkv]``.
+            Each row is quantised independently, so the result for row ``b`` is
+            bit-identical to :meth:`_quant` on that row alone.
+        """
         s = x.float().abs().amax(-1).clamp_min(1e-5) / 127.0
         q = (x.float() / s.unsqueeze(-1)).round().clamp_(-127, 127).to(torch.int8)
         return q, s
@@ -202,6 +315,22 @@ class FullAttn:
         ``ctx`` may carry a 5th entry: the per-row ``rope_delta`` ``[B]`` long
         (mRoPE text offset of a request that has an image).  It only moves the
         cos/sin lookup; ``positions`` keeps addressing the KV slot.
+
+        Args:
+            x: Decode-row inputs, ``[B, hidden]``.
+            positions: Current token index per row, ``[B]`` long.
+            ctx: ``(cos_tbl, sin_tbl, mask_idx[, context_lens[, rope_delta]])``.
+                ``context_lens`` is ``[B]`` int32 and selects the batched kernel;
+                ``rope_delta`` is ``[B]`` long and moves only the rotation.
+
+        Returns:
+            ``[B, hidden]`` gated attention output after the batched ``o_proj``.
+
+        Raises:
+            RuntimeError: The extension is unavailable or no pool is attached.
+                The batched path has no dense-cache fallback, so the caller must
+                either attach a pool before enabling batching or stay on
+                single-stream decode.
         """
         cos_tbl, sin_tbl, mask_idx = ctx[0], ctx[1], ctx[2]
         ctx_lens = ctx[3] if len(ctx) > 3 else None
@@ -216,8 +345,9 @@ class FullAttn:
         k = self.k_norm(k.reshape(B, self.nkv, self.hd))
         v = v.reshape(B, self.nkv, self.hd)
 
+        # [B, 1, rot]: the singleton is the token axis the block kernels expect.
         rope_pos = positions if rope_delta is None else positions + rope_delta[:B]
-        cos = cos_tbl.index_select(0, rope_pos).unsqueeze(1)   # [B, 1, rot]
+        cos = cos_tbl.index_select(0, rope_pos).unsqueeze(1)
         sin = sin_tbl.index_select(0, rope_pos).unsqueeze(1)
         q, k = apply_rope(q, k, cos, sin, self.rot)
 
@@ -251,7 +381,16 @@ class FullAttn:
 
     @staticmethod
     def _quant_seq(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """[C, nkv, hd] bf16 -> (int8, per-(token, head) scale)."""
+        """[C, nkv, hd] bf16 -> (int8, per-(token, head) scale).
+
+        Args:
+            x: Several tokens' K or V, ``[C, nkv, hd]``, in the compute dtype.
+
+        Returns:
+            ``(q, s)`` with int8 codes ``[C, nkv, hd]`` and fp32 scales
+            ``[C, nkv]``. Same per-token reduction as :meth:`_quant`, so a
+            prefill chunk and a per-token write quantise identically.
+        """
         s = x.float().abs().amax(-1).clamp_min(1e-5) / 127.0
         q = (x.float() / s[..., None]).round().clamp_(-127, 127).to(torch.int8)
         return q, s
@@ -261,11 +400,28 @@ class FullAttn:
 
         Split out so a group prefill can run one GEMM over the concatenated
         prompts of several sequences and slice the result afterwards.
+
+        Args:
+            x: Prefill inputs, ``[C, hidden]``.
+
+        Returns:
+            ``(qg, k, v)`` before the q/k norms and rope, i.e. the raw projection
+            the caller may concatenate and later hand to :meth:`prefill_attend`.
         """
         return self.qkv.prefill(x)
 
     def enable_multi_q(self, capacity: int, width: int) -> None:
-        """Buffers for the multi-query verify: one ``(row, token)`` query pair row."""
+        """Buffers for the multi-query verify: one ``(row, token)`` query pair row.
+
+        Args:
+            capacity: Decode rows.
+            width: Drafted tokens per row (``c``); a row and its ``c`` queries
+                become ``c`` entries of the leading dim.
+
+        Returns:
+            Nothing. Buffers are allocated here and only here, because the
+            verify graph captures these addresses.
+        """
         self._mq_width = int(width)
         n = capacity * int(width)
         self.mq_out = torch.zeros(n, self.nh, self.hd, dtype=D, device="cuda")
@@ -284,6 +440,19 @@ class FullAttn:
         ``attn_paged_multi_q`` serves all ``c`` queries of every row from one pass
         over that row's history KV.  Returns the pre-``o_proj`` attention output
         ``[rows*c, nh*hd]``; the caller runs the wide projection once.
+
+        Args:
+            qg: Packed query and gate, ``[rows*c, 2*nh*hd]``.
+            k: Keys, ``[rows*c, nkv*hd]``.
+            v: Values, ``[rows*c, nkv*hd]``.
+            positions: Token indices, ``[rows, c]`` long, row-major inside a row.
+            ctx: ``(cos_tbl, sin_tbl[, rope_delta_rows])``; a 5th entry is the
+                per-row mRoPE offset, applied to the rotation only.
+            rows: Row count ``b``; ``c`` is read from ``positions``.
+
+        Returns:
+            ``[rows*c, nh*hd]`` gated attention output before ``o_proj``, so the
+            caller can run that weight read once for the whole verify batch.
         """
         cos_tbl, sin_tbl = ctx[0], ctx[1]
         b = rows
@@ -301,8 +470,9 @@ class FullAttn:
         sin = sin_tbl.index_select(0, rope_pos.reshape(-1)).view(b, c, 1, self.rot)
         q, k = apply_rope(q, k, cos, sin, self.rot)
 
-        # every verified token's K/V goes in, then the multi-query attention reads
-        # each row's history once for all c queries (kernel masks query j at pos j)
+        # Every verified token's K/V goes in, then the multi-query attention reads
+        # each row's history once for all c queries (the kernel masks query j at
+        # pos j, so one pass serves the whole speculative block).
         kq, ks = self._quant_seq(k.reshape(n, self.nkv, self.hd))
         vq, vs = self._quant_seq(v.reshape(n, self.nkv, self.hd))
         slots = torch.stack([self.pool.pos2slot[i].index_select(0, positions[i])
@@ -330,6 +500,21 @@ class FullAttn:
         positions through this entry point.  ``ctx`` may carry the per-row
         ``rope_delta`` as a 5th entry (mRoPE after an image; ``positions`` keeps
         addressing the KV slot).
+
+        Args:
+            qg: Already-projected query and gate for the ``c`` tokens of each
+                row, ``[B*c, 2*nh*hd]``.
+            k: Projected keys, ``[B*c, nkv*hd]``.
+            v: Projected values, ``[B*c, nkv*hd]``.
+            positions: Token indices, ``[B, c]`` long; used both to place the KV
+                and, plus ``rope_delta``, to look up the rotation.
+            ctx: ``(cos_tbl, sin_tbl, mask_idx)``; a 5th entry is the per-row
+                mRoPE offset.
+
+        Returns:
+            ``[B, hidden]`` gated output after ``o_proj`` -- one row per verified
+            token, which the caller compares against the draft to accept or
+            reject.
         """
         cos_tbl, sin_tbl, mask_idx = ctx[0], ctx[1], ctx[2]
         b = qg.shape[0]
@@ -347,6 +532,8 @@ class FullAttn:
         kp, vp, kps, vps = self._pool_views()
         slots = self.pool.pos2slot[:b].gather(1, positions.view(b, 1)).squeeze(1)
         self.pool.write_rows(self.pidx, slots, qk, sk, qv, sv)
+        # ``attn_paged_batch`` takes a length, not a last index, so +1 turns the
+        # token position into a count. In place, because this is a captured path.
         lens = positions.to(torch.int32).add_(1)
         hip_ops.attn_paged_batch(q, gate, kp, vp, kps, vps,
                                  self.pool.pos2slot[:b], lens,
@@ -372,6 +559,25 @@ class FullAttn:
         rope pair: the prefill call chain (``Layer.prefill`` ->
         ``prefill_state``) only forwards ``ctx``, and this is the same pass-through
         style ``FullAttn.batch`` already uses for ``ctx_lens``.
+
+        Args:
+            qg: Packed query and gate, ``[C, 2*nh*hd]``.
+            k: Keys, ``[C, nkv*hd]``.
+            v: Values, ``[C, nkv*hd]``.
+            positions: Absolute token indices of the chunk, ``[C]`` long; they
+                address both the KV slots and, without explicit ``rope``, the
+                rotation table.
+            ctx: ``(cos_tbl, sin_tbl, mask_idx[, rope])``.
+            tiles: ``(q0, q1, p0, kend)`` query tiles from ``Qwen35.prefill``.
+                ``None`` treats the whole chunk as one tile, correct but with the
+                wasted upper-triangle work described in :meth:`prefill`.
+            row: Slot-map row to write. Defaults to the staging row.
+            rope: Explicit ``(cos, sin)`` of ``[C, rot]`` for a chunk holding
+                image tokens, where a single table lookup cannot produce the
+                three-axis rotation.
+
+        Returns:
+            ``[C, nh*hd]`` gated attention output, before ``o_proj``.
         """
         if row is None:
             row = self.prefill_row
@@ -379,6 +585,8 @@ class FullAttn:
         if rope is None and len(ctx) > 3:
             rope = ctx[3]
         C = qg.shape[0]
+        # The tile list is authoritative for the key range when present: its
+        # bounds already account for a prefix the caller sliced off the front.
         if tiles is None:
             p0, p1 = int(positions[0]), int(positions[-1]) + 1
         else:
@@ -390,10 +598,11 @@ class FullAttn:
         v = v.reshape(C, self.nkv, self.hd)
 
         if rope is None:
-            cos = cos_tbl.index_select(0, positions).unsqueeze(1)   # [C, 1, rot]
+            # [C, 1, rot]: the singleton broadcasts over heads.
+            cos = cos_tbl.index_select(0, positions).unsqueeze(1)
             sin = sin_tbl.index_select(0, positions).unsqueeze(1)
         else:
-            cos = rope[0].to(cos_tbl.dtype).unsqueeze(1)            # [C, 1, rot]
+            cos = rope[0].to(cos_tbl.dtype).unsqueeze(1)
             sin = rope[1].to(sin_tbl.dtype).unsqueeze(1)
         q, k = apply_rope(q, k, cos, sin, self.rot)
 
@@ -412,7 +621,9 @@ class FullAttn:
             self.vcache[:, p0:p1] = qv.transpose(0, 1)
             self.kscale[:, p0:p1] = sk.transpose(0, 1)
             self.vscale[:, p0:p1] = sv.transpose(0, 1)
-            kk = self.kcache[:, :p1]                           # [nkv, S, hd] int8
+            # [nkv, S, hd] int8: only the prefix up to p1 is addressed by this
+            # chunk, so the tail is never touched and needs no zeroing.
+            kk = self.kcache[:, :p1]
             vv = self.vcache[:, :p1]
             kkp = self.kscale[:, :p1]
             vvp = self.vscale[:, :p1]
@@ -434,7 +645,7 @@ class FullAttn:
             qe = q[q0:q1].reshape(nq, self.nkv, self.rep, self.hd).permute(1, 2, 0, 3)
             qf = qe.to(WF)
             qpos = positions[q0:q1]
-            # online softmax over key blocks: acc is the unnormalised output, m the
+            # Online softmax over key blocks: acc is the unnormalised output, m the
             # running max and l the running denominator, all [nkv, rep, nq, .]
             acc = m = l = None
             for k0 in range(0, kend, KB):
@@ -462,11 +673,13 @@ class FullAttn:
                     l = l * alpha + p.sum(-1, keepdim=True)
                     acc *= alpha
                     m = mnew
-                # fold the per-token V scale into the weights (as the untiled
-                # version does) so the einsum runs on raw int8-widened V
+                # Fold the per-token V scale into the weights (as the untiled
+                # version does) so the einsum runs on raw int8-widened V.
                 pw = (p * vvp[:, None, None, k0:k1]).to(WF)
                 pv = torch.einsum("ghcs,gsd->ghcd", pw, vv[:, k0:k1].to(WF))
                 acc = pv if acc is None else acc + pv
+            # acc/l is the normalised tile output in (nkv, rep, nq, hd); the
+            # permute restores (nq, nh, hd) before the gate is applied.
             out[q0:q1] = (acc / l).permute(2, 0, 1, 3).reshape(nq, self.nh, self.hd).to(D)
         out = out * gate.sigmoid()
         return out.reshape(C, -1)
@@ -486,6 +699,18 @@ class FullAttn:
         slot-map row (default: the staging row); the batched drafter passes each
         sequence's own row.  ``rope`` is the optional explicit 3-D ``(cos, sin)``
         for a chunk with image tokens (see :meth:`prefill_attend`).
+
+        Args:
+            x: Prefill inputs, ``[C, hidden]``.
+            positions: Absolute token indices of the chunk, ``[C]`` long.
+            ctx: ``(cos_tbl, sin_tbl, mask_idx[, rope])``.
+            tiles: ``(q0, q1, p0, kend)`` query tiles, from ``Qwen35.prefill``.
+            row: Slot-map row to write; ``None`` uses the staging row.
+            rope: Explicit 3-D ``(cos, sin)`` for a chunk containing image tokens.
+
+        Returns:
+            ``[C, hidden]`` layer output after ``o_proj``, in the same order as
+            ``x`` so the residual add lines up.
         """
         proj = self.prefill_project(x)
         out = self.prefill_attend(*proj, positions, ctx, tiles,
@@ -502,6 +727,24 @@ class FullAttn:
         counter.  ``rope_delta`` (optional, 0-d or ``[1]`` long) is the request's
         mRoPE offset: ``positions`` keeps addressing KV slots, the rotation reads
         ``positions + rope_delta``.
+
+        Rolling back by the position counter only works because a rejected draft
+        leaves nothing behind: the next prefill overwrites those slots. That is
+        why the loop writes each token's KV before attending -- a rejected token
+        is never read again.
+
+        Args:
+            x: The drafted tokens' inputs, ``[C, hidden]``.
+            positions: Token indices of the drafted tokens, ``[C]`` long.
+            cos_tbl: RoPE cos table.
+            sin_tbl: RoPE sin table.
+            mask_idx: Device-side position counter for the mask.
+            rope_delta: Optional mRoPE offset, 0-d or ``[1]`` long; moves only the
+                rotation.
+
+        Returns:
+            ``[C, hidden]`` layer output, one row per drafted token, which the
+            sampler compares against the draft to accept the longest prefix.
         """
         C = x.shape[0]
         qg, k, v = self.qkv.prefill(x)
@@ -542,8 +785,19 @@ class FullAttn:
         return self.o_proj.prefill(out.reshape(C, -1))
 
     def reset(self) -> None:
+        """Clear the dense KV cache between requests.
+
+        Returns:
+            Nothing. Zeroing is not needed for correctness of the next prefill --
+            positions are overwritten before they are read -- but a stale int8
+            scale from a previous request would be dequantised by any path that
+            reads past the current length, so the buffers start neutral.
+
+        Only the dense cache is cleared: with a pool attached the session owns
+        the slots, and zeroing here would wipe a prefix another sequence shares.
+        """
         if self.pool is not None:
-            return                     # the pool outlives a reset; the session owns it
+            return
         self.kcache.zero_()
         self.vcache.zero_()
         self.kscale.zero_()

@@ -20,6 +20,15 @@ internal chunk size is swept again -- the earlier sweep predates the
 strided-view fix, so its numbers are not trustworthy.
 
 Run:  python probe_delta_scan_struct.py [C]
+
+Module: ``coffin/diag``. Targets ``ops/delta.chunked_delta`` and the scan
+structure inside ``models/qwen35/linear_attn``.
+
+Constraints:
+    * Phase 1 is held fixed so only the scan varies; changing both at once is
+      what made the earlier measurements unattributable.
+    * Per-op timing is meaningless here -- the scan is launch-bound, so the
+      number to compare is total step time at a fixed chunk count.
 """
 
 from __future__ import annotations

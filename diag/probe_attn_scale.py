@@ -1,15 +1,38 @@
 """Probe: fused int8-KV decode attention scaling with context length.
 
-Synthetic KV only.  Reuses the engine's cached HIP build (``hip_ops.attn``) and
-its Qwen3.8-27B full-layer geometry: nh=24 q heads, nkv=4 kv heads, hd=256,
-rep=6 (Qwen3.5-4B's nh=16/rep=4 is measured too, for continuity with NOTES.md).
+Answers whether the fused attention kernel is still bandwidth-bound at 256k, and
+which split factor to use there. Synthetic KV only. Reuses the engine's cached HIP
+build (``hip_ops.attn``) and its Qwen3.8-27B full-layer geometry: nh=24 q heads,
+nkv=4 kv heads, hd=256, rep=6 (Qwen3.5-4B's nh=16/rep=4 is measured too, for
+continuity with NOTES.md).
 
 For every (window, split) it reports ms/call and the effective KV-read GB/s,
 then extrapolates to the 16 full-attention layers of Qwen3.8-27B.
 
+Read each ``ATTN_JSON`` row's ``gbps``: it is bytes actually touched (K+V int8
+plus the fp32 scales) over time, so a row well under the card's HBM roof means the
+split is too small to saturate it and a larger ``split`` should win at that
+window. The ``LAYER_EXTRAP`` block then multiplies the best split per window by
+16 layers and converts to ``decode_tok_s``, which is the number that decides
+whether a 256k context is servable at all. ``ATTN_OVERHEAD`` at pos=0 is the
+fixed launch cost — if it is a large fraction of a small-window row, that row is
+measuring overhead rather than bandwidth.
+
     MKL_THREADING_LAYER=GNU PYTHONPATH=/root/private_data/engine \
     TORCH_EXTENSIONS_DIR=/root/private_data/torch_ext \
     python3 coffin/diag/probe_attn_scale.py [--max 262144] [--quick]
+
+Module: ``coffin/diag``. Standalone probe: imports ``hip_ops`` and the engine's
+cached HIP extension, and nothing under ``coffin/`` imports it.
+
+Constraints:
+    * ``PYTORCH_ROCM_ARCH`` and ``TORCH_EXTENSIONS_DIR`` are defaulted before torch
+      is imported; torch reads them at initialisation, so setting them later would
+      build for the wrong arch or a shared extension cache.
+    * The KV pool is allocated at full ``--max`` up front, so peak VRAM is set by
+      the flag rather than by the rows; a 256k run needs the whole window resident.
+    * No real weights and no model: the rows are pure kernel cost, which is why a
+      regression here can be attributed to the kernel alone.
 """
 
 from __future__ import annotations
@@ -31,6 +54,17 @@ import hip_ops  # noqa: E402
 
 
 def bench(fn, iters: int = 5, warmup: int = 2) -> float:
+    """Time ``fn`` with CUDA events and return milliseconds per call.
+
+    Args:
+        fn: Zero-argument callable to time.
+        iters: Calls per timed region; the span is divided by this. The 256k rows
+            drop this internally to keep one region from running for minutes.
+        warmup: Untimed calls first, to absorb kernel first-load.
+
+    Returns:
+        Mean device milliseconds per call.
+    """
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
@@ -44,6 +78,7 @@ def bench(fn, iters: int = 5, warmup: int = 2) -> float:
 
 
 def main() -> None:
+    """Sweep window x split across both geometries, then extrapolate to 16 layers."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--max", type=int, default=262144)
     ap.add_argument("--quick", action="store_true")

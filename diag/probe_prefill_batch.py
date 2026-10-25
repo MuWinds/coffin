@@ -10,6 +10,16 @@ with the serial one (argmax), and prints the fixed cost per forward.
 Run (inside the container, from the engine directory)::
 
     python3 diag/probe_prefill_batch.py --length 128
+
+Module: ``coffin/diag``. Exercises ``Qwen35.prefill_group`` through the batched
+engine in ``llm_engine``.
+
+Constraints:
+    * The comparison is k prompts in one forward against k separate forwards, on
+      the same weights, in the same process -- otherwise the weight read dominates
+      the difference.
+    * Prompt content must be distinct: identical prompts would hit the radix tree
+      and measure reuse instead of grouping.
 """
 
 from __future__ import annotations

@@ -7,6 +7,15 @@ step as well as time per step -- with 1.8 us per kernel inside a graph, 2500
 kernels cost ~4.5 ms before any traffic at all.
 
 Run:  python probe_decode_profile.py [steps]
+
+Module: ``coffin/diag``. Wraps the captured graph from ``models/qwen35``; a
+change in the capture path shows up here as a changed kernel count.
+
+Constraints:
+    * The graph is captured so CPU dispatch is out of the measurement; a run on
+      the eager path would report dispatch cost as device cost.
+    * Kernel count matters as much as kernel time: with ~1.8 us of dispatch per
+      op inside a graph, 2500 kernels are ~4.5 ms before any memory traffic.
 """
 
 from __future__ import annotations

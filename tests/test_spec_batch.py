@@ -1,5 +1,23 @@
 """Batched speculative decoding: per-row drafter, verify and rollback.
 
+Module: ``coffin/tests``. Drives ``model.spec_step_batch`` through the batched
+model API; the scheduler never calls this path in production yet, so this file
+is its only functional gate.
+
+Constraints:
+    * Speculation may only change speed: every token the batched spec path emits
+      has to be the token the plain batched greedy path would emit at that
+      position. Per row, bit for bit, for the per-token verify path.
+    * The batch, MTP and rollback graphs peak around 6 GiB, which does not fit
+      next to the other classes on a 16 GB card; hence the ``RUN_SPEC_BATCH``
+      opt-in skip rather than a normal test.
+    * A row hole is part of the contract, not an edge case: the engine fixes a
+      row per sequence and pads holes with sentinels, so a test with contiguous
+      rows only would never exercise the padding.
+    * The one-forward verify path is judged by token agreement instead of bitwise
+      logits, because its wide-M kernel has a ULP-level difference from the greedy
+      kernel by design.
+
 Speculation may only change speed: every token the batched spec path emits has to
 be the token the plain batched greedy path would emit at that position.  That is
 the strong claim tested here -- per row, bit for bit:
@@ -10,9 +28,6 @@ the strong claim tested here -- per row, bit for bit:
   the recurrent state snapshotted after every verified token;
 * each row independently accepts the matching prefix, restores its own state from
   that token's snapshot and continues.
-
-Row holes (a fixed row per sequence, with sentinel padding) are covered too, since
-that is how the engine schedules the batch.
 """
 
 from __future__ import annotations
@@ -53,12 +68,15 @@ def _tokens(n: int, off: int = 0) -> list[int]:
 @unittest.skipUnless(RUN_SPEC_BATCH,
                      "needs ~6 GiB; run with RUN_SPEC_BATCH=1")
 class BatchSpecTest(support.ModelTestCase):
+    """The batched spec loop must emit exactly the plain batched greedy tokens, per row."""
+
     QUANT = True
     MAX_SEQ = 2048
     PAGED = True
 
     @classmethod
     def setUpClass(cls) -> None:
+        """Capture the batch graphs and then the spec graphs that replay them."""
         super().setUpClass()
         cls.model = support.ModelFixture.get(quant=cls.QUANT, max_seq=cls.MAX_SEQ,
                                              paged=True, bench=False)
@@ -69,15 +87,19 @@ class BatchSpecTest(support.ModelTestCase):
 
     @classmethod
     def tearDownClass(cls) -> None:
+        """Release the ~6 GiB of spec graphs; the next module needs the card."""
         support.ModelFixture.close()
 
     def _alloc(self, n_tokens: int) -> list[int]:
+        """Blocks for the prompt plus the speculative headroom each step may append."""
         return [self.pool.alloc() for _ in range(-(-(n_tokens + STEPS * WIDTH + WIDTH) // BLOCK))]
 
     def _free(self, blocks: list[int]) -> None:
+        """Return blocks to the pool; every ``_alloc`` is paired with this."""
         self.pool.free_blocks(blocks)
 
     def _prefill(self, prompts: list[list[int]], rows=None):
+        """Group-prefill the prompts on their rows; returns the blocks and the last-token logits."""
         rows = list(range(len(prompts))) if rows is None else list(rows)
         blocks = [self._alloc(len(p)) for p in prompts]
         seqs = [SimpleNamespace(token_ids=p, row=r, block_table=b)
@@ -86,6 +108,7 @@ class BatchSpecTest(support.ModelTestCase):
         return blocks, [lg.float().clone() for lg in logits]
 
     def _greedy(self, prompts: list[list[int]], rows=None) -> list[list[int]]:
+        """The oracle: plain batched greedy decoding of the same prompts on the same rows."""
         k = len(prompts)
         rows = list(range(k)) if rows is None else list(rows)
         blocks, logits = self._prefill(prompts, rows)
@@ -130,6 +153,7 @@ class BatchSpecTest(support.ModelTestCase):
                 self._free(blk)
 
     def test_spec_matches_greedy_per_batch_size(self):
+        """Every batch size must reproduce greedy exactly; a rollback bug only appears once two rows roll back differently."""
         lengths = [37, 53, 71, 44, 89, 64, 102, 47]
         for k in (1, 2, 4, 8):
             with self.subTest(k=k):
@@ -178,6 +202,7 @@ class BatchSpecOnceTest(support.ModelTestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
+        """Capture a narrower bucket set with the one-forward verify mode; the assert pins the mode the class measures."""
         super().setUpClass()
         cls.model = support.ModelFixture.get(quant=cls.QUANT, max_seq=cls.MAX_SEQ,
                                              paged=True, bench=False)
@@ -189,6 +214,7 @@ class BatchSpecOnceTest(support.ModelTestCase):
 
     @classmethod
     def tearDownClass(cls) -> None:
+        """Release the model; this class runs the whole card too."""
         support.ModelFixture.close()
 
     # reuse the helpers/buffers of the main class
@@ -199,7 +225,7 @@ class BatchSpecOnceTest(support.ModelTestCase):
     _spec = BatchSpecTest._spec
 
     def test_one_forward_verify_matches_greedy(self):
-        """One-forward verify vs greedy: token agreement, not bitwise logits.
+        """The one-forward verify must agree with the token path and with greedy, so the wider graph is a speed change only.
 
         The wide-M projection kernel the one-forward verify needs (kernels
         task-12) has a ULP-level difference from the greedy kernel, so this path

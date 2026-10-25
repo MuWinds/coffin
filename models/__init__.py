@@ -9,4 +9,14 @@ One subpackage per architecture family.  A family provides:
   tensors resident across a reload.
 
 ``engine_api`` owns the mapping from a checkpoint config to the subpackage.
+
+Module: ``coffin/models``. Bottom of the model side; imports nothing from
+``engine_api`` or the serving layer, so a family can be added without touching
+them.
+
+Constraints:
+    * No import-time work: importing this package must not load weights, allocate
+      device memory or import ``torch`` submodules that need a DCU.
+    * A family subpackage is discovered by ``engine_api``'s registry, not by a
+      side effect here, so adding one never means editing this file.
 """

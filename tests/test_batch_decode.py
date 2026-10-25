@@ -1,13 +1,26 @@
 """Static-batch decode (B in 1/2/4/8) must return the single-stream numbers.
 
+Module: ``coffin/tests``. Drives the batched model API directly (paging, batch
+capture, per-row state moves) rather than through ``llm_engine``; the
+scheduler-level version of the same claim lives in ``test_engine.py``.
+
+Constraints:
+    * The comparison is bit-for-bit, never a tolerance:
+      ``models/qwen35/batch.py`` replays the same GEMV unroll the single-stream
+      kernel picked for each shape, so the partial sums are identical and no bf16
+      rounding may drift. A tolerance would hide exactly the class of bug this
+      test exists for.
+    * Every batch run is compared against a solo ``decode_step`` reference, per
+      row: two batched runs agreeing with each other would pass with a shared bug.
+    * The last row is the staging row, so decode rows stop at ``capacity-2``; a
+      state snapshotted after a decode must be restored before the next bucket,
+      because the graph writes in place.
+    * Blocks are freed in ``finally``; the pool is small enough that a leak
+      changes which bucket fits.
+
 The stage-1 batch path batches only the projections -- the weight reads -- and
 runs attention / the delta-net recurrence once per row through the *same*
 kernels the single-stream engine uses, on row slices of per-row state buffers.
-Every row therefore has to match a solo decode exactly, not merely closely:
-``models/qwen35/batch.py`` replays the same GEMV unroll the single-stream kernel
-picked for each shape, so the partial sums are identical and no bf16 rounding
-drifts.  The logit tensors are compared bit for bit here; a tolerance would hide
-exactly the class of bug this test exists for.
 
 Rows: ``enable_batching(capacity)`` reserves the last row for the single-stream
 prefill/verify path (``prefill_row``); decode rows are ``0 .. capacity-2``.  A
@@ -52,12 +65,15 @@ def _tokens(n: int, off: int = 0) -> list[int]:
 
 @support.needs_model
 class BatchDecodeTest(support.ModelTestCase):
+    """A batched decode row must be bit-identical to that sequence decoding alone."""
+
     QUANT = True
     MAX_SEQ = 2048
     PAGED = True
 
     @classmethod
     def setUpClass(cls) -> None:
+        """Build paging, buckets and both graphs: the comparison needs batch and solo captures side by side."""
         super().setUpClass()
         cls.model = support.ModelFixture.get(quant=cls.QUANT, max_seq=cls.MAX_SEQ,
                                              paged=True, bench=False)
@@ -72,15 +88,19 @@ class BatchDecodeTest(support.ModelTestCase):
 
     @classmethod
     def tearDownClass(cls) -> None:
+        """Return the model and its VRAM before the next module asks for its own."""
         support.ModelFixture.close()
 
     def _alloc(self, n_tokens: int) -> list[int]:
+        """Blocks covering ``n_tokens`` at the pool's block size."""
         return [self.pool.alloc() for _ in range(-(-n_tokens // BLOCK))]
 
     def _free(self, blocks: list[int]) -> None:
+        """Return blocks to the pool; every ``_alloc`` is paired with this."""
         self.pool.free_blocks(blocks)
 
     def _zero_prefill_row(self) -> None:
+        """Clear the staging row, or the previous request's position leaks into this prefill."""
         self.model.pos1.zero_()
         self.model.zero_linear_states(self.prefill_row)
 
@@ -118,9 +138,11 @@ class BatchDecodeTest(support.ModelTestCase):
             self._free(blocks)
 
     def _snapshot(self, rows: int):
+        """Copy every row's recurrent state; the graphs write in place, so a bucket run must be undoable."""
         return [self.model.snapshot_linear_states(row) for row in range(rows)]
 
     def _restore(self, snap) -> None:
+        """Put the snapshotted states back, so the next bucket starts from the same point."""
         for row, states in enumerate(snap):
             self.model.restore_linear_states(states, row)
 
@@ -163,6 +185,7 @@ class BatchDecodeTest(support.ModelTestCase):
         return tokens, logits_out
 
     def _assert_exact(self, got: torch.Tensor, ref: torch.Tensor, label: str) -> None:
+        """Bit equality, reported as a count so one stray ULP is distinguishable from total divergence."""
         self.assertEqual(tuple(got.shape), tuple(ref.shape), label)
         diff = float((got - ref).abs().max())
         differing = int((got != ref).sum())
@@ -171,6 +194,7 @@ class BatchDecodeTest(support.ModelTestCase):
                          f"(max abs diff {diff:.3e}, {got.numel()} values)")
 
     def test_single_stream_graph_matches_bucket1(self):
+        """Bucket 1 is the batch path's degenerate case; if it differs, every larger bucket is suspect."""
         ids = _tokens(48)
         ref_tokens, ref_logits = self._reference(ids)
         blocks, logits = self._stage(ids, 0)
@@ -187,6 +211,7 @@ class BatchDecodeTest(support.ModelTestCase):
             self._free(blocks)
 
     def test_same_prompt_every_row_matches_solo(self):
+        """Identical rows must stay identical: a per-row state or slot-map mix-up shows up as two rows diverging."""
         ids = _tokens(48)
         ref_tokens, ref_logits = self._reference(ids)
         blocks: list[list[int]] = []
@@ -216,6 +241,7 @@ class BatchDecodeTest(support.ModelTestCase):
                 self._free(blk)
 
     def test_different_prefix_lengths_match_their_own_solo(self):
+        """Different lengths mean different positions and block tables, which is where a shared position buffer would break."""
         lengths = [40, 57, 71, 96, 130, 66, 85, 112]
         prompts = [_tokens(n, off=i) for i, n in enumerate(lengths)]
         refs = [self._reference(p) for p in prompts]
@@ -247,6 +273,7 @@ class BatchDecodeTest(support.ModelTestCase):
                 self._free(blk)
 
     def test_bucket_padding_does_not_disturb_valid_rows(self):
+        """A bucket is chosen by the highest live row, so most steps carry sentinel rows; a sentinel that writes real state corrupts a neighbour."""
         rows = 3
         lengths = [45, 70, 120]
         prompts = [_tokens(n, off=3 * i) for i, n in enumerate(lengths)]

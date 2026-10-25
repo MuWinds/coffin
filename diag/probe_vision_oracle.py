@@ -1,13 +1,33 @@
 """Oracle parity for the engine's vision tower (container, real weights).
 
-The authoritative check: load the checkpoint's ``model.visual.*`` into the
-engine's :class:`VisionTower`, run it on the processor's ``pixel_values``, and
+Answers whether the engine's tower computes the reference function, at both
+precisions. The authoritative check: load the checkpoint's ``model.visual.*`` into
+the engine's :class:`VisionTower`, run it on the processor's ``pixel_values``, and
 compare with what transformers 4.57.6's ``Qwen3VLVisionModel`` produces from the
-*same* weights and the same input.  bf16 oracle vs fp16 engine, so the gate is
+*same* weights and the same input. bf16 oracle vs fp16 engine, so the gate is
 relative error, not bit equality.
+
+Read each size row's ``rel_err`` against its printed gate: 2e-3 for the fp16
+tower, 2e-2 for the int8 one. The looser int8 gate is the quantisation cost, not
+sloppiness — a run that fails the int8 gate while passing the fp16 gate has a
+quantisation bug, not a formula bug, so re-run with ``--vision-int8`` off to tell
+the two apart. ``vit_ms`` and ``peak_GiB`` are the cost side of the same trade.
 
     flock /root/private_data/gpu.lock -c 'python3 diag/probe_vision_oracle.py'
     ... --vision-int8      # same, with the resident int8 tower
+
+Module: ``coffin/diag``. Standalone probe: imports ``engine_api`` and
+``models/qwen35/vision.py`` directly, plus transformers for the oracle.
+
+Constraints:
+    * The checkpoint keys are ``model.visual.``-prefixed while the reference module
+      wants them bare; the oracle strips the prefix on load. A change to either
+      naming convention silently loads nothing and the parity result becomes
+      meaningless.
+    * The oracle is bf16 and the engine fp16, so bit equality is impossible by
+      construction; the relative-error gate is the only valid comparison.
+    * ``flock`` is required: the tower and the reference model together do not fit
+      beside a co-tenant on this card.
 """
 from __future__ import annotations
 
@@ -24,7 +44,24 @@ MD = "/root/private_data/models/Qwen3.5-4B"
 
 
 def oracle(processor, pixel_values, grid_thw, model_dir):
-    """transformers' vision tower, loaded from the same checkpoint tensors."""
+    """Run transformers' vision tower on the same checkpoint tensors and inputs.
+
+    Args:
+        processor: The AutoProcessor; kept for signature symmetry with the engine
+            side, which needs it, though the oracle only uses pixel values.
+        pixel_values: Processor output, cast to bf16 for the reference.
+        grid_thw: Image grid, needed to unpatch.
+        model_dir: Checkpoint directory for ``config.json`` and the index.
+
+    Returns:
+        Reference embeddings as a float32 CPU tensor.
+
+    Raises:
+        RuntimeError: The state dict does not match the reference architecture;
+            the message lists missing and unexpected keys. A mismatch means the
+            installed transformers disagrees with the checkpoint, so the parity
+            number would compare against the wrong formula.
+    """
     from safetensors import safe_open
     from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLVisionConfig
     from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
@@ -56,6 +93,7 @@ def oracle(processor, pixel_values, grid_thw, model_dir):
 
 
 def main() -> None:
+    """Compare the engine tower against the bf16 oracle at three image sizes."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=MD)
     ap.add_argument("--vision-int8", action="store_true")
@@ -73,6 +111,17 @@ def main() -> None:
         tokenize=False, add_generation_prompt=True)
 
     def make(h, w):
+        """Build the probe image: two axis gradients with one solid red square.
+
+        Args:
+            h: Image height.
+            w: Image width.
+
+        Returns:
+            A PIL image. The gradients give the patch embedder a smooth field to
+            get wrong in a detectable way, and the red square gives a hard edge
+            whose position reveals a patch-order or crop error.
+        """
         a = np.zeros((h, w, 3), np.uint8)
         a[..., 0] = np.linspace(0, 255, w, dtype=np.uint8)[None, :]
         a[..., 1] = np.linspace(0, 255, h, dtype=np.uint8)[:, None]

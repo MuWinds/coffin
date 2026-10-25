@@ -8,9 +8,29 @@ Loads the checkpoint once, then drives ``N`` concurrent requests through
 
 Why this is the number that matters: a decode step is bound by reading the
 weights (~4 GB of int8 per step at ~700 GB/s), which one weight read serves for
-every row of a batch.  The per-sequence latency barely moves until the attention
+every row of a batch. The per-sequence latency barely moves until the attention
 / recurrent work catches up with the memory traffic, so what grows is the
 aggregate throughput.
+
+Read ``tok/s decode`` as the batching payoff and ``tok/s per seq`` as what a
+single client keeps: if the aggregate rises while the per-sequence figure holds,
+the batch is close to free. A per-sequence figure that falls off with ``B`` means
+the attention or recurrent work has overtaken the weight read, which is the
+signal to look at ``probe_attn_batch.py``.
+
+Module: ``coffin/diag``. Standalone benchmark: imports ``engine_api``,
+``config``, ``llm_engine`` and ``sequence`` — the public engine composition — and
+nothing under ``coffin/`` imports it.
+
+Constraints:
+    * Needs the real checkpoint, a paged model and a captured batch graph; the
+      throughput it reports is meaningless on a host without the weights.
+    * The timing starts only after every request has been prefilled and has a
+      first token, so the figure is the decode step rate rather than a prefill
+      and decode mix.
+    * ``noqa: E402`` on the engine imports is required: ``sys.path`` is fixed
+      after the environment defaults are set, so the imports cannot sit at the
+      top of the file.
 """
 
 from __future__ import annotations
@@ -54,6 +74,7 @@ def run(engine: LLMEngine, prompts: list[list[int]], max_new: int) -> tuple[floa
 
 
 def main() -> None:
+    """Load the model, then sweep the batch plan and print one throughput row each."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=MODEL)
     ap.add_argument("--max-seq", type=int, default=4096)

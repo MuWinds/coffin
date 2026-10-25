@@ -1,10 +1,25 @@
-/* CPU-side decode attention probe for the tiered-KV design.
+/* @file cpu_attn.c
+ * @brief CPU-side decode attention probe for the tiered-KV design.
  *
- * Geometry = Qwen3.8-27B full-attention layer: 24 q heads / 4 kv heads
- * (rep=6) / head_dim=256, int8 or int4 (g128) KV with per-(head,token) scale.
- * This is the "cold KV lives in host RAM and the CPU reads it directly" path:
- * no PCIe hop, one pass over K+V per layer, online softmax, split-K over the
- * context with an OpenMP parallel section over (kv head, key slice).
+ * Module: coffin/diag. Standalone probe: not part of the extension build, not
+ * imported by anything. It answers one question -- how fast can a host core read
+ * cold KV straight out of RAM -- so it shares no code with ``kernels/``.
+ *
+ * Geometry = Qwen3.8-27B full-attention layer: 24 q heads / 4 kv heads (rep=6) /
+ * head_dim=256, int8 or int4 (g128) KV with per-(head,token) scale. This is the
+ * "cold KV lives in host RAM and the CPU reads it directly" path: no PCIe hop, one
+ * pass over K+V per layer, online softmax, split-K over the context with an
+ * OpenMP parallel section over (kv head, key slice).
+ *
+ * Constraints:
+ *   * AVX2 + FMA + OpenMP are required; the ``-mavx2 -mfma -fopenmp`` line below
+ *     is the build contract, and a narrower target silently changes the numbers.
+ *   * Every buffer is cache-line aligned (``aligned_alloc(64, ...)``) so the
+ *     measured bandwidth is not limited by unaligned loads.
+ *   * Output is one JSON line per run: the probe is read by the benchmark script,
+ *     so keep the field names and print exactly one object.
+ *   * The data is synthetic (xorshift fill, fixed scale): this measures bandwidth
+ *     and instruction throughput, never numerical agreement with the GPU kernel.
  *
  * Build (pod):
  *   gcc -O3 -mavx2 -mfma -fopenmp -o /tmp/cpu_attn cpu_attn.c -lm
@@ -23,6 +38,8 @@
 #include <string.h>
 #include <time.h>
 
+/* Geometry of the reference layer. NB/G are the int4 quantisation group: 2 groups
+ * of 128 elements share one scale, which is what the g128 layout means. */
 #define NKV 4
 #define NH 24
 #define REP 6
@@ -30,6 +47,7 @@
 #define NB 2
 #define G 128
 
+/* @brief Horizontal sum of one __m256: the reduce both dot products end with. */
 static inline float hsum256(__m256 v) {
     __m128 lo = _mm256_castps256_ps128(v);
     __m128 hi = _mm256_extractf128_ps(v, 1);
@@ -39,7 +57,11 @@ static inline float hsum256(__m256 v) {
     return _mm_cvtss_f32(s);
 }
 
-/* dot(q[256] float, k[256] int8) */
+/* @brief dot(q[HD] float, k[HD] int8): the score of one key row.
+ *
+ * The int8 bytes are widened to int32 and then to float in one lane-group, so the
+ * per-token scale is applied by the caller after the horizontal reduce.
+ */
 static inline float dot_i8(const int8_t *k, const float *q) {
     __m256 acc = _mm256_setzero_ps();
     for (int d = 0; d < HD; d += 8) {
@@ -51,7 +73,12 @@ static inline float dot_i8(const int8_t *k, const float *q) {
     return hsum256(acc);
 }
 
-/* dot(q[256] float, packed int4 row: 128 bytes, 2 groups of 128 elems) */
+/* @brief dot(q[HD] float, packed int4 row: HD/2 bytes, NB groups of G elements).
+ *
+ * Each group carries its own scale, so the group partials are scaled before the
+ * final sum -- that is what makes the int4 path numerically comparable to int8
+ * rather than a pure bandwidth number.
+ */
 static inline float dot_i4(const uint8_t *k, const float *q, const float *s) {
     float acc = 0.f;
     for (int g = 0; g < NB; ++g) {
@@ -72,7 +99,7 @@ static inline float dot_i4(const uint8_t *k, const float *q, const float *s) {
     return acc;
 }
 
-/* acc[256] += w * v[256] int8 */
+/* @brief acc[HD] += w * v[HD] int8: the V side of one key, weight pre-folded. */
 static inline void saxpy_i8(float *acc, const int8_t *v, float w) {
     __m256 wv = _mm256_set1_ps(w);
     for (int d = 0; d < HD; d += 8) {
@@ -83,7 +110,11 @@ static inline void saxpy_i8(float *acc, const int8_t *v, float w) {
     }
 }
 
-/* acc[256] += w * v4 dequantised (2 groups of 128) */
+/* @brief acc[HD] += w * v4 dequantised (NB groups of G).
+ *
+ * The softmax weight and the group scale are folded into one multiplier first, so
+ * the inner loop is a single FMA per eight elements.
+ */
 static inline void saxpy_i4(float *acc, const uint8_t *v, const float *s, float w) {
     for (int g = 0; g < NB; ++g) {
         const uint8_t *vg = v + g * (G / 2);
@@ -101,18 +132,35 @@ static inline void saxpy_i4(float *acc, const uint8_t *v, const float *s, float 
     }
 }
 
+/* One (kv head, key-slice) partial: the same online-softmax triple the GPU split
+ * pass publishes, so the merge below mirrors ``attn_combine_kernel``. At ~6 KB per
+ * entry the parallel tasks never share a cache line. */
 typedef struct {
     float m[REP];
     float l[REP];
     float acc[REP][HD];
 } Part;
 
+/* @brief Monotonic clock in milliseconds, for the wall-time of one probe run. */
 static inline double now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
 }
 
+/* @brief Run one probe and print its JSON line.
+ *
+ * ``argv[1]`` selects the path: "int8" scores int8 rows, "int4" scores g128 int4
+ * rows, "read8" skips attention and just streams K to measure the read ceiling the
+ * other two must chase. ``argv[2]`` is the context length S and ``argv[3]`` the
+ * split count (default 8), so one binary reproduces every point in HW_PROBE.md.
+ *
+ * @param argc At least 3; otherwise the usage line is printed and the process exits
+ *             2 before touching any buffer.
+ * @param argv Mode, context length, optional split count.
+ * @return 0 on success, 1 when an allocation fails (the run is then meaningless
+ *         rather than partial), 2 on bad usage.
+ */
 int main(int argc, char **argv) {
     if (argc < 3) {
         fprintf(stderr, "usage: %s int8|int4|read8 <S> [splits]\n", argv[0]);
@@ -209,7 +257,8 @@ int main(int argc, char **argv) {
     }
     double ms = now_ms() - t0;
 
-    /* merge the slices (serial; tiny) */
+    /* merge the slices (serial; tiny): the same rescale-then-sum the GPU combine
+     * kernel does, over `split` partials instead of key blocks. */
     float out[NH][HD];
     for (int g = 0; g < NKV; ++g) {
         for (int r = 0; r < REP; ++r) {
@@ -227,8 +276,15 @@ int main(int argc, char **argv) {
             for (int d = 0; d < HD; ++d) out[g * REP + r][d] = a[d] / l;
         }
     }
+    /* ``sink`` is printed so the compiler cannot elide the whole merge; it is not
+     * a meaningful number. */
     double sink = 0;
     for (int h = 0; h < NH; ++h) sink += out[h][0];
+    /* bytes counts the K+V rows plus both scale arrays, so "gbps" is the full read
+     * traffic of the layer, not only the activations. "gflops" assumes two flops
+     * per q.k and per weight.v element; "layers16_ms" scales one layer to the 16
+     * full-attention layers of the reference model and "tok_s" is the implied
+     * single-request token rate. */
     const double bytes = 2.0 * (double)NKV * S * (is4 ? HD / 2 : HD) + 2.0 * NKV * S * (is4 ? NB : 1) * 4;
     printf("{\"mode\":\"%s\",\"S\":%ld,\"split\":%d,\"threads\":%d,\"ms\":%.2f,"
            "\"gbps\":%.1f,\"gflops\":%.1f,\"layers16_ms\":%.0f,\"tok_s\":%.2f,\"sink\":%.6f}\n",
