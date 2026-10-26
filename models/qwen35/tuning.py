@@ -3,14 +3,18 @@
 The defaults are the best points the probes named next to each constant found;
 the env overrides exist so a run can A/B something without editing the engine.
 
-Module: ``coffin/models/qwen35``. Leaf module of the family -- imports only
-``os`` -- read by ``blocks``, ``full_attn``, ``linear_attn`` and ``mtp`` when they
-size their kernels and buffers.
+Module: ``coffin/models/qwen35``. Leaf module of the family -- imports ``os`` and
+``backends`` -- read by ``blocks``, ``full_attn``, ``linear_attn`` and ``mtp`` when
+they size their kernels and buffers.
 
 Constraints:
-    * ``ATTN_SPLIT`` must equal ``ATTN_SPLIT`` in ``kernels/attn.cu``: this side
-      owns the partial buffers the kernel writes, so a mismatch corrupts attention
-      instead of failing a shape check.
+    * Nothing here may carry a *backend* number. ``ATTN_SPLIT`` used to live in this
+      file with a comment saying it must equal the constant in the attention
+      kernel, which was the backend ABI leaking into the model family: on a
+      backend that does not split at all, the caller would still size its partial
+      buffers for 8 and the kernel would write past them. It is now read from
+      ``caps.attn_split`` and re-exported under the old name, so the buffer sizes
+      follow whatever the selected backend actually does.
     * ``CKPT`` sizes the speculative rollback state and bounds the verify width,
       so it must agree with the verify graph captured in ``model.py``.
     * These are measured values, not free parameters; re-run the named probe
@@ -21,6 +25,7 @@ from __future__ import annotations
 
 import os
 
+from backends import caps as _caps
 
 #: Verified tokens per speculative step; the verify graph is captured for it.
 CKPT = 8
@@ -46,6 +51,9 @@ PREFILL_ATTN_KB = int(os.environ.get("PREFILL_ATTN_KB", "1024"))
 #: prefill chunk -- 2048 keeps its score blocks at ~134 MB whatever the prompt.
 PREFILL_MTP_CHUNK = int(os.environ.get("PREFILL_MTP_CHUNK", "2048"))
 
-#: Key-range splits per query head in the decode attention kernel; must match
-#: ``ATTN_SPLIT`` in ``kernels/attn.cu`` (this side owns the partial buffers).
-ATTN_SPLIT = int(os.environ.get("ATTN_SPLIT", "8"))
+#: Key-range splits per query head in the decode attention kernel. This is a
+#: kernel ABI, not a tuning choice, so it is the *backend's* value: this side owns
+#: the ``part_acc``/``part_ml`` buffers the kernel writes, and the width has to be
+#: the one the kernel indexes them with. Read from ``caps.attn_split``; kept under
+#: the old name so every buffer-sizing call site stayed unchanged.
+ATTN_SPLIT = _caps().attn_split

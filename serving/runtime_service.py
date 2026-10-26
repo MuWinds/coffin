@@ -6,6 +6,11 @@ lifecycle, generation and chat behavior to focused mixins.
 Constraints:
     * The model thread remains the only writer of engine state.
     * The socket protocol stays line-oriented and unchanged.
+    * The device and the graph decision are the backend's, not this file's: the
+      only device-shaped read here is the free-VRAM guard below, and it has to
+      answer "unknown" rather than "zero" on a backend without the query, or the
+      guard would disable batched speculation on a host that never had a budget
+      problem.
 """
 
 from __future__ import annotations
@@ -16,8 +21,7 @@ import threading
 import time
 from pathlib import Path
 
-import torch
-
+import backends
 import engine_api
 from engine import llm_engine
 from engine.config import EngineConfig
@@ -28,7 +32,7 @@ from .runtime_parts import (
     RuntimeGenerationMixin,
     RuntimeLifecycleMixin,
 )
-from .runtime_support import MAX_SEQ, MODEL, MMError, SOCK, _eos_ids
+from .runtime_support import (MAX_SEQ, MODEL, MMError, SOCK, _eos_ids, free_bytes)
 
 
 class Server(
@@ -42,10 +46,10 @@ class Server(
                      max_seconds: float = 0.0, max_num_seqs: int = 1,
                      num_blocks: int = 0, spec_batch: bool = False,
                      spec_sparse_k: int = 0, spec_min_ctx: int = 0,
-                     fast_gemv: bool = False, vision: bool = True,
-                     vision_int8: bool = False, image_max_pixels: int = 1048576,
-                     image_min_pixels: int = 65536, max_images: int = 4,
-                     max_image_bytes: int = 8388608) -> None:
+                     vision: bool = True, vision_int8: bool = False,
+                     image_max_pixels: int = 1048576, image_min_pixels: int = 65536,
+                     max_images: int = 4, max_image_bytes: int = 8388608,
+                     graph: bool = True) -> None:
             """Load the checkpoint, freeze ``EngineConfig`` and build the engine.
 
             Args:
@@ -75,9 +79,6 @@ class Server(
                     KV blocks per row. Implies ``spec_batch``.
                 spec_min_ctx: Only speculate in the batched engine past this many
                     cached tokens, 0 to always.
-                fast_gemv: Use the packed-fp16 projection kernels, forwarded through
-                    ``Q35_FAST_GEMV`` because the choice must precede the model
-                    module import.
                 vision: Load the checkpoint's vision tower when it has one.
                 vision_int8: Keep the tower's 2D weights int8, dequantised one GEMM
                     at a time per request.
@@ -87,6 +88,12 @@ class Server(
                     image never costs fewer than 64 tokens.
                 max_images: Images accepted in one request.
                 max_image_bytes: Decoded bytes allowed per image.
+                graph: Capture the decode step into a device graph. The caller
+                    resolves the user's ``--no-graph`` against the backend's own
+                    ``caps.graph`` and passes the effective answer here, because
+                    the value has to reach the engine before ``build()`` captures;
+                    a backend that reports ``caps.graph=False`` stays eager no
+                    matter what was asked for.
 
             Raises:
                 RuntimeError: The checkpoint's ``config.json`` names no registered
@@ -108,6 +115,10 @@ class Server(
             self.snapshot_interval = snapshot_interval
             # hard wall-clock cap per generation (0 = none); a request may lower it
             self.max_seconds = float(max_seconds)
+            #: Effective graph decision: the caller's request ANDed with what the
+            #: backend can capture. A backend that cannot replay a graph would
+            #: silently produce stale outputs, so the capability wins over the flag.
+            self.graph = bool(graph) and bool(backends.caps().graph)
             self.pc = None
             self.n_req = 0
             self.n_reload = 0
@@ -144,12 +155,6 @@ class Server(
             self.spec_batch = bool((spec_batch or spec_sparse_k > 0) and batched)
             self.spec_sparse_k = int(spec_sparse_k) if self.spec_batch else 0
             self.spec_min_ctx = int(spec_min_ctx)
-            #: Opt-in packed-fp16 projection kernels (models/qwen35/batch.py). The
-            #: choice has to happen before the model module is imported, so it is
-            #: passed through the environment.
-            self.fast_gemv = bool(fast_gemv)
-            if self.fast_gemv:
-                os.environ["Q35_FAST_GEMV"] = "1"
             if prefix_cache and spec_k and not self.spec_batch:
                 # A prefix snapshot does not carry the MTP drafter's cache, so a hit
                 # would leave the drafter with a stale context (the output stays
@@ -160,6 +165,12 @@ class Server(
             if spec_k and batched and not self.spec_batch:
                 print("[serve] batched speculation is off; pass --spec-batch to enable it "
                       "(measured 0.79x plain batch decode on this card)")
+            if spec_k and not self.graph:
+                # Both the decode step and the verify step are graph replays; with
+                # capture off there is nothing to replay, so speculation would
+                # raise at the first step. Say so instead of failing mid-request.
+                print("[serve] --spec-k is ignored with graph capture off")
+                self.spec_k = 0
             #: The single source of truth for engine knobs; the LLM engine, its
             #: scheduler and its runner all read from it.
             blocks = int(num_blocks) if num_blocks else (max_seq // block_size) * max(1, max_num_seqs)
@@ -172,7 +183,8 @@ class Server(
                 spec_sparse_k=self.spec_sparse_k,
                 spec_min_ctx=self.spec_min_ctx,
                 max_seconds=self.max_seconds,
-                max_num_seqs=max(1, int(max_num_seqs)))
+                max_num_seqs=max(1, int(max_num_seqs)),
+                graph=self.graph)
             t0 = time.time()
             # stays resident; int8 halves it (4.0 GiB instead of 8.1), which is what
             # leaves room for a long-context KV cache on a 16 GB card
@@ -183,9 +195,12 @@ class Server(
             self.eos = _eos_ids(self.tok)
             if self.cfg.spec_k and self.cfg.spec_batch:
                 # Batched MTP adds ~1.25 GiB of rollback snapshots plus the drafter's
-                # paged KV; refuse it up front rather than OOM inside capture.
-                free, _total = torch.cuda.mem_get_info()
-                if free < 1.5 * 2**30:
+                # paged KV; refuse it up front rather than OOM inside capture. A
+                # backend that cannot report free memory answers -1, which must not
+                # read as "0 bytes free" -- that would disable the feature on a host
+                # that has the budget.
+                free = free_bytes()
+                if 0 <= free < 1.5 * 2**30:
                     print(f"[serve] --spec-batch disabled: only {free / 2**30:.2f} GiB free "
                           f"(batched MTP needs ~1.5 GiB)")
                     self.cfg.spec_k = 0

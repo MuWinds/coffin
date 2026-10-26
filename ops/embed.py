@@ -14,7 +14,8 @@ Constraints:
     * The int8 path dequantises per row with the row's own scale -- a whole-matrix
       dequantise would cost a full pass over the largest weight in the model.
     * Gather and projection are separate entry points on purpose; keeping the
-      autotuned GEMV off the gather path is what makes the gather cheap.
+      projection's kernel selection off the gather path is what makes the gather
+      cheap.
 """
 
 from __future__ import annotations

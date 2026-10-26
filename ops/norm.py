@@ -6,15 +6,21 @@ negative values); ``linear_attn.norm`` (RMSNormGated) is the standard ``w * x``
 times ``silu(gate)``. Mixing the two up garbles the output without raising
 anything, which is why they are two classes and not one flag.
 
-Module: ``coffin/ops``. Uses ``hip_ops`` for the fused kernels and falls back to
-``torch.nn.functional`` when the extension is unavailable; called by every block
-in ``models/qwen35``.
+Module: ``coffin/ops``. Binds the backend's ``rms_norm`` / ``rms_norm_gated``
+entries and folds the checkpoint's weight convention; called by every block in
+``models/qwen35``.
 
 Constraints:
     * ``eps=1e-6`` is fixed by the checkpoint; changing it shifts the logits.
-    * The HIP path only runs on contiguous input (RMSNorm also accepts a
-      row-strided slice, e.g. ``q_norm`` on a transposed head tensor), so the
-      stride and contiguity tests must stay part of the dispatch condition.
+    * The row pitch travels as an argument, not as a property of the tensor: the
+      model normalises column slices of a wider fused buffer (``q_norm`` on a
+      transposed head tensor), so a caller-side ``.contiguous()`` would cost a
+      full copy of the widest activation in the layer. Only a non-unit *last*
+      stride forces the copy, because the 2-D reshaping needs it.
+    * ``torch.nn.functional.rms_norm`` must never appear here. It is a 2.4+ API
+      and the deployment target runs torch 2.1.0, where it raises
+      ``AttributeError``. The hand-written implementation lives in the reference
+      backend, so the table is the single place the maths exists.
     * The zero-centred convention lives in ``RMSNorm`` only; never reuse its
       weight with the gated class.
 """
@@ -22,10 +28,28 @@ Constraints:
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 
-import hip_ops
+from backends import ops as bops
 from ops.dtypes import D
+
+
+def _rows(x: torch.Tensor) -> torch.Tensor:
+    """View ``[..., n]`` as ``[M, n]`` without disturbing the row pitch.
+
+    Args:
+        x: Activations whose last axis is the normalised width. Any leading shape
+            is allowed; the fused kernels index it as a flat batch of rows.
+
+    Returns:
+        A 2-D view when the last stride is unit, otherwise a contiguous copy
+        viewed as 2-D -- a transposed operand has no legal ``[M, n]`` view, and
+        copying is the cheaper of the two wrong answers. Rows of the returned
+        tensor may still be pitched wider than ``n``; that pitch is what the
+        backend's ``stride`` argument carries.
+    """
+    if x.stride(-1) != 1:
+        x = x.contiguous()
+    return x.reshape(-1, x.shape[-1])
 
 
 class RMSNorm:
@@ -56,11 +80,8 @@ class RMSNorm:
         """
         if x.dtype != D:
             x = x.to(D)
-        if hip_ops.available() and x.stride(-1) == 1:
-            n = x.shape[-1]
-            xf = x.reshape(-1, n)                 # rows may be strided (q_norm slice)
-            return hip_ops.rms_norm(xf, self.g, xf.stride(0), 1e-6).view(x.shape)
-        return F.rms_norm(x, (x.shape[-1],), self.g, 1e-6)
+        xf = _rows(x)
+        return bops.rms_norm(xf, self.g, xf.stride(0), 1e-6).view(x.shape)
 
 
 class RMSNormGated:
@@ -78,19 +99,19 @@ class RMSNormGated:
     def __call__(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         """Normalise ``x``, then scale it by the silu of a same-shape gate.
 
+        The norm is per head, so the weight is ``[dv]`` and not the flattened
+        width: flattening first would divide by the RMS of every head at once.
+
         Args:
-            x: Activations, ``[..., hidden]``; cast to bf16 when needed.
+            x: Activations, ``[..., dv]``; cast to bf16 when needed.
             gate: Gate tensor shaped like ``x``. It is a separate projection, so
-                the fused kernel needs both operands contiguous.
+                the fused kernel needs both operands flattened the same way.
 
         Returns:
             Same shape as ``x``, normalised and gated.
         """
         if x.dtype != D:
             x = x.to(D)
-        if hip_ops.available() and x.is_contiguous() and gate.is_contiguous():
-            n = x.shape[-1]
-            y = hip_ops.rms_norm_gated(x.reshape(-1, n), self.w,
-                                       gate.reshape(-1, n), 1e-6)
-            return y.view(x.shape)
-        return F.rms_norm(x, (x.shape[-1],), self.w, 1e-6) * F.silu(gate)
+        if gate.dtype != D:
+            gate = gate.to(D)
+        return bops.rms_norm_gated(_rows(x), self.w, _rows(gate), 1e-6).view(x.shape)

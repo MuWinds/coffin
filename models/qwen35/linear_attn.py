@@ -2,15 +2,15 @@
 
 Module: ``coffin/models/qwen35``. The other per-layer attention kind
 (``full_attn`` is the 8 paged-KV layers); ``blocks.Layer`` picks one per layer
-index and ``model.py`` builds all 32. Depends downward on ``hip_ops`` for the
-kernels, ``ops.delta`` for the chunked prefill scan and ``ops`` for dtypes /
-proj / norm, plus ``models/qwen35/batch`` and ``tuning``. Nothing outside this
-family may import it directly.
+index and ``model.py`` builds all 32. Depends downward on ``backends`` for the
+mixer ops and the device, on ``ops.delta`` for the chunked prefill scan and
+``ops`` for dtypes / proj / norm, plus ``models/qwen35/batch`` and ``tuning``.
+Nothing outside this family may import it directly.
 
 All state (conv window, fp32 recurrent state) lives in fixed buffers updated in
 place, so the decode step is graph-capturable.  Decode runs the fused prologue
-and delta kernels; prefill uses the chunked form in ``ops.delta``; verify runs
-the decode kernels per token and copies the state after each one, because a
+and delta entries; prefill uses the chunked form in ``ops.delta``; verify runs
+the decode entries per token and copies the state after each one, because a
 rejected draft has to be rolled back.
 
 Constraints:
@@ -28,6 +28,9 @@ Constraints:
     * fp32 throughout the recurrence: the delta rule accumulates outer products
       across the whole context, and bf16 state diverges over a few thousand
       tokens.
+    * No path here branches on whether a kernel exists. The eager twin of the
+      prologue/delta chain is the reference backend's implementation, reached
+      through the op table, so there is one maths definition and not two.
     * All mutation is single-threaded, driven by ``llm_engine``; there is no
       locking and none may be added.
 """
@@ -35,9 +38,9 @@ Constraints:
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 
-import hip_ops
+from backends import device as _device
+from backends import ops as bops
 from models.qwen35.batch import batch_proj
 from models.qwen35.tuning import CKPT
 from ops.delta import chunked_delta
@@ -79,7 +82,7 @@ class LinearAttn:
         self.out_proj = _proj(sd, [f"{p}.out_proj"], bench)
         self.norm = RMSNormGated(sd[f"{p}.norm.weight"])
         # The conv kernel arrives as [conv_dim, 1, 4]; the last dim stays last so
-        # the fused kernel can read the four taps as a contiguous stride-1 run.
+        # the fused op can read the four taps as a contiguous stride-1 run.
         self.conv_w = sd[f"{p}.conv1d.weight"].reshape(self.conv_dim, self.kernel).float()
         # ``A_log`` / ``dt_bias`` are stored in fp32 by the checkpoint and are
         # exponentiated here: doing that in a low dtype loses the decay rate.
@@ -96,23 +99,32 @@ class LinearAttn:
         self._bcap = 1
         self.prefill_row = 0
         rows = 1
-        self.conv_state = torch.zeros(rows, self.conv_dim, self.kernel - 1, dtype=torch.float32, device="cuda")
-        self.conv_out = torch.zeros(rows, self.conv_dim, dtype=torch.float32, device="cuda")
-        self.state = torch.zeros(rows, self.num_v, self.dk, self.dv, dtype=torch.float32, device="cuda")
-        self.delta_out = torch.zeros(rows, self.num_v, self.dv, dtype=torch.float32, device="cuda")
+        self.conv_state = torch.zeros(rows, self.conv_dim, self.kernel - 1,
+                                      dtype=torch.float32, device=_device)
+        self.conv_out = torch.zeros(rows, self.conv_dim, dtype=torch.float32,
+                                    device=_device)
+        self.state = torch.zeros(rows, self.num_v, self.dk, self.dv,
+                                 dtype=torch.float32, device=_device)
+        self.delta_out = torch.zeros(rows, self.num_v, self.dv, dtype=torch.float32,
+                                     device=_device)
 
-        # fp32 scratch written by ``delta_prologue`` and read by ``delta_step``.
-        self.q_pro = torch.zeros(rows, self.num_v, self.dk, dtype=torch.float32, device="cuda")
-        self.k_pro = torch.zeros(rows, self.num_v, self.dk, dtype=torch.float32, device="cuda")
-        self.v_pro = torch.zeros(rows, self.num_v, self.dv, dtype=torch.float32, device="cuda")
-        self.beta = torch.zeros(rows, self.num_v, dtype=torch.float32, device="cuda")
-        self.g = torch.zeros(rows, self.num_v, dtype=torch.float32, device="cuda")
+        # fp32 scratch written by ``delta_prologue`` and read by ``delta``.
+        self.q_pro = torch.zeros(rows, self.num_v, self.dk, dtype=torch.float32,
+                                 device=_device)
+        self.k_pro = torch.zeros(rows, self.num_v, self.dk, dtype=torch.float32,
+                                 device=_device)
+        self.v_pro = torch.zeros(rows, self.num_v, self.dv, dtype=torch.float32,
+                                 device=_device)
+        self.beta = torch.zeros(rows, self.num_v, dtype=torch.float32, device=_device)
+        self.g = torch.zeros(rows, self.num_v, dtype=torch.float32, device=_device)
 
         # Per-token state snapshots for speculative-verify rollback (one slot per
         # verified token; the recurrent state cannot be rewound otherwise).
         # ``CKPT`` bounds the verify width for the same reason.
-        self.ckpt_state = torch.zeros(CKPT, self.num_v, self.dk, self.dv, dtype=torch.float32, device="cuda")
-        self.ckpt_conv = torch.zeros(CKPT, self.conv_dim, self.kernel - 1, dtype=torch.float32, device="cuda")
+        self.ckpt_state = torch.zeros(CKPT, self.num_v, self.dk, self.dv,
+                                      dtype=torch.float32, device=_device)
+        self.ckpt_conv = torch.zeros(CKPT, self.conv_dim, self.kernel - 1,
+                                     dtype=torch.float32, device=_device)
         # Batched speculative verify keeps one snapshot per (row, verified token);
         # allocated by ``enable_verify_batch`` only when batch speculative decoding
         # is switched on, because the fp32 state is 2 MB per layer per snapshot.
@@ -134,9 +146,9 @@ class LinearAttn:
         if self.ckpt_state_b is not None and self.ckpt_state_b.shape[:2] == (capacity, width):
             return
         self.ckpt_state_b = torch.zeros(capacity, width, self.num_v, self.dk, self.dv,
-                                        dtype=torch.float32, device="cuda")
+                                        dtype=torch.float32, device=_device)
         self.ckpt_conv_b = torch.zeros(capacity, width, self.conv_dim, self.kernel - 1,
-                                       dtype=torch.float32, device="cuda")
+                                       dtype=torch.float32, device=_device)
 
     def snapshot_batch(self, rows: int, slot: int) -> None:
         """Save the live recurrent (and conv) state of ``rows`` into one slot.
@@ -159,7 +171,7 @@ class LinearAttn:
                           b: torch.Tensor, a: torch.Tensor, slot: int) -> torch.Tensor:
         """One verified token for ``B`` rows, from already-projected qkv/z/b/a.
 
-        Runs the same conv / prologue / delta kernels as the decode step (one
+        Runs the same conv / prologue / delta entries as the decode step (one
         batched launch each, so each row keeps the greedy numbers) and snapshots
         the recurrent state after the token -- ``slot`` is its index inside the
         verify width, i.e. the rollback point if the drafts up to here are
@@ -177,20 +189,20 @@ class LinearAttn:
             read once for the whole bucket.
         """
         rows = qkv.shape[0]
-        hip_ops.conv1d_silu_batch(self.conv_w, qkv, self.conv_state[:rows],
-                                  self.conv_out[:rows])
+        bops.conv1d_silu_batch(self.conv_w, qkv, self.conv_state[:rows],
+                               self.conv_out[:rows])
         conv = self.conv_out[:rows]
         q = conv[:, :self.kdim].reshape(rows, self.num_k, self.dk)
         k = conv[:, self.kdim:2 * self.kdim].reshape(rows, self.num_k, self.dk)
         v = conv[:, 2 * self.kdim:].reshape(rows, self.num_v, self.dv)
-        hip_ops.delta_prologue_batch(q, k, v, b.contiguous(), a.contiguous(),
-                                     self.neg_expA, self.dt_bias,
-                                     self.q_pro[:rows], self.k_pro[:rows],
-                                     self.v_pro[:rows], self.beta[:rows],
-                                     self.g[:rows], self.qscale, self.rep)
-        hip_ops.delta_batch(self.q_pro[:rows], self.k_pro[:rows],
-                            self.v_pro[:rows], self.beta[:rows], self.g[:rows],
-                            self.state[:rows], self.delta_out[:rows])
+        bops.delta_prologue_batch(q, k, v, b.contiguous(), a.contiguous(),
+                                  self.neg_expA, self.dt_bias,
+                                  self.q_pro[:rows], self.k_pro[:rows],
+                                  self.v_pro[:rows], self.beta[:rows],
+                                  self.g[:rows], self.qscale, self.rep)
+        bops.delta_batch(self.q_pro[:rows], self.k_pro[:rows],
+                         self.v_pro[:rows], self.beta[:rows], self.g[:rows],
+                         self.state[:rows], self.delta_out[:rows])
         self.snapshot_batch(rows, slot)
         # One gated-norm launch for every row (the RMSNormGated entry flattens
         # (row, head) pairs internally); the per-row loop here cost ~8 launches
@@ -234,27 +246,30 @@ class LinearAttn:
         self._bcap = capacity
         self.prefill_row = int(prefill_row)
         self.conv_state = torch.zeros(rows, self.conv_dim, self.kernel - 1,
-                                      dtype=torch.float32, device="cuda")
-        self.conv_out = torch.zeros(rows, self.conv_dim, dtype=torch.float32, device="cuda")
+                                      dtype=torch.float32, device=_device)
+        self.conv_out = torch.zeros(rows, self.conv_dim, dtype=torch.float32,
+                                    device=_device)
         self.state = torch.zeros(rows, self.num_v, self.dk, self.dv,
-                                 dtype=torch.float32, device="cuda")
+                                 dtype=torch.float32, device=_device)
         self.delta_out = torch.zeros(rows, self.num_v, self.dv,
-                                     dtype=torch.float32, device="cuda")
-        self.q_pro = torch.zeros(rows, self.num_v, self.dk, dtype=torch.float32, device="cuda")
-        self.k_pro = torch.zeros(rows, self.num_v, self.dk, dtype=torch.float32, device="cuda")
-        self.v_pro = torch.zeros(rows, self.num_v, self.dv, dtype=torch.float32, device="cuda")
-        self.beta = torch.zeros(rows, self.num_v, dtype=torch.float32, device="cuda")
-        self.g = torch.zeros(rows, self.num_v, dtype=torch.float32, device="cuda")
+                                     dtype=torch.float32, device=_device)
+        self.q_pro = torch.zeros(rows, self.num_v, self.dk, dtype=torch.float32,
+                                 device=_device)
+        self.k_pro = torch.zeros(rows, self.num_v, self.dk, dtype=torch.float32,
+                                 device=_device)
+        self.v_pro = torch.zeros(rows, self.num_v, self.dv, dtype=torch.float32,
+                                 device=_device)
+        self.beta = torch.zeros(rows, self.num_v, dtype=torch.float32, device=_device)
+        self.g = torch.zeros(rows, self.num_v, dtype=torch.float32, device=_device)
 
     def batch(self, x: torch.Tensor, *_) -> torch.Tensor:
         """``x`` [B, hidden] -> [B, hidden]: batched projections, per-row recurrence.
 
         The delta rule is sequential over positions and stateful per sequence, so
-        the recurrent kernels stay per row in the maths -- but with the stage-3
-        batch kernels a whole bucket costs one launch per stage (conv, prologue,
-        update) instead of B, each row carrying its own state/conv row.  Without
-        them this falls back to calling the single-row kernels once per row; both
-        paths must stay bit-identical per row.
+        the recurrent maths stays per row -- but with the batched entries a whole
+        bucket costs one launch per stage (conv, prologue, update) instead of B,
+        each row carrying its own state/conv row. Both paths must stay
+        bit-identical per row.
 
         Args:
             x: Decode-row inputs, ``[B, hidden]``.
@@ -263,59 +278,34 @@ class LinearAttn:
 
         Returns:
             ``[B, hidden]`` layer output after the batched ``out_proj``.
-
-        Raises:
-            RuntimeError: ``hip_ops`` is unavailable. The linear mixer has no
-                eager fallback in the batched path because the chunked scan is
-                the only implementation that keeps rows independent.
         """
         B = x.shape[0]
-        if not hip_ops.available():
-            raise RuntimeError("batched linear attention needs hip_ops")
         qkv, z, b, a = batch_proj(self.qkvzb_a, x)
         z = z.reshape(B, self.num_v, self.dv)
-        proj_in = torch.empty(B, self.vdim, dtype=D, device="cuda")
-        use_batch_kernel = hasattr(hip_ops, "conv1d_silu_batch")
-        if use_batch_kernel:
-            # The batch kernels expect exactly [B, ...] buffers; the state/scratch
-            # rows live in capacity-sized buffers, so hand them row prefixes.
-            conv_out = self.conv_out[:B]
-            hip_ops.conv1d_silu_batch(self.conv_w, qkv, self.conv_state[:B], conv_out)
-            # Column slices of the [B, conv_dim] result: their row stride is
-            # conv_dim, which the batched prologue accepts (only the two inner
-            # strides have to be compact).
-            q = conv_out[:, :self.kdim].reshape(B, self.num_k, self.dk)
-            k = conv_out[:, self.kdim:2 * self.kdim].reshape(B, self.num_k, self.dk)
-            v = conv_out[:, 2 * self.kdim:].reshape(B, self.num_v, self.dv)
-            hip_ops.delta_prologue_batch(q, k, v, b.contiguous(), a.contiguous(),
-                                         self.neg_expA, self.dt_bias,
-                                         self.q_pro[:B], self.k_pro[:B], self.v_pro[:B],
-                                         self.beta[:B], self.g[:B], self.qscale, self.rep)
-            hip_ops.delta_batch(self.q_pro[:B], self.k_pro[:B], self.v_pro[:B],
-                                self.beta[:B], self.g[:B], self.state[:B],
-                                self.delta_out[:B])
-            # The gated norm is per (row, value head) and its weight is [dv], so
-            # it cannot be folded into the batched kernels -- this loop is one
-            # launch per row, not per head.
-            for i in range(B):
-                proj_in[i] = self.norm(self.delta_out[i],
-                                       z[i].reshape(self.num_v, self.dv)).reshape(self.vdim)
-        else:
-            for i in range(B):
-                hip_ops.conv1d_silu(self.conv_w, qkv[i], self.conv_state[i],
-                                    self.conv_out[i])
-                q, k, v = self.conv_out[i].split([self.kdim, self.kdim, self.vdim])
-                hip_ops.delta_prologue(q.reshape(self.num_k, self.dk),
-                                       k.reshape(self.num_k, self.dk),
-                                       v.reshape(self.num_v, self.dv), b[i], a[i],
-                                       self.neg_expA, self.dt_bias,
-                                       self.q_pro[i], self.k_pro[i], self.v_pro[i],
-                                       self.beta[i], self.g[i],
-                                       self.qscale, self.rep)
-                hip_ops.delta(self.q_pro[i], self.k_pro[i], self.v_pro[i],
-                              self.beta[i], self.g[i], self.state[i], self.delta_out[i])
-                proj_in[i] = self.norm(self.delta_out[i],
-                                       z[i].reshape(self.num_v, self.dv)).reshape(self.vdim)
+        proj_in = torch.empty(B, self.vdim, dtype=D, device=_device)
+        # The batch entries expect exactly [B, ...] buffers; the state/scratch rows
+        # live in capacity-sized buffers, so hand them row prefixes.
+        conv_out = self.conv_out[:B]
+        bops.conv1d_silu_batch(self.conv_w, qkv, self.conv_state[:B], conv_out)
+        # Column slices of the [B, conv_dim] result: their row stride is
+        # conv_dim, which the batched prologue accepts (only the two inner
+        # strides have to be compact).
+        q = conv_out[:, :self.kdim].reshape(B, self.num_k, self.dk)
+        k = conv_out[:, self.kdim:2 * self.kdim].reshape(B, self.num_k, self.dk)
+        v = conv_out[:, 2 * self.kdim:].reshape(B, self.num_v, self.dv)
+        bops.delta_prologue_batch(q, k, v, b.contiguous(), a.contiguous(),
+                                  self.neg_expA, self.dt_bias,
+                                  self.q_pro[:B], self.k_pro[:B], self.v_pro[:B],
+                                  self.beta[:B], self.g[:B], self.qscale, self.rep)
+        bops.delta_batch(self.q_pro[:B], self.k_pro[:B], self.v_pro[:B],
+                         self.beta[:B], self.g[:B], self.state[:B],
+                         self.delta_out[:B])
+        # The gated norm is per (row, value head) and its weight is [dv], so it
+        # cannot be folded into the batched entries -- this loop is one launch per
+        # row, not per head.
+        for i in range(B):
+            proj_in[i] = self.norm(self.delta_out[i],
+                                   z[i].reshape(self.num_v, self.dv)).reshape(self.vdim)
         return batch_proj(self.out_proj, proj_in)
 
     def __call__(self, x: torch.Tensor, *_) -> torch.Tensor:
@@ -335,44 +325,25 @@ class LinearAttn:
         conv_state, conv_out = self.conv_state[pr], self.conv_out[pr]
 
         # Depthwise causal conv1d (kernel 4) over the last 3 states plus current,
-        # fused with the SiLU into one kernel (was cat + copy_ + mul + sum + silu).
-        if hip_ops.available():
-            hip_ops.conv1d_silu(self.conv_w, qkv, conv_state, conv_out)
-            qkv = conv_out
-        else:
-            win = torch.cat([conv_state, qkv[:, None]], dim=1)   # [C, 4]
-            conv_state.copy_(win[:, 1:])
-            qkv = F.silu((win * self.conv_w).sum(-1))                 # [conv_dim]
+        # fused with the SiLU into one op (was cat + copy_ + mul + sum + silu).
+        bops.conv1d_silu(self.conv_w, qkv, conv_state, conv_out)
+        qkv = conv_out
 
         q, k, v = qkv.split([self.kdim, self.kdim, self.vdim], dim=0)
         q = q.reshape(self.num_k, self.dk)
         k = k.reshape(self.num_k, self.dk)
         v = v.reshape(self.num_v, self.dv)
 
-        # Fused q/k norm + head expand + beta/g: one kernel instead of ~16 small
+        # Fused q/k norm + head expand + beta/g: one op instead of ~16 small
         # elementwise ops (mul, sum, rsqrt, sigmoid, softplus, add,
         # repeat_interleave).
         q_pro, k_pro, v_pro = self.q_pro[pr], self.k_pro[pr], self.v_pro[pr]
         beta, g = self.beta[pr], self.g[pr]
-        if hip_ops.available():
-            hip_ops.delta_prologue(q, k, v, b, a, self.neg_expA, self.dt_bias,
-                                   q_pro, k_pro, v_pro, beta, g,
-                                   self.qscale, self.rep)
-            out = hip_ops.delta(q_pro, k_pro, v_pro, beta, g,
-                                self.state[pr], self.delta_out[pr])
-        else:
-            # Eager reference of the same prologue, kept because the numeric
-            # tests run with the extension absent.
-            if self.rep > 1:
-                q = q.repeat_interleave(self.rep, dim=0)
-                k = k.repeat_interleave(self.rep, dim=0)
-            beta = b.sigmoid().float()
-            # g <= 0 by construction: a decay per step, never a growth.
-            g = self.neg_expA * F.softplus(a.float() + self.dt_bias)
-            q = q.float(); k = k.float()
-            q = q * torch.rsqrt((q * q).sum(-1, keepdim=True) + 1e-6) * self.qscale
-            k = k * torch.rsqrt((k * k).sum(-1, keepdim=True) + 1e-6)
-            out = hip_ops.delta(q, k, v.float(), beta, g, self.state[pr], self.delta_out[pr])
+        bops.delta_prologue(q, k, v, b, a, self.neg_expA, self.dt_bias,
+                            q_pro, k_pro, v_pro, beta, g,
+                            self.qscale, self.rep)
+        out = bops.delta(q_pro, k_pro, v_pro, beta, g,
+                         self.state[pr], self.delta_out[pr])
 
         out = self.norm(out, z).reshape(self.vdim)
         return self.out_proj(out)
@@ -381,10 +352,10 @@ class LinearAttn:
         """``x`` [C, hidden] -> [C, hidden] with per-token state snapshots.
 
         Same maths as ``prefill`` for the linear layers, but the C tokens go
-        through the *decode* kernels (fused prologue + delta), so the recurrent
+        through the *decode* entries (fused prologue + delta), so the recurrent
         state after each token can be copied into ``ckpt_state``/``ckpt_conv``
-        and restored when a draft is rejected. The projections are batched
-        (``gemv_m``), so C tokens cost about one weight pass.
+        and restored when a draft is rejected. The projections are batched, so C
+        tokens cost about one weight pass.
 
         Args:
             x: The drafted tokens' inputs, ``[C, hidden]``, ``C <= CKPT``.
@@ -399,21 +370,22 @@ class LinearAttn:
         qkv, z, b, a = self.qkvzb_a.prefill(x)
         # The recurrent part is per-token, but ``out_proj`` is a weight read: batch
         # it, otherwise C tokens re-read the projection C times.
-        proj_in = torch.empty(C, self.vdim, dtype=D, device="cuda")
+        proj_in = torch.empty(C, self.vdim, dtype=D, device=_device)
         pr = self.prefill_row
         conv_state, conv_out = self.conv_state[pr], self.conv_out[pr]
         q_pro, k_pro, v_pro = self.q_pro[pr], self.k_pro[pr], self.v_pro[pr]
         beta, g = self.beta[pr], self.g[pr]
         state, delta_out = self.state[pr], self.delta_out[pr]
         for i in range(C):
-            hip_ops.conv1d_silu(self.conv_w, qkv[i], conv_state, conv_out)
+            bops.conv1d_silu(self.conv_w, qkv[i], conv_state, conv_out)
             q, k, v = conv_out.split([self.kdim, self.kdim, self.vdim])
-            hip_ops.delta_prologue(q.reshape(self.num_k, self.dk), k.reshape(self.num_k, self.dk),
-                                   v.reshape(self.num_v, self.dv), b[i], a[i],
-                                   self.neg_expA, self.dt_bias,
-                                   q_pro, k_pro, v_pro, beta, g,
-                                   self.qscale, self.rep)
-            hip_ops.delta(q_pro, k_pro, v_pro, beta, g, state, delta_out)
+            bops.delta_prologue(q.reshape(self.num_k, self.dk),
+                                k.reshape(self.num_k, self.dk),
+                                v.reshape(self.num_v, self.dv), b[i], a[i],
+                                self.neg_expA, self.dt_bias,
+                                q_pro, k_pro, v_pro, beta, g,
+                                self.qscale, self.rep)
+            bops.delta(q_pro, k_pro, v_pro, beta, g, state, delta_out)
             # The gated norm is per value head: its weight is [dv], not [vdim], so
             # the state must stay [num_v, dv]. Flattening it first asks the kernel
             # for num_v*dv weights and runs off the end of that [dv] tensor.
@@ -465,40 +437,17 @@ class LinearAttn:
         C = qkv.shape[0]
         conv_state = self.conv_state[row]
 
-        if hip_ops.available():
-            # conv + head prep as two kernels, and -- the reason the prep is worth
-            # fusing -- q/k/v come out already in the [H, C, d] layout the chunked
-            # scan reads, instead of as transposed views it has to copy.
-            qkv = hip_ops.conv1d_silu_seq(self.conv_w, qkv, conv_state)
-            qt = torch.empty(self.num_v, C, self.dk, dtype=torch.float32, device="cuda")
-            kt = torch.empty(self.num_v, C, self.dk, dtype=torch.float32, device="cuda")
-            vt = torch.empty(self.num_v, C, self.dv, dtype=torch.float32, device="cuda")
-            bt = torch.empty(self.num_v, C, dtype=torch.float32, device="cuda")
-            gt = torch.empty(self.num_v, C, dtype=torch.float32, device="cuda")
-            hip_ops.delta_prep_seq(qkv, b, a, self.neg_expA, self.dt_bias,
-                                   qt, kt, vt, bt, gt, self.qscale, self.rep)
-        else:
-            # Eager reference: the same conv window carried across chunks, then
-            # the same head prep, so the numeric tests can run without the
-            # extension.
-            seq = torch.cat([conv_state.t(), qkv.float()], dim=0)  # [3+C, conv_dim]
-            conv_state.copy_(seq[-self.kernel + 1:].t())
-            win = seq.unfold(0, self.kernel, 1)                        # [C, conv_dim, k]
-            qkv = F.silu((win * self.conv_w).sum(-1))                  # [C, conv_dim]
-
-            q, k, v = qkv.split([self.kdim, self.kdim, self.vdim], dim=-1)
-            q = q.reshape(C, self.num_k, self.dk).float()
-            k = k.reshape(C, self.num_k, self.dk).float()
-            v = v.reshape(C, self.num_v, self.dv).float()
-            if self.rep > 1:
-                q = q.repeat_interleave(self.rep, dim=1)
-                k = k.repeat_interleave(self.rep, dim=1)
-            q = q * torch.rsqrt((q * q).sum(-1, keepdim=True) + 1e-6) * self.qscale
-            k = k * torch.rsqrt((k * k).sum(-1, keepdim=True) + 1e-6)
-            qt, kt, vt = q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1)
-            # [Hv, C]: the chunked scan is laid out head-major.
-            bt = b.sigmoid().float().transpose(0, 1)
-            gt = (self.neg_expA * F.softplus(a.float() + self.dt_bias)).transpose(0, 1)
+        # conv + head prep as two ops, and -- the reason the prep is worth fusing
+        # -- q/k/v come out already in the [H, C, d] layout the chunked scan reads,
+        # instead of as transposed views it has to copy.
+        qkv = bops.conv1d_silu_seq(self.conv_w, qkv, conv_state)
+        qt = torch.empty(self.num_v, C, self.dk, dtype=torch.float32, device=_device)
+        kt = torch.empty(self.num_v, C, self.dk, dtype=torch.float32, device=_device)
+        vt = torch.empty(self.num_v, C, self.dv, dtype=torch.float32, device=_device)
+        bt = torch.empty(self.num_v, C, dtype=torch.float32, device=_device)
+        gt = torch.empty(self.num_v, C, dtype=torch.float32, device=_device)
+        bops.delta_prep_seq(qkv, b, a, self.neg_expA, self.dt_bias,
+                            qt, kt, vt, bt, gt, self.qscale, self.rep)
 
         out = chunked_delta(qt, kt, vt, gt, bt, self.state[row], self.state[row], chunk)
         out = out.reshape(C, self.num_v, self.dv)

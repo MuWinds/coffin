@@ -5,13 +5,15 @@ Module: ``coffin/int8_weights.py``. Leaf of the import graph: it imports only
 checkpoint, ``ops/gemv.py`` consumes the resulting ``QWeight``, and both
 ``ops/embed.py`` and ``models/qwen35/vision.py`` understand the same object.
 
-Why: decode on the DCU is bandwidth-bound. The projections run at 540-680 GB/s
-against a ~700 GB/s copy ceiling and account for ~48% of a step, hipBLAS GEMV at
-M=1 is unusable, and Triton has no gfx906 backend. Halving the bytes every
-projection reads is therefore the largest remaining lever, and it is cheap to
-take because the dequantise can hide behind the memory traffic: the weights are
-stored as int8 with one fp32 scale per output row, and the kernel applies that
-scale once to the accumulated dot product instead of per element.
+Why: decode is bandwidth-bound. On the accelerator this engine was first written
+for, the projections ran at 540-680 GB/s against a ~700 GB/s copy ceiling and
+accounted for ~48% of a step; the library's GEMV at M=1 was unusable (55-296
+GB/s, and it changed kernel per shape), and Triton had no backend for that part.
+Halving the bytes every projection reads is therefore the largest remaining
+lever, and it is cheap to take because the dequantise can hide behind the memory
+traffic: the weights are stored as int8 with one fp32 scale per output row, and
+the kernel applies that scale once to the accumulated dot product instead of per
+element.
 
 Scheme: symmetric, per output row (per output channel), absmax.
 

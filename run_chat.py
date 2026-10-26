@@ -143,8 +143,10 @@ def main() -> None:
     ap.add_argument("-n", "--max-new", type=int, default=64)
     ap.add_argument("--bench", action="store_true")
     ap.add_argument("--max-seq", type=int, default=4096)
-    ap.add_argument("--no-bench", action="store_true", help="skip per-shape GEMV method picking")
-    ap.add_argument("--no-graph", action="store_true", help="disable the CUDA-graph decode path")
+    ap.add_argument("--no-bench", action="store_true",
+                    help="skip the backend's load-time kernel selection (its own autotune)")
+    ap.add_argument("--no-graph", action="store_true",
+                    help="disable the device-graph decode path and run eager")
     args = ap.parse_args()
 
     tok = Tokenizer.from_file(str(Path(args.model) / "tokenizer.json"))

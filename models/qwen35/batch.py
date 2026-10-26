@@ -1,116 +1,68 @@
-"""Batched weight reads for the static-batch decode path.
+"""Batched weight reads for the static-batch decode and the one-forward verify.
 
-Stage 1 batches exactly one thing: the projections. A decode step is bound by
-reading the weights (4 GB of int8 per step, ~700 GB/s), so applying one weight
-row to B input vectors costs almost the same as applying it to one -- that is
-the whole win of a static batch.
+A decode step is bound by reading the weights (4 GB of int8 per step, ~700 GB/s),
+so applying one weight row to B input vectors costs almost the same as applying it
+to one -- that is the whole win of a static batch. Both entry points here are
+therefore thin: they hand a ``[M, K]`` activation block to ``linear_m`` and let the
+backend decide which ``M`` it specialises and how it splits the rest.
 
-``GEMV.prefill`` already has the small-M path (``gemv_m``), but it indexes it by
-the autotuned per-M unroll. For the batched decode we instead replay the
-unroll the *single-stream* kernel chose for that shape, because ``gemv_kernel``
-and ``gemv_m_kernel`` accumulate each output row in exactly the same order for
-the same ``U`` (same per-lane 8 accumulators, same ``32*U`` K-stride, same warp
-reduction). Matching ``U`` therefore keeps every row bit-identical to a solo
-decode -- no bf16 rounding drift, which a different unroll would introduce at a
-handful of values. The M=8 kernel tops out at U=2, so a shape whose single-stream
-unroll is U=4 is run as two M=4 calls (U=4 exists there); that only halves the
-weight-read saving for those projections instead of changing the numbers.
+What used to live here was that decision: the per-M unroll table, two
+environment switches that selected a specific vendor kernel, and five ``hasattr``
+probes for optional kernel symbols. All of it was kernel selection, which is the
+backend's job now, so this file keeps only the two things that are actually
+model-side: the group split for a fused projection, and the *capability*
+predicates the verify path asks before choosing an implementation
+(``wide_kernel_ready`` / ``multi_q_ready``, answered from ``caps.native`` rather
+than from symbol presence).
 
-Module: ``coffin/models/qwen35``. Depends on ``ops/gemv`` and ``hip_ops``; used
-by ``blocks.py`` (every projection in the static-batch path) and by
+Module: ``coffin/models/qwen35``. Depends on ``ops/gemv`` and ``backends``; used by
+``blocks.py`` (every projection in the static-batch path) and by
 ``full_attn``/``mtp`` for the verify widths.
 
 Constraints:
-    * Bit-identity with solo decode is the contract: the static batch must
-      produce the same numbers as one-at-a-time decode, or a batched request and
-      an unbatched one disagree. Any new kernel path here has to keep the same
-      accumulation order, or be opt-in behind an env flag.
-    * Every optional kernel is probed with ``hasattr``: a tree built against an
-      older extension must keep working, falling back to the prefill/GEMM path.
-    * ``_M_US`` must stay in sync with the instantiated unrolls in
-      ``kernels/gemv.cu``; a mismatch becomes a wrong-tile launch error rather
-      than a Python exception.
+    * Bit-identity with solo decode is the contract: the static batch must produce
+      the same numbers as one-at-a-time decode, or a batched request and an
+      unbatched one disagree. That is now the backend's responsibility for each
+      ``linear_m`` entry, which is why this file no longer picks an unroll: a
+      caller-side choice could only be right for one card's kernels.
+    * Nothing here may name a kernel symbol, a device API or a tuning flag. A
+      backend without ``linear_m`` still answers the entry (the reference fills
+      it), so the fallback is invisible to this module.
     * ``WIDE_STATS`` is mutated without locking, which is fine because the engine
       drives all projection calls single-threaded from ``llm_engine``.
 """
 
 from __future__ import annotations
 
-import os
-
 import torch
 
-import hip_ops
+from backends import caps as _caps
 from ops.gemv import GEMV, GEMVGroup
 
-#: Unrolls the batched kernel instantiates per M (keep in sync with gemv.cu).
-_M_US = {2: (1, 2, 4), 4: (1, 2, 4), 8: (1, 2)}
-
-#: Opt-in faster projection: ``Q35_FAST_GEMV=1`` routes the batched projection
-#: through ``gemv_w8a16_wide_dot2`` (packed-fp16 ``v_dot2`` math, one weight pass
-#: for all rows).  Measured 1.18x the M=8 projection segment on this card.  It is
-#: *not* bit-identical to the single-stream kernel (bf16 output differs by 1-2 ulp,
-#: ~0.02% of elements), so it stays off unless asked for; the default path is
-#: untouched.  ``serve --fast-gemv`` sets this variable before the model is built.
-_FAST_GEMV = os.environ.get("Q35_FAST_GEMV") == "1"
-
-
-def _fast_project(proj: GEMV, x: torch.Tensor) -> torch.Tensor | None:
-    """Try the opt-in dot2 projection for a batched decode width.
-
-    Args:
-        proj: The projection to apply.
-        x: Activations, ``[M, K]``, bf16.
-
-    Returns:
-        ``[M, N]`` from the dot2 kernel, or ``None`` when the env flag is off, the
-        extension or symbol is missing, or the shape is outside what it
-        implements -- in which case the caller takes the bit-exact path.
-    """
-    if not (_FAST_GEMV and hip_ops.available() and proj.method == "hip"
-            and proj.q is not None and 2 <= x.shape[0] <= 32
-            and x.shape[1] == proj.K):
-        return None
-    fn = getattr(hip_ops, "gemv_w8a16_wide_dot2", None)
-    if fn is None:
-        return None
-    u = proj.u if proj.u in (2, 4) else 2
-    return fn(proj.q.wq, proj.q.scale, x.contiguous(), u, 0)
+#: The selected backend's capability record, read once. Used only by the two
+#: capability predicates below, which exist so the verify path can pick an
+#: implementation *before* capturing a graph -- a decision that has to be made at
+#: capture time, not per step.
+_CAPS = _caps()
 
 
 def _project(proj: GEMV, x: torch.Tensor) -> torch.Tensor:
-    """Apply one projection to a batch of rows, bit-identically to solo calls.
+    """Apply one projection to a batch of rows.
 
     Args:
         proj: The projection to apply.
         x: Activations, ``[M, K]``, bf16.
 
     Returns:
-        ``[M, N]`` where row ``r`` equals ``proj(x[r])`` exactly. Falls back to
-        ``proj.prefill`` for shapes the batched kernel does not instantiate and
-        for non-HIP builds.
+        ``[M, N]``. Row ``r`` equals a solo decode of ``x[r]`` on any backend whose
+        ``linear_m`` keeps the single-row accumulation order, which is the property
+        the batched and unbatched paths are held to (see the module constraints).
     """
-    M = x.shape[0]
-    if M == 1:
-        # Bucket 1 is a one-row graph: use the plain single-stream GEMV (the
-        # batched kernel has no M=1 instantiation) and keep the row dim.
+    if x.shape[0] == 1:
+        # Bucket 1 is a one-row graph: the single-stream entry keeps the row dim
+        # rather than taking the batch entry, whose M is fixed at capture time.
         return proj(x[0]).unsqueeze(0)
-    fast = _fast_project(proj, x)          # opt-in (Q35_FAST_GEMV=1)
-    if fast is not None:
-        return fast
-    if not (hip_ops.available() and proj.method == "hip" and M in (2, 4, 8)
-            and x.shape[1] == proj.K):
-        return proj.prefill(x)               # CPU / non-HIP fallback
-    u = proj.u
-    if u not in _M_US[M]:
-        if M == 8 and u == 4:
-            # No M=8/U=4 instantiation: two M=4/U=4 calls keep the exact sums.
-            return torch.cat([_project(proj, x[:4]), _project(proj, x[4:])], dim=0)
-        u = 2
-    x = x.contiguous()
-    if proj.q is not None:
-        return hip_ops.gemv_w8a16_m(proj.q.wq, proj.q.scale, x, u)
-    return hip_ops.gemv_m(proj.w, x, u)
+    return proj.linear_m(x)
 
 
 def batch_proj(proj, x: torch.Tensor):
@@ -131,66 +83,47 @@ def batch_proj(proj, x: torch.Tensor):
     return _project(proj, x)
 
 
-#: Names the task-12 wide-M kernels are expected to expose.  Probe with
-#: ``hasattr`` so a tree with only the old kernels keeps working (and so the
-#: one-forward verify can fall back to the prefill/GEMM path until they land).
-_WIDE_W8 = ("gemv_w8a16_wide", "gemv_w8a16_m16", "gemv_w8a16_mM")
-_WIDE_BF16 = ("gemv_wide", "gemv_bf16_wide", "gemv_m16", "gemv_bf16_mM")
-
-
 def wide_kernel_ready() -> bool:
-    """Report whether a wide-M batched GEMV (one pass for M up to 32) is loaded.
+    """Report whether the backend has a native batched projection.
 
-    Callers use this to choose the one-forward verify at capture time: without the
-    kernel that path is still correct but reads the int8 weights through a
-    dequantising GEMM, which is why it is worth checking before capturing.
+    Callers use this to choose the one-forward verify at capture time: without a
+    native ``linear_m`` that path is still correct but reads the weights through a
+    dequantising GEMM per row, which is why it is worth asking before capturing.
 
     Returns:
-        ``True`` when any known wide-M symbol exists on ``hip_ops``.
+        ``True`` when the selected backend serves ``linear_m`` with a kernel. This
+        is a capability question, not a symbol probe: ``caps.native`` is the
+        backend's own statement of what it implements.
     """
-    return any(hasattr(hip_ops, name) for name in _WIDE_W8 + _WIDE_BF16)
-
-
-#: Names the task-12 multi-query paged attention kernel may expose (the one that
-#: reads a row's history KV once for all ``c`` verify queries).
-_MULTI_Q = ("attn_paged_multi_q", "attn_paged_multi_q_batch", "attn_paged_multi_query")
+    return "linear_m" in _CAPS.native
 
 
 def multi_q_ready() -> bool:
-    """Report whether the multi-query paged attention kernel is loaded.
+    """Report whether the multi-query paged attention kernel is native here.
 
     Returns:
-        ``True`` when any known symbol exists on ``hip_ops``; ``False`` means
-        verify must fall back to the per-query attention path.
+        ``True`` when the selected backend serves ``attn_paged_multi_q`` natively;
+        ``False`` means verify must fall back to the per-query attention path.
     """
-    return any(hasattr(hip_ops, name) for name in _MULTI_Q)
+    return "attn_paged_multi_q" in _CAPS.native
 
 
 #: Flipped to True once ``FullAttn.verify_batch_multi`` is wired to the kernel.
 MULTI_Q_WIRED = True
 
 
-#: Counts where ``wide_proj`` sent each module: "dot2" / "wide" / "smallM" /
-#: "prefill".  The one-forward verify must be all-dot2 in int8 builds; anything
+#: Counts where :func:`wide_proj` sent each module: "smallM" / "prefill". Kept
+#: because the one-forward verify must be all-smallM in an int8 build; anything
 #: else is the dequant path and shows up as a step-time regression.
 WIDE_STATS: dict[str, int] = {}
-
-#: The dot2 wide kernel measures ~50-72 Gelem/s on this part's shapes, while the
-#: plain M=8 kernel runs at ~184-200 Gelem/s, so a 16-row verify is often faster
-#: as *two* M=8 passes (2 weight reads at 3x the rate) than one M=16 dot2 pass.
-#: Default on: it also keeps the per-row numbers identical to the greedy M=8
-#: decode step.  ``Q35_WIDE_SPLIT8=0`` switches back to the wide kernel.
-import os as _os
-
-_SPLIT8 = _os.environ.get("Q35_WIDE_SPLIT8", "1") != "0"
 
 
 def _count(kind: str) -> None:
     """Record that ``wide_proj`` took the ``kind`` path, for later attribution.
 
     Args:
-        kind: Path label, one of "dot2" / "wide" / "wide_bf16" / "smallM" /
-            "split8" / "prefill"; see :data:`WIDE_STATS` for how it is read.
+        kind: Path label, one of "smallM" / "prefill"; see :data:`WIDE_STATS` for
+            how it is read.
     """
     WIDE_STATS[kind] = WIDE_STATS.get(kind, 0) + 1
 
@@ -198,51 +131,22 @@ def _count(kind: str) -> None:
 def wide_proj(proj, x: torch.Tensor):
     """Batched projection at an arbitrary M (``B*c``), for the one-forward verify.
 
-    Uses the task-12 wide-M GEMV when it exists (one weight read for all rows);
-    otherwise falls back to ``GEMV.prefill`` (correct, but on int8 weights that
-    materialises the fp16 weights, which is why the one-forward verify is slow
-    until the kernel lands). Like :func:`batch_proj` it accepts a
+    The backend's ``linear_m`` is asked for every M here rather than only for the
+    power-of-two widths the old per-M kernels instantiated: it owns the decision of
+    which M it specialises and how to split the rest, so this file has no M table to
+    keep in sync with a kernel. Like :func:`batch_proj` it accepts a
     :class:`~ops.gemv.GEMVGroup` and returns a list for it.
 
     Args:
         proj: A :class:`~ops.gemv.GEMV` or :class:`~ops.gemv.GEMVGroup`.
-        x: Activations, ``[M, K]``, bf16. ``M`` need not be a power of two, which
-            is the difference from :func:`batch_proj`.
+        x: Activations, ``[M, K]``, bf16. ``M`` need not be a power of two.
 
     Returns:
         ``[M, N]``, or a list of per-weight tensors for a fused group. Rows carry
-        no bit-identity guarantee with solo decode when a wide kernel is used;
+        no bit-identity guarantee with solo decode when a wide path is used;
         :data:`WIDE_STATS` records which path ran.
     """
     if isinstance(proj, GEMVGroup):
         return wide_proj(proj.g, x).split(proj.sizes, dim=1)
-    g = proj
-    M = x.shape[0]
-    x = x.contiguous()
-    if g.q is not None:
-        # Prefer the packed-fp16 dot2 kernel (kernels task-12): same one-pass
-        # weight read, ~1.7x the element rate of the first int8 wide kernel, with
-        # a ULP-level difference from the greedy kernel instead of bit equality.
-        dot2 = getattr(hip_ops, "gemv_w8a16_wide_dot2", None)
-        wide = getattr(hip_ops, "gemv_w8a16_wide", None)
-        if _SPLIT8 and M % 8 == 0 and M > 8:
-            _count("split8")
-            return torch.cat([_project(g, x[i:i + 8]) for i in range(0, M, 8)], dim=0)
-        fn = dot2 or wide
-        if fn is not None and M in (16, 24, 32):
-            u = g.u if g.u in (2, 4) else 2
-            _count("dot2" if dot2 is not None else "wide")
-            return fn(g.q.wq, g.q.scale, x, u)
-        if M in (2, 4, 8):
-            _count("smallM")
-            return _project(g, x)
-    else:
-        fn = next((getattr(hip_ops, n) for n in _WIDE_BF16 if hasattr(hip_ops, n)), None)
-        if fn is not None and M in (16, 24, 32):
-            _count("wide_bf16")
-            return fn(g.w, x)
-        if M in (2, 4, 8):
-            _count("smallM")
-            return _project(g, x)
-    _count("prefill")
-    return g.prefill(x)
+    _count("smallM" if x.shape[0] <= 8 else "prefill")
+    return proj.linear_m(x) if x.shape[0] > 1 else proj(x).unsqueeze(0)

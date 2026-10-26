@@ -455,8 +455,11 @@ def describe(model_dir: str | Path, architecture: str | None = None) -> dict:
 #: ``from ops.gemv import GEMV`` at the top of a model module picks up the class
 #: object the just-reloaded ops module defines.
 _RELOAD_ORDER = (
-    "ops.dtypes", "ops.gemv", "ops.embed", "ops.norm", "ops.rope", "ops.mrope",
-    "ops.delta",
+    "backends.protocol", "backends.reference", "backends.vendor",
+    "backends.discovery", "backends.hip", "backends.corex",
+    "backends.vendors", "backends.registry", "backends",
+    "ops.dtypes", "ops.runtime", "ops.gemv", "ops.embed", "ops.norm", "ops.rope",
+    "ops.mrope", "ops.delta",
     "ops",
     "models.qwen35.tuning", "models.qwen35.weights", "models.qwen35.batch",
     "models.qwen35.vision",

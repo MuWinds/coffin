@@ -7,14 +7,22 @@ C-token forward for speculative decoding). The primitives it is built from live
 in ``ops/``; the per-layer blocks are next to this module.
 
 Module: ``coffin/models/qwen35``. Top of the family and the class
-``engine_api`` registers; it imports ``ops`` and every sibling module, and must
-not import ``engine_api``, ``model_runner`` or anything above the family.
+``engine_api`` registers; it imports ``ops``, ``backends`` and every sibling
+module, and must not import ``engine_api``, ``model_runner`` or anything above the
+family.
 
 Constraints:
     * Graphs are captured once and then replayed, so every buffer a captured
       path writes must exist with a stable address before ``capture()`` /
       ``capture_batch()``. Reallocating ``pos``, ``token_in`` or ``rope_delta``
       after capture silently makes the graph write into a dead tensor.
+    * Capture goes through ``ops.runtime``, which is what makes this file work on a
+      backend that cannot capture at all: when ``caps.graph`` is false it returns a
+      handle whose ``replay()`` re-runs the body, and every buffer address is still
+      fixed, so the paths below need no branch. That is not a degraded mode -- a
+      backend whose operator table mixes library and hand-written kernels cannot
+      capture by construction (its library GEMM is uncapturable while its own
+      kernels are not), and running eagerly is the correct path there.
     * ``pos`` addresses KV slots and the context window, while rotation reads
       ``pos + rope_delta``; keeping the two separate is what lets decode stay one
       replay after an image prompt.
@@ -36,6 +44,7 @@ from pathlib import Path
 
 import torch
 
+from backends import device as _device
 from models.qwen35.batch import (MULTI_Q_WIRED, batch_proj, multi_q_ready,
                                  wide_kernel_ready, wide_proj)
 from models.qwen35.blocks import Layer
@@ -44,6 +53,7 @@ from models.qwen35.linear_attn import LinearAttn
 from models.qwen35.mtp import MTP
 from models.qwen35.tuning import CKPT, PREFILL_ATTN_TILE
 from models.qwen35.weights import load_weights
+from ops import runtime
 from ops.dtypes import D, WF
 from ops.embed import TiedEmbedding
 from ops.mrope import mrope_cos_sin, scatter_image_embeds
@@ -103,7 +113,7 @@ class Qwen35:
         self.vision = None
         if weights is None:                 # caller-owned dict stays resident
             sd.clear()
-        torch.cuda.empty_cache()
+        runtime.empty_cache()
 
         rp = self.cfg["rope_parameters"]
         self.rot = int(self.cfg["head_dim"] * rp["partial_rotary_factor"])
@@ -111,9 +121,9 @@ class Qwen35:
         #: both derive from it, so a text-only prompt gets identical cos/sin on
         #: either path.
         self.inv_freq = make_inv_freq(self.cfg["head_dim"], self.rot,
-                                      rp["rope_theta"], "cuda")
+                                      rp["rope_theta"], _device)
         self.cos_tbl, self.sin_tbl = make_rope_tables(
-            self.cfg["head_dim"], self.rot, rp["rope_theta"], max_seq, "cuda",
+            self.cfg["head_dim"], self.rot, rp["rope_theta"], max_seq, _device,
             inv_freq=self.inv_freq)
 
         # Fixed buffers the captured graphs address.  ``pos``/``token_in``/
@@ -129,13 +139,13 @@ class Qwen35:
         #: so the MTP head's prefill is dead work there and is skipped.
         self.mtp_prefill = True
         self.pool = None
-        self._batch_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self._batch_graphs: dict[int, runtime.Capture] = {}
         self._scratch_blocks: list[int] = []
         self._row_tables: dict[int, tuple] = {}
         self._sentinel_token = 0
-        self.pos = torch.zeros(1, dtype=torch.long, device="cuda")
+        self.pos = torch.zeros(1, dtype=torch.long, device=_device)
         self.pos1 = self.pos[:1]
-        self.mask_idx = torch.arange(max_seq, dtype=torch.long, device="cuda")
+        self.mask_idx = torch.arange(max_seq, dtype=torch.long, device=_device)
         #: mRoPE offset of the request being decoded, per row: the mRoPE position
         #: of token ``i`` is ``i + rope_delta``.  0 for a text-only request (where
         #: the three axes collapse to 1-D and this is the identity), and the
@@ -145,10 +155,10 @@ class Qwen35:
         #: token index.  Keeping it a *buffer add* inside the captured graphs is
         #: what lets decode stay one replay: only the cos/sin row moves, every KV
         #: slot is still addressed by the token index.
-        self.rope_delta = torch.zeros(1, dtype=torch.long, device="cuda")
+        self.rope_delta = torch.zeros(1, dtype=torch.long, device=_device)
         self.rope_delta1 = self.rope_delta[:1]
-        self.token_in = torch.zeros(1, dtype=torch.long, device="cuda")
-        self.logits_out = torch.zeros(self.embed.shape[0], dtype=D, device="cuda")
+        self.token_in = torch.zeros(1, dtype=torch.long, device=_device)
+        self.logits_out = torch.zeros(self.embed.shape[0], dtype=D, device=_device)
         self.logits_single = self.logits_out
         self._graph = None
 
@@ -167,18 +177,18 @@ class Qwen35:
         self.spec_toks_b = None
         self.spec_logits_b = None
         self.h_prev_b = None
-        self._verify_batch_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self._verify_batch_graphs: dict[int, runtime.Capture] = {}
 
         # Speculative-verify state; the graph over it is captured by
         # ``capture_verify`` at whatever width ``verify_c`` ends up with.
         hidden = self.cfg["hidden_size"]
-        self.h_prev = torch.zeros(hidden, dtype=D, device="cuda")
+        self.h_prev = torch.zeros(hidden, dtype=D, device=_device)
         self.verify_c = 4
-        self.verify_off = torch.arange(self.verify_c, dtype=torch.long, device="cuda")
-        self.verify_toks = torch.zeros(self.verify_c, dtype=torch.long, device="cuda")
-        self.verify_pos = torch.zeros(self.verify_c, dtype=torch.long, device="cuda")
-        self.verify_hidden = torch.zeros(self.verify_c, hidden, dtype=D, device="cuda")
-        self.verify_logits = torch.zeros(self.verify_c, self.embed.shape[0], dtype=D, device="cuda")
+        self.verify_off = torch.arange(self.verify_c, dtype=torch.long, device=_device)
+        self.verify_toks = torch.zeros(self.verify_c, dtype=torch.long, device=_device)
+        self.verify_pos = torch.zeros(self.verify_c, dtype=torch.long, device=_device)
+        self.verify_hidden = torch.zeros(self.verify_c, hidden, dtype=D, device=_device)
+        self.verify_logits = torch.zeros(self.verify_c, self.embed.shape[0], dtype=D, device=_device)
         self._verify_graph = None
 
         # Acceptance statistics of the last ``spec_generate``, read by ``spec_stats``.
@@ -225,16 +235,16 @@ class Qwen35:
         self.decode_capacity = capacity - 1
         self.prefill_row = capacity - 1
         self.mtp_prefill = False        # speculative decoding is single-stream only
-        self.pos = torch.zeros(capacity, dtype=torch.long, device="cuda")
+        self.pos = torch.zeros(capacity, dtype=torch.long, device=_device)
         self.pos1 = self.pos[self.prefill_row:self.prefill_row + 1]
-        self.rope_delta = torch.zeros(capacity, dtype=torch.long, device="cuda")
+        self.rope_delta = torch.zeros(capacity, dtype=torch.long, device=_device)
         self.rope_delta1 = self.rope_delta[self.prefill_row:self.prefill_row + 1]
-        self.token_in = torch.zeros(capacity, dtype=torch.long, device="cuda")
-        self.logits_out = torch.zeros(capacity, self.embed.shape[0], dtype=D, device="cuda")
+        self.token_in = torch.zeros(capacity, dtype=torch.long, device=_device)
+        self.logits_out = torch.zeros(capacity, self.embed.shape[0], dtype=D, device=_device)
         self.logits_single = self.logits_out[self.prefill_row]
         # Per-row attention window length (``pos+1``) for the stage-3 batched
         # attention kernel; int32 because the kernel reads it on the device.
-        self.ctx_lens = torch.ones(capacity, dtype=torch.int32, device="cuda")
+        self.ctx_lens = torch.ones(capacity, dtype=torch.int32, device=_device)
         for layer in self.layers:
             layer.mix.enable_batching(capacity, self.prefill_row)
         self._row_tables.clear()
@@ -302,14 +312,14 @@ class Qwen35:
         # them first turns "OOM at startup" into "no extra peak at all".
         for mix in full:
             mix.kcache = mix.vcache = mix.kscale = mix.vscale = None
-        torch.cuda.empty_cache()
+        runtime.empty_cache()
         pool = PagedKVCache(len(full), self.cfg["num_key_value_heads"], self.cfg["head_dim"],
                             num_blocks=num_blocks, block_size=block_size,
                             max_seq=self.max_seq, rows=max(self.batch_capacity, 1))
         for i, mix in enumerate(full):
             mix.attach_pool(pool, i)
         self.pool = pool
-        torch.cuda.empty_cache()
+        runtime.empty_cache()
         if self.batch_capacity > 1:
             self._prepare_pool_rows()
         return pool
@@ -344,7 +354,7 @@ class Qwen35:
         if not cfg:
             raise RuntimeError("this checkpoint has no vision_config")
         if self.vision is None:
-            self.vision = VisionTower(self.vision_sd, cfg, device="cuda",
+            self.vision = VisionTower(self.vision_sd, cfg, device=_device,
                                       quant=quant, dtype=dtype)
         return self.vision
 
@@ -372,8 +382,8 @@ class Qwen35:
         """
         if self.vision is None:
             raise RuntimeError("vision tower not enabled (enable_vision())")
-        pv = pixel_values.to(device="cuda", dtype=WF)
-        gt = grid_thw.to(device="cuda", dtype=torch.long)
+        pv = pixel_values.to(device=_device, dtype=WF)
+        gt = grid_thw.to(device=_device, dtype=torch.long)
         with torch.no_grad():
             return self.vision(pv, gt).to(D)
 
@@ -547,12 +557,12 @@ class Qwen35:
                 mm: "MMInput | None" = None) -> torch.Tensor:
         """Process a whole prompt in batched GEMMs; returns the last token's logits.
 
-        ``chunk`` is the GEMM's M, and it is worth a lot: rocBLAS on fp16 reaches
-        ~13 TFLOP/s at M=256 and ~20 at M>=1024, and a bigger chunk also means
-        fewer 4-3-token-sized elementwise ops per token. Measured at n=2048: 865
-        tok/s at 256, 1035 at 512, 1094 at 2048. It only costs activation memory
-        (attention scores are [nkv, rep, C, p1] fp32), which is why this is not
-        ``max_seq``.
+        ``chunk`` is the GEMM's M, and it is worth a lot: the library GEMM on fp16
+        reaches ~13 TFLOP/s at M=256 and ~20 at M>=1024, and a bigger chunk also
+        means fewer 4-3-token-sized elementwise ops per token. Measured at n=2048:
+        865 tok/s at 256, 1035 at 512, 1094 at 2048. It only costs activation
+        memory (attention scores are [nkv, rep, C, p1] fp32), which is why this is
+        not ``max_seq``.
 
         Args:
             tokens: The whole prompt, in order. Position starts from the current
@@ -596,8 +606,8 @@ class Qwen35:
         if n > self.max_seq - pos0:
             raise ValueError(f"prompt of {n} exceeds max_seq={self.max_seq}")
         if n < 4:
-            # Tiny prompts are memory-bound: hipBLAS at M<4 is slower than the
-            # dedicated GEMV kernel, so walk them through the decode path.
+            # Tiny prompts are memory-bound: a library GEMM at M<4 is slower than
+            # the dedicated decode entry, so walk them through the decode path.
             # ``rope_delta`` is a decode-graph input, so it has to be in place
             # before the first ``logits`` call.
             if mm is not None:
@@ -607,14 +617,14 @@ class Qwen35:
                 lg = self.logits(t)
             return lg
 
-        toks = torch.tensor(tokens, dtype=torch.long, device="cuda")
+        toks = torch.tensor(tokens, dtype=torch.long, device=_device)
         ctx = (self.cos_tbl, self.sin_tbl, self.mask_idx)
         Q = PREFILL_ATTN_TILE
         last = None
         for c0 in range(0, n, chunk):
             c1 = min(c0 + chunk, n)
             x = self.embed.lookup(toks[c0:c1])
-            positions = torch.arange(pos0 + c0, pos0 + c1, device="cuda")
+            positions = torch.arange(pos0 + c0, pos0 + c1, device=_device)
             # Query tiles for the causal attention: each tile reads keys only up to
             # its own last position, so the masked-out half of the score block is
             # never built. Host-side ints, so no device sync per layer. The key
@@ -644,7 +654,7 @@ class Qwen35:
                 m1 = min(c1, n - 1)
                 if m1 > c0:
                     self.mtp.prefill(x[:m1 - c0], toks[c0 + 1:m1 + 1],
-                                     torch.arange(pos0 + c0, pos0 + m1, device="cuda"),
+                                     torch.arange(pos0 + c0, pos0 + m1, device=_device),
                                      layer_ctx,
                                      rope=None if rope is None
                                      else (rope[0][:m1 - c0], rope[1][:m1 - c0]))
@@ -654,7 +664,7 @@ class Qwen35:
                 if m1 > c0:
                     self.mtp.prefill_row(
                         spec_row, x[:m1 - c0], toks[c0 + 1:m1 + 1],
-                        torch.arange(pos0 + c0, pos0 + m1, device="cuda"), layer_ctx,
+                        torch.arange(pos0 + c0, pos0 + m1, device=_device), layer_ctx,
                         rope=None if rope is None
                         else (rope[0][:m1 - c0], rope[1][:m1 - c0]))
             last = x[-1]
@@ -809,7 +819,7 @@ class Qwen35:
                 base = matched[i] + c0
                 ids = list(seqs[i].token_ids[base:base + length])
                 emb = self.embed.lookup(torch.as_tensor(
-                    ids, dtype=torch.long, device="cuda"))
+                    ids, dtype=torch.long, device=_device))
                 mm_i = mm_list[i]
                 if mm_i is not None:
                     emb = scatter_image_embeds(emb, mm_i.embeds, mm_i.spans,
@@ -820,7 +830,7 @@ class Qwen35:
                     ropes.append(None)
                 parts.append(emb)
                 positions.append(torch.arange(base, base + length,
-                                              dtype=torch.long, device="cuda"))
+                                              dtype=torch.long, device=_device))
                 # Absolute key range: a tile only reads keys up to its own end.
                 tiles.append(
                     [(q0, min(q0 + Q, length), base, base + min(q0 + Q, length))
@@ -859,9 +869,9 @@ class Qwen35:
                         h = x[starts[k]:starts[k + 1] - 1]
                         nxt = torch.as_tensor(
                             list(seqs[i].token_ids[base + 1:base + length]),
-                            dtype=torch.long, device="cuda")
+                            dtype=torch.long, device=_device)
                         pos = torch.arange(base, base + length - 1,
-                                           dtype=torch.long, device="cuda")
+                                           dtype=torch.long, device=_device)
                         self.mtp.prefill_row(rows[i], h, nxt, pos, ctx)
                     if c1 == suffix[i]:
                         self.h_prev_b[rows[i]].copy_(x[starts[k + 1] - 1])
@@ -883,7 +893,7 @@ class Qwen35:
         return out, states_at
 
     def capture(self, warmup: int = 3) -> None:
-        """Capture ``_forward`` into a CUDA graph for one-launch decode steps.
+        """Capture ``_forward`` into a device graph for one-launch decode steps.
 
         Args:
             warmup: Eager iterations before the capture, to settle the allocator
@@ -891,24 +901,28 @@ class Qwen35:
                 setup work into the graph instead of the steady state.
 
         Raises:
-            RuntimeError: Raised by torch's graph machinery when the stream is
-                busy or a graph is already active; capture must run on a fresh
-                stream before the engine starts serving.
+            RuntimeError: Raised by the runtime's graph machinery when the stream
+                is busy or a graph is already active; capture must run before the
+                engine starts serving. Only reachable on a backend whose
+                ``caps.graph`` is true.
         """
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
-            for _ in range(warmup):
-                self._forward()
-        torch.cuda.current_stream().wait_stream(s)
         self.reset()
         self.token_in.zero_()
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
-            self._forward()
-        self._graph = g
+
+        def _reset() -> None:
+            """Rewind the model between the warmup and the capture.
+
+            The warmup advances ``pos`` and the recurrent state; the graph has to be
+            recorded against the same state its first replay will see, so both
+            counters go back to zero in between -- and ``token_in`` with them, so
+            the recorded body starts from token 0 rather than from the warmup's.
+            """
+            self.reset()
+            self.token_in.zero_()
+
+        self._graph = runtime.capture(self._forward, warmup, reset=_reset)
         # Warm the batched-prefill path as well: its first call otherwise pays for
-        # rocBLAS handle creation, the triangular solver and pool growth.
+        # library handle creation, the triangular solver and pool growth.
         self.prefill([1, 2, 3, 4, 5, 6, 7, 8] * 4)
         self.reset()
         if self.mtp is not None:
@@ -960,8 +974,8 @@ class Qwen35:
         if any(r < 0 or r >= self.decode_capacity for r in rows):
             raise ValueError(f"row out of 0..{self.decode_capacity - 1}: {rows}")
         if rows == list(range(n)):
-            self.token_in[:n].copy_(torch.as_tensor(tokens, dtype=torch.long, device="cuda"))
-            pos_t = torch.as_tensor(positions, dtype=torch.long, device="cuda")
+            self.token_in[:n].copy_(torch.as_tensor(tokens, dtype=torch.long, device=_device))
+            pos_t = torch.as_tensor(positions, dtype=torch.long, device=_device)
             self.pos[:n].copy_(pos_t)
             # Absolute position P means positions 0..P exist, i.e. P+1 keys: the
             # batched attention kernel loops only over this row's own window.
@@ -1015,7 +1029,7 @@ class Qwen35:
             if b not in (1, 2, 4, 8):
                 raise ValueError(f"bucket {b} not in (1, 2, 4, 8)")
         order = sorted(set(int(b) for b in buckets) | {1})
-        pool_handle = torch.cuda.graph_pool_handle()
+        pool_handle = runtime.graph_pool_handle()
         self._batch_graphs = {}
         if self.ctx_lens is not None:
             self.ctx_lens.fill_(1)       # capture-time windows are all pos 0
@@ -1024,17 +1038,8 @@ class Qwen35:
             if b > self.decode_capacity:
                 continue
             impl = lambda b=b: self._forward_batch(b)
-            s = torch.cuda.Stream()
-            s.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(s):
-                for _ in range(warmup):
-                    impl()
-            torch.cuda.current_stream().wait_stream(s)
-            self.reset()
-            g = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g, pool=pool_handle):
-                impl()
-            self._batch_graphs[b] = g
+            self._batch_graphs[b] = runtime.capture(impl, warmup, pool_handle,
+                                                    reset=self.reset)
         self.reset()
 
     @torch.inference_mode()
@@ -1178,13 +1183,13 @@ class Qwen35:
         self.spec_buckets = buckets
         hidden = self.cfg["hidden_size"]
         vocab = self.embed.shape[0]
-        self.verify_toks_b = torch.zeros(cap, width, dtype=torch.long, device="cuda")
-        self.verify_pos_b = torch.zeros(cap, width, dtype=torch.long, device="cuda")
-        self.verify_hidden_b = torch.zeros(cap, width, hidden, dtype=D, device="cuda")
-        self.verify_logits_b = torch.zeros(cap, width, vocab, dtype=D, device="cuda")
-        self.spec_toks_b = torch.zeros(cap, width, dtype=torch.long, device="cuda")
-        self.spec_logits_b = torch.zeros(cap, vocab, dtype=D, device="cuda")
-        self.h_prev_b = torch.zeros(cap, hidden, dtype=D, device="cuda")
+        self.verify_toks_b = torch.zeros(cap, width, dtype=torch.long, device=_device)
+        self.verify_pos_b = torch.zeros(cap, width, dtype=torch.long, device=_device)
+        self.verify_hidden_b = torch.zeros(cap, width, hidden, dtype=D, device=_device)
+        self.verify_logits_b = torch.zeros(cap, width, vocab, dtype=D, device=_device)
+        self.spec_toks_b = torch.zeros(cap, width, dtype=torch.long, device=_device)
+        self.spec_logits_b = torch.zeros(cap, vocab, dtype=D, device=_device)
+        self.h_prev_b = torch.zeros(cap, hidden, dtype=D, device=_device)
         bs = int(block_size or self.pool.bs)
         self.mtp.enable_spec_batch(
             self.batch_capacity, buckets,
@@ -1242,7 +1247,7 @@ class Qwen35:
             Args:
                 tag: Segment name, e.g. "proj" / "recur" / "attn" / "mlp" /
                     "lmhead"; it becomes a key in ``prof``.
-                start: CUDA event recorded before the segment, or ``None`` when
+                start: Event recorded before the segment, or ``None`` when
                     profiling is off, in which case nothing is recorded.
 
             Returns:
@@ -1251,14 +1256,14 @@ class Qwen35:
                 only meaningful as a placeholder before the next event is created.
             """
             if prof is not None:
-                end = torch.cuda.Event(enable_timing=True)
+                end = runtime.Event()
                 end.record()
                 prof.setdefault(tag, []).append((start, end))
             return start
 
         for layer in self.layers:
             mix = layer.mix
-            s = torch.cuda.Event(enable_timing=True) if prof is not None else None
+            s = runtime.Event() if prof is not None else None
             if s is not None:
                 s.record()
             h = layer.in_ln(x)
@@ -1266,7 +1271,7 @@ class Qwen35:
                 qkv, z, b, a = wide_proj(mix.qkvzb_a, h)
                 if s is not None:
                     lap("proj", s)
-                    s = torch.cuda.Event(enable_timing=True)
+                    s = runtime.Event()
                     s.record()
                 qkv = qkv.view(rows, c, -1)
                 z = z.view(rows, c, -1)
@@ -1278,16 +1283,16 @@ class Qwen35:
                                 torch.stack(pieces, dim=1).reshape(total, -1))
                 if s is not None:
                     lap("recur", s)
-                    s = torch.cuda.Event(enable_timing=True)
+                    s = runtime.Event()
                     s.record()
             else:
                 qg, k, v = wide_proj(mix.qkv, h)
                 if s is not None:
                     lap("proj", s)
-                    s = torch.cuda.Event(enable_timing=True)
+                    s = runtime.Event()
                     s.record()
                 if multi_q:
-                    # multi-query kernel returns the pre-out_proj attention output
+                    # multi-query entry returns the pre-out_proj attention output
                     pre = mix.verify_batch_multi(qg, k, v, poss, ctx, rows)
                     out = wide_proj(mix.o_proj, pre)
                 else:
@@ -1301,13 +1306,13 @@ class Qwen35:
                     out = torch.stack(pieces, dim=1).reshape(total, -1)
                 if s is not None:
                     lap("attn", s)
-                    s = torch.cuda.Event(enable_timing=True)
+                    s = runtime.Event()
                     s.record()
             x = x + out
             x = x + layer.mlp.wide(layer.post_ln(x))
             if s is not None:
                 lap("mlp", s)
-        s = torch.cuda.Event(enable_timing=True) if prof is not None else None
+        s = runtime.Event() if prof is not None else None
         if s is not None:
             s.record()
         x = self.norm(x)
@@ -1394,22 +1399,13 @@ class Qwen35:
         """
         if not self.batch_spec:
             raise RuntimeError("enable_spec_batch() first")
-        handle = torch.cuda.graph_pool_handle()
+        handle = runtime.graph_pool_handle()
         self._verify_batch_graphs = {}
         body = (self._verify_batch_once if self.verify_mode == "once"
                 else self._verify_batch_impl)
         for b in self.spec_buckets:
             impl = lambda b=b: body(b)
-            s = torch.cuda.Stream()
-            s.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(s):
-                for _ in range(warmup):
-                    impl()
-            torch.cuda.current_stream().wait_stream(s)
-            g = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g, pool=handle):
-                impl()
-            self._verify_batch_graphs[b] = g
+            self._verify_batch_graphs[b] = runtime.capture(impl, warmup, handle)
 
     @torch.inference_mode()
     def spec_step_batch(self, tokens: list[int], positions: list[int],
@@ -1497,10 +1493,10 @@ class Qwen35:
         for i, row in enumerate(active_rows):
             self.verify_pos_b[row, :width].copy_(
                 torch.arange(int(positions[i]), int(positions[i]) + width,
-                             device="cuda"))
+                             device=_device))
         for row in sorted(pad):
             self.verify_pos_b[row, :width].copy_(
-                torch.arange(width, device="cuda"))
+                torch.arange(width, device=_device))
         self._verify_batch_graphs[bucket].replay()
 
         # Acceptance per live row: logits[j].argmax() must equal the next draft.
@@ -1562,22 +1558,12 @@ class Qwen35:
             raise ValueError(f"verify width must be 2, 4 or 8 (got {c})")
         self.verify_c = c
         hidden = self.cfg["hidden_size"]
-        self.verify_off = torch.arange(c, dtype=torch.long, device="cuda")
-        self.verify_toks = torch.zeros(c, dtype=torch.long, device="cuda")
+        self.verify_off = torch.arange(c, dtype=torch.long, device=_device)
+        self.verify_toks = torch.zeros(c, dtype=torch.long, device=_device)
         self.verify_pos = self.verify_off.clone()
-        self.verify_hidden = torch.zeros(c, hidden, dtype=D, device="cuda")
-        self.verify_logits = torch.zeros(c, self.embed.shape[0], dtype=D, device="cuda")
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
-            for _ in range(warmup):
-                self._verify_impl()
-        torch.cuda.current_stream().wait_stream(s)
-        self.reset()
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
-            self._verify_impl()
-        self._verify_graph = g
+        self.verify_hidden = torch.zeros(c, hidden, dtype=D, device=_device)
+        self.verify_logits = torch.zeros(c, self.embed.shape[0], dtype=D, device=_device)
+        self._verify_graph = runtime.capture(self._verify_impl, warmup, reset=self.reset)
         self.reset()
 
     @torch.inference_mode()

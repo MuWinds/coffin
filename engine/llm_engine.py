@@ -74,7 +74,8 @@ class LLMEngine:
             self.pc = PrefixCacheEngine(
                 model, num_blocks=cfg.num_blocks, block_size=cfg.block_size,
                 max_state_snapshots=cfg.snapshots,
-                snapshot_interval=cfg.snapshot_interval, bm=self.bm)
+                snapshot_interval=cfg.snapshot_interval, bm=self.bm,
+                graph=cfg.graph)
             self.runner.attach_prefix_cache(self.pc)
             # ``capture()`` warms the batched prefill path, which writes KV
             # through the slot map. Reserving a block the pool can never hand out
@@ -97,16 +98,34 @@ class LLMEngine:
     def build(self) -> None:
         """Capture the decode graph(s) and warm up the paths a step will use.
 
-        Must run once before the first :meth:`step`; the captured graphs are what
-        make a decode step a replay instead of a re-trace.
+        Must run once before the first :meth:`step`. With ``cfg.graph`` on (the
+        default) this records the decode forward into a device graph, which is what
+        makes a step a replay instead of a re-trace. With it off the engine stays
+        eager, which is slower per token but is the only safe choice on a backend
+        whose replay is not trusted: a graph that replays stale outputs is a
+        silent wrong answer rather than a crash.
+
+        Batching and speculation are graph-only in this engine -- both replay a
+        per-bucket graph -- so the caller must have cleared them before arriving
+        here when capture is off; :class:`~coffin.serving.runtime_service.Server`
+        does that from ``--no-graph``.
 
         Raises:
+            RuntimeError: Capture is off but batching or speculation is still
+                configured. Both would replay a graph that was never captured, so
+                this fails here instead of at the first decode step.
             RuntimeError: Speculative decoding is configured but the checkpoint
                 has no MTP head. Failing at build time beats producing subtly
                 different tokens later.
         """
         t0 = time.time()
-        if self.batching:
+        if not self.cfg.graph:
+            if self.batching or self.cfg.spec_k:
+                raise RuntimeError(
+                    "graph capture is off but batching/speculation is configured; "
+                    "both replay a captured graph, so they need caps.graph")
+            self.model.reset()
+        elif self.batching:
             self.runner.enable_batching(self.cfg.max_num_seqs)
             if self.cfg.spec_k and (self.cfg.spec_batch or self.cfg.spec_sparse_k):
                 if self.model.mtp is None:

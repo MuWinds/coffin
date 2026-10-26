@@ -17,8 +17,9 @@ The vision tensors are a separate memory policy from the text ones:
   dequantises one GEMM at a time, so the transient is one fp16 matrix rather
   than a second copy of the tower.
 
-Module: ``coffin/models/qwen35``. Depends on ``ops/dtypes``, ``int8_weights``
-and its sibling ``vision``; called by ``engine_api.load_weights``, and its dict
+Module: ``coffin/models/qwen35``. Depends on ``backends`` (for the device the
+tensors land on and the projection dtype), ``ops/dtypes`` and ``int8_weights``,
+plus its sibling ``vision``; called by ``engine_api.load_weights``, and its dict
 is handed straight to ``Qwen35``.
 
 Constraints:
@@ -43,10 +44,10 @@ from pathlib import Path
 
 import torch
 
+from backends import device as _device
 from int8_weights import QWeight, is_quantizable
 from models.qwen35.vision import VISUAL_PREFIX, is_vision_quantizable
 from ops.dtypes import D, WF
-
 
 def load_weights(model_dir: str | Path, prefix: str = "model.language_model.",
                  quant: bool = False, weight_dtype: torch.dtype = WF,
@@ -68,8 +69,9 @@ def load_weights(model_dir: str | Path, prefix: str = "model.language_model.",
             ``*.safetensors`` shards.
         prefix: Parameter-name prefix of the text model in the checkpoint.
         quant: Store the text 2-D projection matrices as int8 ``QWeight``.
-        weight_dtype: dtype for the projections and the vision tensors; fp16 by
-            default because gfx906's packed math is fp16.
+        weight_dtype: dtype for the projections and the vision tensors; defaults to
+            ``caps.weight_dtype``, which is fp16 on the DCU this engine was tuned
+            on because that part has packed fp16 math.
         vision: Whether to load the tower. ``None`` (auto) loads it iff
             ``config.json`` declares a ``vision_config``.
         vision_quant: Store the tower's GEMM weights as int8 + per-row scale.
@@ -99,14 +101,14 @@ def load_weights(model_dir: str | Path, prefix: str = "model.language_model.",
         with safe_open(str(p), "pt") as f:
             for k in f.keys():
                 if k.startswith(prefixes):
-                    t = f.get_tensor(k).to("cuda")
+                    t = f.get_tensor(k).to(_device)
                     if not is_quantizable(k, t):
                         sd[k] = t.to(D).contiguous()
                         continue
                     t = t.to(weight_dtype).contiguous()
                     sd[k] = QWeight.quantize(t) if quant else t
                 elif take_vision and k.startswith(VISUAL_PREFIX):
-                    t = f.get_tensor(k).to("cuda", dtype=weight_dtype).contiguous()
+                    t = f.get_tensor(k).to(_device, dtype=weight_dtype).contiguous()
                     if vision_quant and is_vision_quantizable(k, t):
                         sd[k] = QWeight.quantize(t)
                     else:

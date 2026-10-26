@@ -67,7 +67,10 @@ class Handler(BaseHTTPRequestHandler):
     """
 
     protocol_version = "HTTP/1.1"
-    server_version = "dcu-engine/0.1"
+    # A vendor-neutral identity: this adapter fronts the DCU build and a CoreX
+    # build alike, and a client that branches on the string must not have to
+    # learn a new one each time the engine moves to another accelerator.
+    server_version = "coffin-engine/0.1"
 
     def log_message(self, fmt, *args):  # noqa: A003 - stdlib hook name
         print(f"[http] {self.address_string()} {fmt % args}", flush=True)
@@ -174,7 +177,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/v1/models":
             self._json(200, {"object": "list", "data": [{
                 "id": STATE["served_name"], "object": "model",
-                "created": STATE["created"], "owned_by": "dcu-engine"}]})
+                "created": STATE["created"], "owned_by": "coffin-engine"}]})
         else:
             self._error(404, f"no route {self.path}")
 

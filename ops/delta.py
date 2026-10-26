@@ -28,6 +28,8 @@ import torch.nn.functional as F
 
 from ops.dtypes import NEG_INF
 
+from backends import ops as bops
+
 
 #: Strictly-upper masks, one per chunk length, built once instead of per chunk.
 #: The decay matrix is a difference of cumulative sums over a chunk, so its upper
@@ -133,14 +135,21 @@ def chunked_delta(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Te
     ecum = cum.exp()                                                  # reused twice below
     dkb = kb * ecum.unsqueeze(-1)
 
-    # Both solves share ``ut``, and rocBLAS TRSM costs about linearly in the
+    # Both solves share ``ut``, and a triangular solve costs about linearly in the
     # number of right-hand sides, so inverting once and applying the inverse with
     # two batched matmuls beats two TRSMs with 128 columns each.  Same maths:
     # A^-1 B either way, to fp32 round-off.
+    #
+    # The solve itself goes through the op table, because whether a triangular
+    # solve is even available is a platform fact: on CoreX every ``torch.linalg``
+    # solve path dies in ``dlopen`` (its cuSOLVER is looked for at a path that does
+    # not exist on the cluster), while ROCm answers it in one call. Keeping the
+    # call here would mean an `if platform` in model code; keeping it in the
+    # backend means both platforms run this file unchanged.
     bn = H * nc
     ut2 = ut.reshape(bn, L, L)
     eye = torch.eye(L, dtype=ut.dtype, device=ut.device).expand(bn, L, L)
-    ut_inv = torch.linalg.solve_triangular(ut2, eye, upper=False, unitriangular=True)
+    ut_inv = bops.triangular_solve(ut2, eye)
     nv = torch.bmm(ut_inv, vb.reshape(bn, L, dv)).reshape(H, nc, L, dv)
     kcd = torch.bmm(ut_inv, dkb.reshape(bn, L, dk)).reshape(H, nc, L, dk)
 
@@ -161,7 +170,8 @@ def chunked_delta(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Te
     #
     # ``bn`` is defined above (phase 1); ``A``/``B`` are flattened head-major, so
     # chunk ``i`` lives at batch indices ``i, nc+i, 2*nc+i, ...`` -- the strided
-    # slices below are what a strided-batched rocBLAS GEMM is for.
+    # slices below are exactly what a batched GEMM wants, so the scan needs no
+    # gather and no copy between chunks.
     k2t = k2.transpose(-1, -2).reshape(bn, dk, L)
     A = torch.bmm(k2t, kcd.reshape(bn, L, dk)).neg_()                  # [bn, dk, dk]
     A.diagonal(dim1=-2, dim2=-1).add_(cd.reshape(bn, 1))               # + cd_i * I

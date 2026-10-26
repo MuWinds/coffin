@@ -1,14 +1,10 @@
-"""Build and expose the HIP kernels in ``kernels/``.
+"""Build and expose the HIP kernels in ``backends/hip/kernels/``.
 
-Module: ``coffin`` root, the bottom of the dependency graph. Every layer imports
-it (``ops``, ``models/*``, ``paged_cache``) and it imports nothing from them, so
-it must stay a pure host shim over the extension; adding a model dependency here
-would make the kernel layer unimportable on its own.
-
-The kernels themselves are C++/HIP sources (``gemv.cu``, ``delta.cu``) compiled
-once into a cached extension under ``TORCH_EXTENSIONS_DIR``; this module is only
-the build/loader shim. If the build fails the engine falls back to hipBLAS:
-``available()`` returns ``False`` and every caller keeps an eager path.
+Module: ``coffin/backends/hip``, bottom of the dependency graph next to
+``backends/hip/__init__.py``, which is the only importer. The kernels are C++/HIP
+sources compiled once into a cached extension under ``TORCH_EXTENSIONS_DIR``;
+this module is only the build/loader shim, so it must stay free of model, op-table
+and protocol dependencies.
 
 Constraints:
     * Launch on ``at::cuda::getCurrentCUDAStream()`` (the legacy default stream is
@@ -20,14 +16,16 @@ Constraints:
     * Buffers the kernels write (split partials, KV state, conv state) are
       caller-owned and must stay at fixed addresses for the same reason.
     * The extension targets gfx906 only (``PYTORCH_ROCM_ARCH`` /
-      ``--offload-arch``). A different part needs a new arch string, not a
-      different build path.
+      ``--offload-arch``). A different part gets its own backend, not another arch
+      string here.
     * ``TORCH_EXTENSIONS_DIR`` must be isolated per deployment. A shared cache
       dir makes every new checkout trigger a full HIP rebuild and fight over the
       same build lock; concurrent deploys then wait forever on it.
-    * Import order matters: the two environment variables are set before
-      ``torch.utils.cpp_extension`` is imported, because the loader reads them at
-      import time.
+    * The two ``os.environ`` writes stay above the ``torch`` import, because the
+      extension loader reads them at import time. They are process-wide side
+      effects: keeping them inside a backend (rather than at the package root)
+      is what stops ``PYTORCH_ROCM_ARCH=gfx906`` from leaking into a process that
+      selected a different backend.
 """
 
 from __future__ import annotations

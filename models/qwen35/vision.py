@@ -1,10 +1,11 @@
 """Qwen3.5-4B vision tower: the 24-layer ViT that turns pixels into LLM tokens.
 
-Module: ``coffin/models/qwen35``. Leaf of the model family: it imports only
-``torch`` and ``int8_weights``, and is built by ``models.qwen35.model`` out of
-``weights.load_weights`` tensors. It must not import ``ops``, ``engine_api`` or
-the text-side modules, so ``tests/test_vision.py`` can build a tiny tower with
-no checkpoint and no engine around it.
+Module: ``coffin/models/qwen35``. Leaf of the model family: it imports ``torch``,
+``int8_weights`` and ``backends`` (for the device and the weight dtype, which are
+platform facts), and is built by ``models.qwen35.model`` out of
+``weights.load_weights`` tensors. It must not import ``ops``, ``engine_api`` or the
+text-side modules, so ``tests/test_vision.py`` can build a tiny tower with no
+checkpoint and no engine around it.
 
 Shape flow (``N = Σ t*h*w`` patch tokens, ``n_img = N / 4`` LLM tokens)::
 
@@ -16,10 +17,11 @@ Shape flow (``N = Σ t*h*w`` patch tokens, ``n_img = N / 4`` LLM tokens)::
                                   (exact) -> fc2                       -> [N/4, 2560]
 
 Constraints:
-    * Compute is fp16 on the DCU, not bf16: this part has packed fp16 math and
-      no packed bf16 math (13-20 TFLOP/s vs 2.3-7 for the same GEMM, the same
-      reason the text projections load as ``ops.dtypes.WF``), and the tower is
-      compute-bound.
+    * Compute is fp16 on a part with packed fp16 math and no packed bf16 math
+      (13-20 TFLOP/s vs 2.3-7 for the same GEMM, the same reason the text
+      projections load at ``caps.weight_dtype``), and the tower is compute-bound.
+      A part whose caps report bf16 weights computes in bf16 here too: the rule is
+      the caps value, not a vendor name.
     * The fp32 islands must stay fp32 -- the pos-embed tap sum, the rotary
       angle, the attention softmax. They are the ones HF has too, because a
       bf16/fp16 tap sum is 1e-2 wrong (``.tmp_dsh/vision/reference_spec.md``
@@ -74,6 +76,8 @@ import os
 import torch
 import torch.nn.functional as F
 
+from backends import caps as _caps
+from backends import device as _device
 from int8_weights import QWeight
 
 #: Checkpoint prefix of every tensor this module reads.
@@ -257,7 +261,7 @@ class VisionTower:
     """
 
     def __init__(self, sd: dict, cfg, dtype: torch.dtype = torch.float16,
-                 device="cuda", quant: bool = False,
+                 device=None, quant: bool = False,
                  compute_dtype: torch.dtype | None = None) -> None:
         """Bind one checkpoint to ``device`` and pick the compute dtype.
 
@@ -269,13 +273,16 @@ class VisionTower:
             cfg: ``config.json:vision_config`` as a dict or an object.
             dtype: What :meth:`forward` returns. The model casts it to bf16 for
                 the text side, so this is a boundary dtype, not a compute one.
-            device: Target device, string or ``torch.device``.
+            device: Target device, string or ``torch.device``. ``None`` uses the
+                selected backend's device, which is what the model passes on
+                every path except the CPU numeric tests.
             quant: Force int8 GEMM weights even when ``sd`` is all fp16. Costs
                 the 1.4e-2 fp16 error plus W8A16 on top, so it is for the
                 memory-constrained case only.
-            compute_dtype: Override the default rule, which is fp16 on CUDA for
-                the packed-math reason in the module docstring and ``dtype`` on
-                CPU so the fp32 numeric tests can run.
+            compute_dtype: Override the default rule, which is fp16 where the part
+                has packed fp16 math (the ``caps.weight_dtype`` the text
+                projections already follow) and ``dtype`` otherwise, so the fp32
+                numeric tests can run.
 
         Raises:
             KeyError: The state dict is missing tensors the forward pass reads;
@@ -286,11 +293,13 @@ class VisionTower:
         """
         self.cfg = _VisionConfig(cfg)
         c = self.cfg
+        if device is None:
+            device = _device
         self.device = device if isinstance(device, torch.device) else torch.device(device)
-        on_cuda = self.device.type == "cuda"
+        packed_fp16 = _caps().weight_dtype == torch.float16
         if compute_dtype is None:
             compute_dtype = (torch.float16
-                             if on_cuda and dtype not in (torch.float32, torch.float64)
+                             if packed_fp16 and dtype not in (torch.float32, torch.float64)
                              else dtype)
         self.compute_dtype = compute_dtype
         self.dtype = dtype

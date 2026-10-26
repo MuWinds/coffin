@@ -57,7 +57,7 @@ class PrefixCacheEngine:
 
     def __init__(self, model, num_blocks: int = 512, block_size: int = 64,
                  max_state_snapshots: int = 8, snapshot_interval: int = 512,
-                 bm: BlockManager | None = None) -> None:
+                 bm: BlockManager | None = None, graph: bool = True) -> None:
         """Attach to a model's pool and fix the snapshot policy.
 
         Args:
@@ -74,8 +74,13 @@ class PrefixCacheEngine:
             bm: Pool and tree to share with the rest of the engine. The engine
                 passes one, since the batched and single-stream paths must share
                 one block id space rather than each building a pool.
+            graph: Replay the captured decode graph per token. ``False`` runs the
+                eager forward, which is the path a backend without trustworthy
+                capture takes; the tokens are identical, only the launch differs.
         """
         self.model = model
+        #: Decode path selector; see the ``graph`` argument.
+        self.graph = bool(graph)
         #: The pool and the radix tree are owned by the block manager; this engine
         #: only orchestrates one request's prefill/decode over them.
         self.bm = bm or BlockManager.attach(model, num_blocks, block_size, max_state_snapshots)
@@ -232,7 +237,10 @@ class PrefixCacheEngine:
                 break
             yield nxt
             out += 1
-            logits = model.decode_step(nxt)
+            # Two entry points to the same forward: the graph replay and the eager
+            # one. Both stage the token and advance ``pos1``, so the commit below
+            # reads the same counter either way.
+            logits = model.decode_step(nxt) if self.graph else model.logits(nxt)
             # The model's counter is authoritative: a captured graph, not this
             # loop, decided how many positions the step actually wrote.
             seq.commit_upto(model.pos1)

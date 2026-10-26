@@ -15,3 +15,20 @@ __pycache__/
 # local credentials (never commit)
 .scnet.json
 .scnet_login_state.json
+
+# synthetic trees built by tests/test_backends_purity.py
+.tmp_purity/
+
+# scratch trees from kernel syntax checks and probe runs
+.tmp_cusyn/
+
+
+# editor settings, not part of the engine
+.vscode/
+
+
+# scratch scripts from one-off kernel investigations (each conclusion belongs in
+# the probe or the doc it justifies, not in a file here)
+.tmp_*.py
+.cleanup_*.py
+

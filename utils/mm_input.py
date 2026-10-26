@@ -204,7 +204,7 @@ def find_image_spans(input_ids, image_token_id: int = IMAGE_TOKEN_ID
 
 
 def mrope_positions(spans: list[tuple[int, int]], grids, prompt_len: int,
-                    spatial_merge: int = 2, device="cuda") -> tuple[torch.Tensor, int]:
+                    spatial_merge: int = 2, device=None) -> tuple[torch.Tensor, int]:
     """3-D mRoPE positions of a prompt with image spans, in prompt order.
 
     Mirrors ``Qwen3_5Model.get_rope_index`` for the batch-1, no-padding case:
@@ -221,7 +221,9 @@ def mrope_positions(spans: list[tuple[int, int]], grids, prompt_len: int,
         prompt_len: Total prompt tokens, generated tokens excluded.
         spatial_merge: Patch merge factor of the tower; the grids are divided by
             it to get the LLM-side grid.
-        device: Where the returned positions tensor goes.
+        device: Where the returned positions tensor goes. ``None`` means the
+            selected backend's device: a literal here would name one vendor's
+            stack, and the caller is the one that knows the request's device.
 
     Returns:
         ``(positions, rope_delta)``: ``[3, prompt_len]`` int64 positions and the
@@ -271,4 +273,8 @@ def mrope_positions(spans: list[tuple[int, int]], grids, prompt_len: int,
         n = prompt_len - cur_tok
         pos[:, cur_tok:] = np.arange(n, dtype=np.int64) + cur_pos
     phi = int(pos.max()) + 1 - prompt_len
+    if device is None:
+        import backends
+
+        device = backends.device
     return torch.from_numpy(pos).to(device), phi

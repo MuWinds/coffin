@@ -77,6 +77,12 @@ class EngineConfig:
     max_num_batched_tokens: int = 2048
     #: Hard wall-clock cap of one generation, seconds (0 = none).
     max_seconds: float = 0.0
+    #: Capture the decode step into a device graph. ``False`` runs the eager step
+    #: for every token, which is slower but is the only way to serve a backend
+    #: whose graph replay is not trusted: a graph that replays stale outputs fails
+    #: silently, so the decision is a correctness switch, not a tuning knob. The
+    #: server ANDs this with ``caps.graph`` before it gets here.
+    graph: bool = True
 
     # Multimodal (image) serving.
     #: Serve images at all. ``False`` (``--no-vision``) keeps the vision tower

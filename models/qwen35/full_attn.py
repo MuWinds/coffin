@@ -2,10 +2,10 @@
 
 Module: ``coffin/models/qwen35``. One of the two per-layer attention kinds the
 family composes (the other is ``linear_attn``); ``blocks.Layer`` picks one per
-layer index and ``model.py`` builds all 32. Depends downward on ``hip_ops`` for
-the kernels, ``ops`` for dtypes/rope/norm/proj, and ``models/qwen35/batch`` and
-``tuning`` for the batched projections and split counts. Nothing outside this
-family may import it directly.
+layer index and ``model.py`` builds all 32. Depends downward on ``backends`` for
+the attention ops, the device and the split-K width, and on ``ops`` for
+dtypes/rope/norm/proj plus ``models/qwen35/batch`` for the batched projections.
+Nothing outside this family may import it directly.
 
 Eight of the 32 layers are this kind.  The decode step always spans the whole
 ``max_seq`` window and masks entries past a device-side position counter, so
@@ -19,10 +19,18 @@ Constraints:
       quantiser is ``_quant`` for one token and ``_quant_rows`` /
       ``_quant_seq`` for a batch; all three must stay bit-identical, because
       the kernel dequantises with the same scale the writer stored.
+    * The split-K width of the partial buffers is ``caps.attn_split``, never a
+      literal: this side owns the buffers and the backend's kernel indexes them,
+      so a mismatch corrupts attention instead of failing a shape check. A backend
+      that does not split reports ``1`` and the buffers shrink with it.
     * Decode buffers have static shapes and stable addresses. Anything the
       captured graph writes must be allocated before ``capture()`` and never
       reassigned afterwards; ``enable_batching`` and ``attach_pool`` are the
       only resizers, and both must run pre-capture.
+    * There is no eager fallback in this file. Every path calls the op table, and
+      a backend with no native kernel gets the reference implementation from it --
+      which is what removes the old per-call availability check that appeared once
+      per attention site.
     * Recurrent state does not exist here -- the KV is position-indexed, so
       rollback is a position counter -- but the cache must still be snapshotted
       and restored with it for prefix reuse, or a shared KV pairs a restored
@@ -35,13 +43,20 @@ from __future__ import annotations
 
 import torch
 
-import hip_ops
+from backends import caps as _caps
+from backends import device as _device
+from backends import ops as bops
 from models.qwen35.batch import batch_proj
 from models.qwen35.tuning import ATTN_SPLIT, PREFILL_ATTN_KB
 from ops.dtypes import D, NEG_INF, WF
 from ops.gemv import _proj
 from ops.norm import RMSNorm
 from ops.rope import apply_rope
+
+#: The selected backend's capability record, read once. ``batch_attn`` decides
+#: whether a bucket costs one attention launch or one per row; both are correct,
+#: which is why this is a speed branch and not a fallback branch.
+_CAPS = _caps()
 
 
 class FullAttn:
@@ -90,11 +105,11 @@ class FullAttn:
         # 0.5 GB-per-layer segments for the pool's single large tensors.
         if not paged:
             self.kcache = torch.zeros(self.nkv, max_seq, self.hd, dtype=torch.int8,
-                                      device="cuda")
+                                      device=_device)
             self.vcache = torch.zeros(self.nkv, max_seq, self.hd, dtype=torch.int8,
-                                      device="cuda")
-            self.kscale = torch.zeros(self.nkv, max_seq, dtype=torch.float32, device="cuda")
-            self.vscale = torch.zeros(self.nkv, max_seq, dtype=torch.float32, device="cuda")
+                                      device=_device)
+            self.kscale = torch.zeros(self.nkv, max_seq, dtype=torch.float32, device=_device)
+            self.vscale = torch.zeros(self.nkv, max_seq, dtype=torch.float32, device=_device)
         else:
             self.kcache = self.vcache = self.kscale = self.vscale = None
         # Per-row buffers for the batch path: the leading dim is the batch row
@@ -104,14 +119,14 @@ class FullAttn:
         # kept apart from the decode rows by ``Qwen35.enable_batching``.
         self._bcap = 1
         self.prefill_row = 0
-        self.attn_out = torch.zeros(1, self.nh, self.hd, dtype=D, device="cuda")
+        self.attn_out = torch.zeros(1, self.nh, self.hd, dtype=D, device=_device)
         # Per-key-slice partials for the split decode attention (see attn.cu);
         # kept here because the decode step is a captured graph and needs fixed
         # buffers.
         self.part_acc = torch.zeros(1, self.nh, ATTN_SPLIT, self.hd, dtype=torch.float32,
-                                    device="cuda")
+                                    device=_device)
         self.part_ml = torch.zeros(1, self.nh, ATTN_SPLIT, 2, dtype=torch.float32,
-                                   device="cuda")
+                                   device=_device)
         self._bind_single_views()
         self.pool = None
         self.pidx = 0
@@ -147,11 +162,11 @@ class FullAttn:
             return
         self._bcap = capacity
         self.prefill_row = int(prefill_row)
-        self.attn_out = torch.zeros(capacity, self.nh, self.hd, dtype=D, device="cuda")
+        self.attn_out = torch.zeros(capacity, self.nh, self.hd, dtype=D, device=_device)
         self.part_acc = torch.zeros(capacity, self.nh, ATTN_SPLIT, self.hd,
-                                    dtype=torch.float32, device="cuda")
+                                    dtype=torch.float32, device=_device)
         self.part_ml = torch.zeros(capacity, self.nh, ATTN_SPLIT, 2,
-                                   dtype=torch.float32, device="cuda")
+                                   dtype=torch.float32, device=_device)
         self._bind_single_views()
 
     def attach_pool(self, pool, idx: int) -> None:
@@ -253,35 +268,21 @@ class FullAttn:
             self.kscale.index_copy_(1, pos1, sk.unsqueeze(1))
             self.vscale.index_copy_(1, pos1, sv.unsqueeze(1))
 
-        # One fused kernel per path: dequant k/v, fold the scales, apply the
-        # causal mask, softmax, gate, PV. The fallbacks below only run without
-        # the extension and must produce the same numbers.
-        if self.pool is not None and hip_ops.available():
+        # One op call per path: dequant k/v, fold the scales, apply the causal
+        # mask, softmax, gate, PV. Which kernel answers is the backend's business;
+        # both entries are callable on every backend, so there is no availability
+        # fork and no eager twin to keep numerically in step.
+        if self.pool is not None:
             kp, vp, kps, vps = self._pool_views()
-            out = hip_ops.attn_paged(q.contiguous(), gate.contiguous(), kp, vp, kps, vps,
-                                     self.pool.pos2slot[self.prefill_row], self.attn_out1,
-                                     pos1, self.max_seq, self.rep, self.scale,
-                                     self.part_acc1, self.part_ml1)
-            return self.o_proj(out.reshape(-1))
-        if hip_ops.available():
-            out = hip_ops.attn(q.contiguous(), gate.contiguous(), self.kcache,
-                               self.vcache, self.kscale, self.vscale,
-                               self.attn_out1, pos1, self.rep, self.scale,
-                               self.part_acc1, self.part_ml1)
-            return self.o_proj(out.reshape(-1))
-
-        kcache = self.pool.k[self.pidx] if self.pool is not None else self.kcache
-        kk = kcache.to(D)
-        qe = q.reshape(self.nkv, self.rep, self.hd)
-        scores = torch.einsum("ghd,gsd->ghs", qe, kk).float()
-        scores = scores * self.kscale[:, None, :] * self.scale
-        mask = (mask_idx[None, :] > pos1[:, None])[None, :, :]
-        scores = scores.masked_fill(mask, NEG_INF)
-        probs = scores.softmax(-1).to(D)
-
-        pv = probs * self.vscale[:, None, :].to(D)
-        out = torch.einsum("ghs,gsd->ghd", pv, self.vcache.to(D)).reshape(self.nh, self.hd)
-        out = out * gate.sigmoid()
+            out = bops.attn_paged(q.contiguous(), gate.contiguous(), kp, vp, kps, vps,
+                                  self.pool.pos2slot[self.prefill_row], self.attn_out1,
+                                  pos1, self.max_seq, self.rep, self.scale,
+                                  self.part_acc1, self.part_ml1)
+        else:
+            out = bops.attn_decode(q.contiguous(), gate.contiguous(), self.kcache,
+                                   self.vcache, self.kscale, self.vscale,
+                                   self.attn_out1, pos1, self.rep, self.scale,
+                                   self.part_acc1, self.part_ml1)
         return self.o_proj(out.reshape(-1))
 
     @staticmethod
@@ -304,13 +305,13 @@ class FullAttn:
         """``x`` [B, hidden] -> [B, hidden]: batched projections, per-row attention.
 
         Two of the three stages here are batched: the projections (one weight read
-        for all rows, ``models/qwen35/batch.py``) and -- when the extension has
-        them -- the stage-3 batch kernels, so attention is one launch for the
-        whole bucket instead of B.  Each row still resolves positions through its
-        own ``pos2slot`` row and stops at its own ``context_lens[b]``, and the
-        kernels are numerically identical to the single-row ones.  Without the
-        batch kernels this falls back to calling the single-token kernel once per
-        row on row slices; both paths must stay bit-identical per row.
+        for all rows, ``models/qwen35/batch.py``) and -- on a backend that serves
+        batched paged attention natively -- the attention itself, so the whole
+        bucket is one launch instead of B.  Each row still resolves positions
+        through its own ``pos2slot`` row and stops at its own ``context_lens[b]``,
+        and the kernels are numerically identical to the single-row ones.  On a
+        backend without the batched entry this calls the single-token entry once
+        per row on row slices; both paths must stay bit-identical per row.
 
         ``ctx`` may carry a 5th entry: the per-row ``rope_delta`` ``[B]`` long
         (mRoPE text offset of a request that has an image).  It only moves the
@@ -320,24 +321,25 @@ class FullAttn:
             x: Decode-row inputs, ``[B, hidden]``.
             positions: Current token index per row, ``[B]`` long.
             ctx: ``(cos_tbl, sin_tbl, mask_idx[, context_lens[, rope_delta]])``.
-                ``context_lens`` is ``[B]`` int32 and selects the batched kernel;
+                ``context_lens`` is ``[B]`` int32 and selects the batched entry;
                 ``rope_delta`` is ``[B]`` long and moves only the rotation.
 
         Returns:
             ``[B, hidden]`` gated attention output after the batched ``o_proj``.
 
         Raises:
-            RuntimeError: The extension is unavailable or no pool is attached.
-                The batched path has no dense-cache fallback, so the caller must
-                either attach a pool before enabling batching or stay on
-                single-stream decode.
+            RuntimeError: No paged pool is attached. The batched path reads the
+                pool's slot maps, so the caller must attach a pool before enabling
+                batching or stay on single-stream decode. This is a configuration
+                error, not a missing-kernel one: every backend answers both
+                attention entries.
         """
         cos_tbl, sin_tbl, mask_idx = ctx[0], ctx[1], ctx[2]
         ctx_lens = ctx[3] if len(ctx) > 3 else None
         rope_delta = ctx[4] if len(ctx) > 4 else None
         B = x.shape[0]
-        if not hip_ops.available() or self.pool is None:
-            raise RuntimeError("batched attention needs hip_ops and a paged pool")
+        if self.pool is None:
+            raise RuntimeError("batched attention needs a paged pool (enable_paging())")
         qg, k, v = batch_proj(self.qkv, x)
         qg = qg.reshape(B, self.nh, 2 * self.hd)
         q, gate = qg[..., :self.hd], qg[..., self.hd:]
@@ -352,18 +354,17 @@ class FullAttn:
         q, k = apply_rope(q, k, cos, sin, self.rot)
 
         kp, vp, kps, vps = self._pool_views()
-        use_batch_kernel = ctx_lens is not None and hasattr(hip_ops, "attn_paged_batch")
-        if use_batch_kernel:
+        if ctx_lens is not None and _CAPS.batch_attn:
             # One launch for the whole bucket: quantise every row, write every
             # row's K/V through its own slot, then one paged-attention pass.
             qk, sk = self._quant_rows(k)
             qv, sv = self._quant_rows(v)
             slots = self.pool.pos2slot[:B].gather(1, positions.view(B, 1)).squeeze(1)
             self.pool.write_rows(self.pidx, slots, qk, sk, qv, sv)
-            hip_ops.attn_paged_batch(q, gate, kp, vp, kps, vps,
-                                     self.pool.pos2slot[:B], ctx_lens[:B],
-                                     self.attn_out[:B], self.max_seq, self.rep, self.scale,
-                                     self.part_acc[:B], self.part_ml[:B])
+            bops.attn_paged_batch(q, gate, kp, vp, kps, vps,
+                                  self.pool.pos2slot[:B], ctx_lens[:B],
+                                  self.attn_out[:B], self.max_seq, self.rep, self.scale,
+                                  self.part_acc[:B], self.part_ml[:B])
         else:
             for b in range(B):
                 qk, sk = self._quant(k[b])
@@ -371,10 +372,10 @@ class FullAttn:
                 pos_b = positions[b:b + 1]
                 self.pool.write_slot(self.pidx, self.pool.slots_for(pos_b, b),
                                      qk, sk, qv, sv)
-                hip_ops.attn_paged(q[b].contiguous(), gate[b].contiguous(), kp, vp, kps, vps,
-                                   self.pool.pos2slot[b], self.attn_out[b], pos_b,
-                                   self.max_seq, self.rep, self.scale,
-                                   self.part_acc[b], self.part_ml[b])
+                bops.attn_paged(q[b].contiguous(), gate[b].contiguous(), kp, vp, kps, vps,
+                                self.pool.pos2slot[b], self.attn_out[b], pos_b,
+                                self.max_seq, self.rep, self.scale,
+                                self.part_acc[b], self.part_ml[b])
         # Only the first ``B`` rows of the capacity-sized buffer were written; the
         # slice is what keeps the projection's K at nh*hd.
         return batch_proj(self.o_proj, self.attn_out[:B].reshape(B, -1))
@@ -424,11 +425,11 @@ class FullAttn:
         """
         self._mq_width = int(width)
         n = capacity * int(width)
-        self.mq_out = torch.zeros(n, self.nh, self.hd, dtype=D, device="cuda")
+        self.mq_out = torch.zeros(n, self.nh, self.hd, dtype=D, device=_device)
         self.mq_part_acc = torch.zeros(n, self.nh, ATTN_SPLIT, self.hd,
-                                       dtype=torch.float32, device="cuda")
+                                       dtype=torch.float32, device=_device)
         self.mq_part_ml = torch.zeros(n, self.nh, ATTN_SPLIT, 2,
-                                      dtype=torch.float32, device="cuda")
+                                      dtype=torch.float32, device=_device)
 
     def verify_batch_multi(self, qg: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                            positions: torch.Tensor, ctx, rows: int) -> torch.Tensor:
@@ -484,10 +485,10 @@ class FullAttn:
         out = self.mq_out[:n].view(b, c, self.nh, self.hd)
         from models.qwen35.batch import _count
         _count("multi_q")
-        hip_ops.attn_paged_multi_q(q.contiguous(), gate.contiguous(), kp, vp, kps, vps,
-                                   self.pool.pos2slot[:b], lens, out,
-                                   self.max_seq, self.rep, self.scale,
-                                   self.mq_part_acc[:n], self.mq_part_ml[:n])
+        bops.attn_paged_multi_q(q.contiguous(), gate.contiguous(), kp, vp, kps, vps,
+                                self.pool.pos2slot[:b], lens, out,
+                                self.max_seq, self.rep, self.scale,
+                                self.mq_part_acc[:n], self.mq_part_ml[:n])
         return out.reshape(n, self.nh * self.hd)
 
     def verify_batch_step(self, qg: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
@@ -535,10 +536,10 @@ class FullAttn:
         # ``attn_paged_batch`` takes a length, not a last index, so +1 turns the
         # token position into a count. In place, because this is a captured path.
         lens = positions.to(torch.int32).add_(1)
-        hip_ops.attn_paged_batch(q, gate, kp, vp, kps, vps,
-                                 self.pool.pos2slot[:b], lens,
-                                 self.attn_out[:b], self.max_seq, self.rep, self.scale,
-                                 self.part_acc[:b], self.part_ml[:b])
+        bops.attn_paged_batch(q, gate, kp, vp, kps, vps,
+                              self.pool.pos2slot[:b], lens,
+                              self.attn_out[:b], self.max_seq, self.rep, self.scale,
+                              self.part_acc[:b], self.part_ml[:b])
         return self.o_proj.prefill(self.attn_out[:b].reshape(b, -1))
 
     def prefill_attend(self, qg: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
@@ -639,7 +640,7 @@ class FullAttn:
         if tiles is None:
             tiles = [(0, C, p0, p1)]
         KB = PREFILL_ATTN_KB
-        out = torch.empty(C, self.nh, self.hd, dtype=D, device="cuda")
+        out = torch.empty(C, self.nh, self.hd, dtype=D, device=_device)
         for q0, q1, _p0, kend in tiles:
             nq = q1 - q0
             qe = q[q0:q1].reshape(nq, self.nkv, self.rep, self.hd).permute(1, 2, 0, 3)
@@ -754,7 +755,7 @@ class FullAttn:
         k = self.k_norm(k.reshape(C, self.nkv, self.hd))
         v = v.reshape(C, self.nkv, self.hd)
         rope_pos = positions if rope_delta is None else positions + rope_delta.reshape(())
-        out = torch.empty(C, self.nh, self.hd, dtype=D, device="cuda")
+        out = torch.empty(C, self.nh, self.hd, dtype=D, device=_device)
         kp, vp, kps, vps = self._pool_views() if self.pool is not None else (None,) * 4
         for i in range(C):
             qi, ki, vi = q[i], k[i], v[i]
@@ -768,19 +769,21 @@ class FullAttn:
                                      self.pool.slots_for(positions[i:i + 1],
                                                          self.prefill_row),
                                      qk, sk, qv, sv)
-                hip_ops.attn_paged(qi.contiguous(), gate[i].contiguous(), kp, vp, kps, vps,
-                                   self.pool.pos2slot[self.prefill_row], self.attn_out1,
-                                   positions[i:i + 1],
-                                   self.max_seq, self.rep, self.scale,
-                                   self.part_acc1, self.part_ml1)
+                bops.attn_paged(qi.contiguous(), gate[i].contiguous(), kp, vp, kps, vps,
+                                self.pool.pos2slot[self.prefill_row], self.attn_out1,
+                                positions[i:i + 1],
+                                self.max_seq, self.rep, self.scale,
+                                self.part_acc1, self.part_ml1)
             else:
                 self.kcache.index_copy_(1, positions[i:i + 1], qk.unsqueeze(1))
                 self.vcache.index_copy_(1, positions[i:i + 1], qv.unsqueeze(1))
                 self.kscale.index_copy_(1, positions[i:i + 1], sk.unsqueeze(1))
                 self.vscale.index_copy_(1, positions[i:i + 1], sv.unsqueeze(1))
-                hip_ops.attn(qi.contiguous(), gate[i].contiguous(), self.kcache, self.vcache,
-                             self.kscale, self.vscale, self.attn_out1, positions[i:i + 1],
-                             self.rep, self.scale, self.part_acc1, self.part_ml1)
+                bops.attn_decode(qi.contiguous(), gate[i].contiguous(),
+                                 self.kcache, self.vcache,
+                                 self.kscale, self.vscale, self.attn_out1,
+                                 positions[i:i + 1],
+                                 self.rep, self.scale, self.part_acc1, self.part_ml1)
             out[i] = self.attn_out1
         return self.o_proj.prefill(out.reshape(C, -1))
 

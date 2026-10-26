@@ -2,6 +2,16 @@
 
 Module: ``coffin.serving``. This module owns socket accept/read/write behavior;
 model lifecycle remains in ``runtime_service.Server``.
+
+Constraints:
+    * The startup banner is the only place a silent backend fallback would be
+      visible, so it prints ``backends.status()`` verbatim instead of assembling
+      its own field list: the fields (``backend=``, ``device=``, ``native=``,
+      ``graph=``, ``autotune=``) are the ones an operator diagnoses with, and a
+      hand-built banner drifts from the backend the moment one gains a flag.
+    * Nothing here may touch the device: a transport that allocates or
+      synchronises cannot bind its socket on a host with no accelerator, and the
+      reference backend is exactly the case that has to work there.
 """
 
 from __future__ import annotations
@@ -12,7 +22,7 @@ import socket
 import threading
 import time
 
-import hip_ops
+import backends
 
 from .runtime_service import Server
 from .runtime_support import MMError
@@ -23,9 +33,10 @@ def serve(model_dir: str, max_seq: int, bench: bool, sock_path: str,
           max_seconds: float = 0.0, max_num_seqs: int = 1,
           num_blocks: int = 0, spec_batch: bool = False,
           spec_sparse_k: int = 0, spec_min_ctx: int = 0,
-          fast_gemv: bool = False, vision: bool = True, vision_int8: bool = False,
+          vision: bool = True, vision_int8: bool = False,
           image_max_pixels: int = 1048576, image_min_pixels: int = 65536,
-          max_images: int = 4, max_image_bytes: int = 8388608) -> None:
+          max_images: int = 4, max_image_bytes: int = 8388608,
+          graph: bool = True) -> None:
     """Build the server, bind the unix socket and serve until asked to stop.
 
     The argument list mirrors ``Server.__init__``; see it for the meaning of each
@@ -49,27 +60,32 @@ def serve(model_dir: str, max_seq: int, bench: bool, sock_path: str,
         spec_batch: Speculate in the batched engine.
         spec_sparse_k: Approximate batched verify, top-k historical blocks.
         spec_min_ctx: Skip batched speculation below this cached length.
-        fast_gemv: Use the packed-fp16 projection kernels.
         vision: Load the checkpoint's vision tower when it has one.
         vision_int8: Keep the tower's 2D weights int8.
         image_max_pixels: Largest image the processor serves.
         image_min_pixels: Smallest image after the processor's upscale.
         max_images: Images accepted in one request.
         max_image_bytes: Decoded bytes allowed per image.
+        graph: Capture the decode step into a device graph. ``False`` runs the
+            eager step instead; it is the escape hatch for a backend whose graph
+            replay is not trusted yet, and it must reach the engine before the
+            graph is captured, which is why it travels as a constructor argument
+            rather than an environment variable.
     """
     srv_model = Server(model_dir, max_seq, bench, spec_k, int8, prefix_cache, block_size,
                        snapshots, snapshot_interval, max_seconds, max_num_seqs,
-                       num_blocks, spec_batch, spec_sparse_k, spec_min_ctx, fast_gemv,
+                       num_blocks, spec_batch, spec_sparse_k, spec_min_ctx,
                        vision, vision_int8, image_max_pixels, image_min_pixels,
-                       max_images, max_image_bytes)
+                       max_images, max_image_bytes, graph=graph)
     info = srv_model.info
     print(f"[serve] model {info['model']} ({info['arch']}) at {info['model_path']}",
           flush=True)
     prefix_on = (srv_model.pc is not None
                  or (srv_model.engine.bm is not None
                      and srv_model.engine.bm.radix is not None))
+    print(f"[serve] {backends.status()}", flush=True)
     print(f"[serve] weights {srv_model.load_s:.1f}s + build {srv_model.build_s:.1f}s  "
-          f"eos={sorted(srv_model.eos)}  hip={hip_ops.available()}  "
+          f"eos={sorted(srv_model.eos)}  "
           f"int8={int8}  max_seq={max_seq}  "
           f"prefix_cache={'paged' if prefix_on else 'off'}"
           f"{' (bs=%d, snapshots=%d)' % (block_size, snapshots) if prefix_on else ''}"

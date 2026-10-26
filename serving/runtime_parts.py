@@ -6,16 +6,20 @@ on the state created by ``runtime_service.Server``.
 Constraints:
     * Mixins do not own process state; ``Server.__init__`` remains the single
       place that provisions model, tokenizer and request queues.
-    * The methods are kept body-equivalent to the original service so protocol
-      behavior and engine contracts do not change during the structural split.
+    * No platform fact is spelled here. The device, the VRAM readout, the timing
+      barrier and "are there kernels" all come from ``backends``; the readout
+      helpers live in ``runtime_support`` because they have to degrade to a no-op
+      on a host with no accelerator, where ``COFFIN_BACKEND=reference`` still has
+      to bring the banner and the diagnostics up.
+    * Image preprocessing is the only path here that needs the checkpoint's
+      processor, and it is reached only from a request carrying ``images``: a
+      text-only deployment must never import the vision stack.
 """
 
 from __future__ import annotations
 
 import gc
-import importlib
 import json
-import os
 import queue
 import threading
 import time
@@ -23,18 +27,51 @@ from pathlib import Path
 
 import torch
 
+import backends
 import engine_api
-import hip_ops
 from engine import llm_engine
 from engine.config import EngineConfig
 from engine.sequence import SamplingParams
 from utils.tool_call import parse_tool_calls, split_thinking
 
-from .runtime_support import MMError, _decode_image
+from .runtime_support import (MMError, _decode_image, allocated_gib, empty_cache,
+                              profiler_activities, reserved_gib, sync)
 
 
 
 class RuntimeLifecycleMixin:
+    """Bring-up, teardown and reload: the model, the engine and the tower.
+
+    Owns the three transitions of a server's life -- first build, full rebuild
+    after ``reload``, and the engine loop that drives one step at a time -- and
+    nothing about a request's contents. Kept out of ``Server.__init__`` because a
+    reload re-runs exactly the build step, and the two must not diverge.
+
+    Constraints:
+        * ``_build`` is the only place that constructs a model or an engine, so a
+          reload cannot skip a step the first start performed.
+        * Teardown precedes rebuild: the pool and the captured graphs together
+          exceed the card, so holding the old model while building the new one
+          runs out of memory rather than merely being untidy.
+    """
+
+    def _load_weight_kwargs(self) -> dict:
+        """How to load this server's weights: text quant plus the vision policy.
+
+        The tower rides the same resident dict as the text weights (that is what
+        lets ``reload`` rebuild from VRAM), but it has its own memory policy: fp16
+        by default, int8 with ``--vision-int8``, and not loaded at all with
+        ``--no-vision``. Only forwarded when the checkpoint declares a vision
+        config, so a text-only checkpoint keeps the plain call.
+
+        Returns:
+            Extra keyword arguments for ``engine_api.load_weights``; empty for a
+            checkpoint with no ``vision_config``.
+        """
+        raw = json.loads((Path(self.model_dir) / "config.json").read_text())
+        if not raw.get("vision_config"):
+            return {}
+        return {"vision": self.vision, "vision_quant": self.vision_int8}
 
     def _build(self) -> None:
         """Create the model and the engine, then bring up the vision tower.
@@ -77,7 +114,7 @@ class RuntimeLifecycleMixin:
         self.build_s = time.time() - t0
 
     def _reload(self) -> None:
-        """Re-import the engine (and the kernel extension) and rebuild from VRAM.
+        """Rebuild the model, the engine and the backend op table from VRAM.
 
         The old model (buffers plus its captured graph pool) is torn down first,
         otherwise the two models do not both fit in 16 GB. The graph is nulled
@@ -89,8 +126,8 @@ class RuntimeLifecycleMixin:
         import gc
 
         def _mem(tag: str) -> None:
-            print(f"[reload] {tag}: alloc={torch.cuda.memory_allocated() / 2**30:.2f} "
-                  f"reserved={torch.cuda.memory_reserved() / 2**30:.2f} GiB", flush=True)
+            print(f"[reload] {tag}: alloc={allocated_gib():.2f} "
+                  f"reserved={reserved_gib():.2f} GiB", flush=True)
 
         _mem("before")
         old = self.model
@@ -100,11 +137,14 @@ class RuntimeLifecycleMixin:
             old.close()          # nulls the graphs (they pin their pools) + layers
         del old
         gc.collect()
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
+        sync()
+        empty_cache()
         _mem("after teardown")
 
-        importlib.reload(hip_ops)
+        # Only the backend layer is re-resolved, not reloaded per module: a kernel
+        # build is memoised on the backend module, so re-importing the op table
+        # would leave the engine calling closures over the torn-down context.
+        backends.reload()
 
         # Every engine module, dependencies first: reloading in the other order
         # would leave old classes bound to the new tensors.
@@ -195,6 +235,22 @@ class RuntimeLifecycleMixin:
 
 
 class RuntimeGenerationMixin:
+    """Text generation: submit a request, collect its tokens, clamp the budget.
+
+    Everything here talks to the engine's request queue, so a request is served by
+    the same batched step loop as every other; the one exception is
+    ``_spec_generate``, which drives the model directly because the speculative
+    loop needs the logits of a whole verify window.
+
+    Constraints:
+        * The output budget is clamped against the context window before a request
+          is submitted: the decode step writes KV at ``pos`` with no bounds check,
+          and the rope tables are sized to ``max_seq``, so an unclamped budget runs
+          off the end of both.
+        * ``_spec_generate`` requires the verify graph to be captured for
+          ``k + 1`` tokens, and only supports greedy: the accept test compares the
+          main model's argmax against the draft.
+    """
 
     def _submit(self, ids: list[int], params: SamplingParams, mm=None):
         """Queue one request and return its sequence plus the token queue.
@@ -412,6 +468,195 @@ class RuntimeGenerationMixin:
 
 
 class RuntimeChatMixin:
+    """Chat rendering, image preprocessing and the op dispatcher.
+
+    Turns an OpenAI-shaped request into token ids the engine can run, and turns the
+    engine's token stream back into a reply or an SSE sequence. Also owns the
+    diagnostic ops, which is why they are refused here rather than in the transport:
+    they touch the model directly and so must take the same lock as a decode step.
+
+    Constraints:
+        * One rendering rule for text and images: the template renders the prompt
+          either way and the image path only hands that same text to the processor
+          afterwards, so adding vision cannot change how a text prompt renders.
+        * The image path runs entirely before the prompt is prefilled, so every
+          rejection is a clean status instead of a half-generated answer.
+    """
+
+    def _vision_ready(self) -> bool:
+        """Whether this server can serve an image request at all.
+
+        Read from the checkpoint config rather than from ``self.vision``, because
+        the tower is only built lazily on the first image request: the flag alone
+        would answer "yes" for a text-only checkpoint and turn a clear 503 into a
+        failure halfway through the prefill.
+
+        Returns:
+            ``True`` when ``--no-vision`` was not passed and the checkpoint
+            declares a ``vision_config``.
+        """
+        if not self.vision:
+            return False
+        raw = json.loads((Path(self.model_dir) / "config.json").read_text())
+        return bool(raw.get("vision_config"))
+
+    def _ensure_processor(self):
+        """Load the checkpoint's image processor on first use.
+
+        Lazy rather than eager because it is the only transformers piece with a
+        heavy import cost besides the tokenizer, and a text-only deployment never
+        touches it. The ~2 s lands on the first image request, where it is one
+        more second against a prefill that is already hundreds of ms, instead of
+        on every cold start.
+
+        Returns:
+            The loaded ``AutoProcessor``.
+
+        Raises:
+            MMError: The processor cannot be loaded (503). A broken checkpoint
+                must not retry on every request, so the failure is remembered and
+                reported instead of being re-attempted.
+        """
+        if self.processor is not None:
+            return self.processor
+        if self._processor_failed is not None:
+            raise MMError(f"the image processor is unavailable on this server: "
+                          f"{self._processor_failed}", 503)
+        try:
+            from transformers import AutoProcessor
+
+            self.processor = AutoProcessor.from_pretrained(self.model_dir)
+        except Exception as exc:  # noqa: BLE001 - reported as a 503, not a crash
+            self._processor_failed = f"{type(exc).__name__}: {exc}"
+            raise MMError(f"could not load the image processor: "
+                          f"{self._processor_failed}", 503) from None
+        print(f"[serve] image processor ready: {type(self.processor).__name__} "
+              f"({type(self.processor.image_processor).__name__})", flush=True)
+        return self.processor
+
+    def _prepare_mm(self, images: list[dict], text: str):
+        """An image request's parts -> ``MMInput`` for the engine.
+
+        Runs the whole image path *before* the prompt is prefilled, so every
+        rejection is a clean 400 instead of a half-generated answer:
+
+        1. PIL decode + orientation + RGB conversion per image (``_decode_image``);
+        2. the checkpoint's processor over ``text`` (the rendered prompt, whose
+           ``{"type": "image"}`` markers already became
+           ``<|vision_start|><|image_pad|><|vision_end|>``) -- it downsamples each
+           image into ``[image_min_pixels, image_max_pixels]``, patchifies it and
+           expands the ``<|image_pad|>`` runs to one token per merged patch;
+        3. a self-check that the expanded count is exactly ``Σ grid.prod() / 4``,
+           which is what turns a processor-version drift into a 400 rather than an
+           index mismatch deep inside the model;
+        4. the vision tower -> embeddings, and ``mm_input`` -> 3-D positions.
+
+        Args:
+            images: The request's ``images`` array, one ``{"b64", "mime"}`` dict
+                per image, in prompt order.
+            text: The rendered prompt, i.e. the chat template's output before the
+                processor expands the image placeholders.
+
+        Returns:
+            ``(token_ids, mm)``. ``token_ids`` are the processor's own ids: for an
+            image prompt the tokenizer and the processor agree, but taking them
+            from the processor is what guarantees the placeholders and
+            ``pixel_values`` line up (the count is asserted, so a disagreement
+            cannot pass silently).
+
+        Raises:
+            MMError: The server has no vision tower (503), ``images`` is empty or
+                not a list, the request carries more than ``--max-images``, an
+                image fails to decode, the processor fails, or the placeholder
+                runs disagree with the grids. Every one of those is a client
+                error with a status the transport can forward.
+        """
+        from utils.mm_input import (IMAGE_TOKEN_ID, MMInput, find_image_spans,
+                                    image_digest, mrope_positions)
+
+        proc = self._ensure_processor()
+        if not self._vision_ready():
+            raise MMError("this server cannot serve images (no vision tower was "
+                          "loaded; see --no-vision)", 503)
+        if not isinstance(images, list) or not images:
+            raise MMError("`images` must be a non-empty array")
+        if len(images) > self.max_images:
+            raise MMError(f"too many images: {len(images)} > --max-images "
+                          f"{self.max_images}")
+
+        pil: list = []
+        chunks: list[bytes] = []
+        for i, item in enumerate(images):
+            if not isinstance(item, dict) or "b64" not in item:
+                raise MMError(f"image {i}: expected {{'b64': ..., 'mime': ...}}")
+            img, raw = _decode_image(str(item["b64"]), str(item.get("mime") or ""),
+                                     self.max_image_bytes)
+            pil.append(img)
+            chunks.append(raw)
+
+        t0 = time.time()
+        try:
+            out = proc(text=[text], images=pil, return_tensors="pt",
+                       size={"shortest_edge": self.image_min_pixels,
+                             "longest_edge": self.image_max_pixels})
+        except MMError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a bad image must not 500 the server
+            raise MMError(f"image preprocessing failed: {type(exc).__name__}: {exc}") from None
+        prep_ms = (time.time() - t0) * 1000
+
+        ids = out["input_ids"][0].tolist()
+        grid = out["image_grid_thw"].long()
+        pixel_values = out["pixel_values"]
+        # One merged visual patch == one prompt token, per image.
+        want = int((grid.prod(-1) // 4).sum())
+
+        # Three cheap checks that together pin the whole alignment, so a processor
+        # or template drift fails here instead of surfacing as an embedding/KV
+        # index mismatch inside the model:
+        #
+        # 1. the processor's tokenizer must agree with the one this server renders
+        #    prompts with -- if they were different tokenizers every id would be
+        #    off and the model would answer something unrelated;
+        # 2. the prompt's expansion must be *exactly* "each image marker becomes
+        #    grid.prod()/4 tokens"; the unexpanded rendering has one
+        #    ``<|image_pad|>`` per image, so
+        #    ``len(ids) == len(unexpanded) - n_images + Σ grid.prod()/4`` is the
+        #    processor's own contract;
+        # 3. the resulting placeholder runs are what the model overwrites, and
+        #    their count and order must match the grids the tower encodes.
+        plain_ids = self.tok.encode(text)
+        n_plain_pads = sum(1 for t in plain_ids if t == IMAGE_TOKEN_ID)
+        if n_plain_pads != len(images):
+            raise MMError(
+                f"the rendered prompt has {n_plain_pads} image placeholders but the "
+                f"request carries {len(images)} images; the template and the image "
+                f"parts disagree")
+        if len(ids) != len(plain_ids) - len(images) + want:
+            raise MMError(
+                f"image expansion does not match the processor's grid: {len(ids)} "
+                f"prompt tokens vs {len(plain_ids)} unexpanded - {len(images)} "
+                f"placeholders + {want} image tokens")
+        spans = find_image_spans(ids)
+        got = sum(e - s for s, e in spans)
+        if len(spans) != len(images) or got != want:
+            raise MMError(
+                f"image placeholder mismatch: the prompt has {len(spans)} image runs "
+                f"covering {got} tokens, the processor produced {len(images)} images "
+                f"needing {want} tokens (image_pad count must equal "
+                f"sum(grid.prod()/4))")
+
+        embeds = self.model.image_embeds(pixel_values, grid)
+        positions, rope_delta = mrope_positions(spans, grid, len(ids),
+                                               device=backends.device)
+        mm = MMInput(embeds=embeds, grid_thw=grid, positions=positions,
+                     rope_delta=int(rope_delta),
+                     digest=image_digest(chunks), spans=spans)
+        self.n_image_req += 1
+        print(f"[serve] mm: {len(images)} img grid={grid.tolist()} "
+              f"img_tokens={want} n_prompt={len(ids)} rope_delta={rope_delta} "
+              f"prep={prep_ms:.0f}ms ", flush=True)
+        return ids, mm
 
     def _render_with_text(self, messages: list[dict], tools, enable_thinking: bool,
                           forced_prefix: str = "") -> tuple[list[int], str]:
@@ -665,6 +910,23 @@ class RuntimeChatMixin:
                 self._paused = False
                 self._cv.notify_all()
 
+    def _decode_one(self, logits: torch.Tensor) -> torch.Tensor:
+        """Feed the argmax of ``logits`` back through one decode step.
+
+        Wraps the graph/eager choice the diagnostics need too: with capture off
+        the model has no graph to replay, so ``decode_step`` would raise. The two
+        entry points produce the same numbers, so a benchmark measures the launch
+        mechanism it actually has rather than failing on a missing graph.
+
+        Args:
+            logits: ``[vocab]`` logits from the prefill or the previous step.
+
+        Returns:
+            The next position's logits, in the same buffer either way.
+        """
+        token = int(logits.argmax())
+        return self.model.decode_step(token) if self.graph else self.model.logits(token)
+
     def _handle_impl(self, req: dict) -> dict:
         """Dispatch one op and build its reply.
 
@@ -681,12 +943,22 @@ class RuntimeChatMixin:
         op = req.get("op", "ping")
         self.n_req += 1
         if op == "ping":
+            caps = backends.caps()
             out = {"ok": True, **self.info,
-                   "graph": self.model.graph_ready, "max_seq": self.max_seq,
+                   # The effective decision, not just the model's readiness: with
+                   # capture disabled there is no graph, and reporting
+                   # ``graph_ready`` alone would read as a failed capture.
+                   "graph": self.graph and self.model.graph_ready,
+                   "max_seq": self.max_seq,
                    "load_s": round(self.load_s, 1), "build_s": round(self.build_s, 1),
                    "n_req": self.n_req, "n_reload": self.n_reload,
-                   "hip": hip_ops.available(), "int8": self.int8,
-                   "vram_gib": round(torch.cuda.memory_allocated() / 2**30, 2),
+                   # The backend banner, verbatim: ``ping`` is what the HTTP shell
+                   # merges into ``/health``, so the fields an operator needs to
+                   # tell "wrong platform" from "slow platform" travel with it.
+                   "backend": caps.name, "device": str(backends.device),
+                   "native_ops": len(caps.native), "total_ops": len(backends.Ops.NAMES),
+                   "int8": self.int8,
+                   "vram_gib": round(allocated_gib(), 2),
                    "batch": bool(self.engine is not None and self.engine.batching),
                    "decode_capacity": int(getattr(self.model, "decode_capacity", 1)),
                    # what image requests this server accepts; the OpenAI shell reads
@@ -713,7 +985,8 @@ class RuntimeChatMixin:
         if op == "reload":
             self._reload()
             return {"ok": True, "build_s": round(self.build_s, 1), "n_reload": self.n_reload,
-                    "hip": hip_ops.available(), "hip_err": hip_ops.last_error()}
+                    "backend": backends.caps().name,
+                    "reason": backends.backend().reason()}
         if op == "reset":
             self.engine.reset()
             return {"ok": True}
@@ -795,12 +1068,12 @@ class RuntimeChatMixin:
             self.model.reset()
             logits = self.model.prefill(ids)
             for _ in range(3):  # untimed: the first replay pays graph cache warming
-                logits = self.model.decode_step(int(logits.argmax()))
-            torch.cuda.synchronize()
+                logits = self._decode_one(logits)
+            sync()
             t0 = time.time()
             for _ in range(n):
-                logits = self.model.decode_step(int(logits.argmax()))
-            torch.cuda.synchronize()
+                logits = self._decode_one(logits)
+            sync()
             dt = time.time() - t0
             return {"ok": True, "n": n, "ms_per_step": round(dt / n * 1000, 2),
                     "decode_tok_s": round(n / dt, 2)}
@@ -810,13 +1083,13 @@ class RuntimeChatMixin:
             self.model.reset()
             logits = self.model.prefill(ids)
             for _ in range(3):
-                logits = self.model.decode_step(int(logits.argmax()))
-            torch.cuda.synchronize()
+                logits = self._decode_one(logits)
+            sync()
             with torch.profiler.profile(
-                    activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+                    activities=profiler_activities(device=True)) as prof:
                 for _ in range(n):
-                    logits = self.model.decode_step(int(logits.argmax()))
-                torch.cuda.synchronize()
+                    logits = self._decode_one(logits)
+                sync()
             ka = prof.key_averages()
             total = sum(r.self_device_time_total for r in ka)
             rows = sorted(ka, key=lambda r: r.self_device_time_total, reverse=True)[:18]
@@ -833,11 +1106,10 @@ class RuntimeChatMixin:
             self.model.reset()
             tok = int(self.model.prefill(ids).argmax())
             with torch.inference_mode(), torch.profiler.profile(
-                    activities=[torch.profiler.ProfilerActivity.CPU,
-                                torch.profiler.ProfilerActivity.CUDA]) as prof:
+                    activities=profiler_activities(device=True)) as prof:
                 for _ in range(n):
                     self.model.logits(tok)
-                torch.cuda.synchronize()
+                sync()
             ka = prof.key_averages()
             total = sum(r.self_device_time_total for r in ka)
             rows = sorted(ka, key=lambda r: r.self_device_time_total, reverse=True)[:25]

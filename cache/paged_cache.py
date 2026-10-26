@@ -23,6 +23,11 @@ covers positions ``[b*bs, (b+1)*bs)`` and occupies slots ``[b*bs, (b+1)*bs)``,
 so ``slot = block*bs + (pos % bs)``.
 
 Constraints:
+    * The int8 layout is a contract with the attention kernels, not a storage
+      detail: ``k``/``v`` are ``[n_layers, num_slots, nkv, hd]`` int8 and
+      ``kscale``/``vscale`` are ``[n_layers, num_slots, nkv]`` fp32, addressed by
+      pool slot. Changing either dtype, the scale's rank, or the axis order
+      breaks the kernel's dequantisation, so a backend change must not touch it.
     * ``pos2slot`` stays in device memory because the decode step is
       graph-captured: attention resolves positions by indexing this tensor,
       where arguments baked in at capture time would need one graph per
@@ -35,13 +40,16 @@ Constraints:
       a captured kernel bakes in, so rows are fixed once ``capture()`` has run.
     * No locking. ``llm_engine``'s step loop is the only writer, and a block id
       is valid only while a refcount holds it.
+    * The default device comes from ``backends.device``, never from a literal:
+      the pool is the largest single allocation in the process, so a wrong
+      default puts it on a device the model never reads.
 """
 
 from __future__ import annotations
 
 import torch
 
-D = torch.bfloat16
+import backends
 
 
 class OutOfBlocks(RuntimeError):
@@ -66,7 +74,7 @@ class PagedKVCache:
 
     def __init__(self, n_layers: int, nkv: int, hd: int, num_blocks: int = 512,
                  block_size: int = 64, max_seq: int = 4096,
-                 device: str = "cuda", rows: int = 1) -> None:
+                 device: "torch.device | str | None" = None, rows: int = 1) -> None:
         """Provision the whole pool up front, as a VRAM commitment.
 
         Args:
@@ -80,10 +88,14 @@ class PagedKVCache:
             block_size: Tokens per block; also the radix match granularity.
             max_seq: Longest position the slot map can address. A sequence
                 longer than this cannot be represented even if blocks are free.
-            device: Where the int8 pool and the slot map live.
+            device: Where the int8 pool and the slot map live. ``None`` takes
+                ``backends.device``, i.e. the selected backend's device; tests
+                pass ``"cpu"`` explicitly so the pool needs no accelerator.
             rows: Slot-map rows. ``1`` for single-stream; batched decode passes
                 the batch capacity, and row ``capacity-1`` is the prefill row.
         """
+        if device is None:
+            device = backends.device
         self.n_layers = n_layers
         self.nkv = nkv
         self.hd = hd

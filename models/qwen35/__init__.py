@@ -13,9 +13,11 @@ its own siblings (``blocks``, ``batch``, ``linear_attn``, ``full_attn``, ``mtp``
 Constraints:
     * Absolute imports only (``from models.qwen35.model import Qwen35``): the
       entry points put ``coffin/`` on ``sys.path``, so ``models`` is a top-level
-      package next to ``ops`` and ``hip_ops``.
+      package next to ``ops`` and ``backends``.
     * Nothing in the family may import ``engine_api`` or anything above it --
       that module is the one place allowed to know which families exist.
+    * No hardware detail: the device, the dtypes and the split-K width all come
+      from ``backends``, so a new accelerator changes nothing in this package.
 """
 
 from models.qwen35.model import Qwen35

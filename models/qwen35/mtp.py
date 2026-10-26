@@ -19,6 +19,10 @@ Constraints:
     * Graphs bake in buffer addresses and the pool tensors. ``capture_draft`` /
       ``capture_draft_batch`` must run after every allocation, and the buffers
       they write may never be reallocated while the graph is live.
+    * Capture goes through ``ops.runtime``, so a backend that cannot capture (its
+      operator table mixes library and hand-written kernels) runs the same body
+      eagerly instead. The chained argmax still stays on the device either way,
+      which is what keeps the no-host-round-trip constraint true on both paths.
     * The drafter KV is rewritten at the main model's draft positions and rolled
       back by the main verify, so it only needs the same window; a prompt past
       ``batch_len`` is truncated and reported through ``check_len`` rather than
@@ -34,10 +38,12 @@ from __future__ import annotations
 
 import torch
 
+from backends import device as _device
 from models.qwen35.batch import batch_proj
 from models.qwen35.blocks import MLP
 from models.qwen35.full_attn import FullAttn
 from models.qwen35.tuning import PREFILL_ATTN_TILE, PREFILL_MTP_CHUNK
+from ops import runtime
 from ops.dtypes import D
 from ops.embed import TiedEmbedding
 from ops.gemv import _proj
@@ -76,24 +82,24 @@ class MTP:
         self.post_ln = RMSNorm(sd[f"{p}.layers.0.post_attention_layernorm.weight"])
         self.mlp = MLP(sd, f"{p}.layers.0.mlp", bench)
         self.norm = RMSNorm(sd[f"{p}.norm.weight"])
-        self.pos = torch.zeros(1, dtype=torch.long, device="cuda")
+        self.pos = torch.zeros(1, dtype=torch.long, device=_device)
         #: mRoPE offset of the request being drafted, matching ``Qwen35.rope_delta``:
         #: the drafter's rotation reads ``pos + rope_delta`` while ``pos`` keeps
         #: addressing the KV slot.  The caller (``Qwen35.spec_step`` /
         #: ``spec_step_batch``) copies the row's value in before a draft, because
         #: the captured draft graph can only add a buffer, not branch on one.
-        self.rope_delta = torch.zeros(1, dtype=torch.long, device="cuda")
+        self.rope_delta = torch.zeros(1, dtype=torch.long, device=_device)
 
         # Drafting runs as a captured graph. The chain (h, token) -> (h', token')
         # lives entirely in these device buffers, so K drafts are K replays with
         # no host round trip and no per-op launch overhead; the chained argmax is
         # resolved on the device between replays.
         hidden = cfg["hidden_size"]
-        self.tok_in = torch.zeros(1, dtype=torch.long, device="cuda")
-        self.h_in = torch.zeros(hidden, dtype=D, device="cuda")
-        self.logits_out = torch.zeros(self.embed.shape[0], dtype=D, device="cuda")
+        self.tok_in = torch.zeros(1, dtype=torch.long, device=_device)
+        self.h_in = torch.zeros(hidden, dtype=D, device=_device)
+        self.logits_out = torch.zeros(self.embed.shape[0], dtype=D, device=_device)
         self._ctx = None
-        self._graph = None
+        self._graph: runtime.Capture | None = None
 
         # Batched drafter (one row per sequence).  Kept entirely separate from the
         # single-stream buffers above so the speculative path stays untouched.
@@ -111,7 +117,7 @@ class MTP:
         self.b_pos = self.b_tok = self.b_h = self.b_logits = None
         self.b_h_prev = None
         self._ctx_lens = None
-        self._draft_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self._draft_graphs: dict[int, runtime.Capture] = {}
 
     def reset(self) -> None:
         """Rewind the single-stream drafter to position 0.
@@ -160,17 +166,8 @@ class MTP:
             so the first replay starts at 0.
         """
         self._ctx = ctx
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
-            for _ in range(warmup):
-                self._draft_impl()
-        torch.cuda.current_stream().wait_stream(s)
         self.reset()
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
-            self._draft_impl()
-        self._graph = g
+        self._graph = runtime.capture(self._draft_impl, warmup)
         self.reset()
 
     def draft(self, h_prev: torch.Tensor, tok0: torch.Tensor, K: int,
@@ -271,7 +268,7 @@ class MTP:
                 rope = ctx[3]
             ctx = ctx[:3]
         e = self.embed.lookup(next_toks[:n])
-        # ``fc`` must go through the batched path: the fused GEMV takes a single
+        # ``fc`` must go through the batched path: the fused entry takes a single
         # [K] vector, so calling it with [n, 2*hidden] silently reads row 0 only.
         x = self.fc.prefill(torch.cat([self.pre_norm_emb(e), self.pre_norm_hid(H[:n])],
                                       dim=-1))
@@ -352,16 +349,16 @@ class MTP:
                                self._bench, self.batch_len, paged=True)
         self.attn_b.attach_pool(self.pool, 0)
         self.attn_b.enable_batching(capacity, 0)
-        self.b_pos = torch.zeros(capacity, dtype=torch.long, device="cuda")
-        self.b_tok = torch.zeros(capacity, dtype=torch.long, device="cuda")
-        self.b_h = torch.zeros(capacity, hidden, dtype=D, device="cuda")
-        self.b_h_prev = torch.zeros(capacity, hidden, dtype=D, device="cuda")
-        self.b_logits = torch.zeros(capacity, self.embed.shape[0], dtype=D, device="cuda")
-        self._ctx_lens = torch.ones(capacity, dtype=torch.int32, device="cuda")
+        self.b_pos = torch.zeros(capacity, dtype=torch.long, device=_device)
+        self.b_tok = torch.zeros(capacity, dtype=torch.long, device=_device)
+        self.b_h = torch.zeros(capacity, hidden, dtype=D, device=_device)
+        self.b_h_prev = torch.zeros(capacity, hidden, dtype=D, device=_device)
+        self.b_logits = torch.zeros(capacity, self.embed.shape[0], dtype=D, device=_device)
+        self._ctx_lens = torch.ones(capacity, dtype=torch.int32, device=_device)
         #: Per-row mRoPE offset of the batched drafter, mirrored from the main
         #: model's ``rope_delta`` by the caller (``Qwen35.spec_step_batch``); 0 for
         #: a text-only bucket, so the default bucket is unchanged.
-        self.b_rope_delta = torch.zeros(capacity, dtype=torch.long, device="cuda")
+        self.b_rope_delta = torch.zeros(capacity, dtype=torch.long, device=_device)
         self.capture_draft_batch()
 
     def check_len(self, max_position: int) -> None:
@@ -392,7 +389,7 @@ class MTP:
             bucket graph.
         """
         cos_tbl, sin_tbl, mask_idx = self._ctx[0], self._ctx[1], self._ctx[2]
-        # +1 in place: the kernel takes a length, not a last index, and this runs
+        # +1 in place: the entry takes a length, not a last index, and this runs
         # inside the captured graph, so it cannot allocate.
         self._ctx_lens[:rows].copy_(
             self.b_pos[:rows].to(torch.int32).add_(1))
@@ -423,17 +420,8 @@ class MTP:
         self._draft_graphs = {}
         for b in self.batch_buckets:
             impl = lambda b=b: self._draft_batch_impl(b)
-            s = torch.cuda.Stream()
-            s.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(s):
-                for _ in range(2):
-                    impl()
-            torch.cuda.current_stream().wait_stream(s)
             self.b_pos.zero_()
-            g = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g):
-                impl()
-            self._draft_graphs[b] = g
+            self._draft_graphs[b] = runtime.capture(impl, warmup=2)
         self.b_pos.zero_()
 
     def draft_batch(self, bucket: int, K: int, out_toks: torch.Tensor) -> None:

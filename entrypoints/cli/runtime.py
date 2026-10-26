@@ -1,17 +1,28 @@
 """Command-line client for the resident inference runtime.
 
-Module: ``coffin.serving``. CLI parsing is isolated from model construction so
-importing the runtime does not also define a large command parser.
+Module: ``coffin.entrypoints.cli``. CLI parsing is isolated from model
+construction so importing the runtime does not also define a large command
+parser.
+
+Constraints:
+    * This is the only place that parses runtime flags, so it is also the only
+      place ``--backend`` can take effect: the backend is selected at import of
+      ``coffin.backends``, so the flag has to be written into
+      ``COFFIN_BACKEND`` *before* the serving modules that bind the op table are
+      imported. That is why the imports below the flag parsing are deferred.
+    * ``--no-graph`` cannot be an environment variable: the decision has to
+      reach ``EngineConfig`` before the engine captures, and a backend that
+      cannot capture must win over the flag.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 from serving.runtime_support import MAX_SEQ, MODEL, SOCK
-from serving.runtime_transport import call, serve
 
 def main() -> None:
     """CLI entry point: serve in this process, or act as a client of one.
@@ -25,6 +36,16 @@ def main() -> None:
     ap.add_argument("cmd", nargs="?", default="ping",
                     choices=["ping", "reload", "reset", "stop", "generate", "chat",
                              "bench", "profile", "ops", "spec"])
+    ap.add_argument("--backend", default="",
+                    help="device backend to run on (default: auto-detect, then the "
+                         "pure-torch reference). Sets COFFIN_BACKEND; the backend is "
+                         "selected once at import, so this flag only takes effect "
+                         "with --serve in the same process")
+    ap.add_argument("--no-graph", dest="graph", action="store_false",
+                    help="run the decode step eagerly instead of replaying a captured "
+                         "device graph. Slower per token, and the only safe choice on "
+                         "a backend whose graph replay is not trusted; a backend "
+                         "declaring no graph support is eager regardless")
     ap.add_argument("--model", default=MODEL,
                     help="checkpoint directory; the architecture is read from its "
                          "config.json (default: $ENGINE_MODEL or the Qwen3.5-4B path)")
@@ -65,10 +86,6 @@ def main() -> None:
                     help="only speculate in the batched engine once a sequence has "
                          "this many cached tokens (0 = always); below it a plain "
                          "batched decode step is cheaper")
-    ap.add_argument("--fast-gemv", action="store_true",
-                    help="use the packed-fp16 (v_dot2) projection kernels in the "
-                         "batched decode: ~1.18x the projection segment on this card, "
-                         "but 1-2 ulp off the single-stream result (not bit-identical)")
     ap.add_argument("--spec-sparse-k", type=int, default=0,
                     help="approximate batched verify: keep only the top-k historical "
                          "KV blocks per row (drafter lookahead + last attention) plus "
@@ -111,14 +128,20 @@ def main() -> None:
     ap.add_argument("--temperature", type=float, default=0.0)
     args = ap.parse_args()
 
+    # Written before anything binds the op table: ``coffin.backends`` selects its
+    # backend at import, so a later assignment would change nothing.
+    if args.backend:
+        os.environ["COFFIN_BACKEND"] = args.backend
+    from serving.runtime_transport import call, serve
+
     if args.serve:
         serve(args.model, args.max_seq, not args.no_bench, args.sock, args.spec_k,
               args.int8, args.prefix_cache, args.block_size, args.snapshots,
               args.snapshot_interval, args.max_seconds, args.max_num_seqs,
               args.num_blocks, args.spec_batch, args.spec_sparse_k,
-              args.spec_min_ctx, args.fast_gemv, args.vision, args.vision_int8,
+              args.spec_min_ctx, args.vision, args.vision_int8,
               args.image_max_pixels, args.image_min_pixels, args.max_images,
-              args.max_image_bytes)
+              args.max_image_bytes, graph=args.graph)
         return
 
     if args.cmd in ("ping", "reload", "reset", "stop"):

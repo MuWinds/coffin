@@ -65,6 +65,12 @@ class ModelRunner:
         self.bm: "BlockManager | None" = None
         self.batching = False
         self.buckets: tuple[int, ...] = ()
+        #: Whether the decode step may replay a captured graph. ``False`` routes
+        #: every token through the model's eager forward instead: the numbers are
+        #: the same, but nothing is recorded, which is the only safe path on a
+        #: backend whose capture is untrusted (a graph replaying stale outputs is a
+        #: silent wrong answer). Set from ``EngineConfig.graph`` by the engine.
+        self.graph = cfg.graph
         #: Batch-friendly speculative decoding (MTP), off unless the engine asks.
         self.spec = False
         self.spec_k = 0
@@ -385,7 +391,7 @@ class ModelRunner:
             self.pc.seq.reserve(1)
 
     def decode_step(self, seq: "Sequence", token: int) -> torch.Tensor:
-        """Advance one token through the captured single-stream decode graph.
+        """Advance one token through the decode path (graph replay, or eager).
 
         Args:
             seq: Sequence being advanced.
@@ -394,11 +400,30 @@ class ModelRunner:
         Returns:
             Logits for the next position.
         """
-        logits = self.model.decode_step(token)
+        logits = self._forward_token(token)
         if self.pc is not None and self.pc.seq is not None:
             self.pc.seq.commit_upto(self.model.pos1)
         seq.num_cached_tokens = int(self.model.pos1)
         return logits
+
+    def _forward_token(self, token: int) -> torch.Tensor:
+        """One token through whichever decode path this engine captured.
+
+        The two model entry points differ only in bookkeeping: ``decode_step``
+        replays a captured graph, ``logits`` runs the same forward eagerly. Both
+        stage the token on the prefill row and both advance the position counter,
+        so everything downstream (the KV write window, ``commit_upto``) is
+        identical and only the launch mechanism changes.
+
+        Args:
+            token: Token id to feed.
+
+        Returns:
+            Logits for the next position, a live buffer either way.
+        """
+        if self.graph:
+            return self.model.decode_step(token)
+        return self.model.logits(token)
 
     @torch.inference_mode()
     def decode(self, seqs: list["Sequence"]) -> list[int]:
