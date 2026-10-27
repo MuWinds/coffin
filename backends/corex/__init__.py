@@ -1051,10 +1051,27 @@ NATIVE: frozenset[str] = frozenset(_NATIVE)
 #: model.
 #:
 #: ``check_graph.py`` still covers two ops only and its header says so; it is the cheap
-#: regression check, not the acceptance gate. The acceptance evidence is the repeat run
-#: above, which needs a checkpoint and therefore lives in ``diag/`` -- this package may
-#: not import an engine layer (the R5 gate).
-_GRAPH_VERIFIED = True
+#: regression check, not the acceptance gate.
+#:
+#: **Set back to ``False`` on 2026-10-27. Two independent reasons, either sufficient.**
+#:
+#: 1. *It is no longer faster.* The 1.47x above was measured against an eager path that had
+#:    not been optimised. After the split-K fix (50.53 -> 43.46 ms) and the delta rewrite
+#:    (43.46 -> 37.98 ms), replay measures 46.97 ms on the same prompt -- **0.93x, a
+#:    regression**. A graph removes launch overhead; once the kernels themselves got
+#:    faster, what is left of that overhead is smaller than the cost of replaying.
+#: 2. *It is not stable.* The same code on comparable nodes produced both outcomes: one
+#:    run completed the whole step at 52.41 ms, another stopped right after
+#:    ``graph replay`` with no traceback, on the same build. A hang costs the card's
+#:    context, so the root cause cannot be chased by experiment on shared hardware.
+#:
+#: The repeat-run evidence above is real and still worth keeping: it shows the *graph
+#: mechanism* works on this driver when it works at all. It does not show that enabling it
+#: is a good trade, and it was measured against a slower baseline. Anyone re-enabling this
+#: has to beat 37.98 ms eager with a stable replay, not the 77.09 ms eager it beat before.
+#: See ``PERF_COREX.md`` section 8 for the alternatives and the measurement that should
+#: decide between them.
+_GRAPH_VERIFIED = False
 
 #: Ops the captured decode step calls. A device graph is only safe when every one of
 #: these is a self-written kernel: a reference fallback reaches ``cuBLAS``, which

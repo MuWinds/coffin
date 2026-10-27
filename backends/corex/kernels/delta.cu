@@ -15,14 +15,17 @@
 // piece of layer memory that prefix reuse has to snapshot.
 //
 // Constraints:
-//   * One block covers a tile of (head, value-columns), and inside it the threads are
-//     addressed as ``(column, dk index)``. A state column is only ever read and written
-//     by threads of its own column group, which is what removes cross-thread
-//     communication from the recursion.
-//   * The ``dk`` reduction is a per-group shared-memory tree, not ``__shfl_xor``. This
-//     part's warp is 64 lanes wide, so a butterfly written for 32 would combine the wrong
-//     partners and still produce a plausible number. A tree costs one barrier per step
-//     and makes no assumption about the width.
+//   * One thread owns one value column and one block covers a head, with the threads of a
+//     block addressed as consecutive ``j``. That is forced by the state layout: column
+//     ``j`` of a head lives at ``st[head*dk*dv + i*dv + j]``, so consecutive ``j`` at the
+//     same ``i`` is the only assignment that coalesces. The earlier ``(column, dk index)``
+//     mapping read one column per lane at a stride of ``dv`` floats and pulled 32x the
+//     bytes it used, which is why it measured 294 us against a 7 us floor.
+//   * Both ``dk`` reductions are per-thread register loops, so there is no cross-lane
+//     communication and no shared scratch. This relies on the recurrence coupling ``i``
+//     only within a column; a version that needed a sum across columns would have to
+//     reintroduce a tree -- and a written-for-32 butterfly would combine the wrong
+//     partners here, because this part's warp is 64 lanes wide.
 //   * The state is fp32 and updated in place, and the output is read from the *updated*
 //     state so a token sees its own write. Any other order changes the recurrence rather
 //     than merely the rounding.
@@ -43,90 +46,60 @@
 
 namespace {
 
-//: Value columns per block. One column's group is ``dk`` threads, so a tile of 32 columns
-//: would need 4096 threads; the launch instead fits as many whole column groups as the
-//: thread budget allows, and this constant is that budget divided by the smallest head.
-constexpr int MAX_THREADS = 512;
+//: Threads per block. Each thread owns one value column and walks the whole ``dk`` axis
+//: in registers, so a block covers ``THREADS`` columns and the block count falls by 32x
+//: against the old shape (32 heads x 128/THREADS column tiles).
+//:
+//: The mapping is the whole optimisation and it is worth stating why. The state is
+//: ``[heads, dk, dv]``, so column ``j`` of a head is ``st[head*dk*dv + i*dv + j]``: fixed
+//: ``i``, contiguous in ``j``. Threads are therefore addressed as consecutive ``j`` at the
+//: same ``i``, which makes a 64-lane wavefront read 64 consecutive floats -- one 256-byte
+//: transaction. The previous mapping put the threads of a column group on consecutive
+//: ``i`` instead, so every lane in a warp touched a different 128-byte line and used four
+//: bytes of it: 32x the traffic for the same answer, measured at 294 us per layer against
+//: a 7.3 us floor.
+//:
+//: 128 keeps a whole head's value axis (``dv``) inside one block for this model, so the
+//: shared copies of q and k are loaded once and reused by every column. It is also four
+//: wavefronts per block on a 64-lane part, which leaves enough warps to hide latency.
+constexpr int THREADS = 128;
 
-//: Threads one column group may use. A head of 128 gets 128 threads, so one block covers
-//: ``MAX_THREADS / 128 = 4`` columns and every wavefront is fully used.
-int group_size(int dk) {
-    int t = dk < 32 ? 32 : dk;
-    t = ((t + 63) / 64) * 64;
-    return t > MAX_THREADS ? MAX_THREADS : t;
-}
-
-//: Whole column groups per block.
-int cols_per_block(int dk) {
-    const int g = group_size(dk);
-    const int c = MAX_THREADS / g;
-    return c < 1 ? 1 : c;
-}
-
-// @brief Sum inside one column group through a shared tree.
+// @brief One step of the gated delta rule: one thread per value column, one block per head.
 //
-// The scratch is a flat ``[blockDim.x]`` array and a column's group owns a contiguous
-// segment of it, so a group never reads another column's partial. Every thread of the
-// block must call this: it ends on a barrier.
-//
-// @param v This thread's contribution.
-// @param red Shared scratch, ``blockDim.x`` floats; clobbered.
-// @param group Threads in one column group.
-// @param lane This thread's index inside its own group.
-// @return The sum over this thread's column group, valid in every thread of the group.
-//
-// The closing ``__syncthreads()`` is load-bearing, not tidiness. Without it a thread can
-// return, compute, and reach the *next* ``group_sum``'s ``red[threadIdx.x] = v`` before a
-// slower thread of its own group has read ``red[base]`` from this one -- and for the group
-// at ``base == 0`` that write lands on exactly the slot still being read. The recurrence
-// calls this twice per step, so the race is reached on the first token. Its symptom is a
-// result that is wrong by a fraction of a percent rather than wildly wrong, which is easy
-// to misread as a precision question.
-__device__ __forceinline__ float group_sum(float v, float* red, int group, int lane) {
-    const int base = (int)threadIdx.x - lane;
-    red[threadIdx.x] = v;
-    __syncthreads();
-    for (int step = group >> 1; step > 0; step >>= 1) {
-        if (lane < step) red[base + lane] += red[base + lane + step];
-        __syncthreads();
-    }
-    const float total = red[base];
-    // The barrier here is what lets every thread of the group read ``total`` safely before
-    // any thread starts overwriting the scratch for a following reduction.
-    __syncthreads();
-    return total;
-}
-
-// @brief One step of the gated delta rule: one block per (head, tile of value columns).
+// Each thread owns column ``j`` outright and walks ``i`` over ``dk`` in a register loop,
+// so both reductions across ``dk`` are local to that thread and no cross-lane
+// communication happens at all. That is only correct because the two sums are independent
+// per column -- the recurrence couples ``i`` within a column, never across columns.
 //
 // @param q,k [heads, dk] fp32, already L2-normalised (and q scaled) by the prologue.
 // @param v [heads, dv] fp32.
 // @param beta,g [heads] fp32 write strength and log decay.
 // @param st [heads, dk, dv] fp32 state, updated in place.
 // @param out [heads, dv] fp32, written from the updated state.
-// @param group Threads per column group, i.e. ``dk`` rounded to the wavefront.
-// @param cols Value columns this block covers.
+// @param dk Reduction length, also the stride between successive value columns.
+// @param dv Value columns per head.
 __global__ void delta_kernel(const float* __restrict__ q, const float* __restrict__ k,
                              const float* __restrict__ v, const float* __restrict__ beta,
                              const float* __restrict__ g, float* __restrict__ st,
-                             float* __restrict__ out, int dk, int dv, int group, int cols) {
+                             float* __restrict__ out, int dk, int dv) {
     const int head = blockIdx.x;
-    const int lane = (int)threadIdx.x % group;           // index inside the column group
-    const int slot = (int)threadIdx.x / group;           // which column of this tile
-    const int j = blockIdx.y * cols + slot;              // value column
+    const int j = (int)(blockIdx.y * blockDim.x + threadIdx.x);
+
+    // A thread past ``dv`` must NOT return here.``__syncthreads()`` below is reached by
+    // every thread of the block, so an early exit leaves the rest waiting on a thread
+    // that is gone -- a device-side deadlock with no traceback, which is exactly the
+    // symptom that once hung a card for a full job limit. An out-of-range column instead
+    // runs the barriers and skips only its own state and output access.
+    const bool active = j < dv;
 
     extern __shared__ float sh[];
     float* ks = sh;                  // [dk] this head's key, shared by every column
     float* qs = sh + dk;             // [dk] this head's query
-    float* red = qs + dk;            // [blockDim.x] reduction scratch
-    // One column group loads the shared copies. Every group needs all of ``dk``, so the
-    // load is duplicated work either way; confining it to the first group avoids a
-    // read-write race on the same shared locations.
-    if (slot == 0) {
-        for (int i = lane; i < dk; i += group) {
-            ks[i] = k[(size_t)head * dk + i];
-            qs[i] = q[(size_t)head * dk + i];
-        }
+    // Every column needs all of ``dk``, so the copy is shared rather than repeated per
+    // thread. Threads cooperate on the load, which is contiguous either way.
+    for (int i = (int)threadIdx.x; i < dk; i += (int)blockDim.x) {
+        ks[i] = k[(size_t)head * dk + i];
+        qs[i] = q[(size_t)head * dk + i];
     }
     __shared__ float decay_sh;
     __shared__ float rate_sh;
@@ -137,36 +110,34 @@ __global__ void delta_kernel(const float* __restrict__ q, const float* __restric
     __syncthreads();
     const float decay = decay_sh;
     const float rate = rate_sh;
-    // A column past ``dv`` still runs the reductions: ``group_sum`` ends on a block-wide
-    // barrier, so returning here would leave the remaining groups waiting forever. The
-    // inactive column contributes zeros and skips its own state access instead.
-    const bool active = j < dv;
-    const float value = active ? v[(size_t)head * dv + j] : 0.f;
-    float* column = active ? st + ((size_t)head * dk) * dv + j : nullptr;
+    if (!active) return;
 
-    // Decay applied on read, then again on write, so the state is touched once.
+    const float value = v[(size_t)head * dv + j];
+    float* column = st + (size_t)head * dk * dv + j;
+
+    // Decay applied on read and again on write, so the state is touched once per step.
+    // Threads at the same ``i`` are adjacent in ``j``, so each ``i`` step is one coalesced
+    // transaction per wavefront: this is the access pattern the old mapping lacked.
     float kv_mem = 0.f;
-    if (active) {
-        for (int i = lane; i < dk; i += group) {
-            kv_mem = fmaf(column[(size_t)i * dv] * decay, ks[i], kv_mem);
-        }
+    for (int i = 0; i < dk; ++i) {
+        kv_mem = fmaf(column[(size_t)i * dv] * decay, ks[i], kv_mem);
     }
-    kv_mem = group_sum(kv_mem, red, group, lane);
 
     const float delta = (value - kv_mem) * rate;
     float result = 0.f;
-    if (active) {
-        for (int i = lane; i < dk; i += group) {
-            const float s = fmaf(ks[i], delta, column[(size_t)i * dv] * decay);
-            column[(size_t)i * dv] = s;
-            result = fmaf(s, qs[i], result);
-        }
+    for (int i = 0; i < dk; ++i) {
+        const float s = fmaf(ks[i], delta, column[(size_t)i * dv] * decay);
+        column[(size_t)i * dv] = s;
+        result = fmaf(s, qs[i], result);
     }
-    result = group_sum(result, red, group, lane);
-    if (active && lane == 0) out[(size_t)head * dv + j] = result;
+    out[(size_t)head * dv + j] = result;
 }
 
 // @brief Launch one row of the recurrence.
+//
+// One block per head, ``THREADS`` value columns per block. Grid ``y`` covers the rest of
+// ``dv`` when it is wider than a block, which this model's 128 does not need but a wider
+// head would.
 //
 // @param q,k [heads, dk] fp32.
 // @param v [heads, dv] fp32.
@@ -177,13 +148,11 @@ __global__ void delta_kernel(const float* __restrict__ q, const float* __restric
 void launch_row(const float* q, const float* k, const float* v, const float* beta,
                 const float* g, float* st, float* out, int heads, int dk, int dv,
                 cudaStream_t stream) {
-    const int group = group_size(dk);
-    const int cols = cols_per_block(dk);
-    const int threads = group * cols;
-    const int blocks_y = (dv + cols - 1) / cols;
-    const size_t smem = (size_t)(2 * dk + threads) * sizeof(float);
+    const int threads = dv < THREADS ? dv : THREADS;
+    const int blocks_y = (dv + threads - 1) / threads;
+    const size_t smem = (size_t)(2 * dk) * sizeof(float);
     delta_kernel<<<dim3(heads, blocks_y), threads, smem, stream>>>(
-        q, k, v, beta, g, st, out, dk, dv, group, cols);
+        q, k, v, beta, g, st, out, dk, dv);
 }
 
 }  // namespace

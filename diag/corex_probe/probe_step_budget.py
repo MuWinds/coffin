@@ -1,0 +1,203 @@
+"""Split an eager decode step into GPU-busy, CPU-busy and idle, to choose what replaces
+the graph.
+
+The graph is off the table: replay measured 46.97 ms/step against eager's 43.46 ms, so it
+is now slower as well as unreliable, and one run stopped inside a replay with no traceback.
+Whatever replaces it has to beat the eager path on its own terms, which means the first
+question is what the eager path actually wastes.
+
+Three numbers decide it:
+
+* **wall** -- device events around one step. What a token costs today.
+* **gpu_busy** -- the sum of kernel durations from the profiler for that same step. If it
+  is close to wall, the card is working and only fewer/faster kernels help; if it is much
+  below wall, the card is idle between launches and the fix is to stop paying per launch.
+* **cpu_busy** -- the host time the step spends inside ATen and the launcher. If it exceeds
+  wall, the host is the critical path and a C++ entry point that issues the whole step from
+  one call is worth more than any kernel change.
+
+A fourth measurement, the per-kernel launch count, says how much a persistent kernel would
+have to absorb: every launch is a candidate for fusion.
+
+Module: ``coffin/diag``. Runs on the card.
+
+Constraints:
+    * Eager only. Capturing is what is being replaced, so it must not be in the path that
+      produces the numbers.
+    * Prints and flushes each section before the next begins: the graph experiment runs
+      last precisely so that a wedge in it still leaves the attribution on the log.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import time
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parents[2]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+MODEL = os.environ.get("ENGINE_MODEL", "")
+
+#: Steps to average. Enough to hide scheduler jitter, small enough that a wedged card does
+#: not burn the job before the first section prints.
+STEPS = 20
+
+#: Steps inside the profiler window. One: the trace is read for per-kernel totals, and a
+#: single step is what the timing above measured.
+PROFILE_STEPS = 1
+
+
+def _time_steps(step, n: int) -> float:
+    """Time ``n`` calls of ``step`` with device events.
+
+    Args:
+        step: Zero-argument callable performing one decode step.
+        n: Number of calls.
+
+    Returns:
+        Mean milliseconds per call.
+    """
+    import torch
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(n):
+        step()
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) / n
+
+
+def main() -> int:
+    import torch
+
+    import backends
+
+    print(f"  backend: {backends.status()}", flush=True)
+    if not MODEL or not Path(MODEL).is_dir():
+        print("  ENGINE_MODEL unset or not a directory", flush=True)
+        return 1
+
+    from engine_api import create_model
+
+    model = create_model(MODEL, max_seq=1024, bench=False)
+    print(f"  loaded, caps.graph={int(backends.caps().graph)}", flush=True)
+
+    state = {"logits": None}
+
+    def step() -> None:
+        """Run one eager decode step."""
+        nxt = int(state["logits"].argmax())
+        state["logits"] = model.logits(nxt)
+
+    def prepare() -> None:
+        """Put the model at a fresh prompt, ready to decode."""
+        model.reset()
+        state["logits"] = model.prefill([1, 2, 3, 4, 5])
+        torch.cuda.synchronize()
+
+    # Warmup outside the timing: the first step after a prompt pays allocator and JIT
+    # handle costs that every later step does not.
+    prepare()
+    for _ in range(3):
+        step()
+    torch.cuda.synchronize()
+
+    print("\n=== A. eager wall time ===", flush=True)
+    prepare()
+    wall = _time_steps(step, STEPS)
+    print(f"  wall/step : {wall:.2f} ms  ({1000 / wall:.2f} tok/s)", flush=True)
+
+    print("\n=== B. kernel durations and launch count (profiler) ===", flush=True)
+    gpu_busy = float("nan")
+    launches = 0
+    try:
+        from torch.profiler import ProfilerActivity, profile
+
+        activities = [ProfilerActivity.CPU]
+        if hasattr(ProfilerActivity, "CUDA"):
+            activities.append(ProfilerActivity.CUDA)
+        prepare()
+        with profile(activities=activities) as prof:
+            for _ in range(PROFILE_STEPS):
+                step()
+            torch.cuda.synchronize()
+
+        events = prof.key_averages()
+        total_cuda_us = 0.0
+        total_calls = 0
+        rows = []
+        for e in events:
+            cuda_us = getattr(e, "self_device_time_total", None)
+            if cuda_us is None:
+                cuda_us = getattr(e, "self_cuda_time_total", 0)
+            if cuda_us:
+                total_cuda_us += cuda_us
+                rows.append((cuda_us, e.key, e.count))
+                total_calls += e.count
+        rows.sort(reverse=True)
+        gpu_busy = total_cuda_us / 1000.0 / PROFILE_STEPS
+        launches = total_calls
+        print(f"  {'kernel':<44} {'calls':>6} {'ms/step':>9} {'%':>6}", flush=True)
+        for cuda_us, key, count in rows[:14]:
+            share = 100 * cuda_us / total_cuda_us if total_cuda_us else 0
+            print(f"  {key[:44]:<44} {count // PROFILE_STEPS:>6} "
+                  f"{cuda_us / 1000.0 / PROFILE_STEPS:>9.3f} {share:>5.0f}%", flush=True)
+        print(f"  {'TOTAL':<44} {total_calls // PROFILE_STEPS:>6} "
+              f"{gpu_busy:>9.3f} 100%", flush=True)
+    except Exception as exc:                      # noqa: BLE001 - trace is informational
+        print(f"  profiler unavailable: {type(exc).__name__}: {exc}", flush=True)
+
+    print("\n=== C. what the gap is ===", flush=True)
+    if gpu_busy == gpu_busy:
+        gap = wall - gpu_busy
+        print(f"  gpu busy  : {gpu_busy:.2f} ms", flush=True)
+        print(f"  not busy  : {gap:.2f} ms  ({100 * gap / wall:.0f}% of the step)", flush=True)
+        print(f"  launches  : {launches} per step", flush=True)
+        print(f"  per-launch: {wall * 1000 / launches:.2f} us of wall per launch",
+              flush=True)
+        if gap > 0.25 * wall:
+            print("  verdict   : launch/host bound -- fewer, larger launches win",
+                  flush=True)
+        else:
+            print("  verdict   : device bound -- only kernel work matters", flush=True)
+    else:
+        print("  no profiler data; wall only", flush=True)
+
+    # Last on purpose: capturing is the thing being replaced, and a wedge here must not
+    # cost the attribution above. Printed marker first so a hang is unambiguous.
+    print("\n=== D. graph replay for comparison (may wedge) ===", flush=True)
+    try:
+        if not backends.caps().graph:
+            print("  skipped: caps.graph is false", flush=True)
+        else:
+            prepare()
+            model.reset()
+            t0 = time.time()
+            model.capture()
+            torch.cuda.synchronize()
+            print(f"  captured in {(time.time() - t0) * 1000:.0f} ms", flush=True)
+            model.reset()
+            state["logits"] = model.prefill([1, 2, 3, 4, 5])
+            torch.cuda.synchronize()
+            for _ in range(3):
+                step()
+            torch.cuda.synchronize()
+            replay = _time_steps(step, STEPS)
+            print(f"  replay/step: {replay:.2f} ms  ({1000 / replay:.2f} tok/s)",
+                  flush=True)
+            print(f"  replay vs eager: {replay / wall:.2f}x "
+                  f"({'faster' if replay < wall else 'SLOWER'})", flush=True)
+    except Exception as exc:                      # noqa: BLE001 - this is the suspect
+        print(f"  graph failed: {type(exc).__name__}: {exc}", flush=True)
+
+    print("\nSTEP_BUDGET_DONE", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
