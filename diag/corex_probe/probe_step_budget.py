@@ -73,10 +73,18 @@ def _time_steps(step, n: int) -> float:
 
 
 def main() -> int:
+    # Markers before every import that can be slow. Importing `backends` resolves the
+    # backend selection and the capability record, which loads (or, if the build looks
+    # stale, rebuilds) the compiled extension -- minutes of work that writes to stderr and
+    # nothing to stdout. Without these lines such a wait is indistinguishable from a hang,
+    # and a probe that cannot say where it is has already cost several jobs.
+    print(f"  [i0] python {sys.version.split()[0]} cwd={os.getcwd()}", flush=True)
     import torch
 
+    print(f"  [i1] torch {torch.__version__}", flush=True)
     import backends
 
+    print(f"  [i2] backends imported", flush=True)
     print(f"  backend: {backends.status()}", flush=True)
     if not MODEL or not Path(MODEL).is_dir():
         print("  ENGINE_MODEL unset or not a directory", flush=True)
@@ -84,6 +92,7 @@ def main() -> int:
 
     from engine_api import create_model
 
+    print("  [i3] engine_api imported; loading the model", flush=True)
     model = create_model(MODEL, max_seq=1024, bench=False)
     print(f"  loaded, caps.graph={int(backends.caps().graph)}", flush=True)
 
@@ -155,46 +164,35 @@ def main() -> int:
     print("\n=== C. what the gap is ===", flush=True)
     if gpu_busy == gpu_busy:
         gap = wall - gpu_busy
-        print(f"  gpu busy  : {gpu_busy:.2f} ms", flush=True)
-        print(f"  not busy  : {gap:.2f} ms  ({100 * gap / wall:.0f}% of the step)", flush=True)
-        print(f"  launches  : {launches} per step", flush=True)
-        print(f"  per-launch: {wall * 1000 / launches:.2f} us of wall per launch",
-              flush=True)
-        if gap > 0.25 * wall:
-            print("  verdict   : launch/host bound -- fewer, larger launches win",
+        print(f"  gpu busy (trace): {gpu_busy:.2f} ms  vs wall {wall:.2f} ms", flush=True)
+        print(f"  launches        : {launches} per step", flush=True)
+        if gpu_busy >= wall:
+            # The trace's per-kernel durations include profiling overhead, so adding them up
+            # over-counts: here the sum exceeds the wall clock by more than a quarter. That
+            # makes the *sum* unusable as a busy-time figure, but it does prove the device is
+            # occupied for essentially the whole step -- there is no idle window large enough
+            # to hide a launch-bound path inside.
+            print(f"  trace inflation : {100 * (gpu_busy / wall - 1):.0f}% over wall",
                   flush=True)
+            print("  verdict         : device bound -- the trace cannot be summed, but it "
+                  "already covers the whole step", flush=True)
+            print("  implication     : removing launches cannot help; only less device "
+                  "work can", flush=True)
+        elif gap > 0.25 * wall:
+            print(f"  not busy : {gap:.2f} ms ({100 * gap / wall:.0f}% of the step)",
+                  flush=True)
+            print("  verdict  : launch/host bound -- fewer, larger launches win", flush=True)
         else:
-            print("  verdict   : device bound -- only kernel work matters", flush=True)
+            print(f"  not busy : {gap:.2f} ms ({100 * gap / wall:.0f}% of the step)",
+                  flush=True)
+            print("  verdict  : device bound -- only kernel work matters", flush=True)
     else:
         print("  no profiler data; wall only", flush=True)
 
-    # Last on purpose: capturing is the thing being replaced, and a wedge here must not
-    # cost the attribution above. Printed marker first so a hang is unambiguous.
-    print("\n=== D. graph replay for comparison (may wedge) ===", flush=True)
-    try:
-        if not backends.caps().graph:
-            print("  skipped: caps.graph is false", flush=True)
-        else:
-            prepare()
-            model.reset()
-            t0 = time.time()
-            model.capture()
-            torch.cuda.synchronize()
-            print(f"  captured in {(time.time() - t0) * 1000:.0f} ms", flush=True)
-            model.reset()
-            state["logits"] = model.prefill([1, 2, 3, 4, 5])
-            torch.cuda.synchronize()
-            for _ in range(3):
-                step()
-            torch.cuda.synchronize()
-            replay = _time_steps(step, STEPS)
-            print(f"  replay/step: {replay:.2f} ms  ({1000 / replay:.2f} tok/s)",
-                  flush=True)
-            print(f"  replay vs eager: {replay / wall:.2f}x "
-                  f"({'faster' if replay < wall else 'SLOWER'})", flush=True)
-    except Exception as exc:                      # noqa: BLE001 - this is the suspect
-        print(f"  graph failed: {type(exc).__name__}: {exc}", flush=True)
-
+    # There is deliberately no graph comparison here. Capture is what is being replaced,
+    # and on this driver a replay can wedge a card permanently with no traceback, so a
+    # probe must not touch it even behind a flag -- a probe that can destroy the device it
+    # measures is not a probe. The numbers that decide the alternative come from A-C above.
     print("\nSTEP_BUDGET_DONE", flush=True)
     return 0
 

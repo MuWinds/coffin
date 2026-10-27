@@ -32,6 +32,7 @@ Constraints:
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -80,6 +81,46 @@ def _flags(arch: str) -> dict[str, list[str]]:
     }
 
 
+def _clear_stale_build_lock(cache: str) -> None:
+    """Remove a build lock left behind by a killed process.
+
+    ``torch.utils.cpp_extension`` serialises builds with a baton file at
+    ``<cache>/<name>/lock``. Its ``wait()`` polls until the file disappears, and nothing
+    ages it out: a job killed between creating that file and removing it leaves every later
+    job on the cluster blocked forever, with no output on either stream, because the wait
+    happens inside an import.
+
+    This was not theoretical. Cancelling three submits whose imports were still resolving
+    the backend wedged the shared cache for every subsequent run, and the failure looked
+    exactly like a hang in device code -- the stack dump was the only thing that named it.
+
+    Only a *stale* lock is removed. A fresh one belongs to a build that is genuinely
+    running, and deleting that would let two builds write the same object tree.
+
+    Args:
+        cache: Value of ``TORCH_EXTENSIONS_DIR``.
+
+    Returns:
+        Nothing. Recovery is best effort: an unremovable lock is left to ``load``.
+    """
+    lock = Path(cache) / _EXTENSION / "lock"
+    try:
+        age = time.time() - lock.stat().st_mtime
+    except OSError:
+        return
+    # Ten minutes by default: longer than any successful build of these seven units, far
+    # shorter than the wall clock a blocked job would otherwise burn. The threshold is
+    # overridable because recovering from a wedge that is only seconds old needs a smaller
+    # value, and waiting ten minutes to clear a known-bad lock is its own bug.
+    limit = float(os.environ.get("COFFIN_BUILD_LOCK_MAX_AGE", "600"))
+    if age < limit:
+        return
+    try:
+        lock.unlink()
+    except OSError:
+        return
+
+
 def load_kernels(arch: str = DEFAULT_ARCH) -> Any:
     """Build or attach the extension, once per process.
 
@@ -113,6 +154,7 @@ def load_kernels(arch: str = DEFAULT_ARCH) -> Any:
     try:
         from torch.utils.cpp_extension import load
 
+        _clear_stale_build_lock(cache)
         flags = _flags(arch or DEFAULT_ARCH)
         _module = load(
             name=_EXTENSION,

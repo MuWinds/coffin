@@ -1053,24 +1053,30 @@ NATIVE: frozenset[str] = frozenset(_NATIVE)
 #: ``check_graph.py`` still covers two ops only and its header says so; it is the cheap
 #: regression check, not the acceptance gate.
 #:
-#: **Set back to ``False`` on 2026-10-27. Two independent reasons, either sufficient.**
+#: **Set back to ``False`` on 2026-10-27, and it must stay ``False``.**
 #:
-#: 1. *It is no longer faster.* The 1.47x above was measured against an eager path that had
+#: Three independent reasons, any one sufficient:
+#:
+#: 1. *It randomly kills cards.* Identical code on comparable nodes produced both outcomes
+#:    -- a complete step at 52.41 ms and a run that stopped dead after ``graph replay`` with
+#:    no traceback and no stderr. The wedge is unkillable: the process sits in an
+#:    uninterruptible state while the device spins, so the card is gone until the node is
+#:    reset. Four cards on this partition were lost this way during the port. Nothing that
+#:    is only sometimes safe is worth enabling on shared hardware.
+#: 2. *It is no longer faster.* The 1.47x above was measured against an eager path that had
 #:    not been optimised. After the split-K fix (50.53 -> 43.46 ms) and the delta rewrite
 #:    (43.46 -> 37.98 ms), replay measures 46.97 ms on the same prompt -- **0.93x, a
-#:    regression**. A graph removes launch overhead; once the kernels themselves got
-#:    faster, what is left of that overhead is smaller than the cost of replaying.
-#: 2. *It is not stable.* The same code on comparable nodes produced both outcomes: one
-#:    run completed the whole step at 52.41 ms, another stopped right after
-#:    ``graph replay`` with no traceback, on the same build. A hang costs the card's
-#:    context, so the root cause cannot be chased by experiment on shared hardware.
+#:    regression**. A graph removes launch overhead; once the kernels got faster, what is
+#:    left of that overhead is smaller than the cost of replaying.
+#: 3. *The overhead it targeted is better removed elsewhere.* ``launch`` count and host
+#:    time are attacked directly in ``PERF_COREX.md`` §8, on the eager path, where a bug
+#:    raises an error instead of consuming the device.
 #:
-#: The repeat-run evidence above is real and still worth keeping: it shows the *graph
-#: mechanism* works on this driver when it works at all. It does not show that enabling it
-#: is a good trade, and it was measured against a slower baseline. Anyone re-enabling this
-#: has to beat 37.98 ms eager with a stable replay, not the 77.09 ms eager it beat before.
-#: See ``PERF_COREX.md`` section 8 for the alternatives and the measurement that should
-#: decide between them.
+#: Do not re-enable this to chase the old 1.47x. The repeat-run evidence above shows the
+#: graph *mechanism* works on this driver when it works at all; it does not show the trade
+#: is acceptable, and it was measured against a baseline that no longer exists. Any future
+#: attempt has to beat 37.98 ms eager with a replay that is provably stable across runs,
+#: and it must be done on cards that can afford to be lost.
 _GRAPH_VERIFIED = False
 
 #: Ops the captured decode step calls. A device graph is only safe when every one of

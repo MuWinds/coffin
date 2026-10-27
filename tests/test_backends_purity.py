@@ -422,6 +422,7 @@ ALLOWLISTS: dict[str, dict[str, dict[str, int]]] = {
     "R2_platform_literal": {
         "probe": {
             "diag/build_int4.py": 6,
+            "diag/corex_probe/probe_import_hang.py": 1,
             "diag/corex_probe/probe_torch_upgrade_run.py": 1,
             "diag/corex_probe/probe_truth.py": 1,
             "diag/dbg_int4.py": 4,
@@ -446,7 +447,7 @@ ALLOWLISTS: dict[str, dict[str, dict[str, int]]] = {
             "diag/corex_probe/probe_graph_stages.py": 17,
             "diag/corex_probe/probe_import.py": 4,
             "diag/corex_probe/probe_loadcheck.py": 2,
-            "diag/corex_probe/probe_step_budget.py": 9,
+            "diag/corex_probe/probe_step_budget.py": 6,
             "diag/corex_probe/probe_torch_upgrade_run.py": 6,
             "diag/corex_probe/probe_triangular.py": 11,
             "diag/corex_probe/probe_truth.py": 23,

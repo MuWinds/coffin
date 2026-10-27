@@ -82,10 +82,10 @@ IMPORT_MS=$("$PY" -B -c "import time
 t = time.time()
 import torch
 print(int((time.time() - t) * 1000))" 2>/dev/null || echo 4000)
-# Three seconds on top of the import: the
-# whole point is that an 8x8 matmul is microseconds of device work, so the only budget a
-# healthy card needs is interpreter plus context. Two seconds of slack on top of a measured
-# import lands the cap at 4-6 s, which is short enough that a corpse cannot hold the job.
+# Two seconds of slack on top of the measured import: an 8x8 matmul is microseconds of
+# device work, so the only budget a healthy card needs is interpreter plus context. That
+# lands the cap at 4-6 s, short enough that a corpse cannot hold the job; the clamp keeps a
+# pathologically slow import from making it uselessly long.
 CAP=$(( (IMPORT_MS + 2000) / 1000 + 1 ))
 if [ "$CAP" -lt 3 ]; then CAP=3; fi
 if [ "$CAP" -gt 8 ]; then CAP=8; fi
