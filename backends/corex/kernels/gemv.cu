@@ -176,22 +176,49 @@ int pick_threads(int64_t N) {
 
 // @brief Split-K width, or ``1`` to run the single-pass kernel.
 //
-// Splitting multiplies the block count without touching the weight traffic (each
-// split reads a different K range of every column), so it helps exactly when the
-// single-pass grid is too small to fill the card. The thresholds are the measured
-// ones from COREX_PORT.md §0: ``N = 9728`` at 38 blocks already reached 168 GB/s
-// unsplit, while ``N = 2560`` at 10 blocks only reached 47-63 GB/s. So split only
-// below two blocks per SM, never above.
+// Splitting multiplies the block count without touching the weight traffic: each split
+// reads a different K range of every column, so the bytes moved are the same and only
+// the number of independent loads in flight changes. On a 16-SM part with a 575 GB/s
+// copy ceiling, the single pass leaves the card short of memory-level parallelism on
+// most shapes, so splitting is the default rather than the exception.
+//
+// Measured on a BI-V100 with every configuration checked against a host fp64 reference.
+// The first table is the useful one -- it is what a *decode step* actually pays, taken
+// through ``backends.ops.linear`` so it includes the launch and the partial reduce:
+//
+//   shape      N       K      split 1      split 4      split 8
+//   mlp_up     9216    2560   0.292 ms     0.152 ms     --
+//   qkv_gate   8192    2560   0.286 ms     0.160 ms     --
+//   mlp_down   2560    9216   1.004 ms     --           0.245 ms
+//   o_proj     2560    4096   0.329 ms     --           0.085 ms
+//   lm_head    248320  2560   3.478 ms     2.961 ms     --
+//
+// Two corrections to earlier reasoning are baked into that table, both of which cost a
+// job to learn:
+//
+//   * "Split only when the single-pass grid cannot fill the card" was wrong. mlp_up at
+//     9216 columns is 36 blocks on 16 SMs -- already two waves -- and splitting it 4x
+//     still gains 1.92x. Occupancy in *blocks* was never the limiter; outstanding loads
+//     were.
+//   * "Narrow shapes do not benefit" was also wrong, and backwards. mlp_down and o_proj
+//     are the shapes where splitting is worth the most (4.1x and 3.9x against the single
+//     pass) -- they are the ones with the fewest columns to spread.
+//
+// What the split must respect is ``K``: each split gets ``K / split`` and a slice that
+// is too short loses more to the partial pass than it gains. mlp_down has the longest K
+// of any shape here and takes 8, which is the most this will ever return.
 int pick_split(int64_t N, int64_t K, int threads) {
-    const int64_t blocks = (N + threads - 1) / threads;
-    if (blocks >= 2 * sm_count() || K < 1024) return 1;
-    int64_t want = (4 * (int64_t)sm_count() + blocks - 1) / blocks;
-    int split = 1;
-    while (split < want && split < 8) split <<= 1;
-    // A split whose K range is too short loses more to the second pass than it
-    // gains in occupancy.
-    while (split > 1 && K / split < 512) split >>= 1;
-    return (int)split;
+    if (K < 1024) return 1;
+
+    // A slice shorter than ~512 stops paying for the second launch.
+    const int64_t by_k = K / 512 > 8 ? 8 : K / 512;
+    if (by_k < 2) return 1;
+
+    // Wide shapes fill the card with columns, so they need less help than narrow ones.
+    // mlp_up/qkv_gate measured best at 4 and lost at 8; everything narrower measured
+    // best at 8. The threshold sits where the sweep put the crossover.
+    const int64_t want = N >= 4096 ? 4 : 8;
+    return (int)(want < by_k ? want : by_k);
 }
 
 // @brief Launch the single-pass kernel for one (weight, activation) dtype pair.
