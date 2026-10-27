@@ -95,6 +95,37 @@ const int64_t want = N >= 4096 ? 4 : 8;
 return (int)(want < by_k ? want : by_k);
 ```
 
+### 术语说明：`s1` / `s4` / `s8` / `t256` / `u4`
+
+这些是本文和 `probe_gemv_tune.py` 里的**配置标签缩写**，不是仓库原有术语：
+
+| 标签 | 含义 |
+| --- | --- |
+| `s1` | `split = 1`，即**不切分**，单遍算完整 K |
+| `s4` / `s8` | 把 K 轴切成 4 / 8 段并行算，再求和 |
+| `t256` | 每个 block 用 256 个线程 |
+| `u4` | K 循环展开 4 路 |
+
+完整标签 `t256/u4/s4` 读作"256 线程、展开 4、K 切 4 段"。
+
+split-K 具体在做什么（`gemv_kn_split_kernel` + `gemv_reduce_kernel`）：
+
+```
+GEMV: y[n] = sum_k W[k,n] * x[k]        每个输出列 n 要沿 K 累加
+
+s1：一个线程 own 一个输出列，读完该列全部 K    grid = blocks
+s4：一个输出列由 4 个 block 各算 K/4，先写 part[4][N]，再 reduce 求和
+                                              grid = 4 * blocks
+```
+
+**权重读取总量不变**（每段读不同 K 区间），变的只有并行度，代价是多一个
+reduce kernel 和一块 `part` 缓冲。
+
+它为什么有效：瓶颈是**同时在飞的 load 数**，不是 block 数。16 SM 上 36 个 block
+看似"够了"，但每个线程沿 K 串行累加时 outstanding 访存很有限；切 4 段等于让
+4 组 block 同时向 DRAM 要数据。`mlp_down` / `o_proj` 吃 s8 是因为它们列数少
+（2560），单遍时 grid 本身小，更需要靠 K 方向补并行度。
+
 ### 验证方法（重要，避免自欺）
 
 每一步都在**真实 decode 路径**上验证，而不是只看单算子：
