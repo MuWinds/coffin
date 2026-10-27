@@ -59,7 +59,7 @@ def main() -> int:
     import torch
     from tokenizers import Tokenizer
 
-    from engine_api import create_model, describe
+    from engine_api import create_model, load_weights, describe
 
     _sep("0. backend")
     print(" ", backends.status(), flush=True)
@@ -74,7 +74,12 @@ def main() -> int:
     tok = Tokenizer.from_file(str(Path(MODEL) / "tokenizer.json"))
     t0 = time.time()
     try:
-        model = create_model(MODEL, max_seq=1024, bench=True)
+        # COFFIN_QUANT=1 loads the projections as int8, which is the only way to exercise
+        # the W8A16 kernel end to end: the flag belongs to the loader, not the backend, so
+        # a backend that supports int8 still builds a bf16 model without it.
+        quant = os.environ.get("COFFIN_QUANT") == "1"
+        weights = load_weights(MODEL, quant=quant) if quant else None
+        model = create_model(MODEL, max_seq=1024, bench=True, weights=weights)
     except Exception:
         print("LOAD FAILED", flush=True)
         traceback.print_exc()

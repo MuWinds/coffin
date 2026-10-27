@@ -51,3 +51,22 @@ struct CxScalar<float> {
     // @brief Identity: the fp32 instantiation narrows nothing.
     static __device__ __forceinline__ float from_float(float v) { return v; }
 };
+
+// @brief int8 weight storage: the W8A16 GEMV reads one signed byte per weight.
+//
+// The pair to this specialisation matters: an int8 weight arrives with a per-column
+// fp32 scale that the kernel applies once to the accumulated dot product, so the
+// conversion here must stay the plain integer widening. Folding anything else into
+// ``to_float`` would apply a scale twice or in the wrong place.
+template <>
+struct CxScalar<int8_t> {
+    // @brief Widen one signed weight byte to fp32.
+    static __device__ __forceinline__ float to_float(int8_t v) { return (float)v; }
+
+    // @brief Narrow fp32 to int8 by truncation.
+    //
+    // Never used to store a weight -- quantisation rounds through
+    // ``int8_weights.QWeight.quantize`` on the host -- but a specialisation must be
+    // complete for the generic kernel template to instantiate.
+    static __device__ __forceinline__ int8_t from_float(float v) { return (int8_t)v; }
+};

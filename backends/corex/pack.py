@@ -64,6 +64,92 @@ _CACHE_LIMIT = 4096
 _CACHE: dict[tuple[int, torch.dtype], tuple[weakref.ref, "KnWeight"]] = {}
 
 
+class KnQWeight:
+    """An ``[N, K]`` projection stored as int8 ``[K, N]`` plus one fp32 scale per column.
+
+    The int8 counterpart of :class:`KnWeight`, and it exists for one reason: decode is
+    bandwidth-bound, so halving the bytes read per weight is the only lever left on the
+    projections, which dominate the step (``PERF_COREX.md`` §8).
+
+    The scale is per *output column*, which is the same thing as the checkpoint's per-row
+    scale -- rows of ``[N, K]`` are columns of ``[K, N]``. It is stored alongside the
+    matrix rather than multiplied into it, because applying it once per column after the
+    ``K`` sum is both cheaper and what the quantiser's error model assumes.
+    """
+
+    __slots__ = ("scale", "wt", "n", "k")
+
+    #: Distinguishes this form from :class:`KnWeight` without a type check at every call.
+    int8 = True
+
+    def __init__(self, wt: torch.Tensor, scale: torch.Tensor) -> None:
+        """Wrap an already-transposed int8 matrix and its column scales.
+
+        Args:
+            wt: ``[K, N]`` contiguous int8 matrix.
+            scale: ``[N]`` fp32 scales, one per output column.
+
+        Raises:
+            ValueError: ``wt`` is not 2-D int8, the scale is not 1-D fp32, or their
+                lengths disagree. Each of those produces plausible numbers from the wrong
+                elements instead of failing.
+        """
+        if wt.dim() != 2:
+            raise ValueError(f"packed weight must be 2-D, got {tuple(wt.shape)}")
+        if not wt.is_contiguous():
+            raise ValueError("packed weight must be contiguous")
+        if wt.dtype != torch.int8:
+            raise ValueError(f"packed int8 weight must be int8, got {wt.dtype}")
+        if scale.dim() != 1 or scale.dtype != torch.float32:
+            raise ValueError("scale must be 1-D fp32")
+        self.k, self.n = int(wt.shape[0]), int(wt.shape[1])
+        if int(scale.numel()) != self.n:
+            raise ValueError(f"scale holds {scale.numel()} values for N = {self.n}")
+        self.wt = wt
+        self.scale = scale
+
+    def nbytes(self) -> int:
+        """Resident size in bytes: the int8 matrix plus its fp32 column scales.
+
+        Returns:
+            ``K * N + 4 * N``.
+        """
+        return self.wt.numel() + self.scale.numel() * 4
+
+    def to(self, dtype: torch.dtype) -> torch.Tensor:
+        """Return the checkpoint layout ``[N, K]`` as a plain dequantised tensor.
+
+        The escape hatch for paths this backend serves with the bf16 kernels or the
+        reference implementation. It is a real dequantisation, so it costs the full fp
+        size of the weight -- callers on the decode path must not use it.
+
+        Args:
+            dtype: Dtype the caller's arithmetic runs in.
+
+        Returns:
+            A fresh ``[N, K]`` contiguous tensor.
+        """
+        return (self.wt.float() * self.scale.view(1, -1)).to(dtype).t().contiguous()
+
+    def dequant_kn(self, dtype: torch.dtype = WEIGHT_DTYPE) -> "KnWeight":
+        """Dequantise in place of a transpose, keeping the ``[K, N]`` layout.
+
+        The ``[K, N]`` sibling of :meth:`to`: this is what the bf16 kernels need, so a
+        caller that cannot use the int8 path converts with one multiply instead of a
+        transpose.
+
+        Args:
+            dtype: Storage dtype of the result.
+
+        Returns:
+            A :class:`KnWeight` over the dequantised matrix.
+        """
+        return KnWeight((self.wt.float() * self.scale.view(1, -1)).to(dtype))
+
+    def __repr__(self) -> str:  # pragma: no cover - debug aid
+        return f"KnQWeight(K={self.k}, N={self.n}, int8)"
+
+
 class KnWeight:
     """An ``[N, K]`` projection stored as the contiguous ``[K, N]`` matrix the kernels index.
 
@@ -73,6 +159,11 @@ class KnWeight:
     """
 
     __slots__ = ("wt", "n", "k")
+
+    #: Both packed forms answer these, so a caller can ask "is this int8" and "what is its
+    #: scale" without an isinstance against every subclass.
+    int8 = False
+    scale = None
 
     def __init__(self, wt: torch.Tensor) -> None:
         """Wrap a matrix that is already transposed; nothing is copied here.
@@ -136,11 +227,11 @@ def is_packed(w: Any) -> bool:
         ``True`` for a :class:`KnWeight`. A plain tensor is always ``False``: the
         raw form is the contract's ``[N, K]``.
     """
-    return isinstance(w, KnWeight)
+    return isinstance(w, (KnWeight, KnQWeight))
 
 
-def to_kn(w: torch.Tensor | QWeight | KnWeight,
-          dtype: torch.dtype = WEIGHT_DTYPE) -> KnWeight:
+def to_kn(w: torch.Tensor | QWeight | KnWeight | KnQWeight,
+          dtype: torch.dtype = WEIGHT_DTYPE) -> KnWeight | KnQWeight:
     """Transpose one projection into the layout the kernels read.
 
     Args:
@@ -159,10 +250,14 @@ def to_kn(w: torch.Tensor | QWeight | KnWeight,
             caller packed the wrong tensor, and transposing it would fail later
             with a shape error far from the cause.
     """
-    if isinstance(w, KnWeight):
+    if isinstance(w, (KnWeight, KnQWeight)):
         return w
     if isinstance(w, QWeight):
-        w = w.dequant(dtype)
+        # Already int8 in the checkpoint layout, so the cheap move is to keep it int8 and
+        # transpose one byte per element rather than expanding to two bytes first. The
+        # transpose peak is half of what the bf16 path pays for the same weight.
+        wq = w.wq.t().contiguous()
+        return KnQWeight(wq, w.scale.contiguous())
     if w.dim() != 2:
         raise ValueError(f"projection weight must be 2-D, got {tuple(w.shape)}")
     return KnWeight(w.to(dtype).t().contiguous())
@@ -197,8 +292,8 @@ def _sweep() -> None:
             _CACHE.pop(key, None)
 
 
-def as_kn(w: torch.Tensor | QWeight | KnWeight,
-          dtype: torch.dtype = WEIGHT_DTYPE) -> KnWeight:
+def as_kn(w: torch.Tensor | QWeight | KnWeight | KnQWeight,
+          dtype: torch.dtype = WEIGHT_DTYPE) -> KnWeight | KnQWeight:
     """Return the packed form of a weight, transposing it once per source object.
 
     The op table calls this on every projection. The cost of a transpose is
@@ -218,7 +313,7 @@ def as_kn(w: torch.Tensor | QWeight | KnWeight,
     Raises:
         ValueError: ``w`` is not 2-D; see :func:`to_kn`.
     """
-    if isinstance(w, KnWeight):
+    if isinstance(w, (KnWeight, KnQWeight)):
         return w
     source = w.wq if isinstance(w, QWeight) else w
     key = (id(source), dtype)

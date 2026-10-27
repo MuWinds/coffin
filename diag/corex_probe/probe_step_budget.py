@@ -90,10 +90,17 @@ def main() -> int:
         print("  ENGINE_MODEL unset or not a directory", flush=True)
         return 1
 
-    from engine_api import create_model
+    from engine_api import create_model, load_weights
 
     print("  [i3] engine_api imported; loading the model", flush=True)
-    model = create_model(MODEL, max_seq=1024, bench=False)
+    # quant=True belongs to the *loader*: it is what makes the state dict hold int8
+    # QWeights. A backend's caps.int8_weights only says it can consume them, so a
+    # backend with the kernel but without this flag silently measures the bf16 path --
+    # which is exactly what the first int8 profile run did.
+    weights = load_weights(MODEL, quant=True)
+    print(f"  [i4] weights loaded; sample form: "
+          f"{type(next(iter(weights.values()))).__name__}", flush=True)
+    model = create_model(MODEL, max_seq=1024, bench=False, weights=weights)
     print(f"  loaded, caps.graph={int(backends.caps().graph)}", flush=True)
 
     state = {"logits": None}

@@ -115,6 +115,145 @@ __global__ void gemv_reduce_kernel(const float* __restrict__ part,
     y[n] = CxScalar<XT>::from_float(acc);
 }
 
+// The W8A16 family: identical indexing to the three kernels above, with the int8 weight
+// and a per-column fp32 scale.
+//
+// Why a separate kernel rather than the ``int8_t`` instantiation of ``gemv_kn_kernel``:
+// the scale. It applies once per output column, after the whole ``K`` range is summed --
+// applying it per element would round differently and, worse, invite a caller to fold it
+// into the activation, which double-scales the result. Keeping the entry point distinct
+// makes that contract impossible to satisfy by accident.
+//
+// The bytes read per weight drop from two to one, which is the entire point: decode is
+// bandwidth-bound, and the projections are the majority of the step.
+
+// @brief One activation row against an int8 ``[K, N]`` weight, one thread per column.
+template <typename XT, int U>
+__global__ void gemv_kn_i8_kernel(const int8_t* __restrict__ wt,
+                                  const XT* __restrict__ x, XT* __restrict__ y,
+                                  const float* __restrict__ scale, int N, int K) {
+    const int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= N) return;
+    y[n] = CxScalar<XT>::from_float(scale[n] * dot_kn<int8_t, XT, U>(wt, x, n, N, 0, K));
+}
+
+// @brief One K range of the same product, into this split's slice of the partials.
+template <typename XT, int U>
+__global__ void gemv_kn_i8_split_kernel(const int8_t* __restrict__ wt,
+                                        const XT* __restrict__ x,
+                                        float* __restrict__ part,
+                                        int N, int K, int split, int per) {
+    const int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= N) return;
+    const int s = blockIdx.y;
+    const int k0 = s * per;
+    const int k1 = min(K, k0 + per);
+    part[(size_t)s * N + n] = dot_kn<int8_t, XT, U>(wt, x, n, N, k0, k1);
+}
+
+// @brief Sum the partials and apply the column scale, one thread per column.
+template <typename XT>
+__global__ void gemv_reduce_i8_kernel(const float* __restrict__ part,
+                                      XT* __restrict__ y,
+                                      const float* __restrict__ scale,
+                                      int N, int split) {
+    const int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= N) return;
+    float acc = 0.f;
+    for (int s = 0; s < split; ++s) acc += part[(size_t)s * N + n];
+    y[n] = CxScalar<XT>::from_float(scale[n] * acc);
+}
+
+// Four output columns per thread, for the int8 path.
+//
+// The scalar kernel above reads one byte per weight element, so a wavefront's 64 lanes
+// issue 64 single-byte loads per k step -- 64 bytes of a 128-byte line, one request each.
+// Measured, that capped the int8 kernel at 235-262 GB/s against the bf16 kernel's 314 on
+// the same shape, which is why halving the bytes only bought 1.5x instead of 2x.
+//
+// Reading four adjacent *columns* as one 4-byte load fixes it: columns are contiguous in
+// a ``[K, N]`` row, so ``wt[k*N + n .. n+3]`` is one aligned word, a wavefront then covers
+// 256 contiguous bytes, and the load count drops by four. The four accumulators are
+// independent sums, so the arithmetic is unchanged -- only the scale application moves to
+// four columns at the end.
+//
+// This requires ``N % 4 == 0``; the host checks it and falls back to the scalar kernel
+// otherwise, which keeps the contract whole for a model whose width is not a multiple of
+// four.
+template <typename XT, int U>
+__global__ void gemv_kn_i8x4_kernel(const int8_t* __restrict__ wt,
+                                    const XT* __restrict__ x, XT* __restrict__ y,
+                                    const float* __restrict__ scale, int N, int K) {
+    const int n0 = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (n0 >= N) return;
+    float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+    int k = 0;
+    for (; k + U <= K; k += U) {
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const int32_t word =
+                *reinterpret_cast<const int32_t*>(&wt[(size_t)(k + u) * N + n0]);
+            const float xv = CxScalar<XT>::to_float(x[k + u]);
+            a0 = fmaf((float)(int8_t)(word & 0xff), xv, a0);
+            a1 = fmaf((float)(int8_t)((word >> 8) & 0xff), xv, a1);
+            a2 = fmaf((float)(int8_t)((word >> 16) & 0xff), xv, a2);
+            a3 = fmaf((float)(int8_t)((word >> 24) & 0xff), xv, a3);
+        }
+    }
+    for (; k < K; ++k) {
+        const int32_t word = *reinterpret_cast<const int32_t*>(&wt[(size_t)k * N + n0]);
+        const float xv = CxScalar<XT>::to_float(x[k]);
+        a0 = fmaf((float)(int8_t)(word & 0xff), xv, a0);
+        a1 = fmaf((float)(int8_t)((word >> 8) & 0xff), xv, a1);
+        a2 = fmaf((float)(int8_t)((word >> 16) & 0xff), xv, a2);
+        a3 = fmaf((float)(int8_t)((word >> 24) & 0xff), xv, a3);
+    }
+    y[n0] = CxScalar<XT>::from_float(scale[n0] * a0);
+    y[n0 + 1] = CxScalar<XT>::from_float(scale[n0 + 1] * a1);
+    y[n0 + 2] = CxScalar<XT>::from_float(scale[n0 + 2] * a2);
+    y[n0 + 3] = CxScalar<XT>::from_float(scale[n0 + 3] * a3);
+}
+
+// @brief One K range of the same four-wide product, into this split's partials.
+template <typename XT, int U>
+__global__ void gemv_kn_i8x4_split_kernel(const int8_t* __restrict__ wt,
+                                          const XT* __restrict__ x,
+                                          float* __restrict__ part,
+                                          int N, int K, int split, int per) {
+    const int n0 = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (n0 >= N) return;
+    const int s = blockIdx.y;
+    const int k0 = s * per;
+    const int k1 = min(K, k0 + per);
+    float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+    int k = k0;
+    for (; k + U <= k1; k += U) {
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const int32_t word =
+                *reinterpret_cast<const int32_t*>(&wt[(size_t)(k + u) * N + n0]);
+            const float xv = CxScalar<XT>::to_float(x[k + u]);
+            a0 = fmaf((float)(int8_t)(word & 0xff), xv, a0);
+            a1 = fmaf((float)(int8_t)((word >> 8) & 0xff), xv, a1);
+            a2 = fmaf((float)(int8_t)((word >> 16) & 0xff), xv, a2);
+            a3 = fmaf((float)(int8_t)((word >> 24) & 0xff), xv, a3);
+        }
+    }
+    for (; k < k1; ++k) {
+        const int32_t word = *reinterpret_cast<const int32_t*>(&wt[(size_t)k * N + n0]);
+        const float xv = CxScalar<XT>::to_float(x[k]);
+        a0 = fmaf((float)(int8_t)(word & 0xff), xv, a0);
+        a1 = fmaf((float)(int8_t)((word >> 8) & 0xff), xv, a1);
+        a2 = fmaf((float)(int8_t)((word >> 16) & 0xff), xv, a2);
+        a3 = fmaf((float)(int8_t)((word >> 24) & 0xff), xv, a3);
+    }
+    float* col = part + (size_t)s * N + n0;
+    col[0] = a0;
+    col[1] = a1;
+    col[2] = a2;
+    col[3] = a3;
+}
+
 // @brief ``M`` activation rows share one weight pass, ``M`` a compile-time width.
 //
 // ``M`` is a template parameter rather than a runtime loop bound so the compiler
@@ -257,8 +396,8 @@ torch::Tensor launch_split(const torch::Tensor& wt, const torch::Tensor& x,
     auto part = torch::empty({split, N}, x.options().dtype(torch::kFloat));
     float* pp = part.data_ptr<float>();
     const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
-    const int blocks = (int)((N + threads - 1) / threads);
     const int per = (K + split - 1) / split;
+    const int blocks = (int)((N + threads - 1) / threads);
     const dim3 grid(blocks, split);
     if (unroll == 1) {
         gemv_kn_split_kernel<WT, XT, 1><<<grid, threads, 0, stream>>>(wp, xp, pp, N, K,
@@ -285,6 +424,91 @@ torch::Tensor launch_m(const torch::Tensor& wt, const torch::Tensor& x, torch::T
     const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
     const int blocks = (int)((N + threads - 1) / threads);
     gemv_kn_m_kernel<WT, XT, 4, M><<<blocks, threads, 0, stream>>>(wp, xp, yp, N, K);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return y;
+}
+
+//: Column count below which the four-wide int8 kernel is not worth its parallelism cost.
+//: The wide kernel keeps one thread per four columns, so it launches a quarter of the
+//: threads; on a 16-SM part that is the binding resource rather than the byte traffic.
+//: Measured on the model's own projections: wide-always took a decode step from 34.23 to
+//: 46.81 ms. ``lm_head`` (248320 columns) stays far above this floor; the others do not.
+constexpr int I8_WIDE_MIN_N = 32768;
+
+// @brief Launch the single-pass int8 kernel for one activation dtype and unroll.
+//
+// The four-wide kernel needs ``N % 4 == 0`` and a 4-byte-aligned row start, which the
+// divisibility gives because every row begins ``k * N`` bytes into the buffer.
+template <typename XT>
+torch::Tensor launch_i8_plain(const torch::Tensor& wt, const torch::Tensor& x,
+                              torch::Tensor& y, const torch::Tensor& scale,
+                              int N, int K, int threads, int unroll) {
+    const int8_t* wp = reinterpret_cast<const int8_t*>(wt.data_ptr());
+    const XT* xp = reinterpret_cast<const XT*>(x.data_ptr());
+    XT* yp = reinterpret_cast<XT*>(y.data_ptr());
+    const float* sp = scale.data_ptr<float>();
+    const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    if (N % 4 == 0 && N >= I8_WIDE_MIN_N) {
+        const int blocks = (int)(((N / 4) + threads - 1) / threads);
+        if (unroll == 2) {
+            gemv_kn_i8x4_kernel<XT, 2><<<blocks, threads, 0, stream>>>(wp, xp, yp, sp, N, K);
+        } else {
+            gemv_kn_i8x4_kernel<XT, 4><<<blocks, threads, 0, stream>>>(wp, xp, yp, sp, N, K);
+        }
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        return y;
+    }
+    const int blocks = (int)((N + threads - 1) / threads);
+    if (unroll == 2) {
+        gemv_kn_i8_kernel<XT, 2><<<blocks, threads, 0, stream>>>(wp, xp, yp, sp, N, K);
+    } else {
+        gemv_kn_i8_kernel<XT, 4><<<blocks, threads, 0, stream>>>(wp, xp, yp, sp, N, K);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return y;
+}
+
+// @brief Launch the split-K int8 pair: partials, then a scaled reduce.
+template <typename XT>
+torch::Tensor launch_i8_split(const torch::Tensor& wt, const torch::Tensor& x,
+                              torch::Tensor& y, const torch::Tensor& scale,
+                              int N, int K, int threads, int unroll, int split) {
+    const int8_t* wp = reinterpret_cast<const int8_t*>(wt.data_ptr());
+    const XT* xp = reinterpret_cast<const XT*>(x.data_ptr());
+    XT* yp = reinterpret_cast<XT*>(y.data_ptr());
+    const float* sp = scale.data_ptr<float>();
+    const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    const int per = (K + split - 1) / split;
+    // The partials are scratch, sized once for all splits: the reduce needs every split
+    // written before any column can be scaled, so they cannot share the output buffer.
+    auto part = torch::empty({(int64_t)split, (int64_t)N}, x.options().dtype(torch::kFloat));
+    float* pp = part.data_ptr<float>();
+    if (N % 4 == 0 && N >= I8_WIDE_MIN_N) {
+        const int blocks = (int)(((N / 4) + threads - 1) / threads);
+        if (unroll == 2) {
+            gemv_kn_i8x4_split_kernel<XT, 2><<<dim3(blocks, split), threads, 0, stream>>>(
+                wp, xp, pp, N, K, split, per);
+        } else {
+            gemv_kn_i8x4_split_kernel<XT, 4><<<dim3(blocks, split), threads, 0, stream>>>(
+                wp, xp, pp, N, K, split, per);
+        }
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    } else {
+        const int blocks = (int)((N + threads - 1) / threads);
+        if (unroll == 2) {
+            gemv_kn_i8_split_kernel<XT, 2><<<dim3(blocks, split), threads, 0, stream>>>(
+                wp, xp, pp, N, K, split, per);
+        } else {
+            gemv_kn_i8_split_kernel<XT, 4><<<dim3(blocks, split), threads, 0, stream>>>(
+                wp, xp, pp, N, K, split, per);
+        }
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    // The reduce is one thread per column either way: it reads four adjacent floats per
+    // thread anyway through the partials, and splitting it four-wide would only change
+    // which lane touches which column.
+    const int rblocks = (int)((N + threads - 1) / threads);
+    gemv_reduce_i8_kernel<XT><<<rblocks, threads, 0, stream>>>(pp, yp, sp, N, split);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return y;
 }
@@ -332,6 +556,52 @@ torch::Tensor gemv_kn(torch::Tensor wt, torch::Tensor x, int64_t threads,
     return sp > 1
         ? launch_split<float, float>(wt, x, y, N, K, th, u, sp)
         : launch_plain<float, float>(wt, x, y, N, K, th, u);
+}
+
+// @brief Decode-time W8A16 projection: int8 ``[K, N]`` weight and a per-column fp32 scale.
+//
+// Halves the bytes read per weight against :func:`gemv_kn`, which is the only lever left
+// on a path that is already bandwidth-bound: the projections are the majority of a decode
+// step and the card is saturated for essentially all of it (PERF_COREX.md §8).
+//
+// @param wt [K, N] int8 weight, contiguous.
+// @param x [K] activations, bf16 or fp32. The output takes its dtype.
+// @param scale [N] fp32 absmax scale, one per output column, applied once per column.
+// @param threads Threads per block, ``0`` to pick from ``N``.
+// @param unroll K-loop unroll, ``2`` or ``4``; ``0`` means 4.
+// @param split Split-K width, ``0`` to pick; ``1`` forces one pass.
+// @return [N] output in ``x``'s dtype.
+// @throws c10::Error when the weight is not int8, the scale length disagrees with ``N``,
+//         or a dtype/layout is one the kernels cannot index -- each of those reads the
+//         wrong elements rather than failing.
+torch::Tensor gemv_kn_i8(torch::Tensor wt, torch::Tensor x, torch::Tensor scale,
+                         int64_t threads, int64_t unroll, int64_t split) {
+    TORCH_CHECK(wt.dim() == 2, "weight must be 2-D [K, N]");
+    TORCH_CHECK(x.dim() == 1, "activation must be 1-D [K]");
+    TORCH_CHECK(wt.scalar_type() == torch::kChar,
+                "int8 weight required (a bf16 weight here would be read one byte per "
+                "value and produce plausible garbage)");
+    TORCH_CHECK(scale.scalar_type() == torch::kFloat, "scale must be fp32");
+    TORCH_CHECK(wt.is_contiguous() && x.is_contiguous() && scale.is_contiguous(),
+                "contiguous inputs required");
+    const int K = (int)wt.size(0), N = (int)wt.size(1);
+    TORCH_CHECK(wt.size(0) == x.size(0), "K mismatch: weight ", wt.size(0),
+                " vs activation ", x.size(0));
+    TORCH_CHECK(scale.numel() == N, "scale must hold one value per output column: got ",
+                scale.numel(), " for N = ", N);
+    const bool x16 = x.scalar_type() == torch::kBFloat16;
+    TORCH_CHECK(x16 || x.scalar_type() == torch::kFloat,
+                "activation must be bf16 or fp32");
+    auto y = torch::empty({N}, x.options());
+    const int th = threads > 0 ? (int)threads : pick_threads(N);
+    const int u = unroll > 0 ? (int)unroll : 4;
+    const int sp = split > 0 ? (int)split : pick_split(N, K, th);
+    if (x16) {
+        return sp > 1 ? launch_i8_split<uint16_t>(wt, x, y, scale, N, K, th, u, sp)
+                      : launch_i8_plain<uint16_t>(wt, x, y, scale, N, K, th, u);
+    }
+    return sp > 1 ? launch_i8_split<float>(wt, x, y, scale, N, K, th, u, sp)
+                  : launch_i8_plain<float>(wt, x, y, scale, N, K, th, u);
 }
 
 // @brief Small-M projection: ``M`` activation rows read the weight once.

@@ -446,6 +446,7 @@ ALLOWLISTS: dict[str, dict[str, dict[str, int]]] = {
             "diag/corex_probe/probe_graph_repeat.py": 2,
             "diag/corex_probe/probe_graph_stages.py": 17,
             "diag/corex_probe/probe_import.py": 4,
+            "diag/corex_probe/probe_int8.py": 12,
             "diag/corex_probe/probe_loadcheck.py": 2,
             "diag/corex_probe/probe_step_budget.py": 6,
             "diag/corex_probe/probe_torch_upgrade_run.py": 6,

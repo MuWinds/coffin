@@ -263,9 +263,9 @@ def linear(w: torch.Tensor | QWeight | pack.KnWeight, x: torch.Tensor) -> torch.
     """Decode-time projection: one activation row against ``[N, K]`` ``w``.
 
     Args:
-        w: ``[N, K]`` projection weight -- a plain tensor, a ``QWeight`` (dequantised
-            here, because this backend declares ``int8_weights=False``), or a
-            :class:`pack.KnWeight` the loader already transposed.
+        w: ``[N, K]`` projection weight -- a plain tensor, a ``QWeight`` (kept int8
+            and served by the W8A16 kernel, which is the point of declaring
+            ``int8_weights``), or a packed weight the loader already transposed.
         x: Activations, ``[K]`` or ``[C, K]``.
 
     Returns:
@@ -281,7 +281,10 @@ def linear(w: torch.Tensor | QWeight | pack.KnWeight, x: torch.Tensor) -> torch.
     packed = pack.as_kn(w)
     module = _kernels()
     dtype = x.dtype
-    return _restore(module.gemv_kn(packed.wt, _compute_dtype(x).contiguous()), dtype)
+    act = _compute_dtype(x).contiguous()
+    if packed.int8:
+        return _restore(module.gemv_kn_i8(packed.wt, act, packed.scale), dtype)
+    return _restore(module.gemv_kn(packed.wt, act), dtype)
 
 
 def linear_m(w: torch.Tensor | QWeight | pack.KnWeight, x: torch.Tensor) -> torch.Tensor:
@@ -325,6 +328,14 @@ def _gemv_rows(w: torch.Tensor | QWeight | pack.KnWeight,
     dtype = x.dtype
     act = _compute_dtype(x).contiguous()
     rows = act.shape[0]
+    if packed.int8:
+        # One launch per row: there is no small-M int8 kernel, and the batched paths that
+        # would reach this (verify, speculative decode) are a handful of rows while the
+        # single-row decode path is where the traffic is.
+        out = torch.empty((rows, packed.n), dtype=act.dtype, device=act.device)
+        for r in range(rows):
+            out[r] = module.gemv_kn_i8(packed.wt, act[r], packed.scale)
+        return _restore(out, dtype)
     if rows == 1:
         return _restore(module.gemv_kn(packed.wt, act[0]), dtype)
     if rows <= _ROW_CHUNK:
@@ -362,6 +373,12 @@ def linear_prefill(w: torch.Tensor | QWeight | pack.KnWeight,
     """
     packed = pack.as_kn(w)
     rows = x.shape[0]
+    if packed.int8:
+        # int8 exists for the decode GEMV, where halving the bytes dominates. A prefill
+        # GEMM consumes the weight many times per tile and the library cannot take an
+        # int8 operand here, so the wide path dequantises once and uses the bf16 GEMM.
+        # That keeps one storage form in VRAM instead of two copies of every weight.
+        packed = packed.dequant_kn(pack.WEIGHT_DTYPE)
     if rows < _PREFILL_MIN_M:
         # Below the prefill regime the GEMM reads the weight once per tile and loses
         # to the GEMV, which reads it exactly once for the whole call.
@@ -1131,7 +1148,7 @@ def caps() -> Caps:
         autotune=True,
         attn_split=1,
         batch_attn="attn_paged_batch" in native,
-        int8_weights=False,
+        int8_weights=True,
         recurrent_state=True,
         weight_layout="kn",
     )

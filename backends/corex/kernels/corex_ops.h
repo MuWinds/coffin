@@ -53,6 +53,23 @@ torch::Tensor gemv_kn(torch::Tensor wt, torch::Tensor x, int64_t threads,
 torch::Tensor gemv_kn_m(torch::Tensor wt, torch::Tensor x, int64_t threads,
                         int64_t unroll);
 
+// @brief Decode W8A16 projection: int8 weights plus one fp32 scale per output column.
+//
+// Halves the bytes read per weight against :func:`gemv_kn`. The scale applies once to the
+// finished dot product, never per element and never folded into the activation.
+//
+// @param wt [K, N] int8 weights, contiguous.
+// @param x [K] activations, bf16 or fp32.
+// @param scale [N] fp32 absmax scale, one per output column.
+// @param threads Threads per block; ``0`` picks from ``N``.
+// @param unroll K-loop unroll factor; ``0`` means 4.
+// @param split Split-K width; ``0`` picks, ``1`` forces the single-pass kernel.
+// @return [N] in ``x``'s dtype.
+// @throws c10::Error on a non-int8 weight, a scale length other than ``N``, or a layout
+//         the kernels cannot index.
+torch::Tensor gemv_kn_i8(torch::Tensor wt, torch::Tensor x, torch::Tensor scale,
+                         int64_t threads, int64_t unroll, int64_t split);
+
 // Normalisation.
 
 // @brief Zero-centred RMSNorm over the last axis of ``[M, N]`` with a row pitch.
