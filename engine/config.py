@@ -70,6 +70,12 @@ class EngineConfig:
     spec_min_ctx: int = 0
     #: Prefill GEMM M. rocBLAS tops out around 2048 tokens on this card.
     chunk: int = 2048
+    #: Prompt tokens one request may prefill in one scheduling step. This is a
+    #: *scheduling* knob and is deliberately not ``chunk``: ``chunk`` is the GEMM
+    #: tile the model was tuned for, while this is how long a single request may
+    #: hold the card before the scheduler gives another one a turn. Coupling them
+    #: would make a GEMM re-tune change who gets scheduled first.
+    prefill_quantum: int = 2048
     #: Sequences decoded in one step. The scheduler never admits more than it can
     #: serve, and row ``capacity-1`` stays reserved for a prefill.
     max_num_seqs: int = 1

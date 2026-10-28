@@ -88,6 +88,11 @@ class BlockManager:
 
         Returns:
             The sequence's block table, extended as needed.
+
+        Raises:
+            OutOfBlocks: The pool is empty. The caller must evict the prefix
+                cache and, if that is not enough, preempt a sequence; the request
+                cannot grow here.
         """
         need = (num_tokens + self.block_size - 1) // self.block_size
         while len(seq.block_table) < need:
@@ -97,9 +102,13 @@ class BlockManager:
     def release(self, seq) -> None:
         """Drop ``seq``'s reference on every block it holds.
 
+        The tree keeps its own reference on anything it caches, so a preempting
+        sequence can call this and still leave every block-aligned prefix reusable
+        by the next admission. A block with no other holder returns to the pool.
+
         Args:
-            seq: Sequence being retired. Its table is cleared, so a second call
-                frees nothing rather than freeing the same ids twice.
+            seq: Sequence being retired or preempted. Its table is cleared, so a
+                second call frees nothing rather than freeing the same ids twice.
         """
         self.free(seq.block_table)
         seq.block_table.clear()

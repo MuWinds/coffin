@@ -99,6 +99,11 @@ def main() -> None:
                     help="KV pool blocks shared by all sequences (0 = "
                          "max_seq/block_size * max_num_seqs). Lower it when the "
                          "window is long: the pool is allocated up front.")
+    ap.add_argument("--prefill-quantum", type=int, default=2048,
+                    help="prompt tokens one request may prefill per scheduling step "
+                         "(0 = the step's whole token budget). This is what keeps a "
+                         "long prompt from blocking a short one; it is not the GEMM "
+                         "tile (that is --max-num-batched-tokens' chunk)")
 
     # images
     ap.add_argument("--no-vision", dest="vision", action="store_false",
@@ -141,7 +146,8 @@ def main() -> None:
               args.num_blocks, args.spec_batch, args.spec_sparse_k,
               args.spec_min_ctx, args.vision, args.vision_int8,
               args.image_max_pixels, args.image_min_pixels, args.max_images,
-              args.max_image_bytes, graph=args.graph)
+              args.max_image_bytes, graph=args.graph,
+              prefill_quantum=args.prefill_quantum)
         return
 
     if args.cmd in ("ping", "reload", "reset", "stop"):

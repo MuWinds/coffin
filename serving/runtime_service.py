@@ -49,7 +49,7 @@ class Server(
                      vision: bool = True, vision_int8: bool = False,
                      image_max_pixels: int = 1048576, image_min_pixels: int = 65536,
                      max_images: int = 4, max_image_bytes: int = 8388608,
-                     graph: bool = True) -> None:
+                     graph: bool = True, prefill_quantum: int = 2048) -> None:
             """Load the checkpoint, freeze ``EngineConfig`` and build the engine.
 
             Args:
@@ -94,6 +94,10 @@ class Server(
                     the value has to reach the engine before ``build()`` captures;
                     a backend that reports ``caps.graph=False`` stays eager no
                     matter what was asked for.
+                prefill_quantum: Prompt tokens one request may prefill per step.
+                    With the scheduler's token budget this is what stops one long
+                    prompt from delaying every short request behind it; 0 means
+                    "one chunk may use the whole budget".
 
             Raises:
                 RuntimeError: The checkpoint's ``config.json`` names no registered
@@ -184,6 +188,11 @@ class Server(
                 spec_min_ctx=self.spec_min_ctx,
                 max_seconds=self.max_seconds,
                 max_num_seqs=max(1, int(max_num_seqs)),
+                # 0 means "no separate cap": one chunk may use the whole step
+                # budget, which is the pre-chunking behaviour.
+                prefill_quantum=(int(prefill_quantum) if prefill_quantum > 0
+                                 else EngineConfig.__dataclass_fields__[
+                                     "max_num_batched_tokens"].default),
                 graph=self.graph)
             t0 = time.time()
             # stays resident; int8 halves it (4.0 GiB instead of 8.1), which is what

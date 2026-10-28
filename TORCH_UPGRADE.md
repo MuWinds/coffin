@@ -89,17 +89,7 @@ OSError: ./libnccl.so.2: undefined symbol: ixdrvDeviceGetAttribute, version CUDA
 
 ---
 
-## 4. 复现方式
+## 4. 结论
 
-```bash
-# 只读survey（驱动/工具链/解释器/安装包）
-python scow/tools/deploy.py cohort -d ../coffin/diag/corex_probe \
-    -s ../coffin/diag/corex_probe/launch_upgrade.sh --run upg -g 1 -t 10
-
-# 解释器 × 库路径矩阵（每个组合一个子进程，不安装任何东西）
-python scow/tools/deploy.py cohort -d ../coffin/diag/corex_probe \
-    -s ../coffin/diag/corex_probe/launch_upgrade_run.sh --run upgrun -g 1 -t 12
-
-# 各节点驱动版本对照
-python scow/tools/probe_driver_matrix.py
-```
+这轮 torch/驱动兼容性调查已经完成，原先的一次性 survey launcher 已删除。
+后续如需重新评估，应按当前环境重新设计探针，不复用旧的固定路径和版本假设。

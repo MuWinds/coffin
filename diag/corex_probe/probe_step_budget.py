@@ -168,30 +168,52 @@ def main() -> int:
     except Exception as exc:                      # noqa: BLE001 - trace is informational
         print(f"  profiler unavailable: {type(exc).__name__}: {exc}", flush=True)
 
-    print("\n=== C. what the gap is ===", flush=True)
+    print("\n=== C. host time inside the step (what a C++ entry saves) ===", flush=True)
+    # The launcher-style measurement above cannot answer this: it wraps the whole loop in
+    # device events, so a host that is merely *ahead* of the device looks free. Here the
+    # clock is read on the host around each step, with no synchronise inside the loop, so
+    # the total is exactly the Python + ATen dispatch time. If cpu_busy exceeds wall the
+    # host is the critical path and issuing the step from one C++ call removes real time;
+    # if it is well below wall, the host is already waiting on the device and a C++ entry
+    # would only move dispatches off a non-critical path.
+    prepare()
+    for _ in range(3):
+        step()
+    torch.cuda.synchronize()
+    host_start = time.perf_counter()
+    for _ in range(STEPS):
+        step()
+    cpu_busy = (time.perf_counter() - host_start) * 1000.0 / STEPS
+    # Drain so the device work queued by that loop is not left to pollute the next section.
+    torch.cuda.synchronize()
+    print(f"  cpu busy/step : {cpu_busy:.2f} ms  "
+          f"({100 * cpu_busy / wall:.0f}% of wall)", flush=True)
+    if cpu_busy >= wall:
+        print("  verdict       : HOST BOUND -- one C++ entry point removes real wall time",
+              flush=True)
+    elif cpu_busy >= 0.75 * wall:
+        print("  verdict       : host is close to the critical path; a C++ entry would "
+              "recover much of the gap", flush=True)
+    else:
+        print("  verdict       : host is not the critical path; a C++ entry only moves "
+              "dispatch off it", flush=True)
+
+    print("\n=== D. trace sanity (not a verdict) ===", flush=True)
     if gpu_busy == gpu_busy:
-        gap = wall - gpu_busy
-        print(f"  gpu busy (trace): {gpu_busy:.2f} ms  vs wall {wall:.2f} ms", flush=True)
-        print(f"  launches        : {launches} per step", flush=True)
+        print(f"  trace sum : {gpu_busy:.2f} ms  vs wall {wall:.2f} ms", flush=True)
+        print(f"  launches  : {launches} per step", flush=True)
         if gpu_busy >= wall:
-            # The trace's per-kernel durations include profiling overhead, so adding them up
-            # over-counts: here the sum exceeds the wall clock by more than a quarter. That
-            # makes the *sum* unusable as a busy-time figure, but it does prove the device is
-            # occupied for essentially the whole step -- there is no idle window large enough
-            # to hide a launch-bound path inside.
-            print(f"  trace inflation : {100 * (gpu_busy / wall - 1):.0f}% over wall",
-                  flush=True)
-            print("  verdict         : device bound -- the trace cannot be summed, but it "
-                  "already covers the whole step", flush=True)
-            print("  implication     : removing launches cannot help; only less device "
-                  "work can", flush=True)
-        elif gap > 0.25 * wall:
-            print(f"  not busy : {gap:.2f} ms ({100 * gap / wall:.0f}% of the step)",
-                  flush=True)
-            print("  verdict  : launch/host bound -- fewer, larger launches win", flush=True)
+            # The trace over-counts by construction: every entry carries the profiler's own
+            # cost per kernel, so the sum grows with the launch count rather than with the
+            # work. A sum above the wall clock therefore proves the sum is unusable as a
+            # busy figure -- and nothing more. Reading it as "the device is busy for the
+            # whole step" is the inference PERF_COREX 12.1 had to retract.
+            print(f"  inflation : {100 * (gpu_busy / wall - 1):.0f}% over wall", flush=True)
+            print("  NOTE      : the sum is unusable as busy time. Use section C: it "
+                  "measures host time directly.", flush=True)
         else:
-            print(f"  not busy : {gap:.2f} ms ({100 * gap / wall:.0f}% of the step)",
-                  flush=True)
+            print("  usage     : the sum is only comparable across runs, never a share of "
+                  "wall", flush=True)
             print("  verdict  : device bound -- only kernel work matters", flush=True)
     else:
         print("  no profiler data; wall only", flush=True)

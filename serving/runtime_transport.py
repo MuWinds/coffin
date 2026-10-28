@@ -36,7 +36,7 @@ def serve(model_dir: str, max_seq: int, bench: bool, sock_path: str,
           vision: bool = True, vision_int8: bool = False,
           image_max_pixels: int = 1048576, image_min_pixels: int = 65536,
           max_images: int = 4, max_image_bytes: int = 8388608,
-          graph: bool = True) -> None:
+          graph: bool = True, prefill_quantum: int = 2048) -> None:
     """Build the server, bind the unix socket and serve until asked to stop.
 
     The argument list mirrors ``Server.__init__``; see it for the meaning of each
@@ -71,12 +71,16 @@ def serve(model_dir: str, max_seq: int, bench: bool, sock_path: str,
             replay is not trusted yet, and it must reach the engine before the
             graph is captured, which is why it travels as a constructor argument
             rather than an environment variable.
+        prefill_quantum: Prompt tokens one request may prefill per step. The
+            scheduler uses it to interleave long prompts with short ones; 0 falls
+            back to the step's whole token budget.
     """
     srv_model = Server(model_dir, max_seq, bench, spec_k, int8, prefix_cache, block_size,
                        snapshots, snapshot_interval, max_seconds, max_num_seqs,
                        num_blocks, spec_batch, spec_sparse_k, spec_min_ctx,
                        vision, vision_int8, image_max_pixels, image_min_pixels,
-                       max_images, max_image_bytes, graph=graph)
+                       max_images, max_image_bytes, graph=graph,
+                       prefill_quantum=prefill_quantum)
     info = srv_model.info
     print(f"[serve] model {info['model']} ({info['arch']}) at {info['model_path']}",
           flush=True)

@@ -1042,14 +1042,53 @@ class Qwen35:
                                                     reset=self.reset)
         self.reset()
 
+    def _stage_sentinels(self, rows: int, bucket: int, pad_rows=()) -> None:
+        """Turn every row the caller does not fill into a harmless sentinel.
+
+        A bucket graph runs all ``bucket`` rows -- the batched kernels carry no
+        live mask, they execute the width they were built for -- so a hole has to
+        be a row that is valid to run, not a skipped one: the row's slot map is
+        pointed at its scratch block, and its token, position and context length
+        are the ones of a lone token 0 seen for the first time (position 0, window
+        1). Its result is computed and then discarded by the caller. The rotation
+        offset is part of that reset: left stale from the previous occupant, a
+        negative ``rope_delta`` would index before the first row of the cos/sin
+        table.
+
+        Args:
+            rows: High-water mark of the live rows: everything below it is live
+                except the rows in ``pad_rows``.
+            bucket: Row count of the graph, or of the eager forward, that consumes
+                these buffers. Rows ``rows..bucket-1`` are staged too.
+            pad_rows: Holes inside ``0 .. rows-1``, i.e. rows whose sequence
+                finished while later rows stayed live.
+
+        Raises:
+            ValueError: A pad row is outside ``0 .. bucket-1``. Such a row has no
+                buffers and no scratch block, so it would corrupt a live row's
+                state or index past the buffer; reject it at the runner.
+        """
+        pad = {int(r) for r in pad_rows}
+        if any(r < 0 or r >= bucket for r in pad):
+            raise ValueError(f"pad_rows outside 0..{bucket - 1}: {sorted(pad)}")
+        pad.update(range(rows, bucket))
+        for row in sorted(pad):
+            if self.pool is not None:
+                self.pool.assign(self._scratch_blocks[row], 0, row)
+            self.token_in[row] = self._sentinel_token
+            self.pos[row] = 0
+            self.rope_delta[row] = 0
+            if self.ctx_lens is not None:
+                self.ctx_lens[row] = 1
+
     @torch.inference_mode()
     def decode_batch(self, rows: int, bucket: int, pad_rows=()) -> torch.Tensor:
         """Replay ``bucket``'s graph; returns the logits of all ``bucket`` rows.
 
         The runner keeps each sequence on a fixed decode row, so the live rows of
-        a bucket need not be contiguous. Every hole is filled with the sentinel
-        sequence (its own scratch block + slot-map row, token 0, position 0,
-        context length 1); its logits are computed and then discarded.
+        a bucket need not be contiguous; :meth:`_stage_sentinels` fills the holes.
+        :meth:`decode_batch_eager` is the same step without a graph, for a backend
+        where capture is not allowed.
 
         Args:
             rows: High-water mark of the live rows: everything below it is
@@ -1074,22 +1113,62 @@ class Qwen35:
             raise ValueError(f"no graph captured for bucket {bucket}")
         if not 1 <= rows <= bucket:
             raise ValueError(f"rows={rows} outside 1..{bucket}")
-        pad = {int(r) for r in pad_rows}
-        if any(r < 0 or r >= bucket for r in pad):
-            raise ValueError(f"pad_rows outside 0..{bucket - 1}: {sorted(pad)}")
-        pad.update(range(rows, bucket))
-        if pad:
-            for row in sorted(pad):
-                if self.pool is not None:
-                    self.pool.assign(self._scratch_blocks[row], 0, row)
-                self.token_in[row] = self._sentinel_token
-                self.pos[row] = 0
-                # A hole must rotate at a valid table row: row 0 + a stale negative
-                # delta from the previous occupant would index before the table.
-                self.rope_delta[row] = 0
-                if self.ctx_lens is not None:
-                    self.ctx_lens[row] = 1
+        self._stage_sentinels(rows, bucket, pad_rows)
         graph.replay()
+        return self.logits_out[:bucket]
+
+    @torch.inference_mode()
+    def decode_batch_eager(self, rows: int, bucket: int, pad_rows=()) -> torch.Tensor:
+        """Run ``bucket`` rows of batched decode eagerly, with no captured graph.
+
+        The entry point for a backend that must not capture: the SCOW driver
+        mis-handles graph replay badly enough to damage the card, so capture is
+        forbidden there and :meth:`capture_batch` is never called. Staging,
+        sentinel rows and the ``bucket``-wide output are the ones
+        :meth:`decode_batch` has, and the body is the same :meth:`_forward_batch`.
+        Nothing in that body reads a graph -- it reads only the fixed buffers and
+        advances ``pos[:bucket]`` -- so a bucket's logits here equal the logits of
+        a captured graph of the same width.
+
+        The bucket set is deliberately not validated. The runner's scheduler picks
+        ``bucket`` from the live row count, and the "was this width captured?"
+        check belongs to the graph path, which is the only place a captured set
+        exists; with capture off there is nothing to look up in.
+
+        Args:
+            rows: High-water mark of the live rows: everything below it is
+                occupied except the rows in ``pad_rows``.
+            bucket: Row count to run this step, i.e. the width of the batched
+                forward. Any width up to ``decode_capacity`` is legal.
+            pad_rows: Holes inside ``0 .. rows-1``, i.e. rows whose sequence
+                finished while later rows stayed live.
+
+        Returns:
+            ``[bucket, vocab]`` view of the logits. The caller samples by
+            ``seq.row``; the buffer is live, not a copy, so it is only valid until
+            the next call.
+
+        Raises:
+            RuntimeError: :meth:`enable_batching` was never called with a capacity
+                above 1, or the model has no paged pool. Each sentinel row writes
+                KV through its own scratch block, which only those two calls
+                reserve (``_prepare_pool_rows``), so without them a staged hole
+                would address a block no sequence owns.
+            ValueError: ``rows`` and ``bucket`` are not within
+                ``1 <= rows <= bucket <= decode_capacity``, or a pad row is outside
+                the bucket. Request-shape bugs; reject them at the runner.
+        """
+        if self.batch_capacity <= 1:
+            raise RuntimeError("decode_batch_eager() needs enable_batching(capacity>1)")
+        if self.pool is None:
+            raise RuntimeError("decode_batch_eager() needs a paged pool (enable_paging())")
+        if not 1 <= rows <= bucket:
+            raise ValueError(f"rows={rows} outside 1..{bucket}")
+        if bucket > self.decode_capacity:
+            raise ValueError(
+                f"bucket {bucket} exceeds decode_capacity {self.decode_capacity}")
+        self._stage_sentinels(rows, bucket, pad_rows)
+        self._forward_batch(bucket)
         return self.logits_out[:bucket]
 
     def enable_spec_batch(self, K: int, buckets: tuple[int, ...] = (1, 2, 4, 8),

@@ -504,7 +504,7 @@ prod 侧 75 处属性引用、25 个符号，归并到 17 个算子名：
 3. **`caps.autotune=False` 是"后端给固定选路"**，不是"运行时测一组候选"；并且 `bench=False` 的构造路径
    必须保留，无卡测试依赖它跳过 sweep。
 4. **`D`/`WF` 再导出只是省改名**：语义来源必须唯一是 `caps`，`ops/dtypes.py` 里不能再有第二个字面量。
-5. **不是所有 `diag/` 探针都能平台无关化**：`probe_hw.py` / `probe_longctx.py` / `bench_graph.py` 测的就是这张卡，
+5. **不是所有 `diag/` 探针都能平台无关化**：`probe_hw.py` / `probe_longctx.py` 测的就是这张卡，
    正确去向是 `backends/hip/diag/`，不要硬改成后端无关。
 6. **`TORCH_EXTENSIONS_DIR` 必须按后端隔离**：共享目录会让并发布署抢同一个构建锁（已踩过，见 VISION §11.5）。
 

@@ -384,7 +384,7 @@ capture+replay，逐 token 完全相同，且进程存活。单个算子的捕�
 `diag/corex_probe/` 下每个 launcher 现在第一步都跑 8x8 matmul，失败就 `exit 64`
 （不加载模型、不浪费时间）。
 
-**验收证据**（`probe_graph_repeat.py`，gpu-node-07，同进程 6 轮）：
+**历史验收证据**（gpu-node-07，同进程 6 轮；对应的 graph 探针已按驱动安全规则删除）：
 
 ```
 backend=corex native=18/18 graph=1, loaded in 35.1s
