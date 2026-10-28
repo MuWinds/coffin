@@ -138,13 +138,34 @@ class KnQWeight:
         caller that cannot use the int8 path converts with one multiply instead of a
         transpose.
 
+        Written as cast-then-scale, not scale-then-cast. The obvious spelling
+        ``(wt.float() * scale).to(dtype)`` materialises a ``[K, N]`` fp32 temporary, twice
+        the size of the answer it is immediately narrowed to; over this model's 128
+        projections that is a *fixed* 174.8 ms per prefill request, which was 3.1x the
+        whole prefill at n=128 (``PERF_COREX.md`` §13.2b).
+
+        ``mul_`` on a bf16 destination with an fp32 scale computes in fp32 and rounds
+        once, the same single rounding the old spelling did, so the weights stay
+        bit-identical. Narrowing the scale first (``scale.to(dtype)``) is 1.88x instead of
+        1.70x but moves every weight by one bf16 ULP, and a weight feeds 32 layers; that
+        is not a trade to make for 10% of one operator.
+
         Args:
             dtype: Storage dtype of the result.
 
         Returns:
             A :class:`KnWeight` over the dequantised matrix.
+
+        Raises:
+            TypeError: ``dtype`` is not a float type. Scaling into an integer destination
+                wraps instead of raising, which surfaces as a corrupt checkpoint much
+                further downstream.
         """
-        return KnWeight((self.wt.float() * self.scale.view(1, -1)).to(dtype))
+        if not dtype.is_floating_point:
+            raise TypeError(f"dequant_kn needs a float dtype, got {dtype}")
+        out = self.wt.to(dtype)
+        out.mul_(self.scale.view(1, -1))
+        return KnWeight(out)
 
     def __repr__(self) -> str:  # pragma: no cover - debug aid
         return f"KnQWeight(K={self.k}, N={self.n}, int8)"

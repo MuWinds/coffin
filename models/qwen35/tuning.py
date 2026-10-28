@@ -41,9 +41,19 @@ PREFILL_ATTN_TILE = int(os.environ.get("PREFILL_ATTN_TILE", "512"))
 #: ``[nkv, rep, nq, p1]`` -- O(context length) memory for every tile, which is
 #: 8.6 GB at 256k and cannot coexist with the weights on a 16 GB card. Blocks are
 #: accumulated with a running max (online softmax), so the block stays
-#: ``[nkv, rep, nq, PREFILL_ATTN_KB]`` (~34 MB at the defaults) whatever the
-#: context, at the cost of one rescale of the accumulator per block.
-PREFILL_ATTN_KB = int(os.environ.get("PREFILL_ATTN_KB", "1024"))
+#: ``[nkv, rep, nq, PREFILL_ATTN_KB]`` whatever the context, at the cost of one
+#: rescale of the accumulator per block.
+#:
+#: Raised from 1024 to 4096 after measuring it on the BI-V100. A bigger block means fewer
+#: online-softmax rescales, and prefill there is compute-bound at 45-51 TFLOP/s, so the
+#: rescale is the cost while the extra memory is affordable: at the 512-token tile used in
+#: practice the live score block grows 128 MB, against a 32 GB card and ~4.5 GB of int8
+#: weights. At n=8192 each step up paid -- 512 -> 2048 was 10.5% faster, 2048 -> 4096 a
+#: further 4.9% -- and the direction held at every tile width and in two independent
+#: sweeps (``diag/corex_probe/probe_prefill_sweep.py``, PERF_COREX.md §13.7). A 2048-token
+#: prompt gains nothing (720.0 -> 720.2 ms) because it is a single tile, so the block loop
+#: barely runs there; the win is on long prompts.
+PREFILL_ATTN_KB = int(os.environ.get("PREFILL_ATTN_KB", "4096"))
 
 #: Tokens per chunk in ``MTP.prefill``. Its attention is the same blocked one as
 #: the main layers, but it is fed the whole prompt (to keep the draft cache in

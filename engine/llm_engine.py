@@ -124,6 +124,14 @@ class LLMEngine:
                 raise RuntimeError(
                     "graph capture is off but batching/speculation is configured; "
                     "both replay a captured graph, so they need caps.graph")
+            # Speculation is rejected above, so no drafter KV this prefill writes can
+            # ever be read. Feeding it is one full-attention layer plus five projections
+            # over the whole prompt: 214.8 ms of a 962.5 ms prefill at n=2048 on the part
+            # this was measured on (PERF_COREX.md §13.2a). Cleared here rather than in
+            # ``Qwen35.__init__`` because a caller can also drive ``spec_generate``
+            # directly, which replays the eager substitute captures and does read that KV.
+            if self.model.mtp is not None:
+                self.model.mtp_prefill = False
             self.model.reset()
         elif self.batching:
             self.runner.enable_batching(self.cfg.max_num_seqs)

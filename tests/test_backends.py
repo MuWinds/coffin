@@ -917,6 +917,56 @@ class DependencyDirectionTest(unittest.TestCase):
         self.assertIn("COFFIN_BACKEND", bad.stderr)
 
 
+class CorexPackTest(unittest.TestCase):
+    """The int8 -> bf16 weight conversion, which every int8 prefill call pays for."""
+
+    def _packed(self):
+        """Build a small packed int8 weight with realistic scales.
+
+        Returns:
+            A ``KnQWeight`` whose ``[K, N]`` matrix is contiguous int8 and whose scale is
+            1-D fp32, which is the pair the constructor validates.
+        """
+        from backends.corex.pack import KnQWeight
+
+        k, n = 96, 40
+        wt = torch.randint(-127, 127, (k, n), dtype=torch.int8)
+        scale = (torch.rand(n) * 0.01 + 1e-4).to(torch.float32)
+        return KnQWeight(wt, scale)
+
+    def test_dequant_kn_is_bit_identical_to_the_wide_fp32_spelling(self):
+        """The fast spelling must not move a single weight.
+
+        The conversion used to build a ``[K, N]`` fp32 temporary and narrow it, which cost
+        174.8 ms per prefill request on the card. Casting to the output dtype first and
+        scaling in place is 1.70x faster because ``mul_`` takes its dtype from the
+        destination, so it still multiplies in fp32 and rounds once -- same arithmetic,
+        no temporary. A bf16 *scale* would instead cost 1 ULP on every weight, which is
+        why the scale stays fp32 here and this test is bit-exact rather than approximate.
+        """
+        q = self._packed()
+        got = q.dequant_kn(torch.bfloat16).wt
+        want = (q.wt.float() * q.scale.view(1, -1)).to(torch.bfloat16)
+        self.assertTrue(torch.equal(got, want),
+                        "dequant_kn changed the weights; a faster conversion is only "
+                        "acceptable if it is bit-identical")
+
+    def test_dequant_kn_keeps_the_kn_layout(self):
+        """The result feeds ``matmul(lhs, wt)``, so a transposed or non-contiguous matrix multiplies silently wrong."""
+        q = self._packed()
+        out = q.dequant_kn(torch.bfloat16)
+        self.assertEqual((out.k, out.n), (q.k, q.n))
+        self.assertEqual(tuple(out.wt.shape), (q.k, q.n))
+        self.assertTrue(out.wt.is_contiguous())
+        self.assertEqual(out.wt.dtype, torch.bfloat16)
+
+    def test_dequant_kn_rejects_an_integer_destination(self):
+        """Scaling into an integer destination wraps instead of raising, which reads as a corrupt checkpoint later."""
+        q = self._packed()
+        with self.assertRaises(TypeError):
+            q.dequant_kn(torch.int8)
+
+
 if __name__ == "__main__":
     unittest.main()
 

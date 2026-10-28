@@ -323,7 +323,7 @@ USING_CARD=1 on gpu-node-05
 | --- | --- |
 | `gr-1`（node-06） | 完整通过，52.41 ms/step |
 | `gr2-1`（node-06） | `graph replay` 后无输出，挂死 |
-| `probe_graph_delta`（node-05 card 2） | capture/prefill/5 次 replay 全通过 |
+| 历史 graph 验收（node-05 card 2） | capture/prefill/5 次 replay 全通过；当前按驱动安全规则不再复跑 |
 | `probe_chat`（node-05 card 1） | `graph replay` 后无输出，挂死 |
 
 **同一份代码、同类节点，有时通过有时挂死。** 目前能确定的只有"不稳定"，
@@ -806,4 +806,470 @@ python platform/scow/tools/sync.py push -d coffin \
 是纯权重读，只有 int8→int4 或更大 M 的路子能动；`delta_kernel` 1.85 ms；
 `gemv_reduce_i8` 2.07 ms（A 已证明融不掉，但它是 8% 的步，值得从"减少 split"方向再看一次）。
 
+## 13. prefill：第一次实测（2026-10-28，gpu-node-05 card 3）
 
+此前**没有任何可用的 prefill 数字**：`PERF_COREX.md` 全部是 decode，而唯一条目
+是 `COREX_PORT.md` §6b 的 `prefill 1056.5 ms (5 tokens)`。那个数字不能用，原因不是
+它走了错的分支（`Qwen35.prefill` 只在 `n < 4` 才回退到解码路径，5 token 走的是批量路径），
+而是**它是进程里的第一次调用**：首次调用要付 kernel 懒加载、内存池增长、cuBLAS 句柄
+建一次的全部代价。同一个 prompt 在 warm 之后是毫秒级。**冷启动的第一次 prefill
+不是吞吐量**，这也是本节所有数字都先 warmup 一遍再计时的原因。
+
+### 13.0 结论先说
+
+全部是 **paged KV**（服务路径），n=2048，单卡，eager：
+
+| 配置 | ms | tok/s |
+| --- | ---: | ---: |
+| **int8 权重，当前服务默认（`mtp_prefill=True`）** | **1142.7** | **1792** |
+| int8 权重，`mtp_prefill=False` | 920.9 | 2224 |
+| bf16 权重，`mtp_prefill=False` | 747.9 | **2738** |
+| bf16 权重，`mtp_prefill=True` | 962.5 | 2128 |
+
+**开箱即用的服务默认是 int8 + `mtp_prefill=True` = 1792 tok/s**；把 drafter 的废功
+关掉（§13.2a，一行 Python）就是 2224，换 bf16 权重是 **2739**。
+
+同一份 bf16 模型上，drafter prefill 开关的差值就是它自己的成本：**962.5 − 747.7
+= 214.8 ms**，与 int8 上的 1142.7 − 920.9 = **221.8 ms** 相差 3%。
+
+对照 gfx906（`ENGINE.md` §6，2048 token）：**1729 tok/s**。
+
+**所以 CoreX 的 prefill 不比 DCU 慢**，bf16 下还快 1.58x。原因可以直接读出来：
+这张卡的 bf16 tensor-core GEMM 实测 **45–51 TFLOP/s**（§13.3），而 DCU 的 rocBLAS
+在 fp16 上只有 13–20 TFLOP/s。decode 上 CoreX 落后 3.7x 是另一件事（访存受限），
+prefill 是算力受限，两者的排序本来就不同。
+
+### 13.1 打满程度：45%
+
+2048 token 的前向 FLOPs ≈ `2 x 2048 x 4.0e9` ≈ **16.4 TFLOP**（4B 参数，不含 attention）。
+bf16 最优配置 747.9 ms → **21.9 TFLOP/s 有效算力**，对单 GEMM 峰值 45–51 TFLOP/s
+是 **约 45%**。也就是说"全做对"应该有 2x 左右的空间，但**空间不在投影上**：
+
+profiler（n=2048, chunk=2048, int8），**按叶子 kernel 聚合**（不是按 `aten::*` —— 后者
+有嵌套，`aten::to` → `aten::_to_copy` → `copy_` 三层会重复计数，加起来超过 100%，
+第一版表格就是这么错的）：
+
+| 叶子 kernel | ms | 占 928.5 ms |
+| --- | ---: | ---: |
+| TCU GEMM 三个变体（`gemm_bf16_bf16_tcu_25` 256.8 / `tcuh` 62.7 / `gemm_stride_tcuh2` 46.7） | 366.2 | **39%** |
+| elementwise 三个变体（`elementwise_kernel<512,1>` × 2 + `<128,4>`） | ≥198.2 | **≥21%** |
+| 其余（delta 扫描的 `bmm`/`baddbmm` kernel、int8 的 dequant `copy`、`solve`、`conv1d_silu_seq`） | ≤364.1 | ≤39% |
+
+`aten::` 层面的对照值（同一份 profile 的 `CUDA total`，彼此不嵌套）：`aten::mm` 319.5、
+`aten::copy_` 207.5、`aten::mul` 86.4、`aten::bmm` 85.9、`aten::baddbmm` 46.9。
+
+**两个结论**：
+
+1. **真正的 GEMM 只占 39%**（这份 profile 的 drafter prefill 已关，所以全是主模型），所以优化顺序是先砍废功和胶水，
+   而不是去调 GEMM —— 它已经在跑 45–51 TFLOP/s 了。
+2. **elementwise ≥21%**：`masked_fill` + `amax` + 两次 rescale 的 online softmax，
+   每层每 tile 各来一遍，加上 dequant 的 `mul`。这是纯带宽/发射浪费，不是必要的算术。
+
+### 13.2 三个实测出来的、可以直接拿的收益
+
+#### (a) MTP prefill 是**纯废功**，而且它的慢是 M=2047 造成的：7.46x
+
+**两层，两个独立的问题。**
+
+**第一层：它本来就不该跑。** `Qwen35.mtp_prefill` 默认 `True`，只有
+`enable_batching(capacity>1)` 会把它设成 `False`。但 `caps.graph == 0` 时
+`LLMEngine.build()` **不允许开投机解码**（spec 每一步都是重放按桶捕获的图，
+没有 eager 替身），`Server` 会把 `spec_k` 清零 —— **drafter 的 prefill KV 写完之后
+没有任何人读**。实测这一层值 1.29x：
+
+| 配置 | `mtp_prefill=True` | `mtp_prefill=False` | 收益 |
+| --- | ---: | ---: | ---: |
+| bf16, paged | 962.5 ms / 2128 tok/s | **747.7 / 2739** | **1.29x** |
+| int8, paged | 1142.7 / 1792 | **920.9 / 2224** | 1.24x |
+
+**第二层：它慢得离谱，因为 GEMM 的 M 是 2047。** `MTP.prefill` 被
+`Qwen35.prefill` 用 `m1 - c0` 行调用，而 `m1 = min(c1, n-1)` —— 最后一个 token
+没有"下一个 token"，所以 drafter 的 GEMM **永远比主模型少一行**。这一行把它踢出
+tensor-core 路径。逐 kernel 的 A/B（bf16, n=2048, 同一进程）：
+
+```
+mtp_prefill=True  : GemmEx_kernel::gemmh_new<...>   194.1 ms   <- 非 TCU 回退
+mtp_prefill=False : （该 kernel 完全不存在）
+
+drafter 独占的 GEMM 形状（每个 1 次调用）：
+  [2047,2560] x [2560,18432]   75.7 ms   (M=2048 时 32 次共 137.2 ms，即 4.29 ms/次)
+  [2047,2560] x [2560,10240]   42.3 ms
+  [2047,9216] x [9216,2560]    38.1 ms
+  [2047,5120] x [5120,2560]    21.1 ms
+  [2047,4096] x [4096,2560]    16.9 ms
+```
+
+**同一个 `[2048,2560]x[2560,18432]` 是 4.29 ms，`[2047,...]` 是 75.7 ms —— 17.6x。**
+
+##### M 的对齐悬崖（扫了 M=1024..4096）
+
+三个投影形状上**完全一致**：
+
+| M | `mlp.gate_up` ms / TFLOP/s | `mlp.down` | `mix.out_proj` |
+| ---: | ---: | ---: | ---: |
+| 2040 / 2044 / 2046 | 3.71 / 3.72 / 3.72 ms, **51.9–52.0 TFLOP/s** | 2.67, 36.0–36.1 | 0.80, ~54 |
+| **2047** | **75.50 ms, 2.6** | **37.90, 2.5** | **16.67, 2.6** |
+| 2048 | 4.28, 45.1 | 2.16, 44.8 | 0.89, 48.2 |
+| **2049** | **83.74, 2.3** | **43.89, 2.2** | **18.47, 2.3** |
+| 2050 / 2052 / 2056 / 2064 | 3.97–3.98, ~49 | 2.74–2.76, ~35 | 0.93, ~46 |
+| 1535 | 56.74, 2.6 | 29.15, 2.5 | 12.78, 2.5 |
+| 1536 | 3.21, 45.2 | 1.73, 41.9 | 0.68, 47.3 |
+| 3071 / 3072 | 113.47 → 6.38 | 57.59 → 3.45 | 24.86 → 1.33 |
+| 4095 / 4096 | 151.11 → 8.52 | 76.19 → 4.31 | 33.05 → 1.72 |
+
+**判据是 M 的奇偶性，不是 2 的幂、也不是 256 的倍数。** 17 个扫描点全部一致：
+
+| | M | 结果 |
+| --- | --- | --- |
+| **奇数** | 1535, 2047, 2049, 3071, 4095 | **全部 2.2–2.6 TFLOP/s（慢 17x）** |
+| 偶数 | 1024, 1536, 2040, 2044, 2046, 2048, 2050, 2052, 2056, 2064, 3072, 4096 | 全部 35–54 TFLOP/s |
+
+5 个奇数点全慢、12 个偶数点全快，三个投影形状无一例外。所以
+
+> **奇数 M 落进非 tensor-core 的 `GemmEx_kernel::gemmh_new` 回退，偶数 M 走 TCU。**
+
+2049 这个点很关键：它是 8 的倍数加一，却和 2047 一样慢 —— 如果判据是 8 或 256 的
+倍数，2049 和 2050 应该有同样的行为，但 2050 是快的。**只有奇偶性能同时解释
+2047 和 2049。** 至于为什么是奇数触发（很可能是一行 wavefront / 64 lane 的对齐），
+这版没继续挖，因为不需要 —— 修法只依赖"补齐到偶数"这个可观测事实。
+
+于是修法很清楚：**把 drafter 的 GEMM 行数补齐到偶数**（补一行到 2048）。
+实测收益：
+
+```
+MTP.prefill 直接调用，n=2047 vs n=2048：
+  rows=2047   215.1 ms
+  rows=2048    28.8 ms   -> 7.46x
+```
+
+**7.46x 的差距只来自补了一行。** 补的那一行是真实计算（不是 mask 掉的），
+所以数值不受影响；而且 `MTP.prefill` 已经按 `n = min(...)` 截断，多出来的行
+不会进入 KV 的有效窗口。
+
+**这一条两个层次加起来**：`mtp_prefill=False`（1.29x，纯 Python）+ 对齐修好
+（drafter 真正需要时 7.46x；在 `graph=False` 下它本来就该关，所以这是给
+"将来这个后端开图"留的）。
+
+#### (b) int8 权重在 prefill 上反而**更慢**，代价是每次请求固定 ~173 ms
+
+`linear_prefill` 对 int8 权重每次都调 `pack.KnQWeight.dequant_kn()`，
+把整个权重物化成 bf16：4.4 GB 读、8.8 GB 写。
+
+这个开销**与 M 无关**（权重摊完就是常数），实测非常干净：
+
+| n | int8 ms | bf16 ms | 差 |
+| ---: | ---: | ---: | ---: |
+| 128 | 255.0 | 81.5 | **+173.5** |
+| 512 | 376.4 | 201.1 | +175.3 |
+| 2048 | 920.9 | 747.9 | +173.0 |
+
+固定 ~173 ms/请求。所以短 prompt 上它更致命：n=128 是 **502 vs 1572 tok/s（3.1x）**，
+n=2048 只有 1.23x。
+
+**把 dequant 缓存住能拿回多少，直接量了**（把 128 个投影的 `w` 换成已 dequant 的
+`[K,N]` bf16，其他一字不动）：
+
+```
+int8, 每次调用 dequant     909.9 ms   2251 tok/s
+int8, 只 dequant 一次      738.5 ms   2773 tok/s   (1.23x)
+额外常驻 bf16              6.65 GiB
+```
+
+**1.23x 的代价是 6.65 GiB**，而 int8 权重本来省的就是这块（约 4.4 GB）。
+所以这条不是"免费的优化"：它把 decode 省的显存还给 prefill。真正的选择是
+
+- 只服务 prefill 为主的工作负载 → 直接上 bf16 权重，别用 int8（747.9 ms，最快且最省事）；
+- 两者都要 → dequant 结果要**按需缓存 + 可驱逐**（不是全量常驻），或者在
+  int8 GEMV 里做融合 dequant 的 prefill 核（后者是写 kernel，见 §13.4）。
+
+#### (c) `chunk` 在 2048 上封顶，但 2048 之后没法从这个 sweep 判断
+
+| chunk | bf16 ms | int8 ms |
+| ---: | ---: | ---: |
+| 512 | 851.1 | 1560.7 |
+| 1024 | 775.9 | 1125.5 |
+| **2048** | **747.9** | **920.9** |
+| 4096 | 747.9 | 921.0 |
+
+4096 和 2048 一模一样，因为 prompt 本身只有 2048 token —— **一个 chunk**。
+所以"2048 是不是最优点"这个问题在这组数据里**没有被回答**，只能说不小于。
+要判断得上 8k/16k 的 prompt。DCU 上当年测到 2048 封顶是因为 rocBLAS 在 M>2048 不再涨，
+这张卡的 GEMM 没有那个特征，值得单独测一次。
+
+### 13.3 逐 shape 的 `linear_prefill` 带宽与算力
+
+模型自己的权重，M=2048（int8 走 dequant 路径，bf16 直接 GEMM）：
+
+| 投影 | N | K | bf16 ms | bf16 TFLOP/s | int8 ms | int8 TFLOP/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `mlp.gate_up` | 18432 | 2560 | 4.27 | 45.3 | 6.56 | 29.4 |
+| `mlp.down` | 2560 | 9216 | 2.16 | 44.7 | 3.35 | 28.8 |
+| `mix.in_proj`（linear 层融合） | 12352 | 2560 | 2.53 | 51.2 | 4.14 | 31.3 |
+| `mix.out_proj` | 2560 | 4096 | 0.88 | 48.7 | 1.45 | 29.5 |
+| `mix.in_proj`（full 层融合） | 10240 | 2560 | 2.40 | 44.7 | 3.69 | 29.1 |
+
+bf16 的 45–51 TFLOP/s 就是这张卡的 prefill 天花板，int8 路径的 29–31 是
+**dequant 拖的**（同样的数学，多了一遍 4.4 GB 读 + 8.8 GB 写）。
+
+### 13.4 stage 分解：投影 15%，delta 扫描 + MLP 是主项
+
+`Layer.prefill` 的四个 hook 点（warmup 的 event 清掉之后再计时，否则桶加起来会是
+墙钟的 197% —— 第一版就是这么错的）：
+
+| 段 | ms | 占 909.1 ms |
+| --- | ---: | ---: |
+| `mlp` | 335.0 | 36.9% |
+| `mix_state_linear`（24 层 delta 扫描 + conv + gated norm） | 294.9 | 32.4% |
+| `mix_state_full`（8 层因果分块 attention） | 134.9 | 14.8% |
+| `mix_proj_linear` | 99.8 | 11.0% |
+| `mix_proj_full` | 29.6 | 3.3% |
+| 残差（两个 RMSNorm、add、lm_head） | 14.9 | 1.6% |
+| **accounted** | **894.2** | **98.4%** |
+
+两项加起来 63%，投影 15%。**优化重心和 decode 完全相反**。
+
+### 13.5 delta 扫描的 chunk：64 已经是最优，且上限是 LDS 不是算法
+
+`chunked_delta` 的 `chunk` 默认 64，而 `Layer.prefill` **不把 model 的 `chunk`
+传给 `LinearAttn.prefill`**，所以它永远是 64。2048 token 于是每层 32 个顺序段，
+24 层 = **768 次 `baddbmm`**，profiler 里 59.7 ms。
+
+想放大 chunk 减少段数，实测：
+
+| delta chunk | ms | vs 64 |
+| ---: | ---: | ---: |
+| 64 | 908.2 | 1.00x |
+| 128 | 997.4 | **0.91x** |
+| 256 | 启动失败 | `L=256 needs 65536 bytes of shared memory, over the 49152 byte limit` |
+
+两点都值得记：
+
+1. **128 反而慢 9%。** 段数减半，但 chunk 内的 `[H, L, L]` decay 矩阵和三角系统
+   是 O(L²) 增长（`pd` / `ut` / `ica` 各 `[32, nc, L, L]`），在 L=128 时已经吃掉
+   掉段数省下的 launch 时间。**所以 64 不是"没调"，是调对了。**
+2. **256 撞的是 `triangular_solve` 的 48 KB LDS 上限**，不是算法限制。要往上走
+   必须重写那个核（分块把 `L x L` 流式读入，而不是整个驻留）—— 这是写 kernel 的活。
+
+### 13.5b 已落地：两条改动，真机验收 PASS（2026-10-28，作业 3925）
+
+两条都改完并上了卡，`diag/corex_probe/probe_prefill_fixes.py` 的三项检查全过：
+
+```
+dequant vs old spelling: 128 projections, max |diff| = 0.00e+00  BIT-IDENTICAL
+greedy ids: [6, 24218, 10, 4838, 1665, 15]  baseline [same]  UNCHANGED
+mtp_prefill=True  (old default)     1052.0 ms    1947 tok/s
+mtp_prefill=False (shipped)          834.6 ms    2454 tok/s   1.26x
+```
+
+**1. `pack.KnQWeight.dequant_kn` 改成 cast-then-scale**（`backends/corex/pack.py`）
+
+原写法 `(wt.float() * scale).to(bf16)` 会物化一个 `[K, N]` fp32 临时量，是它立刻要
+窄化成的结果的两倍大；128 个投影上读 3.3 GiB、写 13.3 GiB 才产出 6.7 GiB。
+
+改成先 cast 再原地乘：
+
+```python
+out = self.wt.to(dtype)
+out.mul_(self.scale.view(1, -1))
+```
+
+**关键点是 `scale` 不窄化。** `mul_` 的 dtype 取自目标张量，所以 `bf16.mul_(fp32)`
+以 fp32 计算、只舍入一次 —— 和旧写法的单次舍入完全相同。实测：
+
+| 写法 | ms | 精确 | 备注 |
+| --- | ---: | --- | --- |
+| 旧：`(wt.float()*scale).to(bf16)` | 174.8 | ✅ | 基准 |
+| **新：cast + fp32 `mul_`** | **102.6** | **✅ 逐位相同** | **已落地，1.70x** |
+| 变体：`scale.to(bf16)` 后乘 | 93.0 | ❌ 每元素偏 1 ULP | **不采用** |
+| 行分块（R=8..256） | 300–2782 | ✅ | 全部更慢，废弃 |
+
+那个 1 ULP 的变体虽然再快 10%，但权重会变；**权重喂 32 层，不值得为单个算子 10% 的
+差异去动数值**。测试 `tests/test_backends.py::CorexPackTest` 用 `torch.equal` 把它钉死。
+
+**2. `graph=False` 时关掉 MTP prefill**（`engine/llm_engine.py` 的 `build()`）
+
+关在图关闭的分支里，不是 `Qwen35.__init__`：
+
+```python
+if self.model.mtp is not None:
+    self.model.mtp_prefill = False
+```
+
+**为什么不在 model 里**：`spec_generate` 是一条可以直连的公共 API，它走
+`capture_verify` 的 eager 替身，`_verify_graph` 非空，所以**确实会读** drafter KV。
+放在 `build()` 这个"已知 spec 被拒"的地方才安全 —— 我第一版写在 `__init__` 里，
+那会让直连 `spec_generate` 静默错。
+
+验收 1052.0 → 834.6 ms（**1.26x**），token ids 未变。
+
+**两条合起来对服务默认（int8 + old 默认）的效果**：1142.7 → **834.6 ms**，
+1792 → **2454 tok/s（1.37x）**，纯 Python 改动，无需写 kernel。
+
+### 13.5c 扫参：`PREFILL_ATTN_KB` 1024 → 4096（长 prompt 再 4.9%），tile 与 chunk 不值得动
+
+`diag/corex_probe/probe_prefill_sweep.py`，12 个 (tile, kb) 组合 × 3 个 prompt 长度，
+每个组合一个独立子进程（两个常量都是 `tuning.py` 在 import 期读环境变量，同进程改不了）。
+**整套扫了两遍**（作业 `psweep2` / `psweep3`），36 个格子最大差异 **1.41%**。
+
+#### kb（key block）：单调、可复现、有效
+
+n=8192，每档相对 kb=512：
+
+| tile | kb=512 | kb=1024 | kb=2048 | kb=4096 |
+| ---: | ---: | ---: | ---: | ---: |
+| 256 | 4213.3 | +10.4% | +12.2% | — |
+| **512** | 4037.4 | +5.1% | +10.5% | **+12.7%** |
+| 1024 | 4106.5 | +7.5% | +10.5% | +12.1% |
+| 2048 | 4213.2 | +7.6% | +11.5% | — |
+
+两次独立运行的 kb 效应（2048 vs 512，n=8192）：tile 256 是 12.2/11.3%、512 是 8.9/8.9%、
+1024 是 10.5/10.5%、2048 是 11.5/10.9% —— **每个 tile 宽度上方向一致、幅度一致**。
+2048→4096 在 tile=512/1024 上分别是 3677.4→3591.0（+2.4%）和 3675.6→3609.7（+1.8%），
+单次任务里量到，没有第二遍，所以只当"没到顶"的证据，不当精确值。
+
+**所以默认值从 1024 改成 4096**（`models/qwen35/tuning.py`）。为什么敢改：
+
+- 方向在 4 个 tile 宽度上全一致，且两次扫参复现；
+- 显存是可控的：tile=512、kb=4096 时一层活着的 score block 是 **128 MB**
+  （`[nkv=4, rep=4, 512, 4096]` fp32），对 32 GB 卡 + 4.5 GB int8 权重不算事；
+  accumulator 才随上下文增长，block 不随；
+- 引擎默认 tile 就是 512，所以实际生效的是 128 MB 那一格。
+
+**n=2048 没有收益**（720.0 → 720.2 ms）：一个 prompt 只有一个 tile，block 循环几乎不跑。
+**收益全在长 prompt 上**，这也解释了为什么 DCU 当年调出 1024 —— 它测的场景/tile 不同。
+
+#### tile：1.5–2.1%，在噪声以上但不足以作为依据
+
+kb=2048、n=8192 时四个 tile 的排名两次都不稳定：
+
+| 运行 | 256 | 512 | 1024 | 2048 | 最优 | 极差 |
+| --- | ---: | ---: | ---: | ---: | --- | ---: |
+| 第一遍 | 3697.2 | 3677.4 | **3675.8** | 3729.2 | 1024 | 1.5% |
+| 第二遍 | 3737.0 | 3677.3 | **3675.7** | 3754.2 | 1024 | 2.1% |
+
+1024 两次都最优，但**它和 512 只差 0.05%**（3675.8 vs 3677.4）—— 那不是效应，是巧合。
+tile=2048 明显最慢（+1.5%~+2.1%，两次一致，可解释：少了一个 tile 就多吃上三角的活）。
+**结论：512 保持不动。** 换成 1024 的唯一理由是"两次都正好最低"，而这个差值比扫参
+自身的 1.41% 复现误差还小。
+
+#### chunk：超过 prompt 长度之外没有收益
+
+| n | chunk | chunks | ms | tok/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 2048 | 2048 | 1 | 745.1 | 2749 |
+| 4096 | 2048 | 2 | 1694.1 | 2418 |
+| 4096 | **4096** | 1 | 1674.8 | **2446** |
+| 8192 | 2048 | 4 | 4213.2 | 1944 |
+| 8192 | **4096** | 2 | 4169.9 | **1965** |
+
+（上表是 `psweep2` 那一遍；`psweep3` 的重跑给 4213.2 / 4169.9，逐格一致。）
+
+chunk 4096 比 2048 只快 **1.0–1.3%**，而且这是**两个因素合在一起**的结果（dequant 次数
+减半 + GEMM 的 M 变大），单看每个因素都不到 1%。**默认 chunk=2048 保持不动**：
+1% 换两倍的 attention 暂时显存（`[nkv, rep, C, KB]`，C 翻倍）不划算，而且大 chunk 更容易
+踩到 §13.6b 那个奇数 M 的悬崖。
+
+#### 复现
+
+```bash
+# 12 个 (tile, kb) 组合，每个一个子进程，跑在 3 个 prompt 长度上
+python platform/scow/tools/sync.py push -d coffin \
+    --launcher diag/corex_probe/launch_prefill_sweep.sh --run psweep -g 4 -t 55 --wait
+
+# 落地后的端到端验收（含 kb=4096 的 ids 复核）
+python platform/scow/tools/sync.py push -d coffin \
+    --launcher diag/corex_probe/launch_prefill_fixes.sh --run pfix -g 4 -t 30 --wait
+```
+
+#### 落地后的真机验收（作业 3931）
+
+```
+PREFILL_ATTN_TILE=512 PREFILL_ATTN_KB=4096
+n=2048      825.7 ms   2480 tok/s
+n=8192     4021.5 ms   2037 tok/s
+greedy ids: [6, 24218, 10, 4838, 1665, 15]  baseline [same]  UNCHANGED
+verdict: PASS
+```
+
+`kb` 变了会改 online-softmax 的累加顺序，所以 **ids 必须重新验**，不是假设不变 —— 复核通过。
+
+### 13.6 该做什么，按"实测收益 ÷ 代价"排序
+
+| # | 动作 | 实测/预期收益 | 代价 | 状态 |
+| --- | --- | --- | --- | --- |
+| 1 | `caps.graph == 0` 时把 `mtp_prefill` 设 `False` | **1.26x** 实测（1052.0→834.6 ms） | 一行 Python | **已落地，§13.5b** |
+| 2 | `MTP.prefill` 的 GEMM 行数补齐到偶数 | **7.46x**（215.1→28.8 ms） | 补一行 + 一处上取整 | **可直接做** |
+| 3 | GEMM 的 M 统一按偶数上取整（所有 prefill 分块） | 未知（M=2047/2049/3071 各慢 17x） | 同 #2 的通用化 | 需先确认主路径会不会出奇数 M |
+| 4 | int8 权重的 prefill dequant 缓存 | 1.23x（909.9→738.5 ms） | **不需要了** | **不采用，见 §13.5b** |
+| 5 | `PREFILL_ATTN_TILE` / `PREFILL_ATTN_KB` 在这张卡上重扫 | kb 1024→4096：**长 prompt +4.9%**；tile 不动 | 已扫，见 §13.5c | **已落地** |
+| 6 | chunk > 2048 | 只值 1.0–1.3%（§13.5c） | 已扫 | **不改，不值得** |
+| 7 | delta 扫描的 elementwise / `[H,nc,L,L]` 融合核 | 该段 294.9 ms 的一部分 | 写 kernel，最大工程量 | 最后做 |
+
+**#4 为什么不做了**：它要 6.65 GiB 常驻，而 int8 权重省的正是 4.4 GB；而 §13.5b 的
+一行改动已经把 dequant 从 174.8 降到 102.6 ms（1.70x），**剩下的 102.6 ms 再拿
+6.65 GiB 去换不值得**。真想要 hoisted 的 738.5 ms，直接上 bf16 权重（747.9 ms）即可，
+差 1% 但逻辑全免。
+
+**MTP 的两层收益要分开看**：#1 是"别算它"，#2 是"算就得算对"。在当前 `graph=False`
+的配置下 #1 已经把整件事解决掉了；#2 是给将来这个后端开图（`_GRAPH_VERIFIED`）之后
+准备的 —— 那时 drafter 会真的被用到，而它的 M 仍然是 n−1。
+
+### 13.6b 一个必须记住的通用教训：GEMM 的 M 决定走不走 tensor-core
+
+这次最值钱的发现不是某个百分比，而是一条**形状契约**：
+
+> 在这张卡上，`[M,K] @ [K,N]` 的 M 是奇数 → 走 `GemmEx_kernel::gemmh_new`
+> → **慢 17x**。M 是偶数 → 走 `Gemm_bf16_bf16_tcu` → 35–54 TFLOP/s。
+
+所以任何"每层/每请求算一个行数"的地方都可能踩到它，而且**症状不是报错，是慢**：
+profiler 里只是多了几行 `GemmEx`，总时间悄悄翻倍。已确认会踩的：`MTP.prefill`
+（M = n−1）。**没确认、但机制上同样危险**的：chunked prefill 的最后一个 chunk
+（`n % chunk` 是奇数时）、`prefill_group` 的 `C_total`、verify 的 `B*c`。
+
+自查办法：profiler 里出现 `GemmEx_kernel::gemmh_new` 就是踩了，TCU 路径的
+kernel 名里带 `Gemm_tcu_bi_kernel`。这条比任何一次调度参数都更值得先查。
+
+### 13.7 复现
+
+```bash
+# headline + chunk sweep + MTP A/B + profiler（int8 与 bf16 各一遍）
+python platform/scow/tools/sync.py push -d coffin \
+    --launcher diag/corex_probe/launch_bench_prefill.sh --run prefill -g 4 -t 40 --wait
+
+# stage 分解 / delta chunk / 逐 shape / dequant 缓存实验
+python platform/scow/tools/sync.py push -d coffin \
+    --launcher diag/corex_probe/launch_prefill_attr.sh --run pattr -g 4 -t 40 --wait
+
+# paged 路径的 headline + 两组 profiler
+python platform/scow/tools/sync.py push -d coffin \
+    --launcher diag/corex_probe/launch_prefill_detail.sh --run pdetail -g 4 -t 45 --wait
+
+# MTP drafter 的逐 kernel 代价（A/B 两份 record_shapes profile）
+python platform/scow/tools/sync.py push -d coffin \
+    --launcher diag/corex_probe/launch_prefill_mtp.sh --run pmtp -g 4 -t 40 --wait
+
+# GEMM 的 M 对齐悬崖（17 个 M 点 × 3 个形状 + drafter 补行实测）
+python platform/scow/tools/sync.py push -d coffin \
+    --launcher diag/corex_probe/launch_gemm_align.sh --run galign -g 4 -t 40 --wait
+```
+
+三个 launcher 都先 `pick_card` 验卡（`gpu-node-05` 的 card 0/1/2 是死卡）。
+
+### 13.8 测量口径（免得下一个人重复踩）
+
+1. **必须 paged。** 服务路径是 `PrefixCacheEngine` + `PagedKVCache`。逐项同条件对照，
+   paged 稳定慢 **1.1–1.4%**（就是 `PagedKVCache.gather` 物化 dense view 的成本）：
+
+   | 条件 | dense cache | paged | 差 |
+   | --- | ---: | ---: | ---: |
+   | bf16, mtp off | 737.7 | 747.9 | +1.4% |
+   | int8, mtp off | 908.9 | 920.9 | +1.3% |
+   | int8, mtp on | 1130.7 | 1142.7 | +1.1% |
+
+   差值小，但**混着比会得到完全错误的结论**：本节的表格第一版就把 dense 的
+   `mtp on`（952.5）和 paged 的 `mtp off`（747.9）放进了一张表，读起来像"paged 快 27%"，
+   实际那 27% 全是 `mtp_prefill` 开关的差别。横竖两种口径都要标清楚。
+2. **`create_model` 默认加载 bf16。** 测 int8 必须 `load_weights(quant=True)` 再
+   `create_model(weights=sd)`，否则你测的是 bf16 路径（这条在 PERF_COREX §11 已经栽过一次）。
+3. **stage hook 必须在 warmup 之后清桶**，否则各段之和会是墙钟的 197%。
+4. **`chunk=4096` 在 n=2048 上等价于 2048**（一个 chunk），不是"没收益"。

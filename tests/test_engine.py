@@ -132,6 +132,77 @@ class DenseEngineTest(support.ModelTestCase):
         self.assertEqual(seq.stop_reason, "eos")
 
 
+class GraphOffTest(unittest.TestCase):
+    """What ``build()`` must do when the backend cannot capture a graph.
+
+    Uses stand-ins rather than a checkpoint: the behaviour under test is the branch
+    ``build()`` takes before any weight is touched, so a real model would only make the
+    test slower and platform-dependent.
+    """
+
+    class _Model:
+        """The parts of ``Qwen35`` that ``build()`` reads on the graph-off branch."""
+
+        def __init__(self, has_mtp: bool) -> None:
+            """Record whether this stand-in has an MTP head.
+
+            Args:
+                has_mtp: Value of the ``mtp`` attribute; the drafter flag is only
+                    meaningful when a head exists.
+            """
+            self.mtp = object() if has_mtp else None
+            self.mtp_prefill = True
+            self.reset_calls = 0
+
+        def reset(self) -> None:
+            """Count resets, so the test can prove the branch ran."""
+            self.reset_calls += 1
+
+    def _engine(self, graph: bool, batching: bool, spec_k: int, has_mtp: bool) -> LLMEngine:
+        """Build an engine with the branch's inputs set directly.
+
+        Args:
+            graph: ``EngineConfig.graph``.
+            batching: Whether the engine is configured for batching.
+            spec_k: Drafts per speculative step.
+            has_mtp: Whether the stand-in model has an MTP head.
+
+        Returns:
+            An unbuilt engine wrapping the stand-in model.
+        """
+        # ``prefix_cache=False`` and one sequence keep the constructor off the block
+        # manager, which is the only thing in it that would need a real paged model.
+        cfg = EngineConfig(model_dir="unused", max_seq=64, bench=False, graph=graph,
+                           spec_k=spec_k, prefix_cache=False, max_num_seqs=1)
+        engine = LLMEngine(cfg, self._Model(has_mtp))
+        engine.batching = batching
+        return engine
+
+    def test_graph_off_disables_the_drafter_prefill(self):
+        """Speculation cannot run without capture, so any drafter KV a prefill writes is unread work.
+
+        That KV is one full-attention layer plus five projections over the whole prompt,
+        214.8 ms of a 962.5 ms prefill at n=2048 on the card it was measured on. Nothing
+        else in the graph-off branch notices, so the flag has to be cleared here.
+        """
+        engine = self._engine(graph=False, batching=False, spec_k=0, has_mtp=True)
+        engine.build()
+        self.assertFalse(engine.model.mtp_prefill)
+        self.assertEqual(engine.model.reset_calls, 1)
+
+    def test_graph_off_without_an_mtp_head_is_still_fine(self):
+        """A checkpoint with no drafter must not be asked about one."""
+        engine = self._engine(graph=False, batching=False, spec_k=0, has_mtp=False)
+        engine.build()
+        self.assertEqual(engine.model.reset_calls, 1)
+
+    def test_graph_off_still_rejects_speculation(self):
+        """Clearing the drafter flag must not soften the check that caught the real misconfiguration."""
+        engine = self._engine(graph=False, batching=False, spec_k=2, has_mtp=True)
+        with self.assertRaises(RuntimeError):
+            engine.build()
+
+
 @support.needs_model
 class PagedEngineTest(unittest.TestCase):
     """Paged KV + radix prefix cache, one engine for the class."""
