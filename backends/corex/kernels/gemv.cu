@@ -272,6 +272,15 @@ __global__ void gemv_kn_i8x4_split_kernel(const int8_t* __restrict__ wt,
 template <int W>
 struct CxWideWord;
 
+// W = 1 is the scalar path, which reads one byte at a time. The batched kernel
+// instantiates it too (a narrow projection takes that width), so the type has to
+// exist even though the single-row kernels never reach it through this helper.
+template <>
+struct CxWideWord<1> {
+    using type = uint8_t;
+    static constexpr int kLoads = 1;
+};
+
 template <>
 struct CxWideWord<2> {
     using type = uint16_t;
@@ -450,6 +459,209 @@ __global__ void gemv_kn_m_kernel(const WT* __restrict__ wt,
     }
 #pragma unroll
     for (int m = 0; m < M; ++m) y[(size_t)m * N + n] = CxScalar<XT>::from_float(acc[m]);
+}
+
+// The W8A16 small-M kernel family: the bf16 small-M kernel above, with the int8 weight and
+// its per-column scale.
+//
+// It exists because the int8 path had no batched entry at all, and the absence was not visible
+// as an error -- ``_gemv_rows`` looped the single-row kernel, which reads the whole weight once
+// per row. Measured, an M-row projection then cost M times one row (``M=8/M=1 = 8.19x`` over
+// five decode shapes, ``probe_row_cost.py``), so a c-token speculative verify paid c full weight
+// passes and could not break even at any draft depth (``PERF_COREX.md`` section 14).
+//
+// The first version of this kernel kept the scalar one-byte load and ran no split-K, on the
+// theory that M rows would supply the memory-level parallelism the single-row kernel gets from
+// splitting K. Measured, that was wrong twice over: 28.5 GB/s at M=8 against the 395 GB/s one
+// row reaches, and 13.87x the cost of one row rather than the ~1x intended. Both fixes were
+// already established elsewhere in this file, so this family borrows them rather than
+// inventing a third regime:
+//
+//   * ``W`` adjacent columns per thread, read as one word (``load_i8_row``). A wavefront
+//     issuing 64 single-byte loads covers half a 128-byte line; at W=4 it covers two whole
+//     lines. ``I8_WIDE_MIN_N`` and the sweep behind it apply unchanged.
+//   * split-K, because the grid is what starves: 9728 columns at 256 threads is 38 blocks on
+//     16 SMs, and per-thread work cannot fix a grid that thin. ``pick_split_i8`` decides the
+//     width, unchanged.
+//
+// Correctness is *bit-identity with the single-row entry*, not a tolerance, because batched
+// decode must not change a token (``models/qwen35/batch.py``). So this family mirrors the
+// single-row dispatch instead of picking its own regime: the same ``W`` from
+// ``pick_i8_width``, the same split from ``pick_split_i8``, the same accumulation order inside
+// a slice, and the same reduce order across slices. A different split re-associates the fp32
+// sum and moves a handful of ULPs -- measured, 1-5 values out of 19456-77824 differed from the
+// per-row path when the split was not mirrored, which is exactly the kind of difference that
+// flips an argmax once in a long generation.
+//
+// One asymmetry is deliberate: the accumulation style follows ``W``, because the single-row
+// kernels do. ``gemv_kn_i8_kernel`` (scalar) writes ``acc += w * x`` and ``gemv_kn_i8w_kernel``
+// (wide) writes ``fmaf(w, x, acc)``. Those round differently in the last bit, so one fixed
+// style could not match both; this uses the style of whichever single-row kernel the same shape
+// would have taken.
+
+// @brief M activation rows against a ``W``-wide column group of an int8 ``[K, N]`` weight.
+//
+// @param wt [K, N] int8 weights, row-major, with ``N % W == 0``.
+// @param x [M, K] activations, row-major.
+// @param y [M, N] output in the activation dtype, row-major.
+// @param scale [N] fp32 per-column scale, applied once after each column's full K sum.
+// @param N Row stride and column count.
+// @param K Reduction length.
+template <typename XT, int U, int M, int W>
+__global__ void gemv_kn_i8_m_kernel(const int8_t* __restrict__ wt,
+                                    const XT* __restrict__ x, XT* __restrict__ y,
+                                    const float* __restrict__ scale, int N, int K,
+                                    int rows) {
+    const int n0 = (blockIdx.x * blockDim.x + threadIdx.x) * W;
+    if (n0 >= N) return;
+    float acc[M * W];
+#pragma unroll
+    for (int i = 0; i < M * W; ++i) acc[i] = 0.f;
+    int k = 0;
+    for (; k + U <= K; k += U) {
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            // One weight word feeds M*W accumulators. The load is hoisted out of the row loop
+            // only because that loop is template-instantiated and fully unrolled; a runtime
+            // loop over rows would re-read the bytes once per row, which is the bug this
+            // kernel exists to remove.
+            int8_t bytes[W];
+            load_i8_row<W>(&wt[(size_t)(k + u) * N + n0], bytes);
+#pragma unroll
+            for (int m = 0; m < M; ++m) {
+                // A row past ``rows`` re-reads row 0 instead of the buffer's real rows: the
+                // surplus accumulators are computed and then dropped, so an off-width call
+                // never needs a padded input tensor.
+                const float xv = CxScalar<XT>::to_float(
+                    x[(size_t)(m < rows ? m : 0) * K + k + u]);
+#pragma unroll
+                for (int i = 0; i < W; ++i) {
+                    // W > 1 is the wide single-row kernel, which uses fmaf; W == 1 is the
+                    // scalar one, which uses a separate multiply and add. Keeping the two
+                    // spellings apart is what makes each bit-identical to its twin.
+                    if (W > 1) acc[m * W + i] = fmaf((float)bytes[i], xv, acc[m * W + i]);
+                    else acc[m * W + i] += (float)bytes[i] * xv;
+                }
+            }
+        }
+    }
+    for (; k < K; ++k) {
+        int8_t bytes[W];
+        load_i8_row<W>(&wt[(size_t)k * N + n0], bytes);
+#pragma unroll
+        for (int m = 0; m < M; ++m) {
+            const float xv = CxScalar<XT>::to_float(x[(size_t)(m < rows ? m : 0) * K + k]);
+#pragma unroll
+            for (int i = 0; i < W; ++i) {
+                if (W > 1) acc[m * W + i] = fmaf((float)bytes[i], xv, acc[m * W + i]);
+                else acc[m * W + i] += (float)bytes[i] * xv;
+            }
+        }
+    }
+#pragma unroll
+    for (int m = 0; m < M; ++m) {
+        // Only the real rows are stored: the caller's output has exactly ``rows`` rows, so a
+        // wider store would run off the end of it.
+        if (m >= rows) continue;
+#pragma unroll
+        for (int i = 0; i < W; ++i) {
+            y[(size_t)m * N + n0 + i] =
+                CxScalar<XT>::from_float(scale[n0 + i] * acc[m * W + i]);
+        }
+    }
+}
+
+// @brief One K range of the int8 small-M product, into this split's partial plane.
+//
+// Unscaled on purpose: the partials carry the raw K sums and the reduce applies the scale once
+// after they are added, exactly as the single-row split pair does. Scaling here would scale
+// each slice separately and change the result.
+//
+// @param wt [K, N] int8 weights, row-major, with ``N % W == 0``.
+// @param x [M, K] activations, row-major.
+// @param part [M*split, N] fp32 partial sums; row ``m``'s planes start at ``m * split``.
+// @param N Row stride and column count.
+// @param K Reduction length.
+// @param split Number of K ranges.
+// @param per Length of one K range; the last is clamped to K.
+template <typename XT, int U, int M, int W>
+__global__ void gemv_kn_i8_m_split_kernel(const int8_t* __restrict__ wt,
+                                          const XT* __restrict__ x,
+                                          float* __restrict__ part,
+                                          int N, int K, int split, int per, int rows) {
+    const int n0 = (blockIdx.x * blockDim.x + threadIdx.x) * W;
+    if (n0 >= N) return;
+    const int s = blockIdx.y;
+    const int k0 = s * per;
+    const int k1 = min(K, k0 + per);
+    float acc[M * W];
+#pragma unroll
+    for (int i = 0; i < M * W; ++i) acc[i] = 0.f;
+    int k = k0;
+    for (; k + U <= k1; k += U) {
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            int8_t bytes[W];
+            load_i8_row<W>(&wt[(size_t)(k + u) * N + n0], bytes);
+#pragma unroll
+            for (int m = 0; m < M; ++m) {
+                const float xv = CxScalar<XT>::to_float(
+                    x[(size_t)(m < rows ? m : 0) * K + k + u]);
+#pragma unroll
+                for (int i = 0; i < W; ++i) {
+                    if (W > 1) acc[m * W + i] = fmaf((float)bytes[i], xv, acc[m * W + i]);
+                    else acc[m * W + i] += (float)bytes[i] * xv;
+                }
+            }
+        }
+    }
+    for (; k < k1; ++k) {
+        int8_t bytes[W];
+        load_i8_row<W>(&wt[(size_t)k * N + n0], bytes);
+#pragma unroll
+        for (int m = 0; m < M; ++m) {
+            const float xv = CxScalar<XT>::to_float(x[(size_t)(m < rows ? m : 0) * K + k]);
+#pragma unroll
+            for (int i = 0; i < W; ++i) {
+                if (W > 1) acc[m * W + i] = fmaf((float)bytes[i], xv, acc[m * W + i]);
+                else acc[m * W + i] += (float)bytes[i] * xv;
+            }
+        }
+    }
+#pragma unroll
+    for (int m = 0; m < M; ++m) {
+        if (m >= rows) continue;
+        float* col = part + ((size_t)m * split + s) * N + n0;
+#pragma unroll
+        for (int i = 0; i < W; ++i) col[i] = acc[m * W + i];
+    }
+}
+
+// @brief Sum the split planes and apply the column scale, one thread per column.
+//
+// The reduce order is ``s = 0 .. split-1`` for every row, which is what makes the association
+// identical to the single-row reduce and therefore the whole chain bit-identical to looping the
+// single-row entry.
+//
+// @param part [M*split, N] fp32 partial sums, row-major.
+// @param y [M, N] output in the activation dtype, written in place.
+// @param scale [N] fp32 per-column scale.
+// @param N Output columns.
+// @param split Number of K ranges.
+// @param M Activation rows.
+template <typename XT>
+__global__ void gemv_i8_m_reduce_kernel(const float* __restrict__ part,
+                                        XT* __restrict__ y,
+                                        const float* __restrict__ scale,
+                                        int N, int split, int M, int rows) {
+    const int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= N) return;
+    for (int m = 0; m < M; ++m) {
+        if (m >= rows) continue;
+        float acc = 0.f;
+        for (int s = 0; s < split; ++s) acc += part[((size_t)m * split + s) * N + n];
+        y[(size_t)m * N + n] = CxScalar<XT>::from_float(scale[n] * acc);
+    }
 }
 
 // @brief SM count, queried once. Split-K sizes itself from the card, not from a
@@ -860,6 +1072,85 @@ torch::Tensor launch_i8_split(const torch::Tensor& wt, const torch::Tensor& x,
 
 }  // namespace
 
+// @brief Launch the int8 small-M kernel for one dtype, one M width and one W.
+//
+// @param wp [K, N] int8 weight.
+// @param xp [M, K] activations.
+// @param sp [N] fp32 per-column scales.
+// @param yp [M, N] output.
+// @param pp [M*split, N] fp32 partial buffer, or null when split is 1.
+// @param N Output columns.
+// @param K Reduction length.
+// @param threads Threads per block.
+// @param split Split-K width; 1 takes the single-pass kernel.
+// @param per Length of one K range.
+template <typename XT, int M, int W>
+void launch_i8_m_one(const int8_t* wp, const XT* xp, const float* sp, XT* yp, float* pp,
+                     int N, int K, int threads, int split, int per, int rows) {
+    const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    // The grid follows the wide arithmetic: a thread owns W columns, so the block count is
+    // N/W over the thread block. Keeping the scalar grid instead would launch W times the
+    // blocks and have most of them return immediately.
+    const int blocks = (int)(((N / W) + threads - 1) / threads);
+    if (split > 1) {
+        gemv_kn_i8_m_split_kernel<XT, 4, M, W><<<dim3(blocks, split), threads, 0, stream>>>(
+            wp, xp, pp, N, K, split, per, rows);
+        // The reduce is one thread per *column*, so it needs the undivided grid. Reusing the
+        // W-divided block count leaves every column past N/W unwritten, and those come back as
+        // whatever the scratch buffer held -- which the row-identity check reports as a max
+        // relative error of order 1, not as a launch error.
+        const int rblocks = (int)((N + threads - 1) / threads);
+        gemv_i8_m_reduce_kernel<XT><<<rblocks, threads, 0, stream>>>(
+            pp, yp, sp, N, split, M, rows);
+    } else {
+        gemv_kn_i8_m_kernel<XT, 4, M, W><<<blocks, threads, 0, stream>>>(
+            wp, xp, yp, sp, N, K, rows);
+    }
+}
+
+// @brief Launch the int8 small-M kernel at whatever W the sweep rule picks for N.
+//
+// W and the split both come from the rules the single-row entry uses, never from a separate
+// set. That is the bit-identity contract in one place: an M-row call has to take the same
+// arithmetic path its rows would have taken one at a time, so both dispatch decisions are
+// delegated rather than re-decided here.
+//
+// @param wt [K, N] int8 weight.
+// @param x [M, K] activations.
+// @param y Preallocated [M, N] output, returned unchanged for call chaining.
+// @param scale [N] fp32 per-column scales.
+// @param N Output columns.
+// @param K Reduction length.
+// @param threads Threads per block.
+// @param split Split-K width, as decided by ``pick_split_i8`` for the single-row entry.
+template <typename XT, int M>
+torch::Tensor launch_i8_m(const torch::Tensor& wt, const torch::Tensor& x, torch::Tensor& y,
+                          int rows, const torch::Tensor& scale, int N, int K, int threads,
+                          int split) {
+    const int8_t* wp = reinterpret_cast<const int8_t*>(wt.data_ptr());
+    const XT* xp = reinterpret_cast<const XT*>(x.data_ptr());
+    XT* yp = reinterpret_cast<XT*>(y.data_ptr());
+    const float* sp = scale.data_ptr<float>();
+    const int per = split > 1 ? (K + split - 1) / split : K;
+    // Scratch for all rows at once: M planes per split, because each row's K sum reduces
+    // independently. A [split, N] buffer would have every row overwrite the previous row's
+    // partials, which reads back as a correct shape and a wrong answer.
+    torch::Tensor part;
+    float* pp = nullptr;
+    if (split > 1) {
+        part = torch::empty({M * split, N}, x.options().dtype(torch::kFloat));
+        pp = part.data_ptr<float>();
+    }
+    switch (pick_i8_width(N, 0)) {
+        case 2: launch_i8_m_one<XT, M, 2>(wp, xp, sp, yp, pp, N, K, threads, split, per, rows); break;
+        case 4: launch_i8_m_one<XT, M, 4>(wp, xp, sp, yp, pp, N, K, threads, split, per, rows); break;
+        case 8: launch_i8_m_one<XT, M, 8>(wp, xp, sp, yp, pp, N, K, threads, split, per, rows); break;
+        default: launch_i8_m_one<XT, M, 1>(wp, xp, sp, yp, pp, N, K, threads, split, per, rows); break;
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return y;
+}
+
 // @brief Decode-time projection: one activation vector against a ``[K, N]`` weight.
 //
 // @param wt [K, N] weight, contiguous, bf16 or fp32. fp16 is rejected rather than
@@ -961,6 +1252,75 @@ torch::Tensor gemv_kn_i8(torch::Tensor wt, torch::Tensor x, torch::Tensor scale,
     }
     return sp > 1 ? launch_i8_split<float>(wt, x, y, scale, N, K, th, u, sp, w)
                   : launch_i8_plain<float>(wt, x, y, scale, N, K, th, u, w);
+}
+
+// @brief Batched W8A16 projection: M activation rows share one weight pass.
+//
+// The entry ``_gemv_rows`` was missing: with no batched int8 kernel it looped the single-row
+// GEMV once per row, so an M-row projection cost M weight reads. On this part that is exactly
+// M times one row (``M=8/M=1 = 8.19x``, five decode shapes), and it is why a c-token
+// speculative verify cost c plain steps and could not pay for itself at any draft depth
+// (``PERF_COREX.md`` section 14).
+//
+// Correctness contract: every row is bit-identical to the single-row entry on the same weight
+// and activation. Both dispatch decisions -- the column width and the split-K width -- are
+// therefore taken from the single-row path's own rules rather than chosen again here, and a
+// shape whose regime has no batched kernel falls back to the per-row loop instead of to an
+// approximate path.
+//
+// @param wt [K, N] int8 weight, contiguous.
+// @param x [M, K] activations, bf16 or fp32; the output takes its dtype.
+// @param scale [N] fp32 absmax scale, one per output column.
+// @param threads Threads per block, ``0`` to pick from ``N``.
+// @param unroll K-loop unroll; the launcher pins it, so this is reserved for a sweep.
+// @return [M, N] output in ``x``'s dtype.
+// @throws c10::Error when the weight is not int8, the scale length disagrees with N, or a
+//         dtype and layout the kernel cannot index -- each of those reads the wrong elements
+//         rather than failing.
+torch::Tensor gemv_kn_i8_m(torch::Tensor wt, torch::Tensor x, torch::Tensor scale,
+                           int64_t threads, int64_t unroll) {
+    TORCH_CHECK(wt.dim() == 2, "weight must be 2-D [K, N]");
+    TORCH_CHECK(x.dim() == 2, "activations must be 2-D [M, K]");
+    TORCH_CHECK(wt.scalar_type() == torch::kChar,
+                "int8 weight required (a bf16 weight here would be read one byte per "
+                "value and produce plausible garbage)");
+    TORCH_CHECK(scale.scalar_type() == torch::kFloat, "scale must be fp32");
+    TORCH_CHECK(wt.is_contiguous() && x.is_contiguous() && scale.is_contiguous(),
+                "contiguous inputs required");
+    const int K = (int)wt.size(0), N = (int)wt.size(1), M = (int)x.size(0);
+    TORCH_CHECK(wt.size(0) == x.size(1), "K mismatch: weight ", wt.size(0),
+                " vs activation ", x.size(1));
+    TORCH_CHECK(scale.numel() == N, "scale must hold one value per output column: got ",
+                scale.numel(), " for N = ", N);
+    TORCH_CHECK(M >= 1 && M <= 8, "small-M kernel handles M in [1, 8], got ", M);
+    const bool x16 = x.scalar_type() == torch::kBFloat16;
+    TORCH_CHECK(x16 || x.scalar_type() == torch::kFloat,
+                "activation must be bf16 or fp32");
+    (void)unroll;  // The launcher pins U=4; see launch_i8_m.
+    auto y = torch::empty({M, N}, x.options());
+    const int th = threads > 0 ? (int)threads : pick_threads(N);
+    // Only the widths that carry a kernel are dispatched. Everything else -- a row count the
+    // model never asks for -- stays on the per-row loop, which is the same code path the
+    // absence of this kernel used to force on every call. Keeping it is what makes the
+    // fallback bit-identical by construction rather than by two implementations agreeing.
+    // Widths 2, 4 and 8 are the ones the model asks for (the batched-decode buckets and the
+    // verify record), so those get their own instantiations. Any other width is served by the
+    // next instantiation up, with the surplus rows reading row 0 again: a fallback to a
+    // per-row loop would make M=5 cost five weight reads while M=4 costs one, which is a
+    // cliff that changes the algorithm rather than the batch. The surplus rows compute real
+    // values the caller never reads, so they cannot leak into an answer.
+    const int padded = M <= 2 ? 2 : (M <= 4 ? 4 : 8);
+    // The split is the single-row rule verbatim, so the partial-sum association matches what
+    // the per-row loop would have produced.
+    const int sp = pick_split_i8(N, K, th);
+    if (x16) {
+        if (padded == 2) return launch_i8_m<uint16_t, 2>(wt, x, y, M, scale, N, K, th, sp);
+        if (padded == 4) return launch_i8_m<uint16_t, 4>(wt, x, y, M, scale, N, K, th, sp);
+        return launch_i8_m<uint16_t, 8>(wt, x, y, M, scale, N, K, th, sp);
+    }
+    if (padded == 2) return launch_i8_m<float, 2>(wt, x, y, M, scale, N, K, th, sp);
+    if (padded == 4) return launch_i8_m<float, 4>(wt, x, y, M, scale, N, K, th, sp);
+    return launch_i8_m<float, 8>(wt, x, y, M, scale, N, K, th, sp);
 }
 
 // @brief Small-M projection: ``M`` activation rows read the weight once.

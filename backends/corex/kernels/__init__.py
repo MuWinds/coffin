@@ -59,7 +59,7 @@ DEFAULT_ARCH = "ivcore10"
 #: first one's objects and measures a kernel they did not change. A per-worker suffix gives
 #: each an independent object tree and an independent build baton, which is also what stops
 #: concurrent builds from serialising behind one lock.
-_EXTENSION = os.environ.get("COFFIN_COREX_EXT", "").strip() or "coffin_corex_ops_v12"
+_EXTENSION = os.environ.get("COFFIN_COREX_EXT", "").strip() or "coffin_corex_ops_v13"
 
 #: Loaded extension, or ``None`` before the first attempt.
 _module: Any = None

@@ -259,6 +259,7 @@ def main() -> int:
 
     import backends.corex as corex
     from backends.corex import pack
+    from int8_weights import QWeight
 
     _sep("0. backend state")
     print(" ", corex.describe(), flush=True)
@@ -336,6 +337,44 @@ def main() -> int:
         del w, xs, ref, y
         torch.cuda.empty_cache()
 
+    _sep("2b. linear_m on the int8 path: one weight pass AND bit-identical rows")
+    # The int8 batched entry did not exist until it was added for speculative decoding, and
+    # its absence was invisible: ``_gemv_rows`` looped the single-row kernel, which is
+    # correct and costs one full weight read per row. Two things have to be shown before that
+    # loop may be replaced, and only the first is a tolerance question.
+    #
+    # 1. Every row equals the single-row entry *bit for bit*. That is the model contract
+    #    (batched decode must not change a token), so it is an equality check and not a
+    #    tolerance one: a batched path that is merely close silently re-samples tokens.
+    # 2. The marginal cost of rows 2..8 is near zero, which is the whole point. Printed per
+    #    width so a later dispatch change can see what it buys.
+    for m in (2, 4, 8):
+        n, k = 9728, 2560
+        wq = QWeight.quantize(torch.randn(n, k, dtype=torch.bfloat16, device="cuda"))
+        xs = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
+        got = table.linear_m(wq, xs)
+        solo = torch.stack([table.linear(wq, xs[i]) for i in range(m)])
+        exact = torch.equal(got, solo)
+        nbytes = wq.wq.numel() + wq.scale.numel() * 4
+        ms = _bench(lambda wq=wq, xs=xs: table.linear_m(wq, xs))
+        one_ms = _bench(lambda wq=wq, xs=xs: table.linear(wq, xs[0]))
+        gbs = (nbytes / (ms * 1e-3)) / 1e9
+        row = (f"  linear_m int8 M={m} N={n} K={k}: {ms * 1e3:>8.1f} us "
+               f"{gbs:>6.1f} GB/s  rows-identical={exact}  vs 1 row: {ms / one_ms:.2f}x")
+        print(row, flush=True)
+        if not exact:
+            # How far off, not just how many: a handful of last-bit differences is the fp32
+            # association changing with the split, which is a real (if small) contract break;
+            # a large relative error would be a wrong kernel instead, and the two need
+            # different fixes. Reported together so the number cannot be read as either.
+            worst = int((got != solo).sum())
+            rel = float((got.float() - solo.float()).abs().max()
+                        / solo.float().abs().max().clamp_min(1e-6))
+            print(f"    {worst} of {got.numel()} values differ from the single-row path "
+                  f"(max rel {rel:.2e})", flush=True)
+            failures.append(f"linear_m int8 M={m} not row-identical")
+        del wq, xs, got, solo
+        torch.cuda.empty_cache()
     _sep("3. linear_prefill: library GEMM for M >= 64, chunked above LIB_MAX_N")
     for label, m, n, k in (("mlp_up", 512, 9728, 2560), ("lm_head", 64, 248320, 2560)):
         w = torch.randn(n, k, dtype=torch.bfloat16, device="cuda")

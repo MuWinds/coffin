@@ -81,6 +81,25 @@ torch::Tensor gemv_kn_i8(torch::Tensor wt, torch::Tensor x, torch::Tensor scale,
                          int64_t threads, int64_t unroll, int64_t split,
                          int64_t width);
 
+// @brief Batched W8A16 projection: M rows of activations read the int8 weight once.
+//
+// Without this entry the int8 branch of ``linear_m`` has no kernel to call, so it
+// loops the single-row GEMV and pays one full weight read per row -- on this part
+// M=8 costs 8.19x M=1 (measured, five decode shapes). That is the reason a
+// c-token speculative verify could not beat c plain steps; see ``PERF_COREX.md``
+// section 14.
+//
+// @param wt [K, N] int8 weight, contiguous.
+// @param x [M, K] activations, bf16 or fp32. The output takes its dtype.
+// @param scale [N] fp32 absmax scale, one per output column.
+// @param threads Threads per block; ``0`` picks from ``N``.
+// @param unroll K-loop unroll; the launcher pins it, so this is reserved for a sweep.
+// @return [M, N] in ``x``'s dtype.
+// @throws c10::Error on a non-int8 weight, a scale length other than N, or a layout and
+//         dtype the kernel cannot index.
+torch::Tensor gemv_kn_i8_m(torch::Tensor wt, torch::Tensor x, torch::Tensor scale,
+                            int64_t threads, int64_t unroll);
+
 // Normalisation.
 
 // @brief Zero-centred RMSNorm over the last axis of ``[M, N]`` with a row pitch.

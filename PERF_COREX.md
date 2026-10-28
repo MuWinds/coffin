@@ -1273,3 +1273,134 @@ python platform/scow/tools/sync.py push -d coffin \
    `create_model(weights=sd)`，否则你测的是 bf16 路径（这条在 PERF_COREX §11 已经栽过一次）。
 3. **stage hook 必须在 warmup 之后清桶**，否则各段之和会是墙钟的 197%。
 4. **`chunk=4096` 在 n=2048 上等价于 2048**（一个 chunk），不是"没收益"。
+
+## 14. 后缀解码（suffix / prompt-lookup 投机）与 int8 批处理 GEMV
+
+> 2026-10-28，`gpu-node-05` card 0，int8 权重，eager，`COFFIN_BACKEND=corex`（`graph=0`）。
+> 作业：`sufspec4`（`probe_suffix_spec.py`）、`rowcost`（`probe_row_cost.py`）、
+> `i8batch4`（`probe_i8_batch.py`）、`i8m5`（`check_ops.py`）。
+
+### 14.1 为什么先试后缀解码
+
+`ENGINE.md` §4 记了：`caps.graph == 0` 时 `build()` 拒绝 `--spec-k`，因为 verify 步
+"按构造是一次捕获重放"。SCOW 驱动禁止 graph，于是 MTP drafter 在卡上用不了。
+后缀解码是同一个交易的另一半：草稿来自**请求自己的 token 历史**（一次字典查找，
+零权重读、零发射），由主模型 verify，所以输出逐位不变——正适合"发射受限"的卡。
+
+### 14.2 drafter 是够用的（这一层不是瓶颈）
+
+`probe_suffix_spec.py` 直接在模型自己的 greedy 输出上回放 drafter（纯 host，
+`ops/suffix.py`，10 个 CPU 用例），这给出**上限**：
+
+| 语料 | K=1 | K=2 | K=3 | K=4 | K=6 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| prose | 0.95 (55/58) | 0.91 | 0.88 | 0.84 | 0.80 |
+| code | 0.96 (54/56) | 0.96 | 0.95 | 0.94 | 0.91 |
+| repeat | 0.91 (49/54) | 0.88 | 0.86 | 0.81 | 0.74 |
+
+**接受率 84–96%，显著高于 MTP 在同位置的 73%**，而且它一分显存不占、一次发射不发。
+所以"后缀解码没价值"这个结论**不能**归到 drafter 头上。
+
+### 14.3 真正的分母：一次 c 行 verify 的代价
+
+`ratio = verify_ms / step_ms`，投机只有在 `ratio < 1 + accepted` 时才赚。
+
+| 配置 | step ms | verify ms | ratio | 接受率 | 端到端 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| int8, token-verify, K=1 | 24.45 | 24.13 | **0.99x** | 0.93 | **0.93x** |
+| int8, token-verify, K=2 | 24.45 | 36.30 | 1.49x | 0.87 | 0.89x |
+| int8, token-verify, K=4 | 24.45 | 60.41 | 2.48x | 0.79 | 0.66x |
+
+**K=1 的 verify 就等于一整步**（0.99x）：一个草稿换一个额外 token，价格是一整步，
+理论打平、实测 0.93x。K 越大越糟，ratio 几乎线性。
+
+根因不在 drafter，而在投影入口：`backends/corex/__init__.py::_gemv_rows` 的 int8 分支
+没有批处理核，只能逐行调单行核：
+
+```python
+if packed.int8:
+    for r in range(rows):                      # 每行读一遍完整权重
+        out[r] = module.gemv_kn_i8(packed.wt, act[r], packed.scale)
+```
+
+实测（`probe_row_cost.py`，五个 decode 形状）：**M=8 是 M=1 的 8.19x**，`lm_head` 8.01x、
+`mlp.down` 8.25x——与带宽严格成正比，没有任何摊销。
+
+### 14.4 已落地：`gemv_kn_i8_m`，投影层面 2.42x
+
+新增一个内核（`gemv.cu` 的 `gemv_kn_i8_m_kernel` / `_split_kernel` / `gemv_i8_m_reduce_kernel`
++ bindings + 头声明），一次权重读、M 行结果。分派换成一次调用：
+
+```python
+if packed.int8:
+    return _restore(module.gemv_kn_i8_m(packed.wt, act, packed.scale), dtype)
+```
+
+**内核不自己挑参数**，否则逐位一致性守不住。`W`（每线程列数）和 split-K 宽度都直接复用
+单行路径的 `pick_i8_width` / `pick_split_i8`，累加风格也跟着 `W`（`W>1` 用 `fmaf`，
+`W==1` 用 `a += b*c`），因为它要同时对得上两个单行核。
+
+实测（`probe_i8_batch.py`，直接对比两个 kernel 入口，`torch.equal` 逐位校验）：
+
+| shape | N | K | M=2 | M=4 | M=5 | M=8 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| mlp.gate_up | 18432 | 2560 | 1.89x | 3.21x | 3.03x | **4.53x** |
+| mlp.down | 2560 | 9216 | 1.46x | 2.01x | 1.63x | 2.16x |
+| mix.out_proj | 2560 | 4096 | 1.45x | 1.84x | 1.46x | 1.58x |
+| mix.qkv | 8192 | 2560 | 1.65x | 2.30x | 2.13x | 2.86x |
+| lm_head | 248320 | 2560 | 2.00x | 3.48x | 2.98x | **4.73x** |
+
+**全部 20 格 `identical=True`，平均 2.42x。** `probe_row_cost.py` 的 M=8/M=1 从 **8.19x 降到
+2.87x**（`lm_head` 从 8.01x 到 1.71x）。
+
+### 14.5 四个必须记住的坑（都是本轮实测踩出来的）
+
+1. **`verify_mode="once"` 在这张卡上是错的，而且不会报错。** 用"完美草稿"做对照
+   （oracle：把真值当草稿喂进去，必须逐位复现 greedy）：`token` 模式 **`greedy_equal=True`**
+   （K=1/2/4 全部），`once` 模式 **`greedy_equal=False`**，第一个 token 就错（`760 != 11`），
+   接受率掉到 0。而 `once` 的 ratio 更漂亮（1.71x vs 2.48x）——**只看速度会选到一条算错的路径**。
+   之前的结论是在别的卡上得的，不要默认可移植。
+
+2. **reduce kernel 的 grid 不能跟着 `W` 除。** split-K 的 reduce 是每线程一**列**，主核是
+   每线程 `W` 列。沿用除以 `W` 的 block 数后，`N/W` 之后的列根本没被写，读回来是 scratch 的
+   残留值——逐位检查报 max rel **1.46** 和 **3.9e28**，而 kernel 不报错。容差检查会漏掉这类
+   问题（`2e-3` 的 tol 与它差着量级），只有 `torch.equal` 抓得住。
+
+3. **`_gemv_rows` 的行数不只有 8。** 它同时服务 prefill 的回退路径，那里可能是 24 行；
+   新内核 `TORCH_CHECK(M <= 8)` 会直接抛 `small-M kernel handles M in [1, 8], got 24`。
+   修法是把 bf16 分支早就有的分块循环补到 int8 分支上。`W=1` 同理：`CxWideWord<1>` 之前
+   没有特化，因为单行核从不经这条路径。
+
+4. **不要在 probe 里 patch `corex.linear_m` 做 A/B。** `backends.ops` 是**导入时冻结的**
+   `Ops` 表（`backends/__init__.py`），`ops/gemv.py` 绑的是那张表，patch 模块属性对调用方
+   不可见。第一版 A/B 因此两组测的是同一份代码，报了个漂亮的 **1.00x**——读起来像
+   "内核没用"。改成直接对比两个 kernel 入口才是有效测量。
+
+### 14.6 现在投机能赚了吗：还不能，但瓶颈换了
+
+投影代价已从 `c` 倍降到约 1.5–2.9 倍，可 verify 步仍由**发射次数**主导：
+`verify_mode="token"` 是 `c` 次顺序 batched decode，K=1 实测 24.13 ms 对 24.45 ms 的普通步
+（0.99x），几乎没动。
+
+所以下一步不是继续压投影，而是 `verify_mode="once"`（一次前向出全部 c 个 logits）。
+它在**当前代码上是错的**（14.5 第 1 条），修好之后配合这里的新内核，K=1 才有可能真正低于 1.0x。
+
+### 14.7 复现
+
+```bash
+# 行代价（不加载模型，几秒）
+python platform/scow/tools/sync.py push -d coffin \
+    --launcher diag/corex_probe/launch_row_cost.sh --run rowcost -g 4 -t 20 --wait
+
+# 内核级 A/B：逐行 vs 批处理，逐位校验
+python platform/scow/tools/sync.py push -d coffin \
+    --launcher diag/corex_probe/launch_i8_batch.sh --run i8batch -g 4 -t 25 --wait
+
+# 算子对拍（含 int8 batched 的 rows-identical=True）
+python platform/scow/tools/sync.py push -d coffin \
+    --launcher backends/corex/diag/launch_check_ops.sh --run i8ops -g 4 -t 30 --wait
+
+# 后缀投机全表（接受率上限 / oracle 对照 / 端到端）
+python platform/scow/tools/sync.py push -d coffin \
+    --launcher diag/corex_probe/launch_suffix_spec.sh --run sufspec -g 4 -t 40 --wait
+```

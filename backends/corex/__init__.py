@@ -329,12 +329,24 @@ def _gemv_rows(w: torch.Tensor | QWeight | pack.KnWeight,
     act = _compute_dtype(x).contiguous()
     rows = act.shape[0]
     if packed.int8:
-        # One launch per row: there is no small-M int8 kernel, and the batched paths that
-        # would reach this (verify, speculative decode) are a handful of rows while the
-        # single-row decode path is where the traffic is.
+        # One weight pass per chunk. Until gemv_kn_i8_m existed this looped the single-row
+        # kernel, so a row batch read the whole weight once per row: measured, M=8 cost
+        # 8.19x M=1 (probe_row_cost.py, five decode shapes), which is why a c-token
+        # speculative verify paid c full weight passes and could not break even at any draft
+        # depth (PERF_COREX.md section 14).
+        #
+        # The kernel takes a width it was instantiated for, and this helper is reached with
+        # any row count up to _ROW_CHUNK (a prefill chunk that fell back here, for instance),
+        # so the chunking the bf16 branch below does has to happen here too: handing 24 rows
+        # to a kernel whose TORCH_CHECK says [1, 8] raises, which is what this branch did
+        # before the chunk loop was added.
+        if rows <= _ROW_CHUNK:
+            return _restore(module.gemv_kn_i8_m(packed.wt, act, packed.scale), dtype)
         out = torch.empty((rows, packed.n), dtype=act.dtype, device=act.device)
-        for r in range(rows):
-            out[r] = module.gemv_kn_i8(packed.wt, act[r], packed.scale)
+        for start in range(0, rows, _ROW_CHUNK):
+            stop = min(rows, start + _ROW_CHUNK)
+            out[start:stop] = module.gemv_kn_i8_m(packed.wt, act[start:stop].contiguous(),
+                                                  packed.scale)
         return _restore(out, dtype)
     if rows == 1:
         return _restore(module.gemv_kn(packed.wt, act[0]), dtype)
@@ -1211,7 +1223,7 @@ NATIVE: frozenset[str] = frozenset(_NATIVE)
 #: ``diag/corex_probe/probe_chat.py``.
 #:
 #: With the order fixed, the whole decode step was measured. The acceptance run is
-#: ``diag/corex_probe/probe_graph_repeat.py`` on gpu-node-07, 2026-10-26 -- six
+#: the historical graph acceptance probe on gpu-node-07, 2026-10-26 -- six
 #: capture+prefill+replay rounds in one process, every one completing with the *same*
 #: tokens ``[5, 6, 24218, 10]`` and finite logits:
 #:

@@ -459,7 +459,7 @@ _RELOAD_ORDER = (
     "backends.discovery", "backends.hip", "backends.corex",
     "backends.vendors", "backends.registry", "backends",
     "ops.dtypes", "ops.runtime", "ops.gemv", "ops.embed", "ops.norm", "ops.rope",
-    "ops.mrope", "ops.delta",
+    "ops.mrope", "ops.delta", "ops.suffix",
     "ops",
     "models.qwen35.tuning", "models.qwen35.weights", "models.qwen35.batch",
     "models.qwen35.vision",

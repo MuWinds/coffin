@@ -36,7 +36,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("wt"), pybind11::arg("x"), pybind11::arg("scale"),
           pybind11::arg("threads") = 0, pybind11::arg("unroll") = 0,
           pybind11::arg("split") = 0, pybind11::arg("width") = 0);
-
+    // Bound separately from the single-row entry: a missing registration here is invisible
+    // until something calls it on the card, and then it reads as an AttributeError far from
+    // the dispatch that asked for it (the trap recorded in PERF_COREX section 12.5).
+    m.def("gemv_kn_i8_m", &gemv_kn_i8_m,
+          "batched W8A16 GEMV: int8 [K, N] weights, x [M, K] -> y [M, N]",
+          pybind11::arg("wt"), pybind11::arg("x"), pybind11::arg("scale"),
+          pybind11::arg("threads") = 0, pybind11::arg("unroll") = 0);
     // Normalisation.
     m.def("rms_norm", &rms_norm, "fused zero-centred RMSNorm over pitched [M, N] rows",
           pybind11::arg("x"), pybind11::arg("w"), pybind11::arg("stride") = 0,

@@ -967,6 +967,84 @@ class CorexPackTest(unittest.TestCase):
             q.dequant_kn(torch.int8)
 
 
+class Int8BatchKernelTest(unittest.TestCase):
+    """The int8 batched projection must be a kernel, not a loop that looks like one.
+
+    The failure this guards is silent in both directions. Without a batched entry,
+    ``linear_m`` loops the single-row GEMV, which is *correct* -- so no functional test can
+    see it -- and reads the whole weight once per row, which makes every speculative verify
+    cost ``c`` plain steps. That is the measured reason suffix decoding could not break even
+    on this card (PERF_COREX.md section 14), and it would return the moment somebody reverts
+    the dispatch to the loop.
+
+    A card is needed to *call* the kernel, so these checks are structural: they pin the pieces
+    that must all exist together, because each of them has been the missing one at some point
+    in this port (PERF_COREX.md 12.5).
+    """
+
+    def _sources(self) -> dict:
+        """Read the kernel-side sources this contract spans.
+
+        Returns:
+            ``{file name: text}`` for the header, the binding and the GEMV kernels.
+
+        Raises:
+            unittest.SkipTest: The sources are absent, i.e. a tree without the backend.
+        """
+        from backends import corex
+
+        kernel_dir = corex.kernels.KERNEL_DIR
+        wanted = ("corex_ops.h", "bindings.cpp", "gemv.cu")
+        if not all((kernel_dir / name).is_file() for name in wanted):
+            self.skipTest("corex kernel sources not present")
+        return {n: (kernel_dir / n).read_text(encoding="utf-8") for n in wanted}
+
+    def test_the_batched_int8_entry_exists_in_header_binding_and_kernel(self):
+        """Declaration, registration and definition are three edits that all have to land."""
+        src = self._sources()
+        self.assertIn("gemv_kn_i8_m", src["corex_ops.h"],
+                      "the batched int8 entry is not declared in corex_ops.h")
+        self.assertIn('m.def("gemv_kn_i8_m"', src["bindings.cpp"],
+                      "the batched int8 entry is not registered in bindings.cpp, so "
+                      "calling it raises AttributeError on the card instead of failing "
+                      "the build")
+        self.assertIn("gemv_kn_i8_m_kernel", src["gemv.cu"],
+                      "gemv_kn_i8_m has no kernel body, so the entry has nothing to "
+                      "launch")
+
+    def test_the_batched_int8_kernel_accumulates_m_rows_per_weight_load(self):
+        """The kernel only pays if M chains stay live across one weight read.
+
+        Checked in the source because that property is a compiler outcome no unit test
+        can observe without a card: the row loop has to be template-instantiated and
+        fully unrolled over M, with the weight load hoisted outside it. A runtime ``for``
+        over rows would keep the kernel shape and read the weight M times, which is
+        exactly the bug this kernel exists to remove.
+        """
+        src = self._sources()["gemv.cu"]
+        start = src.index("gemv_kn_i8_m_kernel")
+        body = src[start:src.index(chr(10) + "}" + chr(10), start)]
+        self.assertIn("float acc[M * W];", body,
+                      "the int8 batched kernel has no per-(row, column) accumulator array")
+        self.assertIn("load_i8_row<W>(&wt[", body,
+                      "the weight bytes are not loaded once into a local word, so they "
+                      "are re-read once per row")
+        self.assertIn("#pragma unroll", body,
+                      "the row loop is not unrolled, so the M chains may spill or "
+                      "re-read the weight")
+
+    def test_linear_m_routes_int8_to_the_batched_kernel_not_a_row_loop(self):
+        """The dispatch is the piece a correct-but-slow revert would silently change."""
+        import inspect
+
+        from backends import corex
+
+        source = inspect.getsource(corex._gemv_rows)
+        self.assertIn("gemv_kn_i8_m", source,
+                      "linear_m does not call the batched int8 entry: an int8 row "
+                      "batch falls back to one weight read per row, the regression "
+                      "that made speculative decoding unable to break even")
+
+
 if __name__ == "__main__":
     unittest.main()
-
