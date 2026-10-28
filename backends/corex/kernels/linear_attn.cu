@@ -1,10 +1,14 @@
 // @file linear_attn.cu
-// @brief The gated-delta-rule prologue and the depthwise causal conv1d that feeds it.
+// @brief The gated-delta-rule prologue, the depthwise causal conv1d that feeds it, and
+// the fused decode chain that runs both plus the recurrence and the gated norm.
 //
 // Module: coffin/backends/corex/kernels. Feeds the delta recursion the way
 // ``backends/hip/kernels/linear_attn.cu`` does on the DCU: this file produces the fp32
 // q/k/v/beta/g that the delta step consumes, so the two must agree on the layout and on
-// the 1e-6 L2 epsilon.
+// the 1e-6 L2 epsilon. ``delta_normed`` is the decode path of that pairing and lives here
+// rather than in ``delta.cu`` because its reductions have to reproduce this file's
+// ``block_sum2`` pairing exactly; ``delta.cu`` keeps the separate ``delta`` /
+// ``delta_batch`` entries the batch and verify paths still use.
 //
 // Why fused: before the delta kernel the engine L2-normalises q and k per head, scales
 // q, expands the 16 key heads to the 32 value heads, and builds
@@ -31,6 +35,15 @@
 //   * ``g`` must stay ``<= 0``. ``neg_expA`` is negative and softplus is positive, so
 //     the product is a decay; a sign slip would make the recurrence grow instead, which
 //     diverges rather than merely being wrong.
+//   * ``delta_normed`` must be bit-identical to the ``delta_prologue`` -> ``delta`` ->
+//     ``rms_norm_gated`` chain, because the decode step's greedy ids are the acceptance
+//     bar and a last-ulp shift moves them. That is why it reuses ``block_sum2`` and
+//     ``head_threads`` verbatim instead of growing its own reduction, and why it rounds
+//     the recurrence's fp32 output to bf16 before normalising -- the chain's
+//     ``RMSNormGated`` casts ``delta_out`` first, so the norm's inputs are bf16 there.
+//     A block therefore needs ``dv <= head_threads(dk)``; a wider value axis keeps the
+//     three-op chain, which the wrapper rejects with a shape error rather than silently
+//     changing the arithmetic.
 
 #include "corex_ops.h"
 #include "corex_scalar.h"
@@ -59,6 +72,20 @@ int head_threads(int dk) {
     int t = dk > 128 ? dk : 128;
     t = ((t + 63) / 64) * 64;
     return t > 512 ? 512 : t;
+}
+
+//: Threads ``norm.cu`` uses for a row of width ``N``, reproduced to check the fused kernel
+//: can stand in for the gated norm.
+//:
+//: The rounding is deliberately the same expression, not a call: ``rms_norm_gated_kernel``
+//: lives in another translation unit behind an anonymous namespace, so there is nothing to
+//: call. The duplication is checked rather than trusted -- any drift makes ``delta_normed``
+//: reject a geometry it could have served, which is a documented fallback, whereas the
+//: reverse (accepting one whose reduction pairs differ) would silently change the ids.
+int norm_threads(int n) {
+    int t = n < 64 ? 64 : n;
+    t = ((t + 63) / 64) * 64;
+    return t > 1024 ? 1024 : t;
 }
 
 // @brief Block-wide sum of two values at once, through a shared tree.
@@ -102,6 +129,37 @@ __device__ __forceinline__ void block_sum2(float a, float b, float* red, float* 
 // @return ``log(1 + exp(v))`` for moderate ``v``, ``v`` itself when it is large.
 __device__ __forceinline__ float softplus(float v) {
     return v > SOFTPLUS_LINEAR ? v : __logf(1.f + __expf(v));
+}
+
+// @brief Block-wide sum of one value, paired exactly as :func:`block_sum2` does it.
+//
+// The gated norm's reduction is the other half of ``delta_normed``, and it has to combine
+// the same partners in the same order as ``rms_norm_gated_kernel``'s tree or the scale
+// moves in the last ulp. Sharing the tree shape rather than re-deriving it is what makes
+// that structural instead of a thing to keep in step by eye. ``block_sum2`` cannot serve
+// here: it sums two values and the epilogue has only one, and a second dummy column
+// would double the shared traffic of the kernel's last phase.
+//
+// @param v This thread's contribution.
+// @param red Shared scratch of ``blockDim.x`` floats; clobbered.
+// @return The block-wide sum, valid in every thread after the closing sync.
+//
+// The closing barrier is required for the same reason as in ``block_sum2``: the caller
+// reads the sum out of ``red[0]`` and must not have a faster thread start overwriting
+// ``red`` first. ``delta_normed_kernel`` does reach that hazard -- it reuses ``red`` for
+// this reduction right after ``block_sum2`` returns -- so the barrier is load-bearing
+// there and is not omitted.
+__device__ __forceinline__ float block_sum_scalar(float v, float* red) {
+    const int t = (int)threadIdx.x;
+    red[t] = v;
+    __syncthreads();
+    for (int step = blockDim.x >> 1; step > 0; step >>= 1) {
+        if (t < step) red[t] += red[t + step];
+        __syncthreads();
+    }
+    const float total = red[0];
+    __syncthreads();
+    return total;
 }
 
 // @brief Build the fp32 q/k/v and the beta/g gates for one decode step.
@@ -328,6 +386,198 @@ __global__ void prologue_batch_kernel(const float* __restrict__ q,
     }
 }
 
+// @brief Prologue, recurrence and gated norm for one decode token, one block per head.
+//
+// Why this is one kernel: the three it replaces are one memory problem, not three. The
+// prologue writes ``q_pro``/``k_pro``/``v_pro`` (3 x [nv, dk] fp32) plus ``beta``/``g``,
+// the recurrence reads them straight back and writes ``delta_out`` ([nv, dv] fp32), and
+// the gated norm reads *that* back: about 48 KB round tripped per layer per token, 24
+// times a step, purely to hand values between launches on a card whose launch floor is
+// 5.75 us. Everything the prologue produces for one value head fits in that head's block
+// -- ``q`` and ``k`` in ``2 * dk`` floats of shared memory (1 KB at dk = 128), ``v`` and
+// the two gate scalars in registers -- and the norm's reduction is over ``dv``, which is
+// exactly one block's span, so it folds into the epilogue with no extra reduction.
+//
+// The block shape is not a compromise between the three stages, it is the one shape all
+// three already use: ``prologue_kernel`` runs ``head_threads(dk)`` threads per value
+// head, ``delta_kernel`` runs ``min(dv, THREADS)``, and ``rms_norm_gated_kernel`` runs
+// ``rms_threads(dv)`` -- 128, 128 and 128 for this model, where dk = dv = 128. Sharing
+// that shape is what lets every reduction keep the chain's pairing, which is the
+// difference between bit-identical and merely close: the decode step's greedy ids are the
+// acceptance bar, and a last-ulp shift in any of these three reductions moves them.
+//
+// ``conv1d_silu`` deliberately stays its own launch. It is over ``conv_dim`` = 8192
+// channels rather than over a head, so folding it in would put a slice of a differently
+// shaped vector inside a block whose thread mapping exists to coalesce the state access.
+//
+// @param q,k [nkeys, dk] fp32 raw projection output; normalised here, and ``q`` also
+//        scaled, so the caller applies no per-element fix-up.
+// @param v [nv, dv] fp32 value.
+// @param b,a [nv] bf16 raw beta/decay logits.
+// @param neg_expA,dt_bias [nv] fp32 checkpoint constants for the decay gate.
+// @param z [nv, dv] bf16 gate for the SiLU of the output norm.
+// @param nw [dv] bf16 gated-norm gain, per value head rather than the flattened width.
+// @param st [nv, dk, dv] fp32 state, updated in place.
+// @param out [nv, dv] written with the normed result; the element type only selects the
+//        container, because the value is the chain's bf16 result either way.
+// @param qscale ``dk ** -0.5``.
+// @param rep Value heads per key head.
+//
+// ``ZT`` is the gate's storage type, not a precision choice. The op accepts bf16, which is
+// what the model's gate projection produces, and fp32, which the contract also allows; the
+// instantiation is selected on the host from ``z``'s dtype. Reading an fp32 ``z`` as bf16
+// would reinterpret every second half-word and gate the output with noise, so the two cases
+// cannot share an instantiation.
+template <typename OT, typename ZT>
+__global__ void delta_normed_kernel(const float* __restrict__ q,
+                                    const float* __restrict__ k,
+                                    const float* __restrict__ v,
+                                    const uint16_t* __restrict__ b,
+                                    const uint16_t* __restrict__ a,
+                                    const float* __restrict__ neg_expA,
+                                    const float* __restrict__ dt_bias,
+                                    const ZT* __restrict__ z,
+                                    const uint16_t* __restrict__ nw,
+                                    float* __restrict__ st, OT* __restrict__ out,
+                                    float qscale, int dk, int dv, int rep) {
+    const int vh = blockIdx.x;
+    const int t = (int)threadIdx.x;
+    const int kh = vh / rep;
+
+    extern __shared__ float sh[];
+    float* red = sh;                          // [2 * blockDim.x] the reduction tree
+    float* qs = sh + 2 * (int)blockDim.x;     // [dk] this head's normalised query
+    float* ks = qs + dk;                      // [dk] this head's normalised key
+
+    // Head preparation: the same arithmetic, the same one-pass reduction and the same
+    // tree pairing as ``prologue_kernel``.
+    const float qv = t < dk ? q[(size_t)kh * dk + t] : 0.f;
+    const float kv = t < dk ? k[(size_t)kh * dk + t] : 0.f;
+    float ssq = 0.f;
+    float ssk = 0.f;
+    block_sum2(qv * qv, kv * kv, red, &ssq, &ssk);
+
+    // Kept in shared memory rather than written out and read back: these two buffers are
+    // exactly the traffic the fusion exists to remove, and ``2 * dk`` floats covers one
+    // head's worth of it.
+    if (t < dk) {
+        qs[t] = qv * rsqrtf(ssq + L2_EPS) * qscale;
+        ks[t] = kv * rsqrtf(ssk + L2_EPS);
+    }
+    __shared__ float rate_sh;
+    __shared__ float decay_sh;
+    if (t == 0) {
+        rate_sh = 1.f / (1.f + __expf(-CxScalar<uint16_t>::to_float(b[vh])));
+        const float av = CxScalar<uint16_t>::to_float(a[vh]) + dt_bias[vh];
+        // The chain stores ``g`` in the prologue and exponentiates it in the recurrence;
+        // composing the two here rounds the product once, in fp32, either way. Doing it
+        // per thread instead would repeat one transcendental 128 times for no gain.
+        decay_sh = __expf(neg_expA[vh] * softplus(av));
+    }
+    __syncthreads();
+
+    // A thread past ``dv`` must reach every ``__syncthreads()`` in this kernel and return
+    // only after the last one. Returning here -- before the norm's tree -- leaves the rest
+    // of the block waiting on a thread that is gone: a device-side deadlock with no
+    // traceback rather than a wrong number. That hazard is written up in ``delta.cu``,
+    // whose first version had it.
+    const bool active = t < dv;
+    const float rate = rate_sh;
+    const float decay = decay_sh;
+
+    // The recurrence, unchanged from ``delta_kernel``: thread ``j`` owns value column
+    // ``j`` outright and walks ``i`` over ``dk`` in registers, so both ``dk`` reductions
+    // stay thread-local and the state read at a fixed ``i`` is contiguous in ``j`` -- the
+    // only assignment that coalesces for a ``[nv, dk, dv]`` layout.
+    float result = 0.f;
+    if (active) {
+        const float value = v[(size_t)vh * dv + t];
+        float* column = st + (size_t)vh * dk * dv + t;
+        float kv_mem = 0.f;
+        for (int i = 0; i < dk; ++i) {
+            kv_mem = fmaf(column[(size_t)i * dv] * decay, ks[i], kv_mem);
+        }
+        const float delta = (value - kv_mem) * rate;
+        for (int i = 0; i < dk; ++i) {
+            const float s = fmaf(ks[i], delta, column[(size_t)i * dv] * decay);
+            column[(size_t)i * dv] = s;
+            result = fmaf(s, qs[i], result);
+        }
+    }
+
+    // The chain hands the gated norm a bf16 copy of ``delta_out``: ``RMSNormGated`` casts
+    // its fp32 input to the activation dtype before the kernel sees it, so the norm's
+    // input is already on the bf16 grid. Rounding here reproduces that. Skipping it would
+    // normalise a value up to half a bf16 ulp away from what the chain normalises, which
+    // is enough to move the ids -- this rounding is part of the chain's arithmetic, not an
+    // artefact of its storage.
+    const float xb = active
+                         ? CxScalar<uint16_t>::to_float(CxScalar<uint16_t>::from_float(result))
+                         : 0.f;
+    // ``block_sum_scalar`` closes on a barrier, so ``red`` can be reused here by every
+    // thread -- including the ones that skipped the recurrence, which is why that barrier
+    // is not an optimisation to drop.
+    const float inv = rsqrtf(block_sum_scalar(xb * xb, red) / (float)dv + L2_EPS);
+    if (!active) return;
+
+    // ``y = rms(x) * w * silu(gate)`` in the chain's own operand order. The products
+    // associate left to right and reassociating them changes the last ulp, so the order is
+    // part of the specification rather than a style choice.
+    //
+    // The gate is rounded to bf16 whatever its storage. ``RMSNormGated.__call__`` casts
+    // both operands to the activation dtype before the kernel sees them, so an fp32 gate
+    // reaching the chain would be narrowed there -- rounding here reproduces that, and for
+    // a gate already stored as bf16 the round is the identity.
+    const float gv = CxScalar<uint16_t>::to_float(CxScalar<uint16_t>::from_float(
+        CxScalar<ZT>::to_float(z[(size_t)vh * dv + t])));
+    const float silu = gv / (1.f + __expf(-gv));     // SiLU
+    const float y = xb * inv * CxScalar<uint16_t>::to_float(nw[t]) * silu;
+    // The chain's norm emits bf16 and ``out_proj`` consumes that, so the destination's
+    // dtype is only a container: an fp32 one carries the same bf16 value rather than a
+    // more precise one, which is what keeps both call sites agreeing bit for bit.
+    out[(size_t)vh * dv + t] = CxScalar<OT>::from_float(
+        CxScalar<uint16_t>::to_float(CxScalar<uint16_t>::from_float(y)));
+}
+
+// @brief Launch the fused decode chain: one block per value head.
+//
+// @param out_bf16 Whether ``out`` is bf16 (as ``uint16_t``) or fp32.
+// @param z_bf16 Whether ``z`` is bf16 (as ``uint16_t``) or fp32.
+// @param threads Block size. The wrapper checks it against both ``head_threads(dk)`` and
+//        the block size the chain's other two reductions use, because a different size
+//        would sum the same values in a different order.
+void launch_normed(const float* q, const float* k, const float* v, const uint16_t* b,
+                   const uint16_t* a, const float* neg_expA, const float* dt_bias,
+                   const void* z, bool z_bf16, const uint16_t* nw, float* st, void* out,
+                   bool out_bf16, float qscale, int nv, int dk, int dv, int rep,
+                   int threads, cudaStream_t stream) {
+    const size_t smem = (size_t)(2 * threads + 2 * dk) * sizeof(float);
+    // Four instantiations, because the destination dtype and the gate's storage dtype are
+    // independent choices. All four compute the same arithmetic -- the gate is rounded to
+    // bf16 inside the kernel either way -- so this is dispatch, not four behaviours.
+    if (out_bf16) {
+        if (z_bf16) {
+            delta_normed_kernel<uint16_t, uint16_t><<<nv, threads, smem, stream>>>(
+                q, k, v, b, a, neg_expA, dt_bias, (const uint16_t*)z, nw, st,
+                reinterpret_cast<uint16_t*>(out), qscale, dk, dv, rep);
+        } else {
+            delta_normed_kernel<uint16_t, float><<<nv, threads, smem, stream>>>(
+                q, k, v, b, a, neg_expA, dt_bias, (const float*)z, nw, st,
+                reinterpret_cast<uint16_t*>(out), qscale, dk, dv, rep);
+        }
+    } else {
+        if (z_bf16) {
+            delta_normed_kernel<float, uint16_t><<<nv, threads, smem, stream>>>(
+                q, k, v, b, a, neg_expA, dt_bias, (const uint16_t*)z, nw, st,
+                reinterpret_cast<float*>(out), qscale, dk, dv, rep);
+        } else {
+            delta_normed_kernel<float, float><<<nv, threads, smem, stream>>>(
+                q, k, v, b, a, neg_expA, dt_bias, (const float*)z, nw, st,
+                reinterpret_cast<float*>(out), qscale, dk, dv, rep);
+        }
+    }
+}
+
 }  // namespace
 
 // @brief Launch the single-token depthwise causal conv1d + SiLU.
@@ -503,4 +753,97 @@ void delta_prep_seq(torch::Tensor qkv, torch::Tensor b, torch::Tensor a,
         v_out.data_ptr<float>(), beta.data_ptr<float>(), g.data_ptr<float>(), (float)qscale,
         T, dk, dv, (int)rep, kdim, (int)qkv.size(1), (int)b.stride(0), (int)a.stride(0));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// @brief Prologue, recurrence and gated norm for one decode token, in one launch.
+//
+// The result is the three-op chain's, bit for bit, so the greedy ids cannot move: the
+// reductions reuse ``block_sum2`` and the block size both other stages use, the recurrence
+// runs the same ``fmaf`` chain against the same fp32 values, and the norm's input is
+// rounded to bf16 first because ``RMSNormGated`` casts it before the kernel sees it.
+// That equivalence is why the block size is a checked invariant rather than a tuned
+// parameter -- see the ``head_threads`` guard below.
+//
+// @param q [nkeys, dk] fp32 raw query, normalised and scaled here.
+// @param k [nkeys, dk] fp32 raw key, normalised here.
+// @param v [nv, dv] fp32 value.
+// @param b [nv] bf16 beta logits; ``a`` [nv] bf16 decay logits.
+// @param neg_expA,dt_bias [nv] fp32 checkpoint constants for the decay gate.
+// @param z [nv, dv] bf16 gate for the SiLU of the output norm.
+// @param nw [dv] bf16 gated-norm gain, per value head.
+// @param st [nv, dk, dv] fp32 state, updated in place.
+// @param out [nv, dv] bf16 or fp32. bf16 is what the chain produces and what ``out_proj``
+//        reads, so pass that unless the caller needs the wider container; an fp32
+//        destination holds the same bf16 value rather than a more precise one.
+// @param qscale ``dk ** -0.5``.
+// @param rep Value heads per key head.
+// @return ``out``, for call chaining.
+// @throws c10::Error when a dtype, a shape or the head geometry disagrees with the
+//         kernel's indexing. The geometry case is the one worth reading: it means
+//         ``dk`` or ``dv`` is wide enough that the chain would reduce with a different
+//         block size, so this kernel could not reproduce its rounding and the caller
+//         must keep the three-op path.
+torch::Tensor delta_normed(torch::Tensor q, torch::Tensor k, torch::Tensor v,
+                           torch::Tensor b, torch::Tensor a,
+                           torch::Tensor neg_expA, torch::Tensor dt_bias,
+                           torch::Tensor z, torch::Tensor nw, torch::Tensor st,
+                           torch::Tensor out, double qscale, int64_t rep) {
+    TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous(),
+                "q/k/v must be contiguous");
+    TORCH_CHECK(q.scalar_type() == torch::kFloat && k.scalar_type() == torch::kFloat
+                    && v.scalar_type() == torch::kFloat
+                    && neg_expA.scalar_type() == torch::kFloat
+                    && dt_bias.scalar_type() == torch::kFloat
+                    && st.scalar_type() == torch::kFloat,
+                "q/k/v, neg_expA, dt_bias and the state are fp32");
+    // The two logit tensors are read as bf16 bit patterns, so a wider dtype would be
+    // reinterpreted rather than converted -- a silent wrong number, not a slow path.
+    TORCH_CHECK(b.scalar_type() == torch::kBFloat16 && a.scalar_type() == torch::kBFloat16,
+                "beta and decay logits must be bf16");
+    // ``z`` is templated on its dtype instead, because the contract allows fp32 and the
+    // kernel rounds either form to bf16 before use, matching what the chain's cast does.
+    TORCH_CHECK(z.scalar_type() == torch::kBFloat16 || z.scalar_type() == torch::kFloat,
+                "the norm gate must be bf16 or fp32");
+    TORCH_CHECK(nw.scalar_type() == torch::kBFloat16, "the norm gain must be bf16");
+    TORCH_CHECK(out.scalar_type() == torch::kBFloat16 || out.scalar_type() == torch::kFloat,
+                "output must be bf16 or fp32");
+    TORCH_CHECK(out.is_contiguous() && z.is_contiguous(), "out and z must be contiguous");
+
+    const int nv = (int)st.size(0);
+    const int dk = (int)st.size(1);
+    const int dv = (int)st.size(2);
+    TORCH_CHECK(rep > 0 && nv % (int)rep == 0, "head count does not divide by rep");
+    TORCH_CHECK(q.size(0) == nv / (int)rep && q.size(1) == dk,
+                "q must be [nv / rep, dk]");
+    TORCH_CHECK(k.sizes() == q.sizes(), "k and q must have the same shape");
+    TORCH_CHECK(v.size(0) == nv && v.size(1) == dv, "v must be [nv, dv]");
+    TORCH_CHECK(z.size(0) == nv && z.size(1) == dv, "norm gate must be [nv, dv]");
+    TORCH_CHECK(nw.numel() == (int64_t)dv, "norm gain must have dv elements");
+    TORCH_CHECK(out.size(0) == nv && out.size(1) == dv, "out view must be [nv, dv]");
+
+    // One block per value head, and its size is fixed by the chain it replaces rather than
+    // chosen here. A block wider or narrower than ``head_threads(dk)`` would sum the q/k
+    // norms with different partners than ``prologue_kernel`` does, and one that did not also
+    // match the gated norm's block size would do the same to the second reduction -- either
+    // way the result is close but not equal, which is what moves the greedy ids.
+    const int threads = head_threads(dk);
+    TORCH_CHECK(dk <= threads && dv <= threads,
+                "delta_normed needs dk and dv within one block (dk=", dk, " dv=", dv,
+                " threads=", threads,
+                "); keep the delta_prologue/delta/rms_norm_gated chain for this model");
+    TORCH_CHECK(norm_threads(dv) == threads,
+                "delta_normed needs the prologue's and the gated norm's block sizes to "
+                "agree (dk=", dk, " dv=", dv, " prologue=", threads,
+                " norm=", norm_threads(dv), "); keep the three-op chain for this model");
+
+    launch_normed(q.data_ptr<float>(), k.data_ptr<float>(), v.data_ptr<float>(),
+                  reinterpret_cast<const uint16_t*>(b.data_ptr()),
+                  reinterpret_cast<const uint16_t*>(a.data_ptr()),
+                  neg_expA.data_ptr<float>(), dt_bias.data_ptr<float>(),
+                  z.data_ptr(), z.scalar_type() == torch::kBFloat16,
+                  reinterpret_cast<const uint16_t*>(nw.data_ptr()), st.data_ptr<float>(),
+                  out.data_ptr(), out.scalar_type() == torch::kBFloat16, (float)qscale,
+                  nv, dk, dv, (int)rep, threads, c10::cuda::getCurrentCUDAStream());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
 }

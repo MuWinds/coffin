@@ -41,9 +41,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("rms_norm", &rms_norm, "fused zero-centred RMSNorm over pitched [M, N] rows",
           pybind11::arg("x"), pybind11::arg("w"), pybind11::arg("stride") = 0,
           pybind11::arg("eps") = 1e-6);
+    m.def("add_rms_norm", &add_rms_norm,
+          "residual add followed by the zero-centred RMSNorm, in one launch",
+          pybind11::arg("x"), pybind11::arg("add"), pybind11::arg("w"),
+          pybind11::arg("out"), pybind11::arg("stride") = 0, pybind11::arg("eps") = 1e-6);
     m.def("rms_norm_gated", &rms_norm_gated,
           "fused gated RMSNorm: rms(x) * w * silu(gate)", pybind11::arg("x"),
           pybind11::arg("w"), pybind11::arg("gate"), pybind11::arg("eps") = 1e-6);
+    m.def("kv_quant", &kv_quant,
+          "symmetric int8 quantisation of [M, N], one fp32 scale per row, one launch");
+    m.def("silu_mul", &silu_mul,
+          "out = silu(gate) * up, the SwiGLU product, out may alias up",
+          pybind11::arg("gate"), pybind11::arg("up"), pybind11::arg("out"));
+    m.def("rope_apply", &rope_apply,
+          "rotate the leading rotary_dim channels of every q/k head, one launch",
+          pybind11::arg("q"), pybind11::arg("k"), pybind11::arg("cos"),
+          pybind11::arg("sin"), pybind11::arg("q_out"), pybind11::arg("k_out"),
+          pybind11::arg("rotary_dim"));
 
     // Attention over the int8 KV cache.
     m.def("attn_decode", &attn_decode,
@@ -77,6 +91,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("delta", &delta, "gated delta decode step, updates the state in place");
     m.def("delta_batch", &delta_batch,
           "batched gated delta decode step, one state row per batch entry");
+    m.def("delta_normed", &delta_normed,
+          "prologue + recurrence + gated norm for one decode token, one launch");
 
     // Triangular solve: a replacement for the cuSOLVER path this build cannot load.
     m.def("triangular_solve", &triangular_solve,

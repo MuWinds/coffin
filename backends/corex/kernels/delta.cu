@@ -3,7 +3,9 @@
 //
 // Module: coffin/backends/corex/kernels. Consumes the fp32 q/k/v/beta/g that
 // ``linear_attn.cu`` produces and updates the state in place; the batched form is
-// ``delta_batch`` in this file.
+// ``delta_batch`` in this file. ``delta_normed`` is the decode path: it takes the raw
+// conv output instead and does the head preparation, the recurrence and the gated output
+// norm in one launch, so nothing crosses kernel boundaries between them.
 //
 // The recurrence per token is
 //     st  = st * exp(g)[:, None, None]
@@ -36,6 +38,13 @@
 //     address fixed, so a new buffer would leave the graph writing to a dead tensor.
 //   * Inputs are fp32 and contiguous. The prologue has already normalised and scaled q
 //     and k, so this kernel applies no per-element fix-up.
+//   * ``delta_normed`` is bit-identical to the ``conv1d_silu`` -> ``delta_prologue`` ->
+//     ``delta`` -> ``rms_norm_gated`` chain, not merely close. That forces two things the
+//     other kernels in this file do not need: the block-wide reductions must reproduce the
+//     chain's shared-tree pairing exactly (hence the same ``block_sum2`` shape and the same
+//     block size), and the recurrence's output is rounded to the activation dtype before it
+//     is normalised, because ``RMSNormGated`` casts the fp32 ``delta_out`` to bf16 before
+//     its reduction. The greedy ids are the acceptance bar and this is what keeps them.
 
 #include "corex_ops.h"
 #include "corex_scalar.h"

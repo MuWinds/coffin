@@ -53,7 +53,13 @@ DEFAULT_ARCH = "ivcore10"
 #: Extension name. The suffix is the build-scheme version: bump it when a source change
 #: must not attach to an already-cached object tree. It is bumped with every kernel batch
 #: precisely because a stale cache is invisible -- the old objects load and answer.
-_EXTENSION = "coffin_corex_ops_v12"
+#:
+#: Overridable through ``COFFIN_COREX_EXT`` because two people editing different ``.cu``
+#: files in one tree cannot both bump this: whoever commits second silently reuses the
+#: first one's objects and measures a kernel they did not change. A per-worker suffix gives
+#: each an independent object tree and an independent build baton, which is also what stops
+#: concurrent builds from serialising behind one lock.
+_EXTENSION = os.environ.get("COFFIN_COREX_EXT", "").strip() or "coffin_corex_ops_v12"
 
 #: Loaded extension, or ``None`` before the first attempt.
 _module: Any = None

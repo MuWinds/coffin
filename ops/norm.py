@@ -6,9 +6,9 @@ negative values); ``linear_attn.norm`` (RMSNormGated) is the standard ``w * x``
 times ``silu(gate)``. Mixing the two up garbles the output without raising
 anything, which is why they are two classes and not one flag.
 
-Module: ``coffin/ops``. Binds the backend's ``rms_norm`` / ``rms_norm_gated``
-entries and folds the checkpoint's weight convention; called by every block in
-``models/qwen35``.
+Module: ``coffin/ops``. Binds the backend's ``rms_norm`` / ``add_rms_norm`` /
+``rms_norm_gated`` entries and folds the checkpoint's weight convention; called by
+every block in ``models/qwen35``.
 
 Constraints:
     * ``eps=1e-6`` is fixed by the checkpoint; changing it shifts the logits.
@@ -23,6 +23,11 @@ Constraints:
       backend, so the table is the single place the maths exists.
     * The zero-centred convention lives in ``RMSNorm`` only; never reuse its
       weight with the gated class.
+    * ``add_residual`` accumulates into its ``x`` argument. That is the whole
+      saving -- the residual stream stays in one buffer instead of being written
+      and re-read -- and it is why the caller must own ``x`` exclusively. A tensor
+      it shares with anything else is the caller's bug to prevent, because the
+      kernel cannot tell an aliased residual from a private one.
 """
 
 from __future__ import annotations
@@ -82,6 +87,61 @@ class RMSNorm:
             x = x.to(D)
         xf = _rows(x)
         return bops.rms_norm(xf, self.g, xf.stride(0), 1e-6).view(x.shape)
+
+    def add_residual(self, x: torch.Tensor, add: torch.Tensor,
+                     out: torch.Tensor) -> torch.Tensor:
+        """Fold the residual add into this norm: ``x += add``, then normalise into ``out``.
+
+        A decoder layer's pre-norm half is ``h = mix(norm(x)); x = x + h`` and then
+        ``norm(x)`` again for the MLP. As two ops that is two launches and two reads
+        of the residual row; at this card's 5.75 us launch floor the launch is the
+        cost. Fusing them is the same arithmetic in one pass, so the token ids do not
+        move -- the add is still a bf16 rounding of the sum, and the mean square is
+        still taken over that rounded value.
+
+        The residual is accumulated **in place** in ``x``. That is the buffer the
+        layer keeps live: ``x`` is the residual stream and the next layer adds into it
+        again, so writing the sum anywhere else would only move the copy.
+
+        Args:
+            x: Residual stream, any leading shape, ``[..., hidden]``, bf16.
+                **Mutated**: it holds the sum on return. The caller must own it
+                exclusively; a tensor it shares with a live value (the embedding
+                output, a view another buffer still reads) is corrupted by this call.
+            add: Mixer output to accumulate, shaped like ``x``. It is consumed before
+                any output is written, so it is also free to be ``out`` -- which is
+                how a layer reuses the mixer's own buffer instead of allocating one.
+            out: Dense bf16 destination for the normalised sum, shaped like ``x``. It
+                must not alias ``x``: the sum has to survive the norm.
+
+        Returns:
+            ``out``, for call chaining.
+
+        Raises:
+            TypeError: ``x`` or ``out`` is not bf16. The stream is accumulated in
+                place, so there is no wider buffer to fall back to and casting ``x``
+                here would strand the sum in a temporary.
+            ValueError: ``out`` is not dense, or ``out`` is ``x``. Both would either
+                write through a copy -- losing the result without an error -- or
+                overwrite the residual.
+        """
+        if x.dtype != D or out.dtype != D:
+            raise TypeError(f"add_residual accumulates {D} in place and writes {D}; "
+                            f"got x={x.dtype}, out={out.dtype}")
+        # A non-dense ``out`` would be reshaped into a copy and the kernel would write
+        # into that copy, so the caller would get ``out`` unchanged and no error. This
+        # is the one layout bug in this call that cannot be reported downstream.
+        if out.stride(-1) != 1 or _rows(out).data_ptr() != out.data_ptr():
+            raise ValueError("add_residual needs a dense destination; "
+                             f"got strides {tuple(out.stride())}")
+        if out is x or out.data_ptr() == x.data_ptr():
+            raise ValueError("add_residual cannot write over the residual it "
+                             "accumulates: the sum is still needed")
+        if add.dtype != D:
+            add = add.to(D)
+        xf = _rows(x)
+        bops.add_rms_norm(xf, _rows(add), self.g, _rows(out), xf.stride(0), 1e-6)
+        return out
 
 
 class RMSNormGated:

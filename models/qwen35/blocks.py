@@ -22,8 +22,8 @@ Constraints:
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 
+from backends import ops as bops
 from models.qwen35.batch import batch_proj, wide_proj
 from models.qwen35.full_attn import FullAttn
 from models.qwen35.linear_attn import LinearAttn
@@ -53,6 +53,14 @@ class MLP:
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         """Apply the block to one or a few rows (decode path).
 
+        ``silu(gate) * up`` is written as one op into ``up``'s own buffer rather than as
+        ``F.silu(gate) * up``. As two torch calls it is two launches and two fresh
+        ``[intermediate]`` temporaries per layer; the fused entry is one launch, reads each
+        operand once and writes back over ``up``, which nothing reads afterwards. There are
+        32 MLPs in a decode step and this card's launch floor is ~5.75 us, so the two
+        launches were costing more than the arithmetic. ``out`` may alias ``up`` by
+        contract, which is what makes the writeback legal rather than a trick.
+
         Args:
             x: Activations, ``[hidden]`` or ``[B, hidden]``, bf16.
 
@@ -60,10 +68,14 @@ class MLP:
             Same leading shape as ``x`` with the hidden width.
         """
         gate, up = self.gate_up(x)
-        return self.down(F.silu(gate) * up)
+        return self.down(bops.silu_mul(gate, up, up))
 
     def prefill(self, x: torch.Tensor) -> torch.Tensor:
         """Apply the block to a prefill chunk.
+
+        The same fused product as :meth:`__call__`. Prefill is compute-bound so the launch
+        is a smaller share of it, but this is the identical arithmetic on the identical
+        layout, and a second spelling would be a second thing to keep numerically in step.
 
         Args:
             x: Activations, ``[C, hidden]``, bf16.
@@ -72,7 +84,7 @@ class MLP:
             ``[C, hidden]``.
         """
         gate, up = self.gate_up.prefill(x)
-        return self.down.prefill(F.silu(gate) * up)
+        return self.down.prefill(bops.silu_mul(gate, up, up))
 
     def batch(self, x: torch.Tensor) -> torch.Tensor:
         """Apply the block with the bit-exact batched GEMV path.
@@ -84,7 +96,7 @@ class MLP:
             ``[B, hidden]``, each row identical to the solo-decode result.
         """
         gate, up = batch_proj(self.gate_up, x)
-        return batch_proj(self.down, F.silu(gate) * up)
+        return batch_proj(self.down, bops.silu_mul(gate, up, up))
 
     def wide(self, x: torch.Tensor) -> torch.Tensor:
         """Apply the block at an arbitrary row count (the one-forward verify).
@@ -97,7 +109,7 @@ class MLP:
             wide kernel is in play.
         """
         gate, up = wide_proj(self.gate_up, x)
-        return wide_proj(self.down, F.silu(gate) * up)
+        return wide_proj(self.down, bops.silu_mul(gate, up, up))
 
 
 class Layer:
@@ -145,8 +157,16 @@ class Layer:
             ``[hidden]`` output state.
         """
         h = self.mix(self.in_ln(x), *ctx)
-        x = x + h
-        return x + self.mlp(self.post_ln(x))
+        # The residual add folds into the norm that consumes it: ``post_ln`` accumulates
+        # ``x += h`` in place and normalises the sum into ``h``, whose mixer value the add
+        # has just consumed. One launch instead of two, and no buffer to allocate -- the
+        # mixer output is dead the moment the sum reads it.
+        #
+        # Only this add folds here. The layer's *other* add, ``x + mlp(...)``, is consumed
+        # by the next layer's ``in_ln`` rather than by anything in this layer, so folding it
+        # needs a buffer carried across layers and belongs in ``model._forward``, not here.
+        normed = self.post_ln.add_residual(x, h, h)
+        return x + self.mlp(normed)
 
     def prefill(self, x: torch.Tensor, positions: torch.Tensor, ctx,
                 tiles: list | None = None) -> torch.Tensor:

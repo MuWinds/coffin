@@ -139,6 +139,110 @@ def _rms_norm_gated(x: torch.Tensor, w: torch.Tensor, gate: torch.Tensor,
     return _rms_norm(x, w, 0, eps) * F.silu(gate)
 
 
+def _add_rms_norm(x: torch.Tensor, add: torch.Tensor, w: torch.Tensor,
+                  out: torch.Tensor, stride: int = 0,
+                  eps: float = 1e-6) -> torch.Tensor:
+    """Residual add into ``x``, then the zero-centred RMSNorm of the sum into ``out``.
+
+    The upstream spelling is ``x = x + add`` followed by a norm of ``x``: two
+    launches and two reads of the residual. This is the same arithmetic with the
+    sum materialised once, which is what a fused kernel does, so the reference and
+    the kernel agree by construction rather than by tolerance.
+
+    Args:
+        x: Residual stream, ``[M, N]``; accumulated in place.
+        add: Mixer output to add, same shape as ``x``.
+        w: Gain, ``[N]``, carrying the ``1 + w`` offset.
+        out: Normalised result, ``[M, N]``, written in place. Must not alias ``x``:
+            the residual has to survive the norm.
+        stride: Element pitch of ``x`` between rows. Unused here for the same
+            reason as in :func:`_rms_norm`.
+        eps: Variance floor.
+
+    Returns:
+        ``out``, for call chaining.
+    """
+    del stride
+    x.add_(add)
+    out.copy_(_rms_norm(x, w, 0, eps))
+    return out
+
+
+def _silu_mul(gate: torch.Tensor, up: torch.Tensor,
+              out: torch.Tensor) -> torch.Tensor:
+    """``out = silu(gate) * up``, the SwiGLU product, into a caller-owned buffer.
+
+    Args:
+        gate: Gate half of the fused projection, ``[...]``.
+        up: Up half, same shape as ``gate``.
+        out: Destination, same shape. May alias ``up``: the product overwrites it
+            and nothing reads ``up`` afterwards.
+
+    Returns:
+        ``out``, for call chaining.
+    """
+    out.copy_(F.silu(gate) * up)
+    return out
+
+
+def _rope_apply(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor,
+                sin: torch.Tensor, q_out: torch.Tensor, k_out: torch.Tensor,
+                rotary_dim: int) -> torch.Tensor:
+    """Rotate the leading ``rotary_dim`` channels of every q/k head into caller buffers.
+
+    ``rotate_half`` pairs channel ``i`` with ``i + rotary_dim/2``, which is the layout the
+    ``cat(half, half)`` cos/sin tables are built in. Anything else rotates the wrong pairs
+    without a shape error.
+
+    Args:
+        q: Queries, ``[M, nh, hd]``.
+        k: Keys, ``[M, nkv, hd]``.
+        cos: Cosine for the rows being rotated, ``[M, rotary_dim]`` fp32.
+        sin: Sine, same layout as ``cos``.
+        q_out: Destination for the rotated queries, ``q``'s shape.
+        k_out: Destination for the rotated keys, ``k``'s shape.
+        rotary_dim: Channels to rotate; the rest pass through.
+
+    Returns:
+        ``q_out``, for call chaining.
+    """
+    c = cos.to(q.dtype).unsqueeze(1)          # [M, 1, rotary_dim]
+    s = sin.to(q.dtype).unsqueeze(1)
+    for src, dst in ((q, q_out), (k, k_out)):
+        rot = src[..., :rotary_dim]
+        half = rotary_dim // 2
+        rh = torch.cat([-rot[..., half:], rot[..., :half]], dim=-1)
+        dst[..., :rotary_dim].copy_(rot * c + rh * s)
+        dst[..., rotary_dim:].copy_(src[..., rotary_dim:])
+    return q_out
+
+
+def _kv_quant(x: torch.Tensor, out_q: torch.Tensor,
+              out_s: torch.Tensor) -> torch.Tensor:
+    """Symmetric int8 quantisation of ``[M, N]`` with one scale per row.
+
+    This is the chain ``FullAttn._quant`` performs for the int8 KV cache, and it is
+    an op rather than model-side torch for one reason: the cache is read by a
+    kernel that undoes exactly this quantisation, so the ``1e-5`` floor and the
+    ``127`` divisor are an agreement between the writer and the reader. Two
+    spellings of it that differ in the last ulp would leave the cache and the
+    attention kernel disagreeing about the scale.
+
+    Args:
+        x: Activations to quantise, ``[M, N]``.
+        out_q: int8 destination, ``[M, N]``, written in place.
+        out_s: fp32 destination for the per-row scale, ``[M]``, written in place.
+
+    Returns:
+        ``out_q``, for call chaining.
+    """
+    xf = x.to(torch.float32)
+    s = xf.abs().amax(dim=-1).clamp_min(1e-5) / 127.0
+    out_s.copy_(s)
+    out_q.copy_((xf / s.unsqueeze(-1)).round().clamp_(-127, 127).to(torch.int8))
+    return out_q
+
+
 def _dequant_cache(k: torch.Tensor, kscale: torch.Tensor) -> torch.Tensor:
     """Widen and rescale an int8 KV cache slab to fp32.
 
@@ -661,6 +765,46 @@ def _delta_batch(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     return out
 
 
+def _delta_normed(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                  b: torch.Tensor, a: torch.Tensor,
+                  neg_expA: torch.Tensor, dt_bias: torch.Tensor,
+                  z: torch.Tensor, nw: torch.Tensor, st: torch.Tensor,
+                  out: torch.Tensor, qscale: float, rep: int) -> torch.Tensor:
+    """Head prep, recurrence and gated norm for one decode token.
+
+    The three-stage spelling allocates ``q_pro``/``k_pro``/``v_pro``/``beta``/``g``
+    as fp32 scratch, then ``delta_out``, and re-reads each: about 48 KB round
+    tripped per layer per token. This is the same arithmetic with every
+    intermediate kept local, which is what the fused kernel does, so the two agree
+    by construction and this doubles as the specification.
+
+    Args:
+        q: Query per key head, ``[num_k, dk]``.
+        k: Key per key head, ``[num_k, dk]``.
+        v: Value per value head, ``[num_v, dv]``.
+        b: Beta logits, ``[num_v]``.
+        a: Decay logits, ``[num_v]``.
+        neg_expA: ``-exp(A_log)``, ``[num_v]`` fp32.
+        dt_bias: Decay bias, ``[num_v]`` fp32.
+        z: Gate projection for the output norm, ``[num_v, dv]``.
+        nw: Gated-norm gain, ``[dv]``, per value head rather than flattened.
+        st: Recurrent state ``[num_v, dk, dv]`` fp32, updated in place.
+        out: Output buffer ``[num_v, dv]`` fp32, written in place with the normed
+            result.
+        qscale: ``dk ** -0.5``.
+        rep: Value heads per key head.
+
+    Returns:
+        ``out``, for call chaining.
+    """
+    qn, kn, beta, g = _head_prep(q, k, b, a, neg_expA, dt_bias, qscale, rep)
+    vf = v.float()
+    dh = torch.empty_like(vf)
+    _delta_step(qn, kn, vf, beta, g, st, dh)
+    out.copy_(_rms_norm_gated(dh, nw, z.float(), 1e-6))
+    return out
+
+
 def _triangular_solve(lower: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
     """Solve ``A X = B`` for a unit-lower-triangular ``A``.
 
@@ -708,6 +852,10 @@ def build(caps: Caps | None = None) -> Ops:
         linear_prefill=linear,
         rms_norm=_rms_norm,
         rms_norm_gated=_rms_norm_gated,
+        add_rms_norm=_add_rms_norm,
+        kv_quant=_kv_quant,
+        silu_mul=_silu_mul,
+        rope_apply=_rope_apply,
         attn_decode=_attn_decode,
         attn_paged=_attn_paged,
         attn_paged_batch=_attn_paged_batch,
@@ -720,6 +868,7 @@ def build(caps: Caps | None = None) -> Ops:
         delta_prep_seq=_delta_prep_seq,
         delta=_delta,
         delta_batch=_delta_batch,
+        delta_normed=_delta_normed,
         triangular_solve=_triangular_solve,
     )
 

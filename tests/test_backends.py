@@ -5,7 +5,7 @@ Two things are guarded here, and both have to hold on a host with no accelerator
 * the *selection* is deterministic and legible -- ``COFFIN_BACKEND`` wins, an
   unknown or unusable name fails loudly instead of silently degrading, and the
   pure-torch reference is always the last candidate;
-* the *reference backend implements all 18 ops*, because it is the safety net the
+* the *reference backend implements all 23 ops*, because it is the safety net the
   rest of the engine relies on once the ``hip_ops.available()`` branches are
   deleted. A ``None`` entry here would be a hole that only shows up as a crash
   mid-request on an unsupported platform.
@@ -87,20 +87,21 @@ def _run_py(code: str, env: dict | None = None) -> subprocess.CompletedProcess:
 
 
 class OpTableTest(unittest.TestCase):
-    """``Ops`` is the contract: 18 names, frozen order, and no silently dropped entry."""
+    """``Ops`` is the contract: 23 names, frozen order, and no silently dropped entry."""
 
-    def test_names_are_the_eighteen_contract_ops(self):
+    def test_names_are_the_contract_ops(self):
         """A rename or a dropped name is a contract break for every call site, so the tuple is pinned literally."""
         self.assertEqual(Ops.NAMES, (
             "linear", "linear_m", "linear_prefill",
-            "rms_norm", "rms_norm_gated",
+            "rms_norm", "add_rms_norm", "rms_norm_gated", "kv_quant", "silu_mul",
+            "rope_apply",
             "attn_decode", "attn_paged", "attn_paged_batch", "attn_paged_multi_q",
             "conv1d_silu", "conv1d_silu_seq", "conv1d_silu_batch",
             "delta_prologue", "delta_prologue_batch", "delta_prep_seq",
-            "delta", "delta_batch",
+            "delta", "delta_batch", "delta_normed",
             "triangular_solve",
         ))
-        self.assertEqual(len(Ops.NAMES), 18)
+        self.assertEqual(len(Ops.NAMES), 23)
 
     def test_names_match_the_dataclass_fields_in_order(self):
         """The tuple is hand-maintained, so it can drift from the dataclass; this is the drift alarm."""
@@ -285,7 +286,7 @@ class RegistryTest(unittest.TestCase):
 
 
 class ReferenceTotalityTest(unittest.TestCase):
-    """The reference backend must answer all 18 names: it is the only safety net left after migration."""
+    """The reference backend must answer all 23 names: it is the only safety net left after migration."""
 
     def test_reference_table_has_no_gaps(self):
         """A ``None`` here would reach model code on every unsupported platform, mid-request."""
@@ -296,7 +297,7 @@ class ReferenceTotalityTest(unittest.TestCase):
             self.assertTrue(callable(getattr(table, name)), name)
 
     def test_every_vendor_table_resolves_to_reference_for_every_op(self):
-        """A placeholder must answer all 18 names today: the model has no fallback branch left.
+        """A placeholder must answer all 23 names today: the model has no fallback branch left.
 
         This is the invariant that lets a vendor start with one kernel: the partial
         table it returns is completed from the reference, so the model runs unchanged
@@ -332,6 +333,80 @@ class ReferenceTotalityTest(unittest.TestCase):
         self.assertEqual(table.missing(), ())
         self.assertEqual(backends.caps().name, "hip")
         self.assertIn("linear", backends.caps().native)
+
+
+class NativeRegistrationTest(unittest.TestCase):
+    """A backend's ``_NATIVE`` dict must list every op it has written an adapter for.
+
+    This guards a failure mode that is invisible in every other check. ``_NATIVE`` is a
+    hand-maintained dict of name -> adapter, and an op missing from it is filled from the
+    *reference backend* by ``reference.fill``. So an adapter, a header declaration, a
+    binding, a protocol field and a reference implementation can all land, the whole tree
+    can be green, and the op still never executes a kernel on this backend -- it runs the
+    torch spec while reporting success. A performance measurement taken in that state reads
+    as a clean zero improvement, which is indistinguishable from "the fusion did not pay".
+
+    The check is about the adapter, not the kernel symbol: a kernel is bound under its own
+    extension-level name (``gemv_kn``, ``silu_mul``) which need not match the op name, so
+    the question is only whether the module defines an adapter for an op and then leaves it
+    unregistered.
+    """
+
+    def test_every_op_with_an_adapter_is_registered_native(self):
+        """An op the backend defines a callable adapter for must be in ``_NATIVE``."""
+        from backends import corex
+
+        missing = sorted(name for name in Ops.NAMES
+                         if callable(getattr(corex, name, None))
+                         and name not in corex.NATIVE)
+        self.assertEqual(missing, [], (
+            "these ops have an adapter in backends/corex but are absent from _NATIVE, so "
+            "they silently resolve to the reference implementation and never run on the "
+            f"card: {missing}"))
+
+    def test_decode_op_set_is_a_subset_of_native(self):
+        """``_DECODE_OPS`` gates ``caps.graph``; a name in it with no kernel could capture cuBLAS."""
+        from backends.corex import _DECODE_OPS, NATIVE
+
+        self.assertEqual(sorted(_DECODE_OPS - set(NATIVE)), [])
+
+    def test_every_native_op_is_bound_in_the_extension(self):
+        """A kernel defined in a ``.cu`` file is unreachable until ``bindings.cpp`` registers it.
+
+        This is the second half of the same trap as the ``_NATIVE`` guard above, and it bit
+        once already: ``delta_normed`` had a declaration, a definition, a protocol field, a
+        reference implementation, an adapter and a ``_NATIVE`` entry, and the decode step
+        still died with ``AttributeError`` on the card because the pybind ``m.def`` line was
+        missing. Neither the reference fill nor the local suite can see that: the reference
+        answers on a CPU host, and the binding is only read when the extension is imported.
+
+        The check is a source scan because the extension cannot be imported without a
+        toolchain. It is approximate by nature -- it proves a name appears in a ``m.def``
+        call, not that the signature matches -- but it makes the omission impossible to leave
+        in the tree, which is the failure that actually happened.
+        """
+        import re
+
+        from backends import corex
+
+        bound_path = corex.kernels.KERNEL_DIR / "bindings.cpp"
+        if not bound_path.is_file():
+            self.skipTest("corex bindings not present")
+        bound = set(re.findall(r'm\.def\(\s*"([a-z0-9_]+)"', bound_path.read_text(encoding="utf-8")))
+
+        # A backend-level op name is served by an extension entry of the same name for every
+        # op added by the fusion work; an op whose kernel is bound under a different name
+        # (``linear`` -> ``gemv_kn``) is out of this check's scope by design, so it only
+        # asserts about names that the extension also declares in its header.
+        header_path = corex.kernels.KERNEL_DIR / "corex_ops.h"
+        declared = set(re.findall(r"^(?:torch::Tensor|void)\s+([a-z0-9_]+)\s*\(",
+                                  header_path.read_text(encoding="utf-8"),
+                                  flags=re.MULTILINE))
+        native_and_declared = (set(corex.NATIVE) & declared) | (declared & bound)
+        missing = sorted(native_and_declared - bound)
+        self.assertEqual(missing, [], (
+            "these kernels are declared and listed native but never registered in "
+            f"bindings.cpp, so calling them raises AttributeError on the card: {missing}"))
 
 
 class VendorExtensionTest(unittest.TestCase):

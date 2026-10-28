@@ -61,7 +61,11 @@ _OP_NAMES: tuple[str, ...] = (
     "linear_prefill",    # prefill-chunk GEMM (large M)
     # Normalisation.
     "rms_norm",
+    "add_rms_norm",
     "rms_norm_gated",
+    "kv_quant",
+    "silu_mul",
+    "rope_apply",
     # Full attention over the int8 KV cache.
     "attn_decode",
     "attn_paged",
@@ -76,6 +80,7 @@ _OP_NAMES: tuple[str, ...] = (
     "delta_prep_seq",
     "delta",
     "delta_batch",
+    "delta_normed",
     # Triangular solve: the chunked delta rule inverts a unit-lower-triangular
     # system once per chunk, and that is a *library* capability, not model maths.
     "triangular_solve",
@@ -225,9 +230,49 @@ class Ops:
     #: buffer normalises in place without a copy; ``0`` means "read it from ``x``".
     #: A backend that does not take a separate pitch ignores the argument.
     rms_norm: OpFn | None = None
+    #: ``add_rms_norm(x, add, w, out, stride=0, eps=1e-6) -> out``: the residual
+    #: ``x += add`` and the zero-centred RMSNorm of the sum, in one pass. ``x`` is
+    #: accumulated in place because the residual stream stays live for the rest of
+    #: the layer, and ``out`` is a separate buffer rather than aliasing ``x`` for
+    #: the same reason. A backend that does not implement it gets the reference
+    #: implementation: two launches and one extra read instead of one, which is
+    #: slower and identical numerically.
+    add_rms_norm: OpFn | None = None
     #: ``rms_norm_gated(x, w, gate, eps=1e-6) -> y``: ``rms(x) * w * silu(gate)``,
     #: normalised per head, so ``w`` is ``[dv]`` and not the flattened width.
     rms_norm_gated: OpFn | None = None
+    #: ``kv_quant(x, out_q, out_s) -> out_q``: symmetric int8 quantisation of
+    #: ``[M, N]`` with one fp32 scale per row, ``out_s`` ``[M]``. It exists as its
+    #: own entry because the KV cache contract fixes the quantisation exactly --
+    #: ``abs().amax(-1).clamp_min(1e-5) / 127`` -- and a backend that fused the
+    #: seven-op chain differently would desynchronise the cache from the kernel
+    #: that reads it. Both outputs are caller-owned buffers written in place.
+    kv_quant: OpFn | None = None
+    #: ``silu_mul(gate, up, out) -> out``: ``out = silu(gate) * up``, the SwiGLU
+    #: product of the MLP. It is an op rather than two torch calls because the
+    #: fused ``gate_up`` projection hands both halves back from one weight read, and
+    #: the only thing left between them and the down projection is one elementwise
+    #: product: as ``aten::silu`` + ``aten::mul`` that is two launches and two
+    #: ``[intermediate]`` temporaries per layer. ``out`` may alias ``up`` -- the
+    #: natural spelling writes the product over the ``up`` half, since nothing reads
+    #: it afterwards -- which is why the buffer argument is explicit instead of the
+    #: entry returning a fresh tensor.
+    silu_mul: OpFn | None = None
+    #: ``rope_apply(q, k, cos, sin, q_out, k_out, rotary_dim) -> q_out``: rotate the
+    #: leading ``rotary_dim`` channels of every q/k head by the position's angle, with
+    #: the trailing ``head_dim - rotary_dim`` channels copied through untouched.
+    #:
+    #: ``q`` is ``[M, nh, hd]`` and ``k`` ``[M, nkv, hd]``, so one shape serves both the
+    #: single-token decode path (``M == 1``) and the prefill/verify path (``M`` rows).
+    #: ``cos``/``sin`` are ``[M, rotary_dim]`` fp32 and arrive already gathered for the
+    #: rows being rotated: two call sites (mRoPE and verify) pass a normalised tensor
+    #: rather than a table row, so making the kernel own the gather would force every
+    #: site onto one index expression to save one launch that is not the bottleneck.
+    #:
+    #: The tables stay fp32 and are cast per element in the kernel. Materialising a bf16
+    #: table loses enough angle precision at long context to move the logits.
+    #: ``q_out``/``k_out`` must not alias ``q``/``k``.
+    rope_apply: OpFn | None = None
     #: ``attn_decode(q, gate, kcache, vcache, kscale, vscale, out, pos, rep, scale,
     #: part_acc=None, part_ml=None) -> out``: one token over the dense int8 KV
     #: cache. ``pos`` is a 1-element long tensor that addresses the slot and is
@@ -302,6 +347,21 @@ class Ops:
     #: leading row dim on every argument; each row must stay identical to
     #: :attr:`delta` on that row alone.
     delta_batch: OpFn | None = None
+    #: ``delta_normed(q, k, v, b, a, neg_expA, dt_bias, z, nw, st, out, qscale,
+    #: rep) -> out``: the whole linear-attention mixer for one decode token --
+    #: head prep, the recurrence and the gated output norm -- in one launch.
+    #:
+    #: It is one op because it is one *memory* problem, not three. The three-stage
+    #: spelling writes and re-reads about 48 KB of fp32 scratch per layer per
+    #: token (``q_pro``/``k_pro``/``v_pro`` and ``delta_out``, each ``[32, 128]``)
+    #: to move values a single block can hold in shared memory and registers.
+    #: ``st`` is updated in place and ``out`` carries the normed result, so the
+    #: caller's buffers and the capture path's addresses are unchanged.
+    #:
+    #: ``z`` is the gate projection of the output norm and ``nw`` its ``[dv]``
+    #: gain: the norm is per value head, which is exactly one block's span, so it
+    #: folds into the epilogue with no extra reduction.
+    delta_normed: OpFn | None = None
     #: ``triangular_solve(lower, rhs) -> out``: solve ``A X = B`` where ``A`` is
     #: ``[bn, L, L]`` unit-lower-triangular and ``B`` is ``[bn, L, n]``, returning
     #: ``[bn, L, n]`` in ``rhs``'s dtype.

@@ -485,6 +485,122 @@ def rms_norm_gated(x: torch.Tensor, w: torch.Tensor, gate: torch.Tensor,
     return _restore(y.view(x.shape), dtype)
 
 
+def add_rms_norm(x: torch.Tensor, add: torch.Tensor, w: torch.Tensor,
+                 out: torch.Tensor, stride: int = 0,
+                 eps: float = 1e-6) -> torch.Tensor:
+    """Residual add into ``x`` then the zero-centred RMSNorm, in one launch.
+
+    The upstream spelling is two launches and two reads of the residual stream;
+    fusing them is worth a launch per call at this card's 5.75 us floor and a
+    read of the whole ``[hidden]`` vector.
+
+    Args:
+        x: Residual stream, ``[..., N]``, accumulated in place.
+        add: Mixer output with ``x``'s shape.
+        w: Gain, ``[N]``, already carrying the checkpoint's ``1 + w`` offset.
+        out: Destination for the normalised sum, ``x``'s shape. Must not alias
+            ``x``: the residual has to survive the norm.
+        stride: Element pitch between rows; ``0`` reads it from ``x``.
+        eps: Variance floor.
+
+    Returns:
+        ``out``, for call chaining.
+
+    Raises:
+        RuntimeError: The extension is unavailable.
+    """
+    module = _kernels()
+    width = x.shape[-1]
+    act = _compute_dtype(x)
+    act_add = _compute_dtype(add)
+    rows = _pitch_rows(act, width)
+    rows_add = _pitch_rows(act_add, width)
+    gain = w if w.dtype == act.dtype else w.to(act.dtype)
+    y = module.add_rms_norm(rows, rows_add, gain.contiguous(), out, 
+                            rows.stride(0) if stride == 0 else stride, eps)
+    return y.view(x.shape) if y.dtype == out.dtype else y.to(out.dtype).view(out.shape)
+
+
+def kv_quant(x: torch.Tensor, out_q: torch.Tensor,
+             out_s: torch.Tensor) -> torch.Tensor:
+    """Symmetric int8 quantisation of ``[M, N]``, one fp32 scale per row, one launch.
+
+    Replaces the seven-op torch chain ``_quant`` uses, which costs about 82 us per
+    call against this card's 5.75 us launch floor and runs twice per
+    full-attention layer.
+
+    Args:
+        x: Activations to quantise, ``[M, N]``.
+        out_q: int8 destination, ``[M, N]``, written in place.
+        out_s: fp32 destination for the per-row scale, ``[M]``, written in place.
+
+    Returns:
+        ``out_q``, for call chaining.
+
+    Raises:
+        RuntimeError: The extension is unavailable.
+    """
+    module = _kernels()
+    act = _compute_dtype(x)
+    width = act.shape[-1]
+    return module.kv_quant(_pitch_rows(act, width), out_q, out_s)
+
+
+def silu_mul(gate: torch.Tensor, up: torch.Tensor,
+             out: torch.Tensor) -> torch.Tensor:
+    """``out = silu(gate) * up``, the SwiGLU product, in one launch.
+
+    Nothing is copied to make an operand contiguous, and that is load-bearing rather than
+    tidy. ``GEMVGroup.__call__`` hands the two halves back as ``.split(sizes, dim=1)`` of one
+    fused result, so on every 2-D path (prefill, batch, wide) ``gate`` and ``up`` are
+    *column views* of a wider buffer and are not contiguous. Densifying them here would add
+    two ``_to_copy`` launches per MLP to save two -- three launches where ``F.silu(gate) *
+    up`` was two, and the regression would appear only on the prefill paths, which are not
+    the ones being measured. The kernel takes a per-operand row pitch instead, so a strided
+    column view is served in place.
+
+    Args:
+        gate: Gate half of the fused projection, ``[...]`` with unit innermost stride.
+        up: Up half, same shape as ``gate``, unit innermost stride (need not be contiguous).
+        out: Destination, same shape. May alias ``up``.
+
+    Returns:
+        ``out``, for call chaining.
+
+    Raises:
+        RuntimeError: The extension is unavailable.
+    """
+    module = _kernels()
+    if gate.dim() == 1:
+        return module.silu_mul(gate, up, out)
+    width = gate.shape[-1]
+    return module.silu_mul(_pitch_rows(gate, width), _pitch_rows(up, width),
+                           _pitch_rows(out, width))
+
+
+def rope_apply(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor,
+               sin: torch.Tensor, q_out: torch.Tensor, k_out: torch.Tensor,
+               rotary_dim: int) -> torch.Tensor:
+    """Rotate the leading ``rotary_dim`` channels of every q/k head, in one launch.
+
+    Args:
+        q: Queries, ``[M, nh, hd]``.
+        k: Keys, ``[M, nkv, hd]``.
+        cos: Cosine for the rows being rotated, ``[M, rotary_dim]`` fp32.
+        sin: Sine, same layout as ``cos``.
+        q_out: Destination of the rotated queries, ``q``'s shape.
+        k_out: Destination of the rotated keys, ``k``'s shape.
+        rotary_dim: Channels to rotate.
+
+    Returns:
+        ``q_out``, for call chaining.
+
+    Raises:
+        RuntimeError: The extension is unavailable.
+    """
+    return _kernels().rope_apply(q, k, cos, sin, q_out, k_out, rotary_dim)
+
+
 # Attention
 
 
@@ -871,6 +987,44 @@ def delta_batch(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, beta: torch.T
     return _kernels().delta_batch(q, k, v, beta, g, st, out)
 
 
+def delta_normed(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                 b: torch.Tensor, a: torch.Tensor, neg_expA: torch.Tensor,
+                 dt_bias: torch.Tensor, z: torch.Tensor, nw: torch.Tensor,
+                 st: torch.Tensor, out: torch.Tensor, qscale: float,
+                 rep: int) -> torch.Tensor:
+    """Head prep, recurrence and gated output norm for one decode token, one launch.
+
+    Replaces the ``delta_prologue`` -> ``delta`` -> ``rms_norm_gated`` chain, which
+    wrote and re-read about 48 KB of fp32 scratch per layer per token to hand
+    three values between kernels. See :func:`delta_normed` in ``kernels/delta.cu``
+    for why one block per value head is enough to keep all of it on chip.
+
+    Args:
+        q: Raw query, one row per key head, ``[num_k, dk]`` fp32.
+        k: Raw key, ``[num_k, dk]`` fp32.
+        v: Value, ``[num_v, dv]`` fp32.
+        b: Beta logits, ``[num_v]`` bf16.
+        a: Decay logits, ``[num_v]`` bf16.
+        neg_expA: ``-exp(A_log)``, ``[num_v]`` fp32.
+        dt_bias: Decay bias, ``[num_v]`` fp32.
+        z: Gate projection for the output norm, ``[num_v, dv]``.
+        nw: Gated-norm gain, ``[dv]`` bf16, per value head.
+        st: Recurrent state, ``[num_v, dk, dv]`` fp32, updated in place.
+        out: Output buffer, ``[num_v, dv]`` fp32, written in place with the normed
+            result.
+        qscale: ``dk ** -0.5``.
+        rep: Value heads per key head.
+
+    Returns:
+        ``out``, for call chaining.
+
+    Raises:
+        RuntimeError: The extension is unavailable.
+    """
+    return _kernels().delta_normed(q, k, v, b, a, neg_expA, dt_bias, z, nw, st, out,
+                                   qscale, rep)
+
+
 #: Rows per block in the triangular solve, largest first. Measured against block
 #: sizes 32/64/128/256 at L=512 on this card: 256 was fastest (2.48 ms) and 128 was
 #: pathological (9.3 ms), so the choice matters more than the algorithm. Every block
@@ -988,13 +1142,25 @@ def triangular_solve(lower: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
 
 #: Ops this backend serves with a kernel, in :class:`Ops` field order. Everything
 #: absent is filled from the reference backend by :func:`ops`, which is why a
-#: partially implemented platform still answers all 18 names.
+#: partially implemented platform still answers every name.
+#:
+#: This dict is hand-maintained, and that is a trap worth naming: an adapter, a header
+#: declaration, a binding, a protocol field and a reference implementation can all land
+#: while the op is still missing here -- and then it silently runs the *reference*
+#: implementation on this backend. A measurement taken in that state reads as a clean
+#: zero, which is the same "stale cache is invisible" failure this repo documents twice
+#: in another disguise. ``tests/test_backends.py`` pins this against the adapters that
+#: exist, so a new kernel cannot be added without its registration.
 _NATIVE: dict[str, OpFn] = {
     "linear": linear,
     "linear_m": linear_m,
     "linear_prefill": linear_prefill,
     "rms_norm": rms_norm,
+    "add_rms_norm": add_rms_norm,
     "rms_norm_gated": rms_norm_gated,
+    "kv_quant": kv_quant,
+    "silu_mul": silu_mul,
+    "rope_apply": rope_apply,
     "attn_decode": attn_decode,
     "attn_paged": attn_paged,
     "attn_paged_batch": attn_paged_batch,
@@ -1007,6 +1173,7 @@ _NATIVE: dict[str, OpFn] = {
     "delta_prep_seq": delta_prep_seq,
     "delta": delta,
     "delta_batch": delta_batch,
+    "delta_normed": delta_normed,
     "triangular_solve": triangular_solve,
 }
 
@@ -1103,10 +1270,11 @@ _GRAPH_VERIFIED = False
 #: prefill regime, which is never captured, and it is the one entry that does call the
 #: library (chunked, to stay inside the width this card computes correctly).
 _DECODE_OPS: frozenset[str] = frozenset({
-    "linear", "linear_m", "rms_norm", "rms_norm_gated", "attn_decode",
+    "linear", "linear_m", "rms_norm", "add_rms_norm", "rms_norm_gated",
+    "kv_quant", "silu_mul", "rope_apply", "attn_decode",
     "attn_paged", "attn_paged_batch", "attn_paged_multi_q", "conv1d_silu",
     "conv1d_silu_seq", "conv1d_silu_batch", "delta_prologue", "delta_prologue_batch",
-    "delta_prep_seq", "delta", "delta_batch",
+    "delta_prep_seq", "delta", "delta_batch", "delta_normed",
 })
 
 

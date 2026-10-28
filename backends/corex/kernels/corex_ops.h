@@ -96,6 +96,26 @@ torch::Tensor gemv_kn_i8(torch::Tensor wt, torch::Tensor x, torch::Tensor scale,
 //         narrower than the row.
 torch::Tensor rms_norm(torch::Tensor x, torch::Tensor w, int64_t stride, double eps);
 
+// @brief Residual add followed by the zero-centred RMSNorm, in one launch.
+//
+// Every decoder layer does ``x = x + h`` and then normalises ``x``. As two ops that is two
+// launches and reads the residual buffer twice; fused it is one launch and one pass, and
+// the sum has a single home. A separate entry rather than an optional argument on
+// :func:`rms_norm` so a backend without it falls back to the reference implementation --
+// which is correct, only slower -- instead of silently dropping the add.
+//
+// @param x [M, N] residual stream, accumulated in place with ``add``.
+// @param add [M, N] mixer output to accumulate.
+// @param w [N] gain, already carrying the ``1 + w`` offset.
+// @param stride Element pitch between rows of ``x``; ``0`` means ``N``.
+// @param eps Variance floor.
+// @param out [M, N] normalised result, written in place. It must not alias ``x``: the
+//        residual sum stays live for the rest of the layer.
+// @return ``out``, for call chaining.
+// @throws c10::Error on a shape, dtype or aliasing the kernel cannot serve.
+torch::Tensor add_rms_norm(torch::Tensor x, torch::Tensor add, torch::Tensor w,
+                           torch::Tensor out, int64_t stride, double eps);
+
 // @brief RMSNorm scaled by the SiLU of a gate, normalised per head.
 //
 // @param x [M, N] activations, contiguous, bf16 or fp32.
@@ -107,6 +127,60 @@ torch::Tensor rms_norm(torch::Tensor x, torch::Tensor w, int64_t stride, double 
 //         shape differs from ``x``.
 torch::Tensor rms_norm_gated(torch::Tensor x, torch::Tensor w, torch::Tensor gate,
                              double eps);
+
+// @brief Symmetric int8 quantisation of ``[M, N]``, one scale per row, in one launch.
+//
+// Replaces the torch chain ``abs -> amax -> clamp_min -> div -> round -> clamp_ -> to``,
+// which is six launches per call and is called twice per full-attention layer (k and v).
+// At this card's launch floor the six cost about 82 us for a few microseconds of
+// arithmetic; one launch costs about six.
+//
+// @param x [M, N] bf16 activation to quantise.
+// @param out_q [M, N] int8 destination, written in place.
+// @param out_s [M] fp32 destination for the per-row scale, written in place.
+// @return ``out_q``, for call chaining.
+// @throws c10::Error when a dtype or shape disagrees with the destinations.
+torch::Tensor kv_quant(torch::Tensor x, torch::Tensor out_q, torch::Tensor out_s);
+
+// @brief ``out = silu(gate) * up``, the SwiGLU product, in one launch.
+//
+// The fused ``gate_up`` projection returns both halves from one weight read, so the only
+// work between it and the down projection is this product. As ``aten::silu`` +
+// ``aten::mul`` it is two launches and two ``[intermediate]`` temporaries per layer, which
+// at this card's launch floor costs more than the arithmetic.
+//
+// @param gate [M] or [M, N] gate half, contiguous.
+// @param up Up half, same shape as ``gate``.
+// @param out Destination of the same shape. It may alias ``up``: the product overwrites
+//        it and nothing reads ``up`` afterwards, which is what lets a caller avoid both
+//        the allocation and the extra read.
+// @return ``out``, for call chaining.
+// @throws c10::Error on a shape, dtype or overlap the kernel cannot serve.
+torch::Tensor silu_mul(torch::Tensor gate, torch::Tensor up, torch::Tensor out);
+
+// @brief Rotate the leading ``rotary_dim`` channels of every q/k head, in one launch.
+//
+// Replaces the torch chain ``to -> mul -> cat -> mul -> add -> cat`` that ``apply_rope``
+// runs per layer: about ten launches on ``[16, 256]`` and ``[4, 256]`` tensors, where the
+// arithmetic is a few thousand FMAs. At this card's launch floor that chain costs nearly a
+// millisecond per step and almost none of it is work.
+//
+// One shape serves both paths: ``M == 1`` is decode, ``M == T`` is a prefill chunk or a
+// verify window, so a single kernel keeps them numerically identical.
+//
+// @param q [M, nh, hd] bf16 queries.
+// @param k [M, nkv, hd] bf16 keys.
+// @param cos [M, rotary_dim] fp32, already gathered for the rows being rotated.
+// @param sin Same layout as ``cos``.
+// @param q_out Destination of the rotated queries, ``q``'s shape. Must not alias ``q``.
+// @param k_out Destination of the rotated keys, ``k``'s shape. Must not alias ``k``.
+// @param rotary_dim Channels to rotate; the trailing ``hd - rotary_dim`` pass through
+//        untouched, which is what partial-rotary checkpoints require.
+// @return ``q_out``, for call chaining.
+// @throws c10::Error on a shape, dtype or aliasing the kernel cannot serve.
+torch::Tensor rope_apply(torch::Tensor q, torch::Tensor k, torch::Tensor cos,
+                         torch::Tensor sin, torch::Tensor q_out, torch::Tensor k_out,
+                         int64_t rotary_dim);
 
 // Attention over the int8 KV cache: dense, paged, batched and draft-verify.
 //
@@ -250,6 +324,37 @@ torch::Tensor delta(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Te
 torch::Tensor delta_batch(torch::Tensor q, torch::Tensor k, torch::Tensor v,
                           torch::Tensor beta, torch::Tensor g, torch::Tensor st,
                           torch::Tensor out);
+
+// @brief Prologue, recurrence and gated norm for one decode token, in one launch.
+//
+// Replaces the ``conv1d_silu`` -> ``delta_prologue`` -> ``delta`` -> ``rms_norm_gated``
+// chain. Those four launches write and re-read about 48 KB of fp32 scratch per layer per
+// token (``q_pro``/``k_pro``/``v_pro`` = 3 x [32, 128], ``delta_out`` = [32, 128]), and at
+// this card's ~5.75 us launch floor the round trips cost more than the arithmetic. One
+// block per value head keeps every intermediate in shared memory and registers, and the
+// gated norm's reduction is over exactly one head's ``dv``, so it folds into the epilogue
+// for free.
+//
+// @param conv ``[nv, dv]`` fp32, the conv-and-SiLU output for this token. The q and k
+//        thirds of that buffer are read by column, at ``dk`` per head, so the layout is
+//        q | k | v with ``nv == nkeys * rep``; heads repeat their key head ``rep`` times.
+//        Passed in three slices by the caller rather than as one row, because the conv
+//        output is ``conv_dim`` wide and only its head column of each third is read here.
+// @param b,a ``[nv]`` bf16 raw beta/decay logits.
+// @param neg_expA,dt_bias ``[nv]`` fp32 checkpoint constants for the decay gate.
+// @param z ``[nv, dv]`` fp32-or-bf16 gate projection for the SiLU of the output norm.
+// @param nw ``[dv]`` bf16 gated-norm gain, per value head rather than per flattened width.
+// @param st ``[nv, dk, dv]`` fp32 recurrent state, updated in place.
+// @param out ``[nv, dv]`` fp32, written from the updated state and already normed.
+// @param qscale ``dk ** -0.5``.
+// @param rep Value heads per key head.
+// @return ``out``, for call chaining.
+// @throws c10::Error when a dtype, a head count or a layout contradicts the state.
+torch::Tensor delta_normed(torch::Tensor q, torch::Tensor k, torch::Tensor v,
+                           torch::Tensor b, torch::Tensor a,
+                           torch::Tensor neg_expA, torch::Tensor dt_bias,
+                           torch::Tensor z, torch::Tensor nw, torch::Tensor st,
+                           torch::Tensor out, double qscale, int64_t rep);
 
 // Triangular solve: the one library operation the chunked delta rule needs, and the one
 // this card's cuSOLVER cannot answer.

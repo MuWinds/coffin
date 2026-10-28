@@ -390,6 +390,21 @@ trace 的逐 kernel 时长含 profiler 自身开销，所以它的**总和**不�
 （这里超出 wall 29%，正是过计的证据）。但它同时证明了一件更有用的事：
 **设备在整步里几乎一直是忙的**，不存在能藏下"发射受限"的空窗。
 
+> **2026-10-28 更正 —— 上面这个"device bound"的结论是错的，见 §12.1。**
+>
+> 错在把 trace 的逐 kernel 时长**求和**当成设备忙时间。那个和不可加：profiler 的逐 kernel
+> 时长**按 kernel 计**开销，所以过计量随**发射数**增长，而不是随工作量增长。一个
+> 2407 次发射、求和比墙钟多 45% 的步，恰恰是"大部分时间花在启动工作"的样子。
+>
+> 直接测量（`probe_launch_floor.py`）给出的是 **5.75 us 的发射地板**：一个什么都做的
+> 1 元素 kernel 也要这么多。2407 × 5.75 us = **13.8 ms = 59% 的墙钟**。
+> 按 §12 把胶水算子融合掉之后实测 **23.53 → 20.26 ms（1.16x）**，发射数 2407 → 1399。
+>
+> **教训**：profiler 的时长可以作为**排序**依据，不能作为**占比**依据——它的每一项都被
+> 计入了一次它自己带来的开销。要谈占比就单独测一个地板，或者用 events 计时。
+> 不过 §12.3 又说回来：地板是**发射间隙**的地板，不是**工作**的地板，
+> 所以"能少发一次就少发一次"也不成立，只有"工作也一起消失"才成立。
+
 三条推论，互相独立且一致：
 
 1. **C++ 融合发射**（一次 host 调用发完整步）省的是 host 时间。host 不在关键路径上，
@@ -626,5 +641,169 @@ python platform/scow/tools/sync.py push -d coffin \
    `$'\r': command not found` 静默失败——症状是作业几秒结束、状态 `COMPLETED`、
    日志 0 字节，看起来像调度器的问题。**这一轮被它废掉了两个作业**，
    最后加了 `coffin/.gitattributes`（`*.sh text eol=lf`）从 checkout 层强制。
+
+## 12. 胶水算子融合：23.53 → 20.26 ms（1.16x），以及两个被实测否掉的融合
+
+> 2026-10-28，`gpu-node-05` / `gpu-node-06`，card 3 / card 1，int8 权重，eager。
+> 起点就是 §0 的 **23.527 ms / 42.51 tok/s**，终点 **20.263 ms / 49.35 tok/s**。
+> greedy ids 全程 `[6, 24218, 10, 4838, 1665, 15]` 未变。
+
+### 12.1 先量"一次发射值多少钱"，这决定了后面所有取舍
+
+`diag/corex_probe/probe_launch_floor.py`（作业 `floor2`，同一张卡）：
+
+```
+add_ bf16 x1      5.75 us        <- 发射地板：kernel 什么都不做也要这么多
+add_ bf16 x1024   5.75 us
+add_ bf16 x65536  8.33 us
+add_ bf16 x1048576 13.47 us
+```
+
+一步 decode 有 **2407 个 profiler 行 / 946 个真 kernel 发射**，墙钟 23.53 ms，
+即 **9.77 us/发射**。地板 5.75 us × 2407 ≈ **13.8 ms = 59% 的墙钟**。
+
+**这条推翻了 §8 的判断。** §8 当时用 profiler 逐 kernel 时长求和得到 34 ms（> 墙钟 23 ms），
+据此写下"device bound，去掉发射没用"。那个和**不可加**：profiler 的逐 kernel 时长本身
+带开销，**按 kernel 计**，所以它的膨胀量随**发射数**增长而不是随工作量增长。
+一个 2407 次发射、求和比墙钟多 45% 的步，恰恰是"设备大部分时间在启动工作"的样子。
+**地板是直接测出来的，求和是间接推出来的；这里以直接测量为准。**
+
+### 12.2 落地了什么
+
+| # | 改动 | 省掉的发射 | 状态 |
+| --- | --- | ---: | --- |
+| B1 | `kv_quant`：k/v int8 量化七连（`abs/amax/clamp_min/div/round/clamp_/to`）→ 1 核 | ~100 → 16 | **落地** |
+| B3 | `rope_apply`：`apply_rope` 的 `to/mul/cat/mul/add/cat` 串 → 1 核 | ~96 → 8 | **落地** |
+| B2 | `silu_mul`：`F.silu(gate) * up` 两次发射 → 1 核，写回 `up` 自己的缓冲 | 64 → 32 | **落地** |
+| D | `add_rms_norm`：残差 `x += h` 折进紧随其后的 RMSNorm | 32 | **落地** |
+| C | `delta_normed`：prologue + delta + 门控 norm 三合一 | −48 | **实测更慢，已回退** |
+| A | 把 split-K reduce 融进 GEMV split 核 | −128 | **实测更慢，已回退** |
+
+逐算子实测（`probe_glue_ab.py`，**比的是比特相等而不是容差**）：
+
+| 核 | 每次发射 | 原链 | 每步省 |
+| --- | ---: | ---: | ---: |
+| `kv_quant` | 8.3 us | 68.2 us | 0.96 ms（16 次） |
+| `silu_mul` | 8.6 us | 17.1 us | 0.27 ms（32 次） |
+| `rope_apply` | 11.1 us | 136.4 us | 1.02 ms（8 次） |
+
+三者的核内时间合计只占 0.885 ms，**其余 ~1.77 ms 全是发射地板的消失**——12.1 的论点成立。
+
+### 12.3 两个融合**实测更慢**，都回退了，这是本节最该看的
+
+**A（split-K reduce 融进 GEMV）**：`gemvreduce2`，同一作业内三种模式互为对照：
+
+| reduce 形态 | 发射/步 | 步时间 | 相对 |
+| --- | ---: | ---: | ---: |
+| 原两段式 | 1231 | **20.411 ms** | — |
+| last-block 融合（1 段） | **975** | 21.299 ms | **+0.888 ms 更慢** |
+| split-in-block（1 段、无 partial 缓冲） | — | 33.324 ms | +12.9 ms 更慢 |
+
+发射确实少了 128 个，步反而更慢。**省下的时间没消失，只是搬了家：**
+
+| kernel | 原 | 融合 | 差 |
+| --- | ---: | ---: | ---: |
+| `gemv_kn_i8x4_split` | 6.445 ms | 8.095 ms | **+1.650** |
+| `gemv_kn_i8_split` | 4.750 ms | 5.380 ms | **+0.630** |
+| `gemv_reduce_i8` | 2.076 ms | — | −2.076 |
+
+两个结构性代价，都不可调：①每个 split block 上一次 `__threadfence()`（4096 次）是
+device 域 flush，比它替掉的普通 store 贵；②**丢掉了发射流水线**——独立 reduce 的 block
+可以在 partial grid 收尾时就开始跑，融合版必须等整个 tile 到齐。
+split-in-block 更差的原因正是当初预判的：`cols = threads/split`，split 16–32 时
+`cols` 只有 8–16，64 lane 的 wavefront 横跨 4–8 个 k 行，事务效率崩掉。
+
+**C（delta 三合一）**：`probe_delta_ab.py`，同进程交替 A/B，5 轮，抖动 <0.5%：
+
+```
+chain (3 发射): 86.26 us/call
+fused (1 发射): 91.57 us/call      fused - chain = +5.32 us/call
+输出比特相等: True     state 比特相等: True
+```
+
+真实步里更糟：`delta_normed` 2.781 ms / 24 层 = **115.9 us/层**，而三段式是
+**15.1 + 73.7 + 14.0 = 102.8 us/层**（`prologue` 0.362 ms、`delta` 1.768 ms、
+`rms_norm_gated` 0.336 ms，均 24 次调用，同节点同卡 meas1），
+**+13.1 us/层 × 24 = +0.315 ms/步**；实测 20.285 → 20.615 ms（+0.330），方向与量级一致。
+
+**三个口径互相不一致，而不一致本身有信息**，记在这里因为事后从树里推不出来：
+
+| 口径 | 每层 | 折算每步 |
+| --- | ---: | ---: |
+| 同进程 A/B（最可信的单点测量） | +5.3 us | +0.128 ms |
+| 真实步逐层拆分 | +13.1 us | +0.315 ms |
+| 真实步直接实测 | — | **+0.330 ms** |
+
+A/B 少预测了约 **2.5 倍**，说明融合的代价**有一部分在核体之外**——占用率或调度，
+不只是多出来的算术。这和 12.1 那条（profiler 逐 kernel 时长不可加）是同一根因的两面：
+**孤立的单算子计时只说明核体，说明不了它在真步里挤掉了谁。**
+所以 102.8 → 115.9 不能当预算表读，它只解释了一部分回归。
+
+原因是几何冲突：`delta_kernel` 之所以快，是因为**一个线程独占一个 value 列、把 `dk` 走完
+寄存器循环、全程没有跨线程通信**；而 prologue 和门控 norm 各需要一个 block 归约。
+合成一个核必须为三者取一个几何，那个折中比省下的两次发射更贵。
+
+**两个负面结论的共同教训**：12.1 的 5.75 us 地板是**"发射间隙"的地板，不是"工作"的地板**。
+**去掉一次发射只有在工作也跟着消失时才划算**——把工作从 A 核搬到 B 核，发射省了、时间没省。
+
+### 12.4 三个会静默改掉 token 的舍入陷阱
+
+都不能用容差检查发现，写在这里因为下一个做融合的人一定会再撞：
+
+1. **`silu_mul`**：`F.silu` **返回 bf16**，所以链上是"激活先窄化、再乘"，**两次舍入**。
+   只做一次 fp32 舍入在 18432 个元素里差 ~5000 个。
+2. **`rope_apply`**：`apply_rope` 先 `cos.to(q.dtype)`（fp32 表直接算差 296/1024），
+   而且**逐运算**舍入（mul、mul、add 各一次）。合成一个 fp32 表达式只舍入一次，差 435/个。
+3. **`kv_quant`**：必须是 fp32 **除法**（不是乘倒数）、**ties-to-even**。
+   乘倒数在末位不同，会让写 cache 的核和读 cache 的核**对同一个 scale 的理解不一致**。
+
+三个陷阱现在都写进了核里的注释，并且由探针把"错误写法"的差异数打印出来，
+所以后来的人不会把它们当冗余删掉。
+
+### 12.5 一个基础设施级的坑：适配器写完不等于算子会跑
+
+`_NATIVE` 是手工维护的 `名字 -> 适配器` 字典，**字典里没有的项会被 `reference.fill`
+用纯 torch 实现补上**。于是"适配器 + bindings + 头声明 + protocol 字段 + reference 实现"
+可以全部落地、全套测试全绿，**而算子在卡上从未真正跑过**——用它的测量结果会是
+**一个干净的零**，和"这个融合没用"完全无法区分。本轮真的踩了：
+`kv_quant` / `silu_mul` / `rope_apply` / `add_rms_norm` / `delta_normed` 全都写完但没登记。
+
+更隐蔽的第二层：**`m.def` 忘了写**。`delta_normed` 有声明、有定义、有 `_NATIVE` 条目，
+卡上仍然 `AttributeError`——pybind 注册是另一件事，而且只有 import 扩展时才暴露。
+`bindings.cpp` 那个 \_NATIVE 都查不出来。
+
+现在有两道本地门禁（`tests/test_backends.py::NativeRegistrationTest`），
+且**验证过它们真的会红**：把 `m.def("delta_normed", ...)` 删掉后，
+`test_every_native_op_is_bound_in_the_extension` 立刻报 `['delta_normed']`。
+
+### 12.6 现在的账
+
+| 指标 | 前 | 后 | |
+| --- | ---: | ---: | --- |
+| decode 步 | 23.527 ms | **20.263 ms** | **1.16x** |
+| 吞吐 | 42.51 tok/s | **49.35 tok/s** | |
+| profiler 行/步 | 2407 | **1399** | |
+| 原生算子 | 18/18 | **23/23** | |
+| greedy ids | — | 未变 | |
+
+复现：
+
+```bash
+# 发射地板（无模型，最便宜的一条）
+python platform/scow/tools/sync.py push -d coffin \
+    --launcher diag/corex_probe/launch_floor.sh --run floor -g 4 -t 20 --wait
+
+# 整步：发射清单 + 逐核时间 + greedy ids
+python platform/scow/tools/sync.py push -d coffin \
+    --launcher diag/corex_probe/launch_measure.sh --run meas -g 4 -t 25 --wait
+
+# 融合 C 的同进程 A/B（回退与否的证据）
+python platform/scow/tools/sync.py push -d coffin \
+    --launcher diag/corex_probe/launch_delta_ab.sh --run dab -g 4 -t 20 --wait
+```
+
+**还剩下的**：`gemv_kn_i8x4_split` + `gemv_kn_i8_split` 合计 11.17 ms（55% 的步），
+是纯权重读，只有 int8→int4 或更大 M 的路子能动；`delta_kernel` 1.85 ms；
+`gemv_reduce_i8` 2.07 ms（A 已证明融不掉，但它是 8% 的步，值得从"减少 split"方向再看一次）。
 
 

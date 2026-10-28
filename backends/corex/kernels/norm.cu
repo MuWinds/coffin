@@ -1,8 +1,9 @@
 // @file norm.cu
-// @brief Fused RMSNorm and gated RMSNorm for the CoreX backend.
+// @brief Fused RMSNorm, residual-add RMSNorm and gated RMSNorm for the CoreX backend.
 //
 // Module: coffin/backends/corex/kernels. Bound as ``rms_norm`` /
-// ``rms_norm_gated`` and called only from ``backends/corex/__init__.py``.
+// ``add_rms_norm`` / ``rms_norm_gated`` and called only from
+// ``backends/corex/__init__.py``.
 //
 // Why fused rather than the decomposition: the CoreX torch build is 2.1, which has
 // no ``F.rms_norm`` at all, and the eager equivalent is a reduce plus separate
@@ -107,6 +108,65 @@ __global__ void rms_norm_kernel(const T* __restrict__ x, const T* __restrict__ w
     }
 }
 
+// @brief ``x += add`` then ``y = rms(x) * w``, one block per row.
+//
+// The residual is accumulated *in place* in ``x``, which is the buffer the layer keeps
+// live for the rest of the step, and the normalised result goes to a separate ``y``.
+// That is the whole reason the two operations fuse: the separate spelling writes the
+// sum to ``x`` and then re-reads ``x`` from the norm, and both passes are one launch
+// each at this card's 5.75 us floor.
+//
+// Two details make the result bit-identical to the two-op spelling rather than merely
+// close, and neither is optional:
+//
+//   * The sum is rounded to ``T`` before its square enters the reduction. Bf16 storage
+//     of the sum is what the second launch would have read, so accumulating the *un*
+//     rounded fp32 sum here would give a different mean square.
+//   * The gain is applied in pass 2 from ``x`` read back through ``to_float``, exactly
+//     as ``rms_norm_kernel`` does. Folding the multiply into pass 1 would change the
+//     order of the two roundings.
+//
+// @param add Mixer output to accumulate, rows pitched ``stride`` like ``x``. May alias
+//        ``y``: the notes on aliasing in the wrapper below say why that is allowed and
+//        why the two pointers must therefore stay non-``__restrict__``.
+// @param x Residual stream, accumulated in place; rows pitched ``stride``.
+// @param w [N] gain, already carrying the checkpoint's ``1 + w`` offset.
+// @param y [M, N] densely packed output; must not alias ``x``.
+// @param N Row width.
+// @param stride Element pitch of both ``x`` and ``add`` between rows.
+// @param eps Variance floor.
+//
+// ``add`` and ``y`` are deliberately *not* ``__restrict__``. The wrapper allows them to
+// share storage, and ``__restrict__`` would license the compiler to keep a load of
+// ``add`` live across the stores to ``y`` in pass 1 -- a miscompile that only appears on
+// the card, because the host check runs one lane at a time. ``x`` and ``w`` stay
+// restricted: the wrapper rejects ``y`` aliasing ``x``, and ``w`` is a read-only gain.
+template <typename T>
+__global__ void add_rms_norm_kernel(const T* add, T* x, const T* __restrict__ w, T* y,
+                                    int N, long stride, float eps) {
+    extern __shared__ float red[];
+    const int row = blockIdx.x;
+    const int t = threadIdx.x;
+    const T* ar = add + (size_t)row * stride;
+    T* xr = x + (size_t)row * stride;
+    // One block owns the whole row, so writing the sum back here and reading it again
+    // below is safe: the reduction's own barriers separate the two passes.
+    float ss = 0.f;
+    for (int i = t; i < N; i += blockDim.x) {
+        const float s = CxScalar<T>::to_float(xr[i]) + CxScalar<T>::to_float(ar[i]);
+        const T sum = CxScalar<T>::from_float(s);
+        xr[i] = sum;
+        const float v = CxScalar<T>::to_float(sum);
+        ss += v * v;
+    }
+    const float inv = rsqrtf(block_sum(ss, red) / (float)N + eps);
+    T* yr = y + (size_t)row * N;
+    for (int i = t; i < N; i += blockDim.x) {
+        yr[i] = CxScalar<T>::from_float(CxScalar<T>::to_float(xr[i]) * inv
+                                        * CxScalar<T>::to_float(w[i]));
+    }
+}
+
 // @brief ``y = rms(x) * w * silu(gate)``, one block per row.
 template <typename T>
 __global__ void rms_norm_gated_kernel(const T* __restrict__ x, const T* __restrict__ w,
@@ -173,6 +233,84 @@ torch::Tensor rms_norm(torch::Tensor x, torch::Tensor w, int64_t stride, double 
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return y;
+}
+
+// @brief Residual add into ``x``, then the zero-centred RMSNorm of the sum into ``out``.
+//
+// Collapses the layer's ``x = x + h`` followed by ``rms_norm(x)`` into one launch. The
+// two are one operation in every sense that matters here: the sum is the norm's only
+// input, so materialising it in a separate kernel buys a second launch and a second
+// read of the whole row for nothing.
+//
+// @param x [M, N] residual stream, accumulated in place. It has to be writable and it
+//        must not be ``out``: the sum outlives the norm as the next residual input.
+// @param add [M, N] mixer output to accumulate, pitched ``stride`` like ``x``.
+// @param w [N] gain, already carrying the checkpoint's ``1 + w`` offset.
+// @param out [M, N] destination, densely packed. It may alias ``add`` and must not
+//        alias ``x``.
+// @param stride Element pitch of ``x``/``add`` between rows; ``0`` means ``N``.
+// @param eps Variance floor, added before the rsqrt.
+// @return ``out``, for call chaining.
+// @throws c10::Error when a dtype, a shape, a pitch or an aliasing contradicts the
+//         kernel. The alias check is the important one: ``x`` and ``out`` sharing
+//         storage would overwrite the residual mid-row, and the result reads as a
+//         numerical drift rather than as a bug.
+torch::Tensor add_rms_norm(torch::Tensor x, torch::Tensor add, torch::Tensor w,
+                           torch::Tensor out, int64_t stride, double eps) {
+    TORCH_CHECK(x.dim() == 2 && add.dim() == 2 && out.dim() == 2,
+                "activation, addend and destination must all be 2-D [M, N]");
+    TORCH_CHECK(x.stride(-1) == 1 && add.stride(-1) == 1,
+                "activation and addend must have unit innermost stride");
+    const int M = (int)x.size(0), N = (int)x.size(1);
+    const long pitch = stride > 0 ? (long)stride : (long)N;
+    TORCH_CHECK(pitch >= N, "row pitch ", pitch, " is narrower than the row ", N);
+    TORCH_CHECK(add.size(0) == M && add.size(1) == N,
+                "addend must have the activation's shape");
+    TORCH_CHECK(out.is_contiguous() && out.size(0) == M && out.size(1) == N,
+                "destination must be contiguous [M, N]");
+    TORCH_CHECK(x.scalar_type() == add.scalar_type() &&
+                x.scalar_type() == out.scalar_type(),
+                "activation, addend and destination must share a dtype");
+    TORCH_CHECK(w.numel() == N, "gain must have N elements, got ", w.numel());
+    TORCH_CHECK(w.scalar_type() == x.scalar_type(), "gain dtype must match activation");
+    TORCH_CHECK(x.scalar_type() == torch::kBFloat16 || x.scalar_type() == torch::kFloat,
+                "activation must be bf16 or fp32");
+    // Aliasing, in the two directions that matter and no more.
+    //
+    // ``out`` may alias ``add``. The addend is consumed entirely in pass 1, before any
+    // write to ``out``, and a thread touches only the indices it read -- so the layer can
+    // hand the mixer's output buffer back as the destination once the sum has consumed
+    // it, which is what keeps the fold allocation-free. It is allowed only at a dense
+    // pitch: ``add`` is addressed by ``stride`` and ``out`` by ``N``, so two different
+    // pitches over one allocation would let a row's write land on another row's
+    // still-unread addend.
+    //
+    // ``out`` may never alias ``x``. The residual sum stays live for the rest of the
+    // layer, and ``is_alias_of`` catches a view of it as well as the tensor itself, which
+    // a ``data_ptr`` comparison would not.
+    if (add.is_alias_of(out)) {
+        TORCH_CHECK(pitch == (long)N,
+                    "destination may alias the addend only at a dense row pitch");
+    } else {
+        TORCH_CHECK(!x.is_alias_of(out),
+                    "destination must not alias the residual: the sum stays live");
+    }
+    const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    const int threads = rms_threads(N);
+    const size_t shmem = (size_t)threads * sizeof(float);
+    if (x.scalar_type() == torch::kBFloat16) {
+        add_rms_norm_kernel<uint16_t><<<M, threads, shmem, stream>>>(
+            reinterpret_cast<const uint16_t*>(add.data_ptr()),
+            reinterpret_cast<uint16_t*>(x.data_ptr()),
+            reinterpret_cast<const uint16_t*>(w.data_ptr()),
+            reinterpret_cast<uint16_t*>(out.data_ptr()), N, pitch, (float)eps);
+    } else {
+        add_rms_norm_kernel<float><<<M, threads, shmem, stream>>>(
+            add.data_ptr<float>(), x.data_ptr<float>(), w.data_ptr<float>(),
+            out.data_ptr<float>(), N, pitch, (float)eps);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
 }
 
 // @brief Fused gated RMSNorm: ``y = rms(x) * w * silu(gate)``, normalised per head.

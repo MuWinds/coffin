@@ -117,6 +117,15 @@ class LinearAttn:
                                  device=_device)
         self.beta = torch.zeros(rows, self.num_v, dtype=torch.float32, device=_device)
         self.g = torch.zeros(rows, self.num_v, dtype=torch.float32, device=_device)
+        # Destination of the fused prologue+recurrence+norm entry. It is a separate
+        # buffer from ``delta_out`` rather than sharing it because the fused entry
+        # writes the *normed* result: ``delta_out`` stays the pre-norm scratch the
+        # three-stage spelling (and the verify path) still needs.
+        #
+        # bf16, matching what ``RMSNormGated`` returns and what ``out_proj`` reads in the
+        # three-op chain. An fp32 container here would change the activation dtype reaching
+        # the projection, which is a numeric change even though the value would be equal.
+        self.normed_out = torch.zeros(rows, self.num_v, self.dv, dtype=D, device=_device)
 
         # Per-token state snapshots for speculative-verify rollback (one slot per
         # verified token; the recurrent state cannot be rewound otherwise).
@@ -261,6 +270,7 @@ class LinearAttn:
                                  device=_device)
         self.beta = torch.zeros(rows, self.num_v, dtype=torch.float32, device=_device)
         self.g = torch.zeros(rows, self.num_v, dtype=torch.float32, device=_device)
+        self.normed_out = torch.zeros(rows, self.num_v, self.dv, dtype=D, device=_device)
 
     def batch(self, x: torch.Tensor, *_) -> torch.Tensor:
         """``x`` [B, hidden] -> [B, hidden]: batched projections, per-row recurrence.
@@ -334,9 +344,12 @@ class LinearAttn:
         k = k.reshape(self.num_k, self.dk)
         v = v.reshape(self.num_v, self.dv)
 
-        # Fused q/k norm + head expand + beta/g: one op instead of ~16 small
-        # elementwise ops (mul, sum, rsqrt, sigmoid, softplus, add,
-        # repeat_interleave).
+        # The three-op spelling, not the fused ``delta_normed``. The fusion is bit-identical
+        # and removes 48 launches per step, and it is still slower: measured on the card it
+        # costs +5.3 us per layer of device time in isolation and +13.1 us per layer in the
+        # real step (20.285 -> 20.615 ms over 24 layers), because one kernel has to serve
+        # the recurrence's register-loop geometry and two block reductions at once. The
+        # launch slots it saves are worth less than that. See PERF_COREX.md §12.
         q_pro, k_pro, v_pro = self.q_pro[pr], self.k_pro[pr], self.v_pro[pr]
         beta, g = self.beta[pr], self.g[pr]
         bops.delta_prologue(q, k, v, b, a, self.neg_expA, self.dt_bias,
