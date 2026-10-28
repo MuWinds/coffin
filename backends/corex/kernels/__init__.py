@@ -53,7 +53,7 @@ DEFAULT_ARCH = "ivcore10"
 #: Extension name. The suffix is the build-scheme version: bump it when a source change
 #: must not attach to an already-cached object tree. It is bumped with every kernel batch
 #: precisely because a stale cache is invisible -- the old objects load and answer.
-_EXTENSION = "coffin_corex_ops_v10"
+_EXTENSION = "coffin_corex_ops_v12"
 
 #: Loaded extension, or ``None`` before the first attempt.
 _module: Any = None

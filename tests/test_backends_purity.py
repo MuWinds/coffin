@@ -443,6 +443,8 @@ ALLOWLISTS: dict[str, dict[str, dict[str, int]]] = {
             "diag/corex_probe/probe_gemv_split.py": 11,
             "diag/corex_probe/probe_gemv_tune.py": 12,
             "diag/corex_probe/probe_graph_delta.py": 6,
+            "diag/corex_probe/bench_step_i8.py": 9,
+            "diag/corex_probe/probe_shapes.py": 5,
             "diag/corex_probe/probe_graph_repeat.py": 2,
             "diag/corex_probe/probe_graph_stages.py": 17,
             "diag/corex_probe/probe_import.py": 4,

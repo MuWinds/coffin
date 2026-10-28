@@ -1,0 +1,19 @@
+# Line-ending policy.
+#
+# The launchers under diag/ and backends/corex/diag/ are submitted to a Linux cluster and
+# run by bash. A CRLF there fails in the least diagnosable way this project has hit: the job
+# runs for about two seconds, reports COMPLETED, and leaves a 0-byte log, because the first
+# token of every line carries a trailing carriage return. It reads like a scheduler fault or
+# a wedged card, and it costs a job to discover.
+#
+# Editing on Windows reintroduces CRLF unless git is told not to, so the rule is enforced at
+# checkout time rather than left to the editor.
+*.sh text eol=lf
+
+# Python source is read by the interpreter, which tolerates CRLF, but keeping one convention
+# avoids a spurious whole-file diff whenever a file crosses platforms.
+*.py text eol=lf
+*.cu text eol=lf
+*.cpp text eol=lf
+*.h text eol=lf
+*.md text eol=lf

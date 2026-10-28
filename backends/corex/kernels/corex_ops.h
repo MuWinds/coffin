@@ -64,11 +64,22 @@ torch::Tensor gemv_kn_m(torch::Tensor wt, torch::Tensor x, int64_t threads,
 // @param threads Threads per block; ``0`` picks from ``N``.
 // @param unroll K-loop unroll factor; ``0`` means 4.
 // @param split Split-K width; ``0`` picks, ``1`` forces the single-pass kernel.
+// @param width Adjacent output columns one thread owns, which is also the number of
+//        contiguous weight bytes it loads per k step: ``2`` is one 16-bit load, ``4`` one
+//        32-bit, ``8`` one 64-bit. Legal values are ``1``, ``2``, ``4``, ``8`` and ``16``;
+//        any other non-zero value is rejected rather than rounded, and ``N % width`` must
+//        be ``0`` (the launch falls back to ``1`` when it is not, so a weight whose width
+//        is not a multiple of ``width`` stays correct instead of reading across a row
+//        boundary). ``0`` means auto, which reproduces the dispatch that predates this
+//        argument exactly: four-wide above a column floor, scalar below. Reading wider
+//        divides the thread count by ``width``, so the best value is a measured trade-off
+//        per shape rather than a constant -- see ``diag/tune_gemv_i8_wide.py``.
 // @return [N] in ``x``'s dtype.
-// @throws c10::Error on a non-int8 weight, a scale length other than ``N``, or a layout
-//         the kernels cannot index.
+// @throws c10::Error on a non-int8 weight, a scale length other than ``N``, an unsupported
+//         ``width``, or a layout the kernels cannot index.
 torch::Tensor gemv_kn_i8(torch::Tensor wt, torch::Tensor x, torch::Tensor scale,
-                         int64_t threads, int64_t unroll, int64_t split);
+                         int64_t threads, int64_t unroll, int64_t split,
+                         int64_t width);
 
 // Normalisation.
 

@@ -35,7 +35,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "decode W8A16 GEMV: int8 [K, N] weights plus a per-column fp32 scale",
           pybind11::arg("wt"), pybind11::arg("x"), pybind11::arg("scale"),
           pybind11::arg("threads") = 0, pybind11::arg("unroll") = 0,
-          pybind11::arg("split") = 0);
+          pybind11::arg("split") = 0, pybind11::arg("width") = 0);
 
     // Normalisation.
     m.def("rms_norm", &rms_norm, "fused zero-centred RMSNorm over pitched [M, N] rows",
