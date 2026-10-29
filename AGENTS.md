@@ -230,13 +230,13 @@ cd coffin
 python -m py_compile $(find . -name '*.py' -not -path './__pycache__/*')
 
 # comments only: AST equal outside docstrings
-python diag/check_style.py --ast .
+python ../diag/check_style.py --ast .
 
 # CUDA/C/C++: token stream equal once comments are stripped
-python diag/check_style.py --c-comments .
+python ../diag/check_style.py --c-comments .
 
 # conventions: language, spacing, dividers, Sphinx fields, missing sections
-python diag/check_style.py --style .
+python ../diag/check_style.py --style .
 ```
 
 `--ast` and `--c-comments` are gates: any reported code change is a bug in the

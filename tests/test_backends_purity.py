@@ -13,8 +13,10 @@ Constraints:
       known offenders would go stale the moment a file is added, which is
       exactly when the gate has to fire.
     * Hits are grouped (``prod`` vs ``probe``) and each group carries its own
-      allowlist, so progress on production code cannot be masked by the probe
-      and test directories that are allowed to stay platform-specific longest.
+      allowlist, so progress on production code cannot be masked by ``tests/``,
+      which is allowed to stay platform-specific longest. One-off probes live
+      outside this repository (in the parent tree's ``diag/``), so the gate never
+      sees them and a new probe never needs an allowlist entry.
     * A group's allowlist is per file and holds the exact hit count of that file
       today. More hits fail (a regression), fewer hits fail (the entry must be
       lowered in the same change), and an entry whose file no longer offends
@@ -84,8 +86,8 @@ class Group:
     """A slice of the tree with its own budget, so progress is readable.
 
     Attributes:
-        name: ``"prod"`` for code that ships, ``"probe"`` for ``diag/`` and
-            ``tests/``, which may stay platform-specific longest.
+        name: ``"prod"`` for code that ships, ``"probe"`` for ``tests/``,
+            which may stay platform-specific longest.
         prefixes: Directory prefixes in this group. An empty tuple makes the
             group the catch-all and it must be declared last.
     """
@@ -95,7 +97,7 @@ class Group:
 
 
 PROD = Group("prod", ())
-PROBE = Group("probe", ("diag/", "tests/"))
+PROBE = Group("probe", ("tests/",))
 SHIPPED = (PROD,)
 WITH_PROBES = (PROBE, PROD)
 
@@ -110,7 +112,7 @@ class Rule:
         patterns: Recognisers; a line matching any of them is one offender line.
         scope: Directory prefixes to scan. Empty means the whole tree.
         exempt: Directory prefixes whose hits are reported but never budgeted --
-            the backend package itself, plus ``diag/`` for rule 1. The scanner
+            the backend package itself. The scanner
             file is always exempt as well.
         groups: Budget slices, probe first then the ``prod`` catch-all.
         budgets: Allowlist as ``group -> posix relative path -> exact lines``.
@@ -421,79 +423,12 @@ ALLOWLISTS: dict[str, dict[str, dict[str, int]]] = {
     },
     "R2_platform_literal": {
         "probe": {
-            "diag/build_int4.py": 6,
-            "diag/corex_probe/probe_truth.py": 1,
-            "diag/dbg_int4.py": 4,
-            "diag/probe_attn_scale.py": 4,
-            "diag/probe_gemv_int4.py": 6,
-            "diag/probe_multi_q.py": 3,
-            "diag/probe_wide_gemv.py": 3,
         },
         "prod": {
         },
     },
     "R3_cuda_literal": {
         "probe": {
-            "diag/bench_batch.py": 1,
-            "diag/bench_prefill2.py": 4,
-            "diag/corex_probe/bench_prefill.py": 13,
-            "diag/corex_probe/bench_step_i8.py": 9,
-            "diag/corex_probe/probe_decode_profile.py": 15,
-            "diag/corex_probe/probe_delta_ab.py": 5,
-            "diag/corex_probe/probe_dequant_exact.py": 3,
-            "diag/corex_probe/probe_gemm_align.py": 14,
-            "diag/corex_probe/probe_gemv_split.py": 11,
-            "diag/corex_probe/probe_gemv_tune.py": 12,
-            "diag/corex_probe/probe_glue_ab.py": 23,
-            "diag/corex_probe/probe_host_budget.py": 5,
-            "diag/corex_probe/probe_int8.py": 12,
-            "diag/corex_probe/probe_int8_apply.py": 6,
-            "diag/corex_probe/probe_int8_prefill.py": 10,
-            "diag/corex_probe/probe_launch_floor.py": 12,
-            "diag/corex_probe/probe_launch_inventory.py": 9,
-            "diag/corex_probe/probe_prefill_attr.py": 8,
-            "diag/corex_probe/probe_prefill_detail.py": 13,
-            "diag/corex_probe/probe_prefill_fixes.py": 7,
-            "diag/corex_probe/probe_prefill_mtp.py": 8,
-            "diag/corex_probe/probe_prefill_sweep.py": 8,
-            "diag/corex_probe/probe_i8_batch.py": 5,
-            "diag/corex_probe/probe_row_cost.py": 6,
-            "diag/corex_probe/probe_shapes.py": 5,
-            "diag/corex_probe/probe_step_budget.py": 8,
-            "diag/corex_probe/probe_suffix_spec.py": 3,
-            "diag/corex_probe/probe_triangular.py": 11,
-            "diag/corex_probe/probe_truth.py": 23,
-            "diag/dbg_int4.py": 4,
-            "diag/det_probe.py": 2,
-            "diag/e2e_vision.py": 4,
-            "diag/engine_path_probe.py": 2,
-            "diag/make_vision_fixture.py": 5,
-            "diag/probe_attn_batch.py": 38,
-            "diag/probe_attn_scale.py": 6,
-            "diag/probe_batch_decode.py": 17,
-            "diag/probe_decode_profile.py": 5,
-            "diag/probe_delta_batch.py": 38,
-            "diag/probe_delta_scan_struct.py": 10,
-            "diag/probe_gemm_shapes.py": 11,
-            "diag/probe_gemv_cfg.py": 8,
-            "diag/probe_gemv_int4.py": 7,
-            "diag/probe_hw.py": 21,
-            "diag/probe_launch_overhead.py": 16,
-            "diag/probe_longctx.py": 16,
-            "diag/probe_multi_q.py": 25,
-            "diag/probe_ops2.py": 9,
-            "diag/probe_prefill_batch.py": 5,
-            "diag/probe_prefill_cache.py": 4,
-            "diag/probe_prefill_chunk.py": 4,
-            "diag/probe_prefill_ops.py": 13,
-            "diag/probe_prefill_split.py": 15,
-            "diag/probe_scan_ab.py": 5,
-            "diag/probe_spec_batch.py": 11,
-            "diag/probe_spec_segments.py": 7,
-            "diag/probe_vision_e2e.py": 1,
-            "diag/probe_vision_oracle.py": 10,
-            "diag/probe_wide_gemv.py": 15,
-            "diag/vision_accept.py": 16,
             "tests/support.py": 7,
             "tests/test_attention.py": 3,
             "tests/test_backends.py": 4,
@@ -507,7 +442,6 @@ ALLOWLISTS: dict[str, dict[str, dict[str, int]]] = {
     },
     "R4_kernels_path": {
         "probe": {
-            "diag/cpu_attn.c": 1,
             "tests/test_attention.py": 1,
         },
         "prod": {
@@ -535,7 +469,7 @@ RULES: tuple[Rule, ...] = (
                     re.compile(r"(?:import_module|sys\.modules)\s*[\(\[]\s*[\"']hip_ops[\"']")),
         ),
         groups=WITH_PROBES,
-        exempt=("backends/", "diag/"),
+        exempt=("backends/",),
         budgets=ALLOWLISTS["R1_hip_ops_import"],
     ),
     Rule(
@@ -677,7 +611,7 @@ class PurityGateTest(unittest.TestCase):
         self.fail("\n".join(problem))
 
     def test_rule1_no_hip_ops_import_outside_backend(self):
-        """Only ``backends/`` (plus the ``diag/`` probes, temporarily) may import ``hip_ops``."""
+        """Only ``backends/`` may import ``hip_ops``."""
         self._assert_rule("R1_hip_ops_import")
 
     def test_rule2_no_platform_build_literals_outside_backend(self):
@@ -716,9 +650,9 @@ class PurityGateTest(unittest.TestCase):
             self.assertIn(expected, walked)
 
     def test_production_is_separated_from_probe_directories(self):
-        """Rule 3 must report shipping code apart from ``diag/`` and ``tests/``.
+        """Rule 3 must report shipping code apart from ``tests/``.
 
-        A diag-only allowance would otherwise hide a regressed production file,
+        A test-only allowance would otherwise hide a regressed production file,
         and the production number is the one the migration had to drive to zero.
 
         Production is now at zero, so the assertion is that the split still exists
@@ -729,9 +663,9 @@ class PurityGateTest(unittest.TestCase):
         report = self.scan.reports["R3_cuda_literal"]
         groups = {group.group.name: group for group in report.groups}
         self.assertEqual(set(groups), {"prod", "probe"})
-        self.assertTrue(all(not path.startswith(("diag/", "tests/"))
+        self.assertTrue(all(not path.startswith("tests/")
                             for path in groups["prod"].per_file))
-        self.assertTrue(all(path.startswith(("diag/", "tests/"))
+        self.assertTrue(all(path.startswith("tests/")
                             for path in groups["probe"].per_file))
         # The v3 rule's namesake property: no shipped file may still spell a
         # vendor's device API. Probes may, and do.

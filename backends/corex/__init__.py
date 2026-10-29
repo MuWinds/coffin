@@ -1220,7 +1220,7 @@ NATIVE: frozenset[str] = frozenset(_NATIVE)
 #: prefill. That wipes the prompt's KV cache and recurrent state, so the replay drove
 #: attention over a window that was never written. ``run_chat.generate`` does it the other
 #: way round -- ``reset()``, ``capture()``, ``reset()``, then ``prefill()`` -- and so does
-#: ``diag/corex_probe/probe_chat.py``.
+#: ``diag/corex/probe_chat.py``.
 #:
 #: With the order fixed, the whole decode step was measured. The acceptance run is
 #: the historical graph acceptance probe on gpu-node-07, 2026-10-26 -- six
@@ -1243,7 +1243,7 @@ NATIVE: frozenset[str] = frozenset(_NATIVE)
 #: earlier failed capture. So the operational rule is: check a node with an 8x8 matmul
 #: before blaming a run, because a wedged context and a wedged kernel produce the same
 #: log, and nothing in the log distinguishes them. Every launcher under
-#: ``diag/corex_probe/`` now does that check first and exits 64 without touching the
+#: ``diag/corex/`` now does that check first and exits 64 without touching the
 #: model.
 #:
 #: ``check_graph.py`` still covers two ops only and its header says so; it is the cheap

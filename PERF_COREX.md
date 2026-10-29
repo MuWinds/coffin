@@ -14,7 +14,7 @@
 > 所以不再依赖它。
 >
 > **本机所有测量都在坏卡之外**：`gpu-node-05` 的 card 0/1/2 是死卡（8x8 matmul 超时），
-> 每次作业先逐卡探活再选卡，见 `coffin/diag/_pick_card.sh`。
+> 每次作业先逐卡探活再选卡，见 `diag/_pick_card.sh`。
 
 ## 0. 已经拿到的结果
 
@@ -30,13 +30,13 @@
 | 投影占整步 | 64% | 62%（分母也变小了） | |
 | 端到端文本 | ` Paris.` | ` Paris.` | 未变 |
 
-数值验收（`backends/corex/diag/check_ops.py`，逐算子对拍 reference 后端）：
+数值验收（`../diag/corex/check_ops.py`，逐算子对拍 reference 后端）：
 `delta rel=3.270e-07`、`delta_batch == per-row rel=0.000e+00`，
 全部 18 个算子 `ok`，无 fallback。
 
 ## 1. 一次 decode step 的时间去向（优化前基线）
 
-`diag/corex_probe/probe_decode_profile.py`，eager 路径，device events 计时：
+`diag/corex/probe_decode_profile.py`，eager 路径，device events 计时：
 
 ```
 decode step                             50.53 ms    (19.79 tok/s)
@@ -144,10 +144,10 @@ reduce kernel 和一块 `part` 缓冲。
 
 每一步都在**真实 decode 路径**上验证，而不是只看单算子：
 
-- `diag/corex_probe/probe_gemv_tune.py`：逐形状扫 `(threads, unroll, split)`，
+- `diag/corex/probe_gemv_tune.py`：逐形状扫 `(threads, unroll, split)`，
   **每个配置都对 host fp64 参考做正确性检查**，错的配置不参与"最优"评选。
-- `diag/corex_probe/probe_decode_profile.py`：跑真实模型，给出整步时间和占比。
-- `diag/corex_probe/probe_chat.py`：端到端文本，` Paris.` 必须不变。
+- `diag/corex/probe_decode_profile.py`：跑真实模型，给出整步时间和占比。
+- `diag/corex/probe_chat.py`：端到端文本，` Paris.` 必须不变。
 
 **踩过的坑**：改完 `gemv.cu` 忘了升 `_EXTENSION` 版本号（`coffin_corex_ops_v3`），
 作业会**静默加载旧的 `.so`**——那个文件的注释里就写着这句警告，
@@ -253,24 +253,24 @@ CoreX 的 `caps.int8_weights` 现在是 `False`，需要新增一条 W8A16 的 `
 ```bash
 # 单项：整步时间分解 + 每形状带宽 + profiler 排名
 python scow/tools/deploy.py cohort -d ../coffin \
-    -s ../coffin/diag/corex_probe/launch_decode_profile.sh --run prof -g 1 -t 25
+    -s ../diag/corex/launch_decode_profile.sh --run prof -g 1 -t 25
 
 # 逐形状扫 (threads, unroll, split)，带正确性检查
 python scow/tools/deploy.py cohort -d ../coffin \
-    -s ../coffin/diag/corex_probe/launch_gemv_tune.sh --run tune -g 1 -t 25
+    -s ../diag/corex/launch_gemv_tune.sh --run tune -g 1 -t 25
 
 # 端到端文本（必须仍是 ' Paris.'）
 python scow/tools/deploy.py cohort -d ../coffin \
-    -s ../coffin/diag/corex_probe/launch_chat.sh --run chat -g 1 -t 25
+    -s ../diag/corex/launch_chat.sh --run chat -g 1 -t 25
 ```
 
 ### 单作业多卡（推荐）
 
-`diag/corex_probe/run_multigpu.sh` 一次申请多张卡，**在作业内部逐张验卡并自动选健康的**：
+`diag/corex/run_multigpu.sh` 一次申请多张卡，**在作业内部逐张验卡并自动选健康的**：
 
 ```bash
 # 提交命令只需一句，逻辑都在脚本里（网关会拦复合命令）
-#   WORKDIR=<dir> PROBE=diag/corex_probe/probe_decode_profile.py bash <dir>/raw/mg.sh
+#   WORKDIR=<dir> PROBE=diag/corex/probe_decode_profile.py bash <dir>/raw/mg.sh
 ```
 
 实测输出（`gpu-node-05`，申请 4 张卡）：
@@ -355,7 +355,7 @@ USING_CARD=1 on gpu-node-05
 
 ### 重新开工前必须先量的一组数
 
-`diag/corex_probe/probe_step_budget.py` 已经写好（**还没跑出结果**），它给三件事：
+`diag/corex/probe_step_budget.py` 已经写好（**还没跑出结果**），它给三件事：
 
 * `wall/step`：一次 step 的墙钟；
 * `gpu_busy`：同一 step 里 profiler 统计的 kernel 时长之和；
@@ -377,7 +377,7 @@ USING_CARD=1 on gpu-node-05
 
 **答案是不需要。卡已经是满的，没有发射开销可拿。**
 
-`diag/corex_probe/probe_step_budget.py` 的实测（gpu-node-07，graph 关，单卡）：
+`diag/corex/probe_step_budget.py` 的实测（gpu-node-07，graph 关，单卡）：
 
 ```
 wall/step        : 37.05 ms   (26.99 tok/s)
@@ -612,19 +612,19 @@ W=2 也仍然输给 W=1。原因是 W=2 既没拿到 W=4 的字节效率，又�
 ```bash
 # 真实形状统计（一个 decode step 到底调了哪些形状）
 python platform/scow/tools/sync.py push -d coffin \
-    --launcher diag/corex_probe/launch_probe_shapes.sh --run shapes -g 4 -t 20 --wait
+    --launcher diag/corex/launch_probe_shapes.sh --run shapes -g 4 -t 20 --wait
 
 # 真实形状 × (threads, split) 扫描 + split 转折点
 python platform/scow/tools/sync.py push -d coffin \
-    --launcher backends/corex/diag/launch_tune_gemv_real.sh --run tune -g 4 -t 40 --wait
+    --launcher diag/corex/launch_tune_gemv_real.sh --run tune -g 4 -t 40 --wait
 
 # 宽度 × 线程 × split 扫描（带 production / 改动前两个对照行）
 python platform/scow/tools/sync.py push -d coffin \
-    --launcher backends/corex/diag/launch_tune_gemv_i8_wide.sh --run wide -g 4 -t 50 --wait
+    --launcher diag/corex/launch_tune_gemv_i8_wide.sh --run wide -g 4 -t 50 --wait
 
 # 端到端（int8 服务路径，必须比对 token ids）
 python platform/scow/tools/sync.py push -d coffin \
-    --launcher diag/corex_probe/launch_bench_step_i8.sh --run step -g 4 -t 45 --wait
+    --launcher diag/corex/launch_bench_step_i8.sh --run step -g 4 -t 45 --wait
 ```
 
 ### 三个会让人白跑一趟的坑
@@ -634,7 +634,7 @@ python platform/scow/tools/sync.py push -d coffin \
    量的其实是 **bf16 GEMV**；照它调 int8 会调错核。要测 int8 必须显式
    `load_weights(quant=True)` 再 `create_model(weights=sd)`。**这一条让第一个形状探针
    返回了 0 次 int8 调用**，差点把整轮优化建在错的基础上。
-2. **作业里 `cd` 的相对层级。** 探针在 `diag/corex_probe/` 下，距 `coffin/` 是**两级**，
+2. **作业里 `cd` 的相对层级。** 探针在 `diag/corex/` 下，距 `coffin/` 是**两级**，
    不是三级；而且作业的工作目录是 `coffin/` 的**父目录**。写错的表现是
    `can't open file`，看起来像文件没上传。
 3. **`.sh` 必须是 LF。** Windows 上写出来的文件默认是 CRLF，bash 以
@@ -650,7 +650,7 @@ python platform/scow/tools/sync.py push -d coffin \
 
 ### 12.1 先量"一次发射值多少钱"，这决定了后面所有取舍
 
-`diag/corex_probe/probe_launch_floor.py`（作业 `floor2`，同一张卡）：
+`diag/corex/probe_launch_floor.py`（作业 `floor2`，同一张卡）：
 
 ```
 add_ bf16 x1      5.75 us        <- 发射地板：kernel 什么都不做也要这么多
@@ -791,15 +791,15 @@ A/B 少预测了约 **2.5 倍**，说明融合的代价**有一部分在核体�
 ```bash
 # 发射地板（无模型，最便宜的一条）
 python platform/scow/tools/sync.py push -d coffin \
-    --launcher diag/corex_probe/launch_floor.sh --run floor -g 4 -t 20 --wait
+    --launcher diag/corex/launch_floor.sh --run floor -g 4 -t 20 --wait
 
 # 整步：发射清单 + 逐核时间 + greedy ids
 python platform/scow/tools/sync.py push -d coffin \
-    --launcher diag/corex_probe/launch_measure.sh --run meas -g 4 -t 25 --wait
+    --launcher diag/corex/launch_measure.sh --run meas -g 4 -t 25 --wait
 
 # 融合 C 的同进程 A/B（回退与否的证据）
 python platform/scow/tools/sync.py push -d coffin \
-    --launcher diag/corex_probe/launch_delta_ab.sh --run dab -g 4 -t 20 --wait
+    --launcher diag/corex/launch_delta_ab.sh --run dab -g 4 -t 20 --wait
 ```
 
 **还剩下的**：`gemv_kn_i8x4_split` + `gemv_kn_i8_split` 合计 11.17 ms（55% 的步），
@@ -1052,7 +1052,7 @@ bf16 的 45–51 TFLOP/s 就是这张卡的 prefill 天花板，int8 路径的 2
 
 ### 13.5b 已落地：两条改动，真机验收 PASS（2026-10-28，作业 3925）
 
-两条都改完并上了卡，`diag/corex_probe/probe_prefill_fixes.py` 的三项检查全过：
+两条都改完并上了卡，`diag/corex/probe_prefill_fixes.py` 的三项检查全过：
 
 ```
 dequant vs old spelling: 128 projections, max |diff| = 0.00e+00  BIT-IDENTICAL
@@ -1107,7 +1107,7 @@ if self.model.mtp is not None:
 
 ### 13.5c 扫参：`PREFILL_ATTN_KB` 1024 → 4096（长 prompt 再 4.9%），tile 与 chunk 不值得动
 
-`diag/corex_probe/probe_prefill_sweep.py`，12 个 (tile, kb) 组合 × 3 个 prompt 长度，
+`diag/corex/probe_prefill_sweep.py`，12 个 (tile, kb) 组合 × 3 个 prompt 长度，
 每个组合一个独立子进程（两个常量都是 `tuning.py` 在 import 期读环境变量，同进程改不了）。
 **整套扫了两遍**（作业 `psweep2` / `psweep3`），36 个格子最大差异 **1.41%**。
 
@@ -1174,11 +1174,11 @@ chunk 4096 比 2048 只快 **1.0–1.3%**，而且这是**两个因素合在一�
 ```bash
 # 12 个 (tile, kb) 组合，每个一个子进程，跑在 3 个 prompt 长度上
 python platform/scow/tools/sync.py push -d coffin \
-    --launcher diag/corex_probe/launch_prefill_sweep.sh --run psweep -g 4 -t 55 --wait
+    --launcher diag/corex/launch_prefill_sweep.sh --run psweep -g 4 -t 55 --wait
 
 # 落地后的端到端验收（含 kb=4096 的 ids 复核）
 python platform/scow/tools/sync.py push -d coffin \
-    --launcher diag/corex_probe/launch_prefill_fixes.sh --run pfix -g 4 -t 30 --wait
+    --launcher diag/corex/launch_prefill_fixes.sh --run pfix -g 4 -t 30 --wait
 ```
 
 #### 落地后的真机验收（作业 3931）
@@ -1234,23 +1234,23 @@ kernel 名里带 `Gemm_tcu_bi_kernel`。这条比任何一次调度参数都更�
 ```bash
 # headline + chunk sweep + MTP A/B + profiler（int8 与 bf16 各一遍）
 python platform/scow/tools/sync.py push -d coffin \
-    --launcher diag/corex_probe/launch_bench_prefill.sh --run prefill -g 4 -t 40 --wait
+    --launcher diag/corex/launch_bench_prefill.sh --run prefill -g 4 -t 40 --wait
 
 # stage 分解 / delta chunk / 逐 shape / dequant 缓存实验
 python platform/scow/tools/sync.py push -d coffin \
-    --launcher diag/corex_probe/launch_prefill_attr.sh --run pattr -g 4 -t 40 --wait
+    --launcher diag/corex/launch_prefill_attr.sh --run pattr -g 4 -t 40 --wait
 
 # paged 路径的 headline + 两组 profiler
 python platform/scow/tools/sync.py push -d coffin \
-    --launcher diag/corex_probe/launch_prefill_detail.sh --run pdetail -g 4 -t 45 --wait
+    --launcher diag/corex/launch_prefill_detail.sh --run pdetail -g 4 -t 45 --wait
 
 # MTP drafter 的逐 kernel 代价（A/B 两份 record_shapes profile）
 python platform/scow/tools/sync.py push -d coffin \
-    --launcher diag/corex_probe/launch_prefill_mtp.sh --run pmtp -g 4 -t 40 --wait
+    --launcher diag/corex/launch_prefill_mtp.sh --run pmtp -g 4 -t 40 --wait
 
 # GEMM 的 M 对齐悬崖（17 个 M 点 × 3 个形状 + drafter 补行实测）
 python platform/scow/tools/sync.py push -d coffin \
-    --launcher diag/corex_probe/launch_gemm_align.sh --run galign -g 4 -t 40 --wait
+    --launcher diag/corex/launch_gemm_align.sh --run galign -g 4 -t 40 --wait
 ```
 
 三个 launcher 都先 `pick_card` 验卡（`gpu-node-05` 的 card 0/1/2 是死卡）。
@@ -1390,17 +1390,17 @@ if packed.int8:
 ```bash
 # 行代价（不加载模型，几秒）
 python platform/scow/tools/sync.py push -d coffin \
-    --launcher diag/corex_probe/launch_row_cost.sh --run rowcost -g 4 -t 20 --wait
+    --launcher diag/corex/launch_row_cost.sh --run rowcost -g 4 -t 20 --wait
 
 # 内核级 A/B：逐行 vs 批处理，逐位校验
 python platform/scow/tools/sync.py push -d coffin \
-    --launcher diag/corex_probe/launch_i8_batch.sh --run i8batch -g 4 -t 25 --wait
+    --launcher diag/corex/launch_i8_batch.sh --run i8batch -g 4 -t 25 --wait
 
 # 算子对拍（含 int8 batched 的 rows-identical=True）
 python platform/scow/tools/sync.py push -d coffin \
-    --launcher backends/corex/diag/launch_check_ops.sh --run i8ops -g 4 -t 30 --wait
+    --launcher diag/corex/launch_check_ops.sh --run i8ops -g 4 -t 30 --wait
 
 # 后缀投机全表（接受率上限 / oracle 对照 / 端到端）
 python platform/scow/tools/sync.py push -d coffin \
-    --launcher diag/corex_probe/launch_suffix_spec.sh --run sufspec -g 4 -t 40 --wait
+    --launcher diag/corex/launch_suffix_spec.sh --run sufspec -g 4 -t 40 --wait
 ```

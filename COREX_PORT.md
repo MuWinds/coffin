@@ -102,7 +102,7 @@ N 越大越接近上限，小 N 受 launch/占用率限制 → 需要按形状�
 
 1. `python -m unittest discover -s tests` 在**无卡机器**上仍然全绿（238 例基线）。
 2. `COFFIN_BACKEND=<name>` 启动横幅显示 `native=N/17`，N 是我们真写了的算子数。
-3. 在真机上跑 `diag/corex_probe/` 下的对拍脚本，**每个算子相对 `reference`
+3. 在真机上跑 `diag/corex/` 下的对拍脚本，**每个算子相对 `reference`
    后端 rel < 2e-2**（bf16 容差），并打印实测带宽。
 
 **性能不是第一验收标准**。先逐位不崩、能出连贯文本，再谈 tok/s。
@@ -381,7 +381,7 @@ capture+replay，逐 token 完全相同，且进程存活。单个算子的捕�
 **第二次失败（不是 graph，是卡）**：`gr2-1` 在 `decode path: graph replay` 之后无输出。
 几分钟后**同一节点连 8x8 matmul 都不返回**——那是上下文已经被上一次失败的 capture 卡住
 了，不是这次 replay 的问题。**两种故障的日志完全一样，从日志分辨不出来**，所以
-`diag/corex_probe/` 下每个 launcher 现在第一步都跑 8x8 matmul，失败就 `exit 64`
+`diag/corex/` 下每个 launcher 现在第一步都跑 8x8 matmul，失败就 `exit 64`
 （不加载模型、不浪费时间）。
 
 **历史验收证据**（gpu-node-07，同进程 6 轮；对应的 graph 探针已按驱动安全规则删除）：

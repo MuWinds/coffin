@@ -407,7 +407,7 @@ S1 之前所有工作都不改生产代码，所以"方案评审 → S0/S1"可�
 | `.tmp_dsh/platforms/INVENTORY.md` | 逐文件迁移清单（与门禁同一次扫描生成） | 360 行 |
 
 整体状态：`python -m unittest discover -s tests` → **233 例通过 / 58 skip**（无卡机器，skip 的都是 GPU 用例）；
-`python diag/check_style.py --style backends tests/test_backends*.py` → **0 error / 0 warning**。
+`python ../diag/check_style.py --style backends tests/test_backends*.py` → **0 error / 0 warning**。
 `git -C coffin status --short` 只有 `backends/`、两个测试文件、`PLATFORMS.md`、`.gitignore` 一行新增。
 
 **S0 没做的事**（都是 S1–S3 的范围，见我上文的 5.1 缺口清单）：

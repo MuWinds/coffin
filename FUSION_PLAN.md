@@ -6,14 +6,14 @@
 
 ## 0. The measurement that drives all of this
 
-`diag/corex_probe/probe_launch_floor.py` (job `floor2`, card 3):
+`diag/corex/probe_launch_floor.py` (job `floor2`, card 3):
 
 ```
 launch floor (1-element add_) : 5.75 us
 a kernel crosses 2x the floor : n = 1048576 elements
 ```
 
-`diag/corex_probe/probe_launch_inventory.py` (job `inv1`, same card, same session):
+`diag/corex/probe_launch_inventory.py` (job `inv1`, same card, same session):
 
 ```
 decode step : 23.527 ms   (42.51 tok/s)
@@ -205,7 +205,7 @@ minutes**; that is the `EXT_CACHE` line in the log, not a hang.
 ```bash
 # from coffin-repo/platform
 python scow/tools/sync.py push -d ..\coffin \
-    --launcher diag/corex_probe/<your launcher>.sh --run <name> -g 4 -t 25 --wait
+    --launcher diag/corex/<your launcher>.sh --run <name> -g 4 -t 25 --wait
 ```
 
 `-g 4` matters: the partition has dead cards and `diag/_pick_card.sh` probes each one. Never
@@ -217,7 +217,7 @@ Local, no card (all of these must pass before a job is worth submitting):
 cd coffin
 python -m py_compile $(find . -name '*.py' -not -path './__pycache__/*')
 python -m unittest discover -s tests            # 238 tests, 58 skipped
-python diag/check_style.py --style backends/corex
+python ../diag/check_style.py --style backends/corex
 ```
 
 Local kernel check, no card — the existing pattern, worth copying rather than reinventing:
@@ -235,7 +235,7 @@ costs minutes.
 | greedy ids unchanged | `[6, 24218, 10, 4838, 1665, 15]` from `probe_launch_inventory.py` |
 | launch count down | the `launches` line of the same probe |
 | step time down | its `BASELINE step_ms=` line, compared against 23.527 |
-| no numeric drift per op | `backends/corex/diag/check_ops.py` vs the reference backend |
+| no numeric drift per op | `../diag/corex/check_ops.py` vs the reference backend |
 | local suite green | `python -m unittest discover -s tests` |
 
 A change that trades one launch for another launch plus an allocation has not helped. Say so
