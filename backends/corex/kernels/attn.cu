@@ -334,11 +334,19 @@ __global__ void rope_apply_kernel(const T* __restrict__ q, const T* __restrict__
 // @param g KV head.
 // @param pos2slot Device position-to-slot map, or null for the dense layout.
 // @param stride ``S`` for dense, ``nkv`` for paged.
+// @param map_base Element index where this query's slot-map row starts.
 // @return The flat row id shared by k, v and both scales.
 __device__ __forceinline__ int cache_row(int s, int g, const int64_t* pos2slot,
-                                         int stride) {
-    return pos2slot ? (int)((long)pos2slot[s] * stride + g) : g * stride + s;
+                                         int stride, int map_base) {
+    return pos2slot ? (int)((long)pos2slot[map_base + s] * stride + g) : g * stride + s;
 }
+//
+// ``map_base`` is a parameter rather than a literal ``b * max_seq`` because the two callers
+// disagree on what they hand in, and only the caller knows which: the single-row entries pass
+// a slice (``pos2slot[row]``, already offset, so their base is 0) while the batched ones pass
+// the whole ``[B, max_seq]`` map. Reading it flat ignored the row entirely -- every row above
+// zero attended over row 0's keys, measured as three identical batched rows against per-row
+// references differing by 34.5 (``docs/SLOT_MAP_BUG.md``).
 
 //: Layout selector, shared by every entry point. One struct keeps the argument list of
 //: :func:`slice_launch` readable and makes the null-vs-null pairing of ``pos2slot`` and
@@ -354,6 +362,28 @@ struct AttnLayout {
     int stride;
     //: Window cap, i.e. the slot-map row stride.
     int max_seq;
+    //: ``ctx_lens`` holds the verify anchor's *last index* rather than a key count.
+    //:
+    //: The two callers disagree on the unit and both are right for their own shape:
+    //: ``attn_paged_batch`` passes ``positions + 1``, which is already a count, while
+    //: ``attn_paged_multi_q`` passes ``positions[:, 0]``, the anchor's index. Query ``j`` of a
+    //: verify window must see ``anchor + 1 + j`` keys -- dropping that term is the bug recorded
+    //: at the ``ctx`` computation in :func:`attn_slice_kernel` -- and ``j`` is not in scope at
+    //: either call site, so the conversion has to happen here.
+    //:
+    //: Last, not next to ``ctx_lens``, so every aggregate initialiser keeps its positional
+    //: meaning: inserting it earlier silently re-binds ``max_seq`` and the window becomes 0.
+    bool ctx_anchor;
+    //: Whether ``pos2slot`` is the whole ``[B, max_seq]`` map rather than one row's slice.
+    //:
+    //: ``attn_paged`` and ``attn_decode`` pass ``pos2slot[row]``, a view whose first element
+    //: already is that row's first position, so their offset is 0. ``attn_paged_batch`` and
+    //: ``attn_paged_multi_q`` pass the full map. Without this flag the kernel read it flat and
+    //: every row above zero attended over row 0's keys -- measured as three identical batched
+    //: rows against per-row references differing by 34.5 (``docs/SLOT_MAP_BUG.md``). Trailing
+    //: for the same reason ``ctx_anchor`` is: a positional aggregate initialiser must not
+    //: re-bind ``max_seq``.
+    bool map_rows;
 };
 
 // @brief One block per (query head, key slice, row); one slice of the online softmax.
@@ -383,10 +413,16 @@ __global__ void attn_slice_kernel(const uint16_t* __restrict__ q,
     const int t = threadIdx.x;
     const int nt = blockDim.x;
 
-    // Draft query ``j`` must see ``ctx + j + 1`` keys so it is identical to decoding
-    // that token alone; a plain decode sees the position itself.
-    const int ctx = layout.ctx_lens ? (int)layout.ctx_lens[b]
-                                    : (int)*layout.pos + 1 + j;
+    // Draft query ``j`` must see ``ctx_anchor + 1 + j`` keys so it is identical to decoding that
+    // token alone. Dropping the ``+ 1 + j`` term when ``ctx_lens`` is supplied is a silent
+    // correctness bug, not a rounding one: every draft query then shares one window, and with
+    // the verify caller passing the anchor's *index* the first query sees one key too few, so
+    // the softmax denominator is wrong for every query at once. Measured on a perfect-draft
+    // oracle: row 0 differs in every logit while its argmax still happens to match, so no
+    // tolerance-based test can see it. ``ctx_anchor`` says which unit ``ctx_lens`` is in.
+    const int ctx = layout.ctx_lens
+                        ? (int)layout.ctx_lens[b] + (layout.ctx_anchor ? 1 : 0) + j
+                        : (int)*layout.pos + 1 + j;
     const int nvalid = ctx > layout.max_seq ? layout.max_seq : ctx;
 
     extern __shared__ float sh[];
@@ -410,10 +446,15 @@ __global__ void attn_slice_kernel(const uint16_t* __restrict__ q,
     float l = 0.f;
     float acc = 0.f;
 
+    // ``b`` is the row this block serves (0 on every single-row entry), and the map each caller
+    // handed in decides the offset: whole ``[B, max_seq]`` map -> skip to this row's slab;
+    // one row's slice -> already there.
+    const int map_base = layout.map_rows ? b * layout.max_seq : 0;
+
     for (int base = kfrom; base < kto; base += KEY_BLOCK) {
         const int nb = kto - base < KEY_BLOCK ? kto - base : KEY_BLOCK;
         for (int i = t; i < nb; i += nt) {
-            rows[i] = cache_row(base + i, g, layout.pos2slot, layout.stride);
+            rows[i] = cache_row(base + i, g, layout.pos2slot, layout.stride, map_base);
         }
         __syncthreads();
 
@@ -577,11 +618,19 @@ torch::Tensor attn_decode(torch::Tensor q, torch::Tensor gate, torch::Tensor kca
                           torch::Tensor part_ml) {
     TORCH_CHECK(q.dim() == 2, "query must be [nh, hd]");
     TORCH_CHECK(kcache.scalar_type() == torch::kChar, "cache must be int8");
+// These pointers are dereferenced ON THE DEVICE. A host tensor of the right dtype passes a
+// ``scalar_type`` check and is then dereferenced anyway, so the kernel reads whatever lives at
+// that host address: a wrong-but-plausible window on every launch, with no error raised. Measured
+// once in ``diag/probe_precision.py``, where a host ``pos`` made a deterministic kernel look like
+// it had a 10-in-20 race. ``TORCH_CHECK(..., .is_cuda())`` turns that into a throw.
     TORCH_CHECK(pos.scalar_type() == torch::kLong, "pos must be int64");
+    TORCH_CHECK(pos.is_cuda() && pos.device() == q.device(),
+                "pos must be a device tensor on the query's device: the kernel dereferences it "
+                "on the device, so a host tensor is read as garbage instead of being rejected");
     const int nh = (int)q.size(0);
     const int hd = (int)q.size(1);
     const int S = (int)kcache.size(1);
-    AttnLayout layout{nullptr, nullptr, pos.data_ptr<int64_t>(), S, S};
+    AttnLayout layout{nullptr, nullptr, pos.data_ptr<int64_t>(), S, S, false, false};
     return slice_launch(q, gate, kcache, vcache, kscale, vscale, out, part_acc, part_ml,
                         layout, nullptr, 1, nh, hd, (int)rep, (float)scale, 1, 0);
 }
@@ -616,11 +665,20 @@ torch::Tensor attn_paged(torch::Tensor q, torch::Tensor gate, torch::Tensor kpoo
     TORCH_CHECK(q.dim() == 2, "query must be [nh, hd]");
     TORCH_CHECK(kpool.scalar_type() == torch::kChar, "pool must be int8");
     TORCH_CHECK(pos2slot.scalar_type() == torch::kLong, "slot map must be int64");
+    TORCH_CHECK(pos2slot.is_cuda() && pos2slot.device() == q.device(),
+                "slot map must be a device tensor on the query's device");
+    TORCH_CHECK(pos.is_cuda() && pos.device() == q.device(),
+                "pos must be a device tensor on the query's device: the kernel dereferences it "
+                "on the device, so a host tensor is read as garbage instead of being rejected");
     const int nh = (int)q.size(0);
     const int hd = (int)q.size(1);
     const int nkv = (int)kpool.size(1);
+    // ``pos2slot`` here is ``pool.pos2slot[row]``, a view whose element 0 is this row's first
+    // position, so the kernel adds no row offset. The batched entries pass the whole map and set
+    // the flag; getting this wrong for this entry would make a single decode step read a
+    // neighbouring row's keys.
     AttnLayout layout{pos2slot.data_ptr<int64_t>(), nullptr, pos.data_ptr<int64_t>(),
-                      nkv, (int)max_pos};
+                      nkv, (int)max_pos, false, false};
     return slice_launch(q, gate, kpool, vpool, kscale, vscale, out, part_acc, part_ml,
                         layout, nullptr, 1, nh, hd, (int)rep, (float)scale, 1, 0);
 }
@@ -653,12 +711,18 @@ torch::Tensor attn_paged_batch(torch::Tensor q, torch::Tensor gate, torch::Tenso
                                torch::Tensor part_acc, torch::Tensor part_ml) {
     TORCH_CHECK(q.dim() == 3, "queries must be [B, nh, hd]");
     TORCH_CHECK(context_lens.scalar_type() == torch::kInt, "context lengths must be int32");
+    TORCH_CHECK(context_lens.is_cuda() && context_lens.device() == q.device(),
+                "context lengths must be a device tensor on the query's device");
+    TORCH_CHECK(slots.is_cuda() && slots.device() == q.device(),
+                "slot map must be a device tensor on the query's device");
     const int rows = (int)q.size(0);
     const int nh = (int)q.size(1);
     const int hd = (int)q.size(2);
     const int nkv = (int)kpool.size(1);
+    // ``context_lens`` is a key count here, so the verify anchor conversion does not apply.
+    // ``slots`` is the whole ``[B, max_seq]`` map, so the kernel must offset into row ``b``.
     AttnLayout layout{slots.data_ptr<int64_t>(), context_lens.data_ptr<int32_t>(), nullptr,
-                      nkv, (int)max_seq};
+                      nkv, (int)max_seq, false, true};
     return slice_launch(q.reshape({rows, nh, hd}), gate, kpool, vpool, kscale, vscale,
                         out, part_acc, part_ml, layout, nullptr, rows, nh, hd, (int)rep,
                         (float)scale, 1, 0);
@@ -697,13 +761,20 @@ torch::Tensor attn_paged_multi_q(torch::Tensor q, torch::Tensor gate, torch::Ten
                                  torch::Tensor block_mask, int64_t mask_block) {
     TORCH_CHECK(q.dim() == 4, "draft queries must be [B, c, nh, hd]");
     TORCH_CHECK(ctx_lens.scalar_type() == torch::kInt, "context lengths must be int32");
+    TORCH_CHECK(ctx_lens.is_cuda() && ctx_lens.device() == q.device(),
+                "context lengths must be a device tensor on the query's device");
+    TORCH_CHECK(slots.is_cuda() && slots.device() == q.device(),
+                "slot map must be a device tensor on the query's device");
     const int rows = (int)q.size(0);
     const int draft = (int)q.size(1);
     const int nh = (int)q.size(2);
     const int hd = (int)q.size(3);
     const int nkv = (int)kpool.size(1);
+    // ``ctx_lens`` is the anchor's last index here, not a count: query ``j`` needs
+    // ``anchor + 1 + j`` keys, and the kernel adds both terms from ``ctx_anchor``.
+    // ``slots`` is the whole ``[B, max_seq]`` map, so the kernel must offset into row ``b``.
     AttnLayout layout{slots.data_ptr<int64_t>(), ctx_lens.data_ptr<int32_t>(), nullptr,
-                      nkv, (int)max_seq};
+                      nkv, (int)max_seq, true, true};
     // The mask is optional in the contract; an empty tensor is how "exact attention"
     // arrives, and treating it as a mask would zero every key.
     const bool masked = block_mask.defined() && block_mask.numel() > 0;
