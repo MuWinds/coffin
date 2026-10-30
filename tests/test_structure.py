@@ -74,9 +74,12 @@ class RegistryTest(unittest.TestCase):
         seen: dict = {}
 
         class _Dummy:
+            # ``quant`` is forwarded only when this call loads the checkpoint itself; it is
+            # part of the signature here so a future knob added to ``create_model`` without a
+            # matching pass-through fails this test instead of failing at the call site.
             def __init__(self, model_dir, max_seq=4096, bench=True,
-                         weights=None, paged=False):
-                seen["ctor"] = (model_dir, max_seq, bench, weights, paged)
+                         weights=None, paged=False, quant=False):
+                seen["ctor"] = (model_dir, max_seq, bench, weights, paged, quant)
 
         real = engine_api._REGISTRY["qwen3_5"]
         engine_api._REGISTRY["qwen3_5"] = engine_api._Entry(_Dummy, real.load_weights)
@@ -86,7 +89,7 @@ class RegistryTest(unittest.TestCase):
         finally:
             engine_api._REGISTRY["qwen3_5"] = real
         self.assertIsInstance(model, _Dummy)
-        self.assertEqual(seen["ctor"][1:], (8192, False, None, True))
+        self.assertEqual(seen["ctor"][1:], (8192, False, None, True, False))
 
     def test_load_weights_dispatches_to_the_family_loader(self):
         """Pins the loader signature every family must accept: a new kwarg added to the dispatch and not to a family breaks loading, not this test's own call."""

@@ -94,7 +94,12 @@ def load_weights(model_dir: str | Path, prefix: str = "model.language_model.",
         cfg = json.load(f)
     take_vision = bool(cfg.get("vision_config")) if vision is None else bool(vision)
 
-    prefixes = (prefix, "mtp.")
+    # ``lm_head.`` is listed unconditionally: on a tied checkpoint (the 4B) the tensor is
+    # absent and the prefix simply matches nothing, while on an untied one (the 27B) this
+    # is the only place it can be picked up -- it carries no ``prefix``. Omitting it does
+    # not fail; the head silently falls back to the embedding, which is a wrong answer
+    # rather than an error, so the two cases have to be handled by the tensors present.
+    prefixes = (prefix, "mtp.", "lm_head.")
     sd: dict[str, torch.Tensor] = {}
     n_vision = 0
     for p in sorted(model_dir.glob("*.safetensors")):

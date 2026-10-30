@@ -354,11 +354,18 @@ def _entry_for(model_dir: str | Path, architecture: str | None = None) -> _Entry
 
 def create_model(model_dir: str | Path, max_seq: int = 4096, bench: bool = True,
                  weights: dict | None = None, paged: bool = False,
-                 architecture: str | None = None) -> Model:
+                 architecture: str | None = None, quant: bool = False) -> Model:
     """Load the model implementation this checkpoint asks for.
 
     ``weights`` is the resident tensor dict from :func:`load_weights`, passed
     through on a reload so rebuilding skips the ~1 min disk read.
+
+    ``quant`` applies only when ``weights`` is ``None``, i.e. when this call loads the
+    checkpoint itself. It exists because a caller that owns the dict has already chosen
+    the storage form, while a caller that does not would otherwise be stuck with the
+    loader's default of bf16 -- twice the resident size, which is the difference between
+    a 27B fitting a card and not fitting it. Passing ``quant`` together with ``weights``
+    is not an error and not a conversion: the dict is used as it is.
 
     Args:
         model_dir: Checkpoint directory.
@@ -371,6 +378,8 @@ def create_model(model_dir: str | Path, max_seq: int = 4096, bench: bool = True,
         paged: Build the paged-KV variant. The prefix-cache and batched paths
             need it; ``capture`` without paging bakes in the dense layout.
         architecture: Registry key overriding config detection.
+        quant: Store the text projections as int8 when this call loads the checkpoint
+            itself. Ignored when ``weights`` is supplied.
 
     Returns:
         A ``Model``; cast it to ``PagedModel`` only when ``paged`` was set.
@@ -382,7 +391,7 @@ def create_model(model_dir: str | Path, max_seq: int = 4096, bench: bool = True,
     """
     entry = _entry_for(model_dir, architecture)
     return entry.model(model_dir, max_seq=max_seq, bench=bench,
-                       weights=weights, paged=paged)
+                       weights=weights, paged=paged, quant=quant)
 
 
 def load_weights(model_dir: str | Path, quant: bool = False,

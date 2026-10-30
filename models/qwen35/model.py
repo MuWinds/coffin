@@ -62,11 +62,38 @@ from ops.rope import make_inv_freq, make_rope_tables
 from cache.paged_cache import PagedKVCache
 
 
+def _drop_prefix(sd: dict, prefix: str) -> None:
+    """Delete every entry of ``sd`` under ``prefix``.
+
+    Called after a layer has been built, so the peak footprint of a build is the final
+    model rather than the model plus the dict it was read into. This is not a
+    micro-optimisation: a 27B int8 checkpoint is ~26 GiB, the card is 31.7 GiB, and
+    ``GEMVGroup`` copies each ``gate``/``up`` pair into one fused matrix, so a build that
+    keeps the sources resident peaks past the card and dies with ``OutOfMemoryError``
+    mid-construction.
+
+    Only safe when the caller owns the dict -- a caller-supplied one has to survive so the
+    same tensors can rebuild the model, which is the whole reason
+    ``engine_api.load_weights`` is a separate call.
+
+    Args:
+        sd: State dict to prune in place.
+        prefix: Parameter-name prefix of the layer just built.
+
+    Returns:
+        Nothing. Tensors are released when their last reference goes, which after this
+        is the projection that copied them.
+    """
+    for k in [k for k in sd if k.startswith(prefix)]:
+        del sd[k]
+
+
 class Qwen35:
     """The Qwen3.5-4B model: layers, rope tables, graph buffers and execution paths."""
 
     def __init__(self, model_dir: str | Path, max_seq: int = 4096, bench: bool = True,
-                 weights: dict | None = None, paged: bool = False) -> None:
+                 weights: dict | None = None, paged: bool = False,
+                 quant: bool = False) -> None:
         """Load the checkpoint and allocate everything the execution paths need.
 
         Args:
@@ -86,6 +113,9 @@ class Qwen35:
                 :meth:`enable_paging` (PrefixCacheEngine does). The MTP layer is
                 not paged -- its cache is not part of a prefix snapshot -- so it
                 keeps its own.
+            quant: Store the text projections as int8 when this call reads the
+                checkpoint itself. Ignored when ``weights`` is given: that dict
+                already decided the storage form.
 
         Raises:
             ValueError: ``model_dir`` has no ``config.json`` or no
@@ -97,13 +127,46 @@ class Qwen35:
         self.raw_cfg = json.loads((model_dir / "config.json").read_text())
         self.cfg = self.raw_cfg["text_config"]
         self.max_seq = max_seq
-        sd = weights if weights is not None else load_weights(model_dir)
+        #: Whether this instance owns the state dict and may release tensors as it
+        #: consumes them. It does when it loaded them itself; a caller-supplied dict is
+        #: kept intact so the same tensors can rebuild the model on a reload.
+        #:
+        #: Ownership decides the build's peak footprint, which is what makes a 27B
+        #: checkpoint loadable at all: ``GEMVGroup`` replaces two source matrices with one
+        #: fused copy, so without draining, both forms are resident and the peak is the
+        #: dict plus the fused copies. Draining frees each source as its layer is built,
+        #: which holds the peak at roughly the final size instead of twice it (measured:
+        #: a 26 GiB int8 27B peaked past 31.7 GiB and raised OutOfMemoryError mid-build).
+        #:
+        #: The fused copies are also freed per layer. ``GEMVGroup`` concentrates every
+        #: pair of projections into one wider matrix, and each of those transients is
+        #: charged to the caching allocator's segments even after the two sources are
+        #: gone: a 27B build reached 27.00 GiB allocated + 4.57 GiB *reserved but
+        #: unallocated* and then failed a 170 MiB ``cat``. Returning the segments after
+        #: each layer keeps the reserved pool tracking the live set instead of the peak
+        #: of the largest layer.
+        own_sd = weights is None
+        sd = weights if weights is not None else load_weights(model_dir, quant=quant)
 
         self.embed = TiedEmbedding(sd["model.language_model.embed_tokens.weight"], bench)
         self.norm = RMSNorm(sd["model.language_model.norm.weight"])
-        self.layers = [Layer(sd, i, self.cfg, bench, max_seq, paged)
-                       for i in range(self.cfg["num_hidden_layers"])]
-        self.lm_head = self.embed
+        self.layers = []
+        for i in range(self.cfg["num_hidden_layers"]):
+            self.layers.append(Layer(sd, i, self.cfg, bench, max_seq, paged))
+            # A layer that has been built holds whatever it needs; its remaining entries
+            # in the dict are the ones `GEMVGroup` already copied, so they are pure peak.
+            if own_sd:
+                _drop_prefix(sd, f"model.language_model.layers.{i}.")
+                runtime.empty_cache()
+        # Tied or untied is a property of the checkpoint, not of the architecture: both
+        # the 4B and the 27B are ``Qwen3_5ForConditionalGeneration``, and only the 27B
+        # ships a separate ``lm_head.weight``. Keying on the tensor rather than on the
+        # family name is what lets one code path serve both -- and the alternative is
+        # not a crash, it is the head silently reading the embedding, which produces
+        # plausible logits from the wrong matrix.
+        head_w = sd.get("lm_head.weight")
+        self.lm_head = self.embed if head_w is None else TiedEmbedding(head_w, bench)
+        self.head_is_tied = head_w is None
         self.mtp = MTP(sd, self.cfg, bench, max_seq) if "mtp.fc.weight" in sd else None
         #: Vision tensors stay in the resident dict but are only turned into a
         #: tower on the first image request (see ``enable_vision``); a text-only

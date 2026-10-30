@@ -128,6 +128,15 @@ class GEMVGroup:
     def __init__(self, ws: list, bench: bool = True) -> None:
         """Concatenate the weights along the output axis and build the fused GEMV.
 
+        The fused matrix is allocated once and filled in place rather than built with
+        ``torch.cat``. ``cat`` needs its output and both inputs alive at the same time,
+        so on a 27B checkpoint each layer's ``gate``/``up`` pair momentarily costs three
+        copies of itself; sixty-four of those transients left the caching allocator
+        holding 4.2 GiB of *reserved but unallocated* segments that it could not split
+        into the next 170 MiB request, and the build died with 27.0 GiB live on a
+        31.7 GiB card. Copying into a pre-allocated destination keeps it at one extra
+        copy per layer and lets the source be dropped immediately after.
+
         Args:
             ws: Projections sharing one input, each row-major ``[N_i, K]``. All
                 must be the same storage class (all int8 or all plain) and share
@@ -136,11 +145,27 @@ class GEMVGroup:
         """
         if isinstance(ws[0], QWeight):
             self.sizes = [w.n for w in ws]
-            fused = QWeight(torch.cat([w.wq for w in ws], dim=0),
-                            torch.cat([w.scale for w in ws], dim=0))
+            k = ws[0].k
+            total = sum(self.sizes)
+            wq = torch.empty((total, k), dtype=ws[0].wq.dtype, device=ws[0].wq.device)
+            scale = torch.empty(total, dtype=ws[0].scale.dtype, device=ws[0].scale.device)
+            row = 0
+            for w in ws:
+                wq[row:row + w.n].copy_(w.wq)
+                scale[row:row + w.n].copy_(w.scale)
+                row += w.n
+            fused = QWeight(wq, scale)
         else:
             self.sizes = [w.shape[0] for w in ws]
-            fused = torch.cat([w.contiguous() for w in ws], dim=0)
+            first = ws[0]
+            total = sum(self.sizes)
+            buf = torch.empty((total, first.shape[1]), dtype=first.dtype,
+                              device=first.device)
+            row = 0
+            for w in ws:
+                buf[row:row + w.shape[0]].copy_(w)
+                row += w.shape[0]
+            fused = buf
         self.g = GEMV(fused, bench)
 
     def __call__(self, x: torch.Tensor) -> list[torch.Tensor]:

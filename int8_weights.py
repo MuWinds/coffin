@@ -46,9 +46,16 @@ from __future__ import annotations
 
 import torch
 
-# Local copy of the activation dtype rather than an import of ``ops.dtypes``:
-# ``ops/`` imports this module, so reaching back into it would close a cycle.
+#: Local copy of the activation dtype rather than an import of ``ops.dtypes``:
+#: ``ops/`` imports this module, so reaching back into it would close a cycle.
 D = torch.bfloat16
+
+#: Rows quantised per fp32 temporary. 4096 rows of a 5120-wide matrix is a 80 MB
+#: temporary, which is small next to the int8 output it feeds, while still enough rows
+#: that the per-chunk overhead disappears. The value matters only for very wide
+#: matrices: an unchunked ``lm_head`` on a 27B checkpoint needs a 4.7 GiB fp32 copy and
+#: fails on a 32 GiB card during load.
+_QUANT_CHUNK_ROWS = 4096
 
 
 def is_quantizable(key: str, w: torch.Tensor) -> bool:
@@ -92,24 +99,47 @@ class QWeight:
         self.n, self.k = wq.shape
 
     @classmethod
-    def quantize(cls, w: torch.Tensor) -> "QWeight":
+    def quantize(cls, w: torch.Tensor, chunk_rows: int = _QUANT_CHUNK_ROWS) -> "QWeight":
         """Quantise a dense ``[N, K]`` weight, symmetric per output row.
 
         The absmax scale is clamped at ``1e-8`` so an all-zero row divides
         instead of producing ``inf``/NaN; such a row then quantises to zeros and
         decodes back to zeros.
 
+        Rows are independent, so the work is done in row chunks. That is not a
+        throughput decision -- it is what lets a wide weight be quantised at all: an
+        fp32 copy of ``lm_head`` on a 27B checkpoint is ``248320 * 5120 * 4`` B = 4.7 GiB
+        alive at once, on top of the int8 rows already emitted, and it raised
+        ``OutOfMemoryError`` while the model was being loaded. A chunk bounds that
+        temporary to ``chunk_rows * K * 4`` whatever the matrix's height.
+
         Args:
             w: Dense weight, row-major ``[N, K]``, any float dtype.
+            chunk_rows: Rows per fp32 temporary. Large enough to keep the kernels
+                saturated, small enough that the temporary stays a few hundred MB.
 
         Returns:
             The int8 rows and their absmax scales, both made contiguous so the
             HIP kernels can take a flat pointer over them.
         """
-        wf = w.float()
-        scale = wf.abs().amax(-1).clamp_min(1e-8) / 127.0
-        q = (wf / scale[:, None]).round().clamp_(-127, 127).to(torch.int8)
-        return cls(q.contiguous(), scale.contiguous())
+        n = w.shape[0]
+        if n <= chunk_rows:
+            wf = w.float()
+            scale = wf.abs().amax(-1).clamp_min(1e-8) / 127.0
+            q = (wf / scale[:, None]).round().clamp_(-127, 127).to(torch.int8)
+            return cls(q.contiguous(), scale.contiguous())
+
+        # The destination is allocated once and filled per chunk: building N chunk
+        # tensors and concatenating them would need both each chunk and the whole.
+        q = torch.empty(w.shape, dtype=torch.int8, device=w.device)
+        scale = torch.empty(n, dtype=torch.float32, device=w.device)
+        for start in range(0, n, chunk_rows):
+            stop = min(n, start + chunk_rows)
+            wf = w[start:stop].float()
+            s = wf.abs().amax(-1).clamp_min(1e-8) / 127.0
+            q[start:stop] = (wf / s[:, None]).round().clamp_(-127, 127)
+            scale[start:stop] = s
+        return cls(q, scale)
 
     def dequant(self, dtype: torch.dtype = D) -> torch.Tensor:
         """Materialise weights in ``dtype``; used by the prefill GEMM path only.
