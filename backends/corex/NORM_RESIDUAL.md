@@ -1,7 +1,7 @@
 # Folding the residual add into the RMSNorm
 
 > 2026-10-28, `gpu-node-05`, Iluvatar BI-V100, `COFFIN_BACKEND=corex`.
-> Workstream D of `coffin/FUSION_PLAN.md`. **Partially landed: patch A is in, patch B is not.**
+> Workstream D of `../../../PERF_COREX.md`. **Partially landed: patch A is in, patch B is not.**
 
 ## What landed
 

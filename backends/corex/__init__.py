@@ -333,7 +333,7 @@ def _gemv_rows(w: torch.Tensor | QWeight | pack.KnWeight,
         # kernel, so a row batch read the whole weight once per row: measured, M=8 cost
         # 8.19x M=1 (probe_row_cost.py, five decode shapes), which is why a c-token
         # speculative verify paid c full weight passes and could not break even at any draft
-        # depth (PERF_COREX.md section 14).
+        # depth (../../../PERF_COREX.md section 14).
         #
         # The kernel takes a width it was instantiated for, and this helper is reached with
         # any row count up to _ROW_CHUNK (a prefill chunk that fell back here, for instance),
@@ -1277,7 +1277,7 @@ NATIVE: frozenset[str] = frozenset(_NATIVE)
 #:    regression**. A graph removes launch overhead; once the kernels got faster, what is
 #:    left of that overhead is smaller than the cost of replaying.
 #: 3. *The overhead it targeted is better removed elsewhere.* ``launch`` count and host
-#:    time are attacked directly in ``PERF_COREX.md`` §8, on the eager path, where a bug
+#:    time are attacked directly in ``../../../PERF_COREX.md`` §8, on the eager path, where a bug
 #:    raises an error instead of consuming the device.
 #:
 #: Do not re-enable this to chase the old 1.47x. The repeat-run evidence above shows the

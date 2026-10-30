@@ -349,7 +349,7 @@ class LinearAttn:
         # costs +5.3 us per layer of device time in isolation and +13.1 us per layer in the
         # real step (20.285 -> 20.615 ms over 24 layers), because one kernel has to serve
         # the recurrence's register-loop geometry and two block reductions at once. The
-        # launch slots it saves are worth less than that. See PERF_COREX.md §12.
+        # launch slots it saves are worth less than that. See ../../../PERF_COREX.md §12.
         q_pro, k_pro, v_pro = self.q_pro[pr], self.k_pro[pr], self.v_pro[pr]
         beta, g = self.beta[pr], self.g[pr]
         bops.delta_prologue(q, k, v, b, a, self.neg_expA, self.dt_bias,

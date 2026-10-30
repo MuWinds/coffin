@@ -974,12 +974,12 @@ class Int8BatchKernelTest(unittest.TestCase):
     ``linear_m`` loops the single-row GEMV, which is *correct* -- so no functional test can
     see it -- and reads the whole weight once per row, which makes every speculative verify
     cost ``c`` plain steps. That is the measured reason suffix decoding could not break even
-    on this card (PERF_COREX.md section 14), and it would return the moment somebody reverts
+    on this card (../../PERF_COREX.md section 14), and it would return the moment somebody reverts
     the dispatch to the loop.
 
     A card is needed to *call* the kernel, so these checks are structural: they pin the pieces
     that must all exist together, because each of them has been the missing one at some point
-    in this port (PERF_COREX.md 12.5).
+    in this port (../../PERF_COREX.md 12.5).
     """
 
     def _sources(self) -> dict:

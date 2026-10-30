@@ -468,7 +468,7 @@ __global__ void gemv_kn_m_kernel(const WT* __restrict__ wt,
 // as an error -- ``_gemv_rows`` looped the single-row kernel, which reads the whole weight once
 // per row. Measured, an M-row projection then cost M times one row (``M=8/M=1 = 8.19x`` over
 // five decode shapes, ``probe_row_cost.py``), so a c-token speculative verify paid c full weight
-// passes and could not break even at any draft depth (``PERF_COREX.md`` section 14).
+// passes and could not break even at any draft depth (``../../../../PERF_COREX.md`` section 14).
 //
 // The first version of this kernel kept the scalar one-byte load and ran no split-K, on the
 // theory that M rows would supply the memory-level parallelism the single-row kernel gets from
@@ -1198,7 +1198,7 @@ torch::Tensor gemv_kn(torch::Tensor wt, torch::Tensor x, int64_t threads,
 //
 // Halves the bytes read per weight against :func:`gemv_kn`, which is the only lever left
 // on a path that is already bandwidth-bound: the projections are the majority of a decode
-// step and the card is saturated for essentially all of it (PERF_COREX.md §8).
+// step and the card is saturated for essentially all of it (../../../../PERF_COREX.md §8).
 //
 // @param wt [K, N] int8 weight, contiguous.
 // @param x [K] activations, bf16 or fp32. The output takes its dtype.
@@ -1260,7 +1260,7 @@ torch::Tensor gemv_kn_i8(torch::Tensor wt, torch::Tensor x, torch::Tensor scale,
 // GEMV once per row, so an M-row projection cost M weight reads. On this part that is exactly
 // M times one row (``M=8/M=1 = 8.19x``, five decode shapes), and it is why a c-token
 // speculative verify cost c plain steps and could not pay for itself at any draft depth
-// (``PERF_COREX.md`` section 14).
+// (``../../../../PERF_COREX.md`` section 14).
 //
 // Correctness contract: every row is bit-identical to the single-row entry on the same weight
 // and activation. Both dispatch decisions -- the column width and the split-K width -- are

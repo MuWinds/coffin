@@ -69,7 +69,7 @@ class KnQWeight:
 
     The int8 counterpart of :class:`KnWeight`, and it exists for one reason: decode is
     bandwidth-bound, so halving the bytes read per weight is the only lever left on the
-    projections, which dominate the step (``PERF_COREX.md`` §8).
+    projections, which dominate the step (``../../../PERF_COREX.md`` §8).
 
     The scale is per *output column*, which is the same thing as the checkpoint's per-row
     scale -- rows of ``[N, K]`` are columns of ``[K, N]``. It is stored alongside the
@@ -142,7 +142,7 @@ class KnQWeight:
         ``(wt.float() * scale).to(dtype)`` materialises a ``[K, N]`` fp32 temporary, twice
         the size of the answer it is immediately narrowed to; over this model's 128
         projections that is a *fixed* 174.8 ms per prefill request, which was 3.1x the
-        whole prefill at n=128 (``PERF_COREX.md`` §13.2b).
+        whole prefill at n=128 (``../../../PERF_COREX.md`` §13.2b).
 
         ``mul_`` on a bf16 destination with an fp32 scale computes in fp32 and rounds
         once, the same single rounding the old spelling did, so the weights stay

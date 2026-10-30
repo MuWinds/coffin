@@ -250,57 +250,7 @@ N 越大越接近上限，小 N 受 launch/占用率限制 → 需要按形状�
    `prod.tracked == 0`（迁移目标本身），后者按"遍历到的文件"而非"有违规的文件"判定。
 3. **`coffin/.gitignore` 收掉 `.tmp_cusyn/`**：内核语法检查用的 stub 头文件目录，
    曾被门禁当成生产代码报违规。
-
-验收（2026-10-26，无卡 Windows）：`python -m unittest discover -s tests` →
-**Ran 238 tests, OK (skipped=58)**。
-
 ---
-
-## 6b. 端到端跑通：CoreX 上第一次吐出正确文本（2026-10-26）
-
-作业 `e2e2-1`，**`gpu-node-06`**，`COFFIN_BACKEND=corex`（完整日志）：
-
-```
-backend=corex device=cuda:0 native=18/18 graph=0 autotune=1
-loaded in 35.5s
-
-The capital of France is  →  'The capital of France is Paris.\nA. True\nB. False\nAnswer'
-  prefill 1056.5 ms (5 tokens) / decode 77.09 ms/step (12.97 tok/s) / logits finite: True
-
-2 + 2 =                   →  '2 + 2 = 4.\nThe sum of two'
-  prefill 355.4 ms (5 tokens) / decode 47.86 ms/step (20.89 tok/s) / logits finite: True
-
-summary: backend corex (18/18 native), failures: (none)
-```
-
-**`The capital of France is` → ` Paris.`**：18 个算子的数值语义、int8 KV、Gated DeltaNet
-递推、paged attention、mRoPE 全部串对了，而且是**同一套生产代码**跑出来的。
-
-### 节点健康矩阵（重要，跑作业前必须先看）
-
-这台集群的卡**不是都健康的**。同一天、同一份代码，六个并发作业落在六个节点上：
-
-| 节点 | 8x8 matmul 健康检查 | 模型加载 | 结论 |
-| --- | --- | --- | --- |
-| `gpu-node-05` | ❌ 超时 | — | **不可用**（首次分配即挂起） |
-| **`gpu-node-06`** | ✅ | 35.5 s | **可用，端到端通过** |
-| `gpu-node-07` | ✅ | > 420 s 超时 | 不可用 |
-| `gpu-node-08` | ✅ | > 420 s 超时 | 不可用 |
-| `gpu-node-09` | ❌ 超时 | — | **不可用** |
-| `gpu-node-16` | ✅ | > 420 s 超时 | 不可用 |
-
-**两个必须记住的操作事实**：
-
-1. **调度器会反复把作业派给同一个节点。** 串行提交时六次里有五次落在 `gpu-node-05`；
-   改成**并发提交**后立刻散到了 05/06/07/08/09/16 六个节点，一次就找到健康的 06。
-   `submitJob` 没有节点约束字段，所以**并发提交 + 脚本内的健康检查**是唯一可靠的选卡方式。
-2. **脚本自己的位置不代表引擎的位置。** `launch_chat.sh` 是单独上传的、落在工作目录根，
-   而引擎解压在 `./coffin/`。用 `dirname $0` 推导根目录得到的是 `/data/home/diag/...`，
-   报 `can't open file`。正确做法是调用方通过 `COFFIN_ROOT` 显式传入。
-
-`launch_chat.sh` 因此做成三步：**先 8x8 matmul 验卡（失败立即退出，不浪费一次加载）→
-再加载 → 再解码**，并带 `timeout --foreground -k` 硬上限。那次"卡死 25 分钟"就是因为
-没有上限，而设备端自旋既没有 traceback 也不写 stderr。
 
 ### 从 5/17 到 18/18 之间修掉的三件事
 
