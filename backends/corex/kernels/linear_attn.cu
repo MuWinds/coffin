@@ -223,23 +223,35 @@ __global__ void prologue_kernel(const float* __restrict__ q_raw,
 // Thread ``c`` owns channel ``c`` and its three-tap window, so the read-then-write of the
 // state needs no synchronisation: no other thread touches that window.
 //
+// Grid ``y`` is the batch row. A row's inputs and window are separate slabs, so the row
+// axis costs one block index and no traffic between rows; the pitches are passed in rather
+// than assumed, because the batched caller reads a column slice of the fused projection
+// whose row pitch is larger than ``C``.
+//
 // @param w [C, 4] fp32 taps, oldest first; the last tap multiplies the current input.
-// @param x [C] bf16 projection output.
-// @param state [C, 3] fp32 previous inputs, shifted in place.
-// @param out [C] fp32 conv + SiLU result.
+// @param x [B, C] bf16 projection output with row pitch ``ldx``.
+// @param state [B, C, 3] fp32 previous inputs, shifted in place with row pitch ``lds``.
+// @param out [B, C] fp32 conv + SiLU result with row pitch ``ldo``.
+// @param C Channels, i.e. the width the ``x`` grid extent covers.
+// @param ldx Row pitch of ``x``, in elements. The verify body hands in ``qkv[:, j]``, a
+//        column slice of a ``[rows, c, conv_dim]`` view, so this is ``c * C`` there and a
+//        kernel that assumed ``C`` would silently read the neighbouring token's channels.
+// @param lds Row pitch of ``state``, in floats.
+// @param ldo Row pitch of ``out``, in floats.
 __global__ void conv1d_silu_kernel(const float* __restrict__ w,
                                    const uint16_t* __restrict__ x,
                                    float* __restrict__ state, float* __restrict__ out,
-                                   int C) {
+                                   int C, int ldx, int lds, int ldo) {
+    const int row = blockIdx.y;
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
-    float* s = state + (size_t)c * CONV_STATE;
+    float* s = state + (size_t)row * lds + (size_t)c * CONV_STATE;
     const float* wc = w + (size_t)c * CONV_K;
-    const float x3 = CxScalar<uint16_t>::to_float(x[c]);
+    const float x3 = CxScalar<uint16_t>::to_float(x[(size_t)row * ldx + c]);
     const float acc = fmaf(s[0], wc[0],
                            fmaf(s[1], wc[1], fmaf(s[2], wc[2], x3 * wc[3])));
     const float y = acc / (1.f + __expf(-acc));     // SiLU
-    out[c] = y;
+    out[(size_t)row * ldo + c] = y;
     s[0] = s[1];
     s[1] = s[2];
     s[2] = x3;
@@ -582,6 +594,10 @@ void launch_normed(const float* q, const float* k, const float* v, const uint16_
 
 // @brief Launch the single-token depthwise causal conv1d + SiLU.
 //
+// One row, so the grid's ``y`` extent is 1 and every pitch is the row's own width. This is
+// the same kernel the batched entry launches, with the row axis collapsed, so the two paths
+// cannot drift apart in their arithmetic.
+//
 // @param conv_w [C, 4] fp32 taps.
 // @param x [C] bf16 projection output.
 // @param conv_state [C, 3] fp32 history, shifted in place.
@@ -593,9 +609,9 @@ void conv1d_silu(torch::Tensor conv_w, torch::Tensor x, torch::Tensor conv_state
     TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "activation must be bf16");
     TORCH_CHECK(conv_state.numel() == (int64_t)C * CONV_STATE, "conv state must be [C, 3]");
     const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
-    conv1d_silu_kernel<<<(C + 255) / 256, 256, 0, stream>>>(
+    conv1d_silu_kernel<<<dim3((C + 255) / 256, 1), 256, 0, stream>>>(
         conv_w.data_ptr<float>(), reinterpret_cast<const uint16_t*>(x.data_ptr()),
-        conv_state.data_ptr<float>(), out.data_ptr<float>(), C);
+        conv_state.data_ptr<float>(), out.data_ptr<float>(), C, C, CONV_STATE, C);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -627,31 +643,42 @@ torch::Tensor conv1d_silu_seq(torch::Tensor conv_w, torch::Tensor x,
     return out;
 }
 
-// @brief Launch the batched single-token conv1d + SiLU: one window per row.
+// @brief Launch the batched single-token conv1d + SiLU: one launch for every row.
+//
+// The grid's ``y`` axis is the row, so the whole bucket costs one launch and keeps
+// ``rows * ceil(C/256)`` blocks in flight instead of the single row's 32. Measured, the old
+// per-row loop cost a flat 9.57 us per row for 368 KB of traffic per row -- 39 GB/s, which is
+// grid width and not bytes -- and a 4-row verify window paid it 96 times over its 24 linear
+// layers.
+//
+// The pitches come from the tensors rather than from ``C``, and that is load-bearing: the
+// verify body hands in ``qkv[:, j]``, a column slice of a ``[rows, c, conv_dim]`` view whose
+// row pitch is ``c * C``. Reading with a pitch of ``C`` made rows >= 1 take row 0's channel
+// block, which is invisible at ``rows == 1`` and would have been a silent wrong answer at
+// every width above it (measured: 3 of 4 rows wrong before this argument existed).
 //
 // @param conv_w [C, 4] fp32 taps, shared by every row.
-// @param x [B, C] bf16.
+// @param x [B, C] bf16 with row pitch honoured; a strided column slice is legal.
 // @param conv_state [B, C, 3] fp32, shifted in place.
 // @param out [B, C] fp32, written in place.
-// @throws c10::Error on a dtype or shape the kernel cannot index.
+// @throws c10::Error on a dtype, rank or inner stride the kernel cannot index.
 void conv1d_silu_batch(torch::Tensor conv_w, torch::Tensor x, torch::Tensor conv_state,
                        torch::Tensor out) {
     TORCH_CHECK(x.dim() == 2, "activation must be [B, C]");
     TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "activation must be bf16");
+    TORCH_CHECK(x.stride(1) == 1, "activation must have unit inner stride");
     const int rows = (int)x.size(0);
     const int C = (int)x.size(1);
+    TORCH_CHECK(out.dim() == 2 && out.size(0) == rows && out.size(1) == C
+                && out.stride(1) == 1, "output must be [B, C] with unit inner stride");
+    TORCH_CHECK(conv_state.numel() == (int64_t)rows * C * CONV_STATE,
+                "conv state must be [B, C, 3]");
     const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
-    for (int b = 0; b < rows; ++b) {
-        // One launch per row rather than a second grid axis: the row's window is a
-        // separate ``[C, 3]`` slab and ``C`` already fills the grid, so a loop costs the
-        // same number of launches and keeps the addressing trivially correct.
-        conv1d_silu_kernel<<<(C + 255) / 256, 256, 0, stream>>>(
-            conv_w.data_ptr<float>(),
-            reinterpret_cast<const uint16_t*>(x.data_ptr()) + (size_t)b * C,
-            conv_state.data_ptr<float>() + (size_t)b * C * CONV_STATE,
-            out.data_ptr<float>() + (size_t)b * C, C);
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
-    }
+    conv1d_silu_kernel<<<dim3((C + 255) / 256, rows), 256, 0, stream>>>(
+        conv_w.data_ptr<float>(), reinterpret_cast<const uint16_t*>(x.data_ptr()),
+        conv_state.data_ptr<float>(), out.data_ptr<float>(), C,
+        (int)x.stride(0), (int)conv_state.stride(0), (int)out.stride(0));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 // @brief Launch the single-token gated-delta prologue.
 //
