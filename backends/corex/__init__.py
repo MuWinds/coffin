@@ -747,9 +747,18 @@ def attn_paged_batch(q: torch.Tensor, gate: torch.Tensor, kpool: torch.Tensor,
     module = _kernels()
     rows, nh = q.shape[0], q.shape[1]
     pa, pm = _split_k(part_acc, part_ml, (rows, nh), q)
-    return module.attn_paged_batch(q, gate, kpool, vpool, kscale, vscale, slots,
-                                   context_lens.contiguous(), out, max_seq, rep, scale,
-                                   pa, pm)
+    # Dense operands, made so here rather than trusted from the caller. The kernel indexes ``q`` and
+    # ``gate`` through ``data_ptr()`` as one flat ``[B, nh, hd]`` block, so a column view silently
+    # reads the wrong bytes -- and the natural way to build the gate is exactly such a view
+    # (``qg[..., hd:]`` of a fused ``[.., 2*hd]`` projection, whose last stride is 1 but whose row
+    # pitch is ``2*hd``). Measured: with the strided gate this entry disagreed with
+    # ``attn_paged_multi_q`` on 3834/4096 elements of layer 3 while the query and the pool bytes were
+    # bit-identical, which read as a kernel defect across several sessions
+    # (``docs/STAGE_LOCALISED.md``). The copy is a no-op when the caller already passes dense
+    # tensors, which is why it belongs at the boundary instead of at every call site.
+    return module.attn_paged_batch(q.contiguous(), gate.contiguous(), kpool, vpool, kscale,
+                                   vscale, slots, context_lens.contiguous(), out, max_seq,
+                                   rep, scale, pa, pm)
 
 
 def attn_paged_multi_q(q: torch.Tensor, gate: torch.Tensor, kpool: torch.Tensor,
@@ -793,9 +802,12 @@ def attn_paged_multi_q(q: torch.Tensor, gate: torch.Tensor, kpool: torch.Tensor,
     pa, pm = _split_k(part_acc, part_ml, (rows * draft, nh), q)
     mask = block_mask if block_mask is not None else torch.empty(
         0, dtype=torch.uint8, device=q.device)
-    return module.attn_paged_multi_q(q, gate, kpool, vpool, kscale, vscale, slots,
-                                     ctx_lens.contiguous(), out, max_seq, rep, scale,
-                                     pa, pm, mask, mask_block)
+    # Dense operands at the boundary, for the reason given on ``attn_paged_batch``: the kernel
+    # indexes the gate through ``data_ptr()`` as one flat block, and every caller builds it as a
+    # column slice of a fused projection.
+    return module.attn_paged_multi_q(q.contiguous(), gate.contiguous(), kpool, vpool, kscale,
+                                     vscale, slots, ctx_lens.contiguous(), out, max_seq,
+                                     rep, scale, pa, pm, mask, mask_block)
 
 
 # Gated DeltaNet
