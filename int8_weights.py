@@ -27,7 +27,9 @@ bf16——连激活一起量化（W8A8）要在关键路径上再加一个量化
 
 Constraints:
     * 权重保持行主序 ``[N, K]``，那是 checkpoint 发出的、HIP 内核索引的布局；这里
-      只换 dtype，绝不换布局。
+      只换 dtype，绝不换布局。唯一一处例外是 :meth:`QWeight.from_kn`：它接受内核
+      布局 ``[K, N]``（也就是离线预量化写到盘上的那个形状）并交出 ``[N, K]`` 转置
+      视图，目的是让 ``pack.to_kn`` 的那次 ``.contiguous()`` 成为空操作。
     * 存储的是 int8 加每输出行一个 fp32 scale，数学依赖这一配对：不带行 scale 反量化，
       或者按张量缩放，都会重新引入本方案避开的漂移。
     * ``dequant`` 会实体化一份稠密拷贝。它只为预填充 GEMM 路径存在；在解码循环里
@@ -88,6 +90,42 @@ class QWeight:
         self.wq = wq                      # [N, K] int8，连续
         self.scale = scale                # [N] fp32，连续
         self.n, self.k = wq.shape
+
+    @classmethod
+    def from_kn(cls, wt: torch.Tensor, scale: torch.Tensor) -> "QWeight":
+        """包住一份已经是 ``[K, N]`` 的 int8 权重，不复制也不转置。
+
+        ``backends/corex/pack.to_kn`` 消费 ``QWeight`` 的方式是 ``w.wq.t()`` 再
+        ``.contiguous()``。这里交出的 ``wq`` 是 ``wt`` 的转置视图（strides
+        ``(1, N)``），所以那一步取回来正是 ``wt`` 自己，``.contiguous()`` 空转不复制。
+        离线预量化到盘上时就写成 ``[K, N]``，省掉的正是这一次转置。
+
+        Args:
+            wt: ``[K, N]`` 连续存放的 int8 权重，内核读取的布局。
+            scale: ``[N]`` 个 fp32 scale，每个输出列一个。
+
+        Returns:
+            ``wq`` 为转置视图的 ``QWeight``。
+
+        Raises:
+            ValueError: ``wt`` 不是二维 int8、``scale`` 不是一维 fp32，或两者长度对
+                不上。拿错元素算出来的数看着合理，所以在这里拒绝。
+        """
+        if wt.dim() != 2 or wt.dtype != torch.int8:
+            raise ValueError(f"packed int8 weight must be 2-D int8, got "
+                             f"{tuple(wt.shape)} {wt.dtype}")
+        if scale.dim() != 1 or scale.dtype != torch.float32:
+            raise ValueError("scale must be 1-D fp32")
+        k, n = int(wt.shape[0]), int(wt.shape[1])
+        if int(scale.numel()) != n:
+            raise ValueError(f"scale holds {scale.numel()} values for N = {n}")
+        if not wt.is_contiguous():
+            raise ValueError("packed [K, N] weight must be contiguous")
+        obj = cls.__new__(cls)
+        obj.wq = wt.t()                   # [N, K] 视图，strides (1, N)
+        obj.scale = scale
+        obj.n, obj.k = n, k
+        return obj
 
     @classmethod
     def quantize(cls, w: torch.Tensor, chunk_rows: int = _QUANT_CHUNK_ROWS) -> "QWeight":

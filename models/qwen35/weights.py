@@ -4,6 +4,11 @@
 关掉时，同一趟里把它也读进来（``config.json: vision_config``），因为常驻字典
 正是 ``Qwen35.enable_vision`` 之后用来建塔的东西。MTP 头保留，投机解码要用。
 
+目录里带 ``quant_index.json`` 时整趟加载改由 ``quantized_load`` 承担：那是一个由
+``coffin/tools/quant_disk.py`` 离线预量化好的目录，权重已经是 ``int8 [K, N]`` 加每
+输出列一个 fp32 scale，所以这一趟既不量化也不转置，只读文件、装箱。调用方不需要
+为它改任何东西——``engine_api.load_weights`` 仍然只传一个目录。
+
 视觉张量采用和文本张量不同的内存策略：
 
 * 它们保留 ``model.visual.`` 前缀（``Qwen35`` 会把它们从字典里筛出去放进
@@ -14,8 +19,8 @@
   一个 fp16 矩阵，而不是再多一份塔的拷贝。
 
 Module: ``coffin/models/qwen35``。依赖 ``backends``（决定张量落在哪个设备、
-投影用什么 dtype）、``ops/dtypes`` 和 ``int8_weights``，以及同级的
-``vision``；由 ``engine_api.load_weights`` 调用，返回的字典直接交给
+投影用什么 dtype）、``ops/dtypes``、``int8_weights`` 和 ``quantized_load``，以及同级
+的 ``vision``；由 ``engine_api.load_weights`` 调用，返回的字典直接交给
 ``Qwen35``。
 
 Constraints:
@@ -24,10 +29,14 @@ Constraints:
       内核会在错误的精度下静默运行。
     * 在加载过程中量化，而不是加载完再量化：fp16 张量一量化完就丢掉，于是峰值
       内存是两种形式中较大的那个而不是两者之和——9 GB 的 checkpoint 能塞进
-      16 GB 卡靠的就是这一点。
+      16 GB 卡靠的就是这一点。预量化目录把这一步提前到离线做掉了，所以那条路径上
+      峰值只是最终的 int8 常驻集。
     * 键按前缀字符串匹配（``model.language_model.``、``mtp.``、
       ``model.visual.``）；它们来自 checkpoint 布局，在这里改个名字不会触发形状
       检查，而是直接让加载坏掉。
+    * ``lm_head.`` 无条件列入前缀：4B 是绑定权重的（没有这个张量，前缀什么都匹配
+      不到），27B 是 untied 的（只有它能拿到那个 N=248320、1.27 GB 的头）。按张量
+      而不是按族名分辨两种情况，一条路径才同时服务两者。
     * ``vision=None`` 表示「自动」：checkpoint 声明了视觉塔才加载；在没有视觉
       张量的 checkpoint 上显式传 ``True`` 是错误，不是得到一个空塔。
 """
@@ -39,10 +48,12 @@ from pathlib import Path
 
 import torch
 
+import quantized_load
 from backends import device as _device
 from int8_weights import QWeight, is_quantizable
 from models.qwen35.vision import VISUAL_PREFIX, is_vision_quantizable
 from ops.dtypes import D, WF
+
 
 def load_weights(model_dir: str | Path, prefix: str = "model.language_model.",
                  quant: bool = False, weight_dtype: torch.dtype = WF,
@@ -57,9 +68,13 @@ def load_weights(model_dir: str | Path, prefix: str = "model.language_model.",
     fp16 的形式到达：每步解码要读的字节数减半，常驻占用也减半。
     ``vision_quant`` 对视觉塔的 GEMM 权重独立地做同样的事。
 
+    ``model_dir`` 是预量化目录（``quant_index.json`` 在场）时，本函数不读任何源
+    权重分片、不做量化、也不转置：权重直接从 int8 文件读上卡并装箱成 ``QWeight``。
+    那时 ``weight_dtype`` 只在 ``quant=False`` 的反量化里起作用。
+
     Args:
         model_dir: 放着 ``config.json`` 和 ``*.safetensors`` 分片的 checkpoint
-            目录。
+            目录，或 ``coffin/tools/quant_disk.py`` 写出的预量化目录。
         prefix: 文本模型在 checkpoint 里的参数名前缀。
         quant: 把文本的二维投影矩阵存成 int8 ``QWeight``。
         weight_dtype: 投影和视觉张量用的 dtype；默认 ``caps.weight_dtype``，
@@ -78,9 +93,38 @@ def load_weights(model_dir: str | Path, prefix: str = "model.language_model.",
             ``VISUAL_PREFIX`` 张量。宁可报出这份不匹配的 checkpoint，也不要启动
             一个会在第一张图上失败的引擎。
     """
+    model_dir = Path(model_dir)
+    if quantized_load.is_quantized_dir(model_dir):
+        return quantized_load.load(
+            model_dir, device=_device, quant=quant, prefix=prefix,
+            weight_dtype=None if quant else weight_dtype,
+            vision=vision, vision_quant=vision_quant)
+    return _load_checkpoint(model_dir, prefix=prefix, quant=quant,
+                            weight_dtype=weight_dtype, vision=vision,
+                            vision_quant=vision_quant)
+
+
+def _load_checkpoint(model_dir: Path, prefix: str, quant: bool,
+                     weight_dtype: torch.dtype, vision: bool | None,
+                     vision_quant: bool) -> dict:
+    """从原始 checkpoint 分片读权重，按需在读取过程中量化。
+
+    Args:
+        model_dir: checkpoint 目录。
+        prefix: 文本模型参数名前缀。
+        quant: 把文本的二维投影量化成 int8。
+        weight_dtype: 投影和视觉张量的 dtype。
+        vision: 是否加载视觉塔；``None`` 表示看 ``config.json``。
+        vision_quant: 把视觉塔的 GEMM 权重量化成 int8。
+
+    Returns:
+        按 checkpoint 参数名索引的 state dict。
+
+    Raises:
+        RuntimeError: 声明了视觉塔却一个视觉张量都没读到。
+    """
     from safetensors import safe_open
 
-    model_dir = Path(model_dir)
     with (model_dir / "config.json").open() as f:
         cfg = json.load(f)
     take_vision = bool(cfg.get("vision_config")) if vision is None else bool(vision)
@@ -114,3 +158,4 @@ def load_weights(model_dir: str | Path, prefix: str = "model.language_model.",
             f"config.json declares a vision_config but no {VISUAL_PREFIX}* tensor "
             f"was found under {model_dir}")
     return sd
+

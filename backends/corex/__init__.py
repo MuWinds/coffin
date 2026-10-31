@@ -339,14 +339,66 @@ def _gemv_rows(w: torch.Tensor | QWeight | pack.KnWeight,
     return _restore(out, dtype)
 
 
+def _w8a8_rows(packed: pack.KnQWeight, act: torch.Tensor) -> torch.Tensor:
+    """用三个 W8A8 内核做一次预填充投影：量化激活、int8 GEMM、乘两个 scale。
+
+    这是本后端 int8 权重的预填充实现。它替掉的是「每次调用把整份权重反量化成
+    bf16 再 GEMM」那条路，那条路在 4B 上每个请求固定多付一次全量权重转换
+    （``pack.KnQWeight.dequant_kn`` 的 docstring 记的是 174.8 ms 一档的代价），
+    而这里权重全程留在 int8。
+
+    ``N`` 超过 :data:`pack.LIB_MAX_N` 时沿列切块，每块的累加器单独分配：``[K, N]``
+    矩阵的列切片不连续，而 ``w8a8_gemm`` 要求最内层连续，正确写法是切一次权重再
+    GEMM，而不是把不连续的视图递进去。
+
+    Args:
+        packed: int8 权重，``[K, N]`` 矩阵加 ``[N]`` 个 fp32 列 scale。
+        act: 激活，``[M, K]``，bf16 或 fp32。
+
+    Returns:
+        ``[M, N]``，dtype 同 ``act``。
+
+    Raises:
+        RuntimeError: 扩展不可用。这条路径没有纯 torch 的回退——调用方
+            :func:`linear_prefill` 只在 int8 权重且 ``M`` 够大时才走到这里，
+            而那种形状上退回参考实现比慢更糟。
+    """
+    module = _kernels()
+    rows, k = act.shape
+    n = packed.n
+    xq = torch.empty((rows, k), dtype=torch.int8, device=act.device)
+    xs = torch.empty(rows, dtype=torch.float32, device=act.device)
+    out = torch.empty((rows, n), dtype=act.dtype, device=act.device)
+    # 量化排在循环外：一份激活只按行量化一次，切块只在 N 上做，所以每块共用同一
+    # 份 int8 激活和同一份 scale。
+    module.quant_act_i8(act, xq, xs)
+    for start in range(0, n, pack.LIB_MAX_N):
+        stop = min(n, start + pack.LIB_MAX_N)
+        width = stop - start
+        block = packed.wt[:, start:stop]
+        if not block.is_contiguous():
+            block = block.contiguous()
+        acc = torch.empty((rows, width), dtype=torch.int32, device=act.device)
+        module.w8a8_gemm(xq, block, acc)
+        # 行距传 ``n`` 而不是块宽：``out`` 的列切片在最内层仍然连续到 ``n``，
+        # 用块宽当行距会让第二行写回到第一行的尾部。
+        module.w8a8_epilogue(acc, xs, packed.scale[start:stop],
+                             out[:, start:stop], n)
+    return out
+
+
 def linear_prefill(w: torch.Tensor | QWeight | pack.KnWeight,
                    x: torch.Tensor) -> torch.Tensor:
     """预填充分块投影（大 ``M``），此时 GEMM 胜过流式读权重。
 
     库只用在这张卡已知能算对的宽度内：输出列超过 :data:`pack.LIB_MAX_N` 时它的
     GEMM 在 ``N = 248320``（就是 ``lm_head``）返回 NaN，而那正是最经不起这种错误
-    的一个形状。所以宽 ``N`` 的预填充改为按行分块跑自写 ``[K, N]`` GEMV：受限的是
-    带宽而不是算力，但结果是对的。
+    的一个形状。切块判定在 :func:`_w8a8_rows` 里，内核里还有第二道断言。
+
+    ``M`` 低于 :data:`_PREFILL_MIN_M` 时仍然走自写 GEMV，int8 权重也一样：那条
+    分界是实测的（``27B-4CARD-PLAN.md`` §3.4，M=1 上 W8A8 慢 42%），不是可调
+    参数。这里额外把分界判断提到 int8 反量化之前，所以小 ``M`` 的 int8 预填充
+    不再先付一次全量反量化再把它丢掉。
 
     Args:
         w: 任意可接受存储形式的 ``[N, K]`` 投影权重。
@@ -360,17 +412,16 @@ def linear_prefill(w: torch.Tensor | QWeight | pack.KnWeight,
     """
     packed = pack.as_kn(w)
     rows = x.shape[0]
-    if packed.int8:
-        # int8 是为解码 GEMV 存在的，那里减半字节数占主导。预填充 GEMM 每个 tile 要
-        # 消费很多次权重，而库在这里不接受 int8 操作数，所以宽路径只反量化一次、改用
-        # bf16 GEMM。这样显存里只有一种存储形式，而不是每个权重两份拷贝。
-        packed = packed.dequant_kn(pack.WEIGHT_DTYPE)
     if rows < _PREFILL_MIN_M:
         # 低于预填充区间时 GEMM 每个 tile 都要读一遍权重，输给整次调用只读一遍的
-        # GEMV。
+        # GEMV。分界必须走在打包之后、任何按 dtype 的分支之前。
         return _gemv_rows(w, x)
     dtype = x.dtype
     act = _compute_dtype(x)
+    if packed.int8:
+        # int8 权重不再反量化。反量化那条路留给没有 W8A8 内核的后端；这里权重全程
+        # 保持 int8，省下的不只是时间还有一整份 bf16 副本的显存。
+        return _restore(_w8a8_rows(packed, act), dtype)
     weight_dtype = packed.wt.dtype
     # GEMM 两个操作数必须同一 dtype，而本卡 bf16 和 fp16 的 TFLOP/s 一样（M=2048 时
     # 32.6），所以由权重自己的 dtype 决定，激活跟着它，而不是反过来。

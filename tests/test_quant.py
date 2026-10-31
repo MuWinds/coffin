@@ -54,9 +54,18 @@ def _text_ids() -> list[int]:
 def _teacher_forced(ids: list[int], *, quant: bool, weight_dtype=None):
     """逐位置给出真实下一个 token 的 logprob 与模型自己的 top-1 选择。
 
+    **这个写法只测得到权重格式，测不到 W8A8。** 它先 ``prefill(ids[:4])`` 再逐 token
+    ``decode_step``，而引擎在 ``M < 64`` 时把投影走 GEMV——所以激活量化那条路径一次都
+    不会被调用。用它对照 W8A8 与 W8A16 会得到逐位相同的结果，读起来像「W8A8 精度无损」，
+    实际是两条臂跑了同一段代码。
+
+    这条陷阱在本仓库真实发生过：``probe_w8a8_accuracy.py`` 第一版就这么写，靠加路径
+    计数器自证（W8A16 臂 ``w8a8_calls=0``、W8A8 臂 9576）才发现。要量 W8A8 必须让每个
+    计分位置都走 ``M >= 64`` 的预填充，也就是逐前缀预填充而不是增量 decode。
+
     Args:
         ids: 两个模型共同吃进的真实 token id。
-        quant: 以 INT8 权重加载模型。
+        quant: 以 INT8 权重加载模型。这选的是**权重存储形式**；``W8A8`` 是另一件事。
         weight_dtype: 覆盖存储 dtype；``None`` 沿用 checkpoint 自带的。
 
     Returns:
