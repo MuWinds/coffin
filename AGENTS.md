@@ -1,107 +1,150 @@
-# AGENTS.md — coffin comment conventions
+# AGENTS.md — coffin 注释与提交规范
 
-Comment contract for this repository. Read before touching any comment.
-`coffin/` is its own git repo, so this file is the top-level rule for it.
-Scope: every `.py`, `.cu`, `.c`, `.h`, `.cpp` under `coffin/`.
-
----
-
-## 1. Language: English only
-
-- All comments, docstrings and file headers are written in **English**.
-- Do not translate existing English in place. Rewrite it to the standard below.
-- Keep verbatim: identifiers, tensor shapes `[B, S, H]`, file paths, URLs, CLI
-  flags, units, measured numbers, and tool directives (`# noqa: E402`,
-  `# type: ignore[...]`, `# pragma: no cover`). Explain a directive on its own
-  line above it, never by rewriting it.
-- Non-ASCII text is acceptable only inside quoted sample data (e.g. a prompt
-  fragment), never in prose.
+本仓库的注释契约。改动任何注释之前先读完本文件。
+`coffin/` 是独立 git 仓库，所以本文件就是它的顶层规则。
+适用范围：`coffin/` 下所有 `.py`、`.cu`、`.c`、`.h`、`.cpp`、`.md`。
 
 ---
 
-## 2. Write the Why, not the What
+## 1. 语言：一律中文
 
-The test: **delete the comment — would a reader now make a wrong change?**
-If no, the comment is noise. Delete it.
+- 所有注释、docstring、文件头、文档正文一律用**中文**书写。
+- 不保留成段的英文散文。英文只允许出现在下面这些「原样保留」的内容里。
+- 原样保留（不翻译、不改写）：
+  - 标识符、函数名、类名、模块路径
+  - 张量形状 `[B, S, H]`、数值、单位、实测数字
+  - 文件路径、URL、命令行开关、环境变量名
+  - 协议字段名（如 OpenAI wire format 的 `tool_calls`）
+  - 结构标记：`Args:` / `Returns:` / `Raises:` / `Module:` / `Constraints:`
+    / `@file` / `@brief` / `@param` / `@return` / `@throws` / `#:`
+  - 工具指令：`# noqa: E402`、`# type: ignore[...]`、`# pragma: no cover`
+- 工具指令要在上面单独一行用中文解释它为什么在那里，指令本身绝不改写。
+- 代码块、行内反引号、引号里的样例数据可以保留原语言（例如一段英文
+  prompt）。门禁按「散文」判定，样例不算散文。
 
-Delete on sight:
+---
+
+## 2. 写「为什么」，不写「是什么」
+
+自检标准：**删掉这条注释，读者会不会因此改错代码？**
+如果不会，这条注释就是噪音，删掉。
+
+见到就删：
 
 ```python
-i += 1                  # increment i
-for x in xs:            # loop over the list
-self.n = 0              # initialise n
-return out              # return the result
-import torch            # import torch
-if not xs:              # check whether empty
+i += 1                  # i 加一
+for x in xs:            # 遍历列表
+self.n = 0              # 初始化 n
+return out              # 返回结果
+import torch            # 导入 torch
+if not xs:              # 判断是否为空
 ```
 
-Keep, because they answer something the code cannot:
+该保留，因为代码本身回答不了：
 
 ```python
-# Old API pagination is 1-based; the +1 keeps the two call sites agreeing.
+# 旧版 API 的分页是从 1 开始的；这个 +1 让两处调用点的语义对齐。
 offset = page * size + 1
 
-# gfx906 has 64 KB of LDS, and any dynamic allocation past 48 KB needs an
-# opt-in attribute, so the key window is streamed instead of staged whole.
+# gfx906 只有 64 KB LDS，超过 48 KB 的动态分配需要额外声明属性，
+# 所以关键窗口用流式读取而不是整块暂存。
 for blk in window:
     ...
 
-# 131072 is the widest row-major-B GEMV that stays correct on this card;
-# 196608 was measured returning NaN.
+# 131072 是这张卡上仍然正确的行主序-B GEMV 最宽尺寸；
+# 196608 实测会返回 NaN。
 if n > 131072:
     ...
 
-# Materialising the cache as bf16 costs two [nkv, S, hd] copies. Keeping it
-# int8 and dequantising in-kernel trades a few ALU ops for 1 GB+ of VRAM.
+# 把缓存实体化成 bf16 要多两次 [nkv, S, hd] 拷贝。保持 int8、在内核里
+# 反量化，用几条 ALU 指令换掉 1 GB+ 显存。
 ```
 
-A comment earns its line by answering at least one of:
+一条注释值得占一行，至少要回答下列之一：
 
-1. Why must it be written this way, and what breaks otherwise (NaN, 2x VRAM,
-   cache aliasing, protocol mismatch)?
-2. Which external contract forces it (legacy API, OpenAI wire format,
-   checkpoint layout)?
-3. Which hardware limit fixes the shape (LDS, bandwidth, wavefront, INT8
-   row-major weights)?
-4. Where does the magic number come from, and what was measured?
-5. What was given up (the trade-off), and why that is acceptable?
+1. 为什么必须这样写，不这样写会坏在哪（NaN、显存翻倍、缓存别名、协议不匹配）？
+2. 哪个外部契约迫使这样写（旧版 API、OpenAI 报文格式、checkpoint 布局）？
+3. 哪个硬件限制决定了这个形状（LDS、带宽、wavefront、INT8 行主序权重）？
+4. 这个魔数从哪来，实测过什么？
+5. 放弃了什么（取舍是什么），为什么可以接受？
 
 ---
 
-## 3. Standard docstring format
+## 3. 标准 docstring 格式
 
-| Language | Style | Sections |
+| 语言 | 风格 | 小节标记（保持英文） |
 | --- | --- | --- |
 | Python | **Google Style** | `Args:` / `Returns:` / `Raises:` |
 | CUDA / C / C++ | **Doxygen** | `@brief` / `@param` / `@return` / `@throws` |
 
-- No Sphinx `:param:` / `:returns:` / `:raises:` (the vendored `reference/`
-  package keeps its own style; that is not this repo).
-- No NumPy `Parameters` / `----------` sections.
-- Section order is fixed: `Args:` then `Returns:` then `Raises:`. Omit a
-  section entirely when it would be empty.
-- First line is a one-sentence summary ending in a period. Blank line. Then
-  the detail and the sections.
-- `#:` stays the prefix for constants and dataclass fields.
+- 不用 Sphinx 的 `:param:` / `:returns:` / `:raises:`（`reference/` 里随源码
+  引入的第三方包保持它自己的风格，那不属于本仓库）。
+- 不用 NumPy 的 `Parameters` / `----------` 写法。
+- 小节顺序固定：`Args:` → `Returns:` → `Raises:`。某一段为空就整段省略。
+- 首行是一句话摘要，以句号结尾。空一行。然后才是细节和小节。
+- 常量和 dataclass 字段仍然用 `#:` 前缀。
+
+```python
+def match_prefix(self, tokens: list[int], require_states: bool = False) -> tuple[int, int]:
+    """在基数树里找出 ``tokens`` 最长的已缓存前缀。
+
+    只返回按块对齐的长度：KV 以整块为粒度共享，半块的命中会在块表里留下
+    一个不完整的块，而写时复制无法为它维护引用计数。
+
+    Args:
+        tokens: 完整请求 token（prompt 加已生成部分），不能为空。
+        require_states: 要求命中点处有线性注意力状态快照。混合模型上只有
+            KV 命中是错误的，那会把共享的 key 配上一个从没见过它们的状态，
+            所以命中会被截断到有快照的最深边界。
+
+    Returns:
+        ``(prefix_len, node_id)``。``prefix_len == 0`` 表示没有命中，
+        此时 ``node_id`` 为 ``-1``。
+
+    Raises:
+        ValueError: ``tokens`` 为空。空请求应该在调用方就拒绝，这里返回
+            一个零长度命中只会把 bug 藏起来。
+    """
+```
+
+```cpp
+// @brief 对 INT8 KV 做单 token 全注意力，单次遍历，online softmax。
+//
+// @param q        查询向量，[heads, head_dim]，已经乘过 1/sqrt(d)。
+// @param k_cache  分页池的 INT8 K 视图，通过 slot map 寻址。
+// @param out      输出缓冲区，[heads, head_dim]，连续存放。
+// @return 无。错误通过 host 侧的 hipGetLastError() 暴露。
+// @throws 无；HIP 以错误码上报，非法参数由 host 侧断言拦下。
+```
+
+详细程度：
+
+| 目标 | 最低要求 |
+| --- | --- |
+| 有副作用、会抛异常或参数不直观的公开函数 | 四段齐全 |
+| 简单的判定函数或 getter | 一句话摘要，说清它存在的理由 |
+| 私有辅助函数 | 目的加关键约束 |
+| 测试用例 | 不写 `Args` / `Returns`。说明它守的是什么不变量、为什么重要 |
+
+`Returns:` 描述语义和边界值，不描述类型——类型在签名里。
+`Raises:` 说明触发条件以及调用方该怎么处理；只抛不解释的不算文档。
 
 ---
 
-## 4. File-level header
+## 4. 文件头
 
-Every source file opens by stating three things.
+每个源文件开头必须讲清三件事。
 
 ### Python
 
 ```python
-"""One-sentence responsibility: why this file exists.
+"""一句话职责：这个文件为什么存在。
 
-Module: ``coffin/<package>``. Its place in the dependency graph — who calls
-it, what it is allowed to call.
+Module: ``coffin/<包名>``。它在依赖图里的位置——谁调用它，它允许调用谁。
 
 Constraints:
-    * A hard rule covering the whole file, with the reason attached
-      (hardware, precision, invariant, import convention).
-    * A second one if it exists.
+    * 覆盖整个文件的一条硬规则，附上原因（硬件、精度、不变量、导入约定）。
+    * 如果还有第二条就继续写。
 """
 ```
 
@@ -109,154 +152,158 @@ Constraints:
 
 ```cpp
 // @file attn.cu
-// @brief Fused single-token full attention over the INT8 KV cache.
+// @brief 对 INT8 KV 缓存做融合的单 token 全注意力。
 //
-// Module: coffin/kernels. Loaded by hip_ops.py as a torch extension.
+// Module: coffin/kernels。由 hip_ops.py 作为 torch 扩展加载。
 //
 // Constraints:
-//   * LDS budget is 64 KB per CU; the key window is streamed, never staged.
-//   * One block per query head; no cross-block synchronisation.
+//   * 每个 CU 的 LDS 预算是 64 KB；关键窗口流式读取，绝不整块暂存。
+//   * 每个查询头一个 block；不存在跨 block 同步。
 ```
 
-- **Responsibility** is the problem the file solves, not a list of its
-  functions.
-- **Module** states the dependency direction that applies here (for example
-  `ops/` must not import `models/`).
-- **Constraints** are file-wide rules, not per-function notes. Typical ones:
-  absolute imports because the entry script puts `coffin/` on `sys.path`;
-  INT8 row-major weights, so new kernels must accept `[K, N]`; linear-attention
-  recurrent state must be snapshotted with the KV or prefix reuse goes wrong;
-  no locking, all mutation driven single-threaded by `llm_engine`.
+- **职责**是这个文件解决的问题，不是它的函数清单。
+- **Module** 写清这里适用的依赖方向（例如 `ops/` 不许 import `models/`）。
+- **Constraints** 是覆盖整个文件的规则，不是单个函数的备注。典型的有：
+  入口脚本把 `coffin/` 加进 `sys.path`，所以用绝对导入；权重是 INT8 行主序，
+  新内核必须接受 `[K, N]`；线性注意力的循环状态必须和 KV 一起打快照，否则
+  前缀复用会算错；不做加锁，所有变更由 `llm_engine` 单线程驱动。
 
 ---
 
-## 5. Function / method docstring
+## 5. 内联注释与块注释
 
-Cover the four things: purpose (what and why), inputs, outputs, exceptions.
-
-```python
-def match_prefix(self, tokens: list[int], require_states: bool = False) -> tuple[int, int]:
-    """Find the longest cached prefix of ``tokens`` in the radix tree.
-
-    Only block-aligned lengths are returned: KV is shared at whole-block
-    granularity, and a half-block hit would leave the block table with a
-    partial block that copy-on-write cannot refcount.
-
-    Args:
-        tokens: Full request tokens (prompt plus generated), must be non-empty.
-        require_states: Require a linear-attention state snapshot at the hit
-            point. On the hybrid model a KV-only hit would pair shared keys
-            with a state that never saw them, so the match is truncated to the
-            deepest boundary that has a snapshot.
-
-    Returns:
-        ``(prefix_len, node_id)``. ``prefix_len == 0`` means no hit and
-        ``node_id`` is then ``-1``.
-
-    Raises:
-        ValueError: ``tokens`` is empty. Reject empty requests at the caller;
-            returning a 0-length hit here would hide the bug.
-    """
-```
-
-```cpp
-// @brief Single-token full attention over INT8 KV, one pass, online softmax.
-//
-// @param q        Query vectors, [heads, head_dim], already scaled by 1/sqrt(d).
-// @param k_cache  INT8 K view of the paged pool, addressed through the slot map.
-// @param out      Output buffer, [heads, head_dim], contiguous.
-// @return Nothing. Errors surface through hipGetLastError() on the host side.
-// @throws Nothing; HIP reports error codes and illegal arguments trip the
-//         host-side assert instead.
-```
-
-Detail level:
-
-| Target | Minimum |
-| --- | --- |
-| Public function with side effects, exceptions, or non-obvious params | All four sections |
-| Simple predicate or getter | One-line summary that says why it exists |
-| Private helper | Purpose plus its key constraint |
-| Test case | No `Args` / `Returns`. State the invariant it guards and why it matters |
-
-`Returns:` describes semantics and edge values, not types — types live in the
-signature. `Raises:` states the trigger and what the caller should do about it;
-a raise with no explanation is not documentation.
+1. 不直观的算法、业务黑魔法和魔数必须有注释点名取舍。宁可写实测数字，
+   也不要写形容词：`3.1 us/token at 64k, ~24 GB/s of KV traffic against a
+   ~600 GB/s roof` 比「这样更快」有用得多。
+2. 标记后一个空格：`# 正文`、`// 正文`。行尾注释前两个空格：
+   `x = 1  # 原因`。
+3. 语句级注释与它上面的代码之间空一行，免得读起来像上一句的补充说明。
+4. 块注释紧贴它解释的代码，描述这段代码达成什么，而不是逐行翻译。
+5. 小节分隔只用朴素的 `# 小节名`。**禁止 ASCII 分隔线**——不许 `# ----`、
+   `# ====`、`# ****`。已有的 `# -- 子系统 ---` 按这条规则删除。
+6. 不留注释掉的死代码。如果某条分支因为硬件限制被关掉，说明为什么保留它、
+   什么条件下能重新打开。
 
 ---
 
-## 6. Inline and block comments
+## 6. 文档（`.md`）规则
 
-1. Non-obvious algorithms, business black magic and magic numbers get a comment
-   that names the trade-off. Prefer the measurement over the adjective:
-   `3.1 us/token at 64k, ~24 GB/s of KV traffic against a ~600 GB/s roof` beats
-   "this is faster".
-2. One space after the marker: `# text`, `// text`. Two spaces before an inline
-   comment: `x = 1  # why`.
-3. A statement-level comment is separated from the code above it by a blank
-   line, so it does not read as an aside on the previous statement.
-4. A block comment sits flush against the code it explains and describes what
-   the block achieves, not each line.
-5. Section dividers are plain `# label`. **No ASCII rules** — no `# ----`, no
-   `# ====`, no `# ****`. Existing `# -- subsystem ---` lines are removed
-   under this rule.
-6. No commented-out dead code. If a branch is disabled by a hardware limit,
-   say why it is kept and what would re-enable it.
+- 正文一律中文。标题、正文、表格、列表、说明文字都翻译。
+- 原样保留：代码块里的代码、命令、路径、URL、字段名、实测数字、表格里的
+  标识符。
+- 标题层级、锚点、链接目标不变。内部链接指向的文件名不改。
+- 不删内容、不合并章节、不改变结论。这是翻译与改写，不是重新创作。
+- 术语按 `coffin/GLOSSARY.md` 统一，同一概念全书只用一种译法。
 
 ---
 
-## 7. Refactoring discipline
+## 7. 重构纪律
 
-- **Comments only.** No code token, string literal, number, identifier, import
-  order or statement may change. The result must be semantically identical.
-- Do not rewrite whole large files in one shot. Edit in function-sized batches
-  and run the equivalence check after each batch.
-- Remove noise, do not add padding. Fewer, sharper comments beat coverage.
-- Avoid the stock phrases that mark generated prose: "Note that", "It is
-  important to note", "This function is responsible for", "Here we", "In
-  order to" (use "to"), "leverage" (use "use"), "utilize", "seamlessly",
-  "robust", "comprehensive". State the fact and move on.
+- **只改注释和散文。** 任何代码 token、字符串字面量、数字、标识符、import
+  顺序、语句都不许变。结果必须语义完全等价。
+- 不要一次性重写整个大文件。按函数规模分批改，每批之后跑一次等价性检查。
+- 删噪音，不要凑篇幅。宁可少而准，也不要为覆盖率补废话。
+- 避免生成式中文的腔调：「需要注意的是」「值得注意的是」「该函数负责」
+  「这里我们」「综上所述」「起到了……的作用」「简单来说」。陈述事实，
+  然后结束。
+- 不要为了清掉一条警告给一行的小函数硬补四段式——那正是第 7 条禁止的
+  凑覆盖率。
 
 ---
 
-## 8. Checks
+## 8. 检查
 
-After editing a file:
+改完文件之后：
 
 ```bash
 cd coffin
 
-# every file still compiles
+# 每个文件仍然能编译
 python -m py_compile $(find . -name '*.py' -not -path './__pycache__/*')
 
-# comments only: AST equal outside docstrings
+# 只改了注释：AST 等价（docstring 以外的代码）
 python ../diag/check_style.py --ast .
 
-# CUDA/C/C++: token stream equal once comments are stripped
+# CUDA/C/C++：剥掉注释后 token 流等价
 python ../diag/check_style.py --c-comments .
 
-# conventions: language, spacing, dividers, Sphinx fields, missing sections
+# 规范：中文、空格、分隔线、Sphinx 字段、缺失小节
 python ../diag/check_style.py --style .
+
+# 只看某个文件
+python ../diag/check_style.py --style path/to/file.py --verbose
 ```
 
-`--ast` and `--c-comments` are gates: any reported code change is a bug in the
-refactor, restore the file and redo the batch. Do not use `git checkout` to
-restore it if other people share the worktree — find the difference and put the
-token back by hand.
+`--ast` 和 `--c-comments` 是硬门禁：任何代码改动都是重构引入的 bug，
+必须把 token 原样改回去，不能靠 `git checkout` 覆盖（多人共用工作区时那会
+冲掉别人的改动）。
 
-`--style` splits into two levels. **Errors** are hard: non-English prose, a
-missing space after the marker, ASCII dividers, Sphinx field lists, a missing
-file header, or no docstring on a public function. **Warnings** are advisory:
-missing `Args`/`Returns`/`Raises` sections, a missing `Module:`/`Constraints:`
-line, or a docstring missing from a trivial helper. Do not pad a one-line
-helper just to clear a warning — that is the coverage-chasing failure mode
-section 7 forbids. Treat the warning list as a reading list, not a checklist.
+`--style` 分两级。**错误**是硬性的：散文不是中文、标记后缺空格、ASCII
+分隔线、Sphinx 字段列表、缺文件头、公开函数没有 docstring。**警告**是提示：
+缺 `Args`/`Returns`/`Raises` 小节、缺 `Module:`/`Constraints:` 行、简单
+辅助函数没有 docstring。把警告当作阅读清单，不要当勾选清单。
 
-Checklist for one file:
+单文件检查清单：
 
-1. Header states responsibility, module and constraints.
-2. Public functions have the Google/Doxygen sections, `Args:` covers every
-   parameter, `Raises:` names the trigger.
-3. Every remaining comment survives the delete-test in section 2.
-4. No restating-the-code comments, no non-English prose, no ASCII dividers.
-5. `# text` spacing, blank line before statement-level comments.
+1. 文件头写清了职责、模块位置、约束。
+2. 公开函数有 Google/Doxygen 小节，`Args:` 覆盖每个参数，`Raises:` 说明触发条件。
+3. 每一条留下的注释都能通过第 2 节的删除测试。
+4. 没有复述代码的注释，没有英文散文，没有 ASCII 分隔线。
+5. 标记后有空格的排版，语句级注释前有空行。
+
+---
+
+## 9. 提交规范（中文）
+
+本仓库所有提交信息一律用中文。
+
+### 格式
+
+```
+<类型>: <一句话说清做了什么>
+
+<可选正文：为什么这么做、放弃了什么、实测数字>
+```
+
+- 首行不超过 72 个字符，结尾不加句号。
+- 首行之后空一行，再写正文。
+- 正文每行不超过 80 个字符。
+- 类型标记保留英文小写，后面跟中文冒号加空格。
+
+### 类型
+
+| 类型 | 用途 |
+| --- | --- |
+| `feat` | 新增能力 |
+| `fix` | 修 bug |
+| `perf` | 只改性能，行为不变 |
+| `refactor` | 只改结构，行为不变 |
+| `docs` | 只改文档和注释 |
+| `test` | 只改测试 |
+| `chore` | 构建、依赖、杂务 |
+| `repo` | 仓库结构调整（移动、拆分） |
+
+范围可以加在类型后面：`corex: 修 split-K 派发` 里的 `corex` 是范围。
+范围本身保持英文（它是目录名或平台名），冒号后面的描述用中文。
+
+### 示例
+
+```
+docs: 把引擎注释统一改写为中文
+
+术语按 GLOSSARY.md 统一，结构标记（Args:/@brief 等）保持英文，
+代码 token 一字未动，AST 与剥注释后的 token 流均与基线一致。
+
+检查：--ast / --c-comments / --style 全部通过。
+```
+
+```
+perf: 融合 decode 步骤的胶水算子，23.53 -> 20.26 ms（1.16x）
+```
+
+### 禁止
+
+- 英文提交信息。
+- `update`、`fix bug`、`修改`、`.` 这类没有信息的首行。
+- 把多个无关改动塞进一个提交。
+- 在首行使用句号或感叹号。
