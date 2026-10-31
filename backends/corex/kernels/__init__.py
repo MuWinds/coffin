@@ -50,7 +50,7 @@ DEFAULT_ARCH = "ivcore10"
 #: 法都递增这个值：后提交的人会静默复用前者的目标文件，量的是一个自己没改过的
 #: 内核。按 worker 加后缀让各自拥有独立的目标树和独立的构建锁，这也是并发构建
 #: 不必串在同一把锁后面的原因。
-_EXTENSION = os.environ.get("COFFIN_COREX_EXT", "").strip() or "coffin_corex_ops_v15"
+_EXTENSION = os.environ.get("COFFIN_COREX_EXT", "").strip() or "coffin_corex_ops_v16"
 
 #: 已加载的扩展，首次尝试之前是 ``None``。
 _module: Any = None

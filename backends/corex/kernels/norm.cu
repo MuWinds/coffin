@@ -303,6 +303,63 @@ __global__ void add_rms_norm_i8_kernel(const T* __restrict__ add, T* __restrict_
     }
 }
 
+// @brief ``y = rms(x) * w`` 并直接量化成 int8，每行一个 block。
+//
+// **这是预填充真正会走的那条。** 预填充的层是 ``mix.prefill_project(self.in_ln(x))``
+// 和 ``self.mlp.prefill(self.post_ln(x))`` —— 两次都是**普通** RMSNorm，残差相加是
+// 另一条 ``x = x + h`` 的张量运算。``add_rms_norm_i8`` 对应的其实是解码路径的
+// ``add_residual``，不是预填充；两条都得有，否则接的时候会发现融合位对不上。
+//
+// 与 ``rms_norm`` 写 bf16 再接 ``quant_act_i8`` 逐位相同：中间那排归一化值舍入成
+// ``T`` 之后才进 absmax，量化仍走 round 后夹到 ``[-127, 127]``。
+//
+// @param x [M, N] 激活，行间距 ``stride``（``q_norm``/``k_norm`` 会传更宽的间距）。
+// @param w [N] 增益，已经带着 checkpoint 的 ``1 + w`` 偏移。
+// @param out_q [M, N] int8 目的地，稠密。
+// @param out_s [M] 每行 fp32 scale 目的地。
+// @param N 行宽。
+// @param stride ``x`` 行之间的元素间距。
+// @param eps 方差下限。
+template <typename T>
+__global__ void rms_norm_i8_kernel(const T* __restrict__ x, const T* __restrict__ w,
+                                   int8_t* __restrict__ out_q, float* __restrict__ out_s,
+                                   int N, long stride, float eps) {
+    extern __shared__ float red[];
+    T* srow = reinterpret_cast<T*>(red + blockDim.x);
+    const int row = blockIdx.x;
+    const int t = threadIdx.x;
+    const T* xr = x + (size_t)row * stride;
+
+    float ss = 0.f;
+    for (int i = t; i < N; i += blockDim.x) {
+        const float v = CxScalar<T>::to_float(xr[i]);
+        srow[i] = xr[i];
+        ss += v * v;
+    }
+    const float inv = rsqrtf(block_sum(ss, red) / (float)N + eps);
+
+    // 与 ``add_rms_norm_i8`` 同一条理由：absmax 取自舍入成 ``T`` 之后的值，因为拆开跑
+    // 时 ``quant_act_i8`` 读到的是 bf16 存储的那一份。取未舍入的 fp32 会让 scale 差
+    // 几个 ULP，贴近边界的 code 差 1。
+    float amax = 0.f;
+    for (int i = t; i < N; i += blockDim.x) {
+        const T y = CxScalar<T>::from_float(
+            CxScalar<T>::to_float(srow[i]) * inv * CxScalar<T>::to_float(w[i]));
+        srow[i] = y;
+        amax = fmaxf(amax, fabsf(CxScalar<T>::to_float(y)));
+    }
+    const float sc = fmaxf(block_max(amax, red), 1e-5f) / 127.0f;
+    const float rsc = 1.0f / sc;
+    if (t == 0) out_s[row] = sc;
+
+    int8_t* qr = out_q + (size_t)row * N;
+    for (int i = t; i < N; i += blockDim.x) {
+        int q = __float2int_rn(CxScalar<T>::to_float(srow[i]) * rsc);
+        q = max(-127, min(127, q));
+        qr[i] = (int8_t)q;
+    }
+}
+
 }  // namespace
 
 // @brief 带行间距的融合 RMSNorm。
@@ -343,6 +400,70 @@ torch::Tensor rms_norm(torch::Tensor x, torch::Tensor w, int64_t stride, double 
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return y;
+}
+
+// @brief 带行间距的 RMSNorm，结果直接量化成 int8——预填充 W8A8 的激活入口。
+//
+// 与 ``rms_norm`` 写 bf16 再接 ``quant_act_i8`` 相比省掉两趟 global 往返：拆开是
+// 写 bf16 (2 B/元素) + 读 bf16 (2 B) + 写 int8 (1 B)，融合后只剩 1 B。这里的
+// **逐位等价**是验收口径，不是"误差很小"。
+//
+// 预填充的每个层有两处这条路径（``in_ln`` 和 ``post_ln``），所以它每步被调 64 次，
+// 比 ``add_rms_norm_i8`` 更常走。
+//
+// @param x [M, N] 激活，行间距 ``stride``，可以大于 ``N``。
+// @param w [N] 增益，已经带着 checkpoint 的 ``1 + w`` 偏移。
+// @param out_q [M, N] int8 目的地，稠密打包。
+// @param out_s [M] 每行 fp32 scale 目的地。
+// @param stride 行之间的元素间距；``0`` 表示 ``N``。
+// @param eps 方差下限。
+// @param threads_override 每块线程数；``0`` 用按 ``M`` 分档的实测最优点。
+// @return ``out_q``，便于调用链串接。
+// @throws c10::Error dtype、形状、间距与内核矛盾，或 LDS 装不下这一行。
+torch::Tensor rms_norm_i8(torch::Tensor x, torch::Tensor w, torch::Tensor out_q,
+                          torch::Tensor out_s, int64_t stride, double eps,
+                          int64_t threads_override) {
+    TORCH_CHECK(x.dim() == 2, "activation must be 2-D [M, N]");
+    TORCH_CHECK(x.stride(-1) == 1, "activation must have unit innermost stride");
+    const int M = (int)x.size(0), N = (int)x.size(1);
+    const long pitch = stride > 0 ? (long)stride : (long)N;
+    TORCH_CHECK(pitch >= N, "row pitch ", pitch, " is narrower than the row ", N);
+    TORCH_CHECK(w.numel() == N, "gain must have N elements, got ", w.numel());
+    TORCH_CHECK(w.scalar_type() == x.scalar_type(), "gain dtype must match activation");
+    TORCH_CHECK(x.scalar_type() == torch::kBFloat16 || x.scalar_type() == torch::kFloat,
+                "activation must be bf16 or fp32");
+    TORCH_CHECK(out_q.is_contiguous() && out_q.scalar_type() == torch::kChar &&
+                out_q.size(0) == M && out_q.size(1) == N,
+                "int8 destination must be contiguous [M, N]");
+    TORCH_CHECK(out_s.scalar_type() == torch::kFloat && out_s.numel() == M,
+                "scale destination must be fp32 with one value per row");
+    const int threads = int64_t(threads_override) > 0 ? (int)threads_override
+                                                     : i8_fused_threads(M);
+    TORCH_CHECK(threads % WAVEFRONT == 0,
+                "thread count must be a multiple of the ", WAVEFRONT,
+                "-lane wavefront, got ", threads);
+    // 归约缓冲在前，舍入后的归一化行紧随其后。48 KB 是**不带额外属性**就能申请的上限。
+    const size_t row_bytes = (size_t)N * (x.scalar_type() == torch::kBFloat16
+                                          ? sizeof(uint16_t) : sizeof(float));
+    const size_t shmem = (size_t)threads * sizeof(float) + row_bytes;
+    TORCH_CHECK(shmem <= 48u * 1024u,
+                "fused rmsnorm->int8 needs ", shmem, " bytes of shared memory for N = ",
+                N, ", over the 48 KB per-block budget; use rms_norm + quant_act_i8 "
+                "for widths this large");
+    const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    int8_t* qp = out_q.data_ptr<int8_t>();
+    float* sp = out_s.data_ptr<float>();
+    if (x.scalar_type() == torch::kBFloat16) {
+        rms_norm_i8_kernel<uint16_t><<<M, threads, shmem, stream>>>(
+            reinterpret_cast<const uint16_t*>(x.data_ptr()),
+            reinterpret_cast<const uint16_t*>(w.data_ptr()), qp, sp, N, pitch,
+            (float)eps);
+    } else {
+        rms_norm_i8_kernel<float><<<M, threads, shmem, stream>>>(
+            x.data_ptr<float>(), w.data_ptr<float>(), qp, sp, N, pitch, (float)eps);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out_q;
 }
 
 // @brief 把残差加进 ``x``，再把和做零中心 RMSNorm 写进 ``out``。

@@ -49,6 +49,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "residual add followed by the zero-centred RMSNorm, in one launch",
           pybind11::arg("x"), pybind11::arg("add"), pybind11::arg("w"),
           pybind11::arg("out"), pybind11::arg("stride") = 0, pybind11::arg("eps") = 1e-6);
+    m.def("rms_norm_i8", &rms_norm_i8,
+          "zero-centred RMSNorm quantised straight to int8, one launch",
+          pybind11::arg("x"), pybind11::arg("w"), pybind11::arg("out_q"),
+          pybind11::arg("out_s"), pybind11::arg("stride") = 0,
+          pybind11::arg("eps") = 1e-6, pybind11::arg("threads") = 0);
     m.def("add_rms_norm_i8", &add_rms_norm_i8,
           "residual add + zero-centred RMSNorm, quantised straight to int8, one launch",
           pybind11::arg("x"), pybind11::arg("add"), pybind11::arg("w"),

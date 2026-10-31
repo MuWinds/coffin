@@ -123,6 +123,25 @@ torch::Tensor rms_norm(torch::Tensor x, torch::Tensor w, int64_t stride, double 
 torch::Tensor add_rms_norm(torch::Tensor x, torch::Tensor add, torch::Tensor w,
                            torch::Tensor out, int64_t stride, double eps);
 
+// @brief 零中心 RMSNorm，结果直接量化成 int8，一次启动——预填充 W8A8 的激活入口。
+//
+// 预填充的每个层有两处这条路径(in_ln 和 post_ln)，每步共 64 次，比 add_rms_norm_i8
+// 更常走。与 `rms_norm` 写 bf16 再接 `quant_act_i8` **逐位相同**，但省掉两趟
+// global 往返:拆开是写 bf16(2 B/元素) + 读回(2 B) + 写 int8(1 B)，融合后只剩 1 B。
+//
+// @param x [M, N] 激活，行间距 `stride`，可以大于 `N`。
+// @param w [N] 增益，已带 `1 + w` 偏移。
+// @param out_q [M, N] int8 目的地，稠密。
+// @param out_s [M] 每行 fp32 scale 目的地。
+// @param stride `x` 的行间距；`0` 表示 `N`。
+// @param eps 方差下限。
+// @param threads_override 每块线程数；`0` 用按 `M` 分档的实测最优点。
+// @return `out_q`。
+// @throws c10::Error dtype、形状、间距矛盾，或 LDS 装不下这一行。
+torch::Tensor rms_norm_i8(torch::Tensor x, torch::Tensor w, torch::Tensor out_q,
+                          torch::Tensor out_s, int64_t stride, double eps,
+                          int64_t threads_override = 0);
+
 // @brief 残差相加接零中心 RMSNorm，并把结果直接量化成 int8，一次启动。
 //
 // W8A8 预填充的入口：下一个消费者是 int8 GEMM，它要 int8 激活加每行一个 fp32 scale。
