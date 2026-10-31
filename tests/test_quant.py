@@ -1,25 +1,22 @@
-"""Weight-format quality: does fp16 storage or int8 quantisation change the model?
+"""权重格式的精度账：换成 fp16 存储或压成 int8，模型的答案会不会被挪动。
 
-Module: ``coffin/tests``. Loads two differently-quantised models through
-``support.ModelFixture``, so it must run alone or last: two 4B models plus KV do
-not fit on the card at once.
+Module: ``coffin/tests``。经 ``support.ModelFixture`` 先后加载两个量化方式不同的
+模型，所以必须单独跑或放到最后：两张 4B 模型的权重加 KV 同时驻留，一张卡放不下。
 
 Constraints:
-    * Teacher forcing, never free-running generation: any perturbation flips one
-      argmax eventually and the two continuations then describe different (both
-      valid) text, so free-running equality is not a property of correctness.
-    * Both models must see the same ground-truth prefix; that is what makes the
-      top-1 agreement and the perplexity of the true next token comparable.
-    * A non-finite logprob is a failure even when the agreement looks fine:
-      fp16 has a narrower exponent than bf16, so the risk of the format is range
-      overflow, and an inf would corrupt the perplexity rather than flag itself.
+    * 一律 teacher forcing，绝不放任自由生成：任何扰动迟早会翻转一个 argmax，
+      之后两条续写给出的是两份不同（但都合法）的文本，所以自由生成的逐 token
+      相等不是正确性该有的性质。
+    * 两个模型必须吃同一段真实前缀，top-1 一致率和真实下一个 token 的困惑度
+      才可比。
+    * logprob 只要不是有限值就算失败，哪怕一致率看着很好：fp16 的指数位比 bf16
+      窄，这个格式真正的风险是范围溢出，一个 inf 会污染困惑度而不是把自己报出来。
 
-Port of ``diag/check_int8.py``, ``diag/check_int8_ppl.py`` and
-``diag/check_f16_ppl.py`` (accuracy halves; the speed halves stay in the probes).
-The documented measurements are:
+移植自 ``diag/check_int8.py``、``diag/check_int8_ppl.py`` 和
+``diag/check_f16_ppl.py``（只保留精度那一半，速度那一半留在探针里）。实测数字：
 
-* fp16 vs bf16 weights: 98.5% (130/132) top-1 agreement, ppl 5.108 vs 5.113;
-* int8 (W8A16) vs fp16: 96.2% (127/132) agreement, ppl +0.29%.
+* fp16 对 bf16 权重：top-1 一致率 98.5%（130/132），ppl 5.108 对 5.113；
+* int8（W8A16）对 fp16：一致率 96.2%（127/132），ppl +0.29%。
 """
 
 from __future__ import annotations
@@ -48,25 +45,24 @@ TEXT = (
 
 @functools.lru_cache(maxsize=1)
 def _text_ids() -> list[int]:
-    """Tokenise the fixed passage once; a per-test tokenisation could differ by a merge."""
+    """把固定段落只分词一次；逐用例重新分词可能落在不同的 merge 上。"""
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(str(support.MODEL_DIR))
     return tok.encode(TEXT)
 
 
 def _teacher_forced(ids: list[int], *, quant: bool, weight_dtype=None):
-    """Logprob of the true next token and the top-1 pick, position by position.
+    """逐位置给出真实下一个 token 的 logprob 与模型自己的 top-1 选择。
 
     Args:
-        ids: Ground-truth token ids both models are fed.
-        quant: Load the model with INT8 weights.
-        weight_dtype: Override the storage dtype; ``None`` keeps the checkpoint's.
+        ids: 两个模型共同吃进的真实 token id。
+        quant: 以 INT8 权重加载模型。
+        weight_dtype: 覆盖存储 dtype；``None`` 沿用 checkpoint 自带的。
 
     Returns:
-        ``(logprobs, top1)``. ``logprobs[i]`` is the log-softmax of the token that
-        actually comes next, ``top1[i]`` the model's own argmax at that position,
-        so comparing the two across formats separates "stored differently" from
-        "predicts differently".
+        ``(logprobs, top1)``。``logprobs[i]`` 是真正下一个 token 的 log-softmax，
+        ``top1[i]`` 是该位置上模型自己的 argmax；两者配合即可把「存得不一样」和
+        「预测得不一样」分开。
     """
     model = support.ModelFixture.get(quant=quant, max_seq=1024,
                                      weight_dtype=weight_dtype)
@@ -85,23 +81,23 @@ def _teacher_forced(ids: list[int], *, quant: bool, weight_dtype=None):
 
 
 def _report(lp: torch.Tensor) -> tuple[float, float]:
-    """``(mean negative log-likelihood, perplexity)`` over the scored positions."""
+    """打分位置上返回 ``(平均负对数似然, 困惑度)``。"""
     nll = -lp.mean().item()
     return nll, math.exp(nll)
 
 
 @support.needs_model
 class WeightFormatQualityTest(unittest.TestCase):
-    """The fp16/int8 storage choices must not move the model's answers."""
+    """fp16 与 int8 的存储选择不得改变模型给出的答案。"""
 
     def test_fp16_weights_match_bf16_quality(self):
-        """fp16 stores weights for speed and halves the bytes; it may not change which token the model picks."""
+        """fp16 存储省一半字节、换来更快的读取，但它不许改变模型选哪个 token。"""
         ids = _text_ids()
         lp16, top16 = _teacher_forced(ids, quant=False, weight_dtype=torch.float16)
         lpbf, topbf = _teacher_forced(ids, quant=False, weight_dtype=torch.bfloat16)
 
-        # fp16 has more mantissa bits but a narrower exponent; the risk is range,
-        # so a non-finite logprob is a failure even if the agreement looks fine.
+        # fp16 的尾数位比 bf16 多，指数位却更窄；风险在取值范围上，所以 logprob
+        # 一旦非有限就判失败，哪怕一致率看着没问题。
         self.assertTrue(torch.isfinite(lp16).all(), "fp16 weights produced non-finite logprob")
         self.assertTrue(torch.isfinite(lpbf).all(), "bf16 weights produced non-finite logprob")
 
@@ -109,17 +105,17 @@ class WeightFormatQualityTest(unittest.TestCase):
         _, ppl16 = _report(lp16)
         _, pplbf = _report(lpbf)
         self.assertEqual(tuple(lp16.shape), tuple(lpbf.shape))
-        # Measured 98.5%; 95% leaves room for a different prompt/seed.
+        # 实测 98.5%；门槛压到 95% 是给换 prompt 或换 seed 留余量。
         self.assertGreater(agree, 0.95,
                            f"fp16 vs bf16 top-1 agreement {agree:.1%} ({(top16 == topbf).sum()}/{len(ids) - 5})")
-        # Measured 5.108 vs 5.113 (penny-level difference).
+        # 实测 5.108 对 5.113，差异小到可以忽略。
         self.assertLess(abs(ppl16 / pplbf - 1.0), 0.02,
                         f"fp16 ppl {ppl16:.3f} vs bf16 {pplbf:.3f}")
 
     def test_int8_weights_keep_quality(self):
-        """INT8 is the serve default, so its error budget is a product decision: it must stay inside the measured drift."""
+        """INT8 是服务默认格式，误差预算因此是产品决策：漂移必须停在实测水平以内。"""
         ids = _text_ids()
-        # fp16 is the production reference (WG weights), int8 is the serve default.
+        # 线上参照是 fp16（WG 权重），INT8 量化才是服务默认。
         lp16, top16 = _teacher_forced(ids, quant=False, weight_dtype=torch.float16)
         lp8, top8 = _teacher_forced(ids, quant=True)
 
@@ -128,9 +124,9 @@ class WeightFormatQualityTest(unittest.TestCase):
         _, ppl16 = _report(lp16)
         _, ppl8 = _report(lp8)
         self.assertEqual(tuple(lp8.shape), tuple(lp16.shape))
-        # Measured 96.2% (127/132); per-row W8 is coarse, so keep the bar at 90%.
+        # 实测 96.2%（127/132）；按行做的 W8 粒度粗，所以门槛只压在 90%。
         self.assertGreater(agree, 0.90,
                            f"int8 vs fp16 top-1 agreement {agree:.1%}")
-        # Measured +0.29%; 2% catches a real quantisation regression.
+        # 实测 +0.29%；2% 的窗口足够抓住真正的量化回归。
         self.assertLess(abs(ppl8 / ppl16 - 1.0), 0.02,
                         f"int8 ppl {ppl8:.3f} vs fp16 {ppl16:.3f}")

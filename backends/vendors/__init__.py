@@ -1,48 +1,41 @@
-"""Vendor backend declarations: one module per platform, discovered by filename.
+"""厂商后端声明：一个平台一个模块，按文件名发现。
 
-Module: ``coffin/backends/vendors``. A namespace of declarations, not code: each module
-here defines one ``SPEC`` and imports nothing but ``backends.vendor``. The loader is
-:mod:`coffin.backends.discovery`; the consumer is :mod:`coffin.backends.registry`. A
-vendor module may never import ``coffin/ops``, ``models``, ``engine``, ``serving`` or
-``cache``.
+Module: ``coffin/backends/vendors``。这里是一堆声明而不是代码：每个模块定义一份
+``SPEC``，且只 import ``backends.vendor``。加载器是
+:mod:`coffin.backends.discovery`，使用方是 :mod:`coffin.backends.registry`。厂商模块
+永远不得 import ``coffin/ops``、``models``、``engine``、``serving`` 或 ``cache``。
 
-Drop ``<name>.py`` (or ``<name>/__init__.py`` once it needs a ``kernels/`` directory) in
-here, define a module-level ``SPEC`` (:class:`coffin.backends.vendor.VendorSpec`), and
-the platform is selectable by ``COFFIN_BACKEND=<name>``. No other file changes.
+把 ``<name>.py``（等它需要 ``kernels/`` 目录时改成 ``<name>/__init__.py``）丢进来，
+定义一个模块级 ``SPEC``（:class:`coffin.backends.vendor.VendorSpec`），平台就能用
+``COFFIN_BACKEND=<name>`` 选中。别的文件都不用改。
 
-What a vendor file must satisfy
--------------------------------
-* **Import anywhere.** Importing it must work on a host that has never seen the
-  hardware: no vendor runtime at module scope, no build, no allocation. The registry
-  imports every vendor to ask whether it matches.
-* **Declare, do not measure.** Capability values are expectations. A datasheet number
-  belongs in ``notes`` until a probe has actually produced it, because a declared flag
-  is indistinguishable from a measured one downstream.
-* **Start from the reference.** ``build_ops`` may return a partial table; the resolver
-  fills every remaining op. A vendor with one kernel is a working backend.
-* **Do not claim what is not proven.** Leave ``has_kernels=False`` until kernels run.
-  A placeholder is still discovered, still resolvable by name, and still reported by
-  ``describe_all`` -- it is just never auto-selected.
+厂商文件必须满足什么
 
-The platforms this engine is aimed at
--------------------------------------
-They differ in a way the seam has to absorb, which is why detection returns a claim
-strength rather than a boolean:
+* **在任何地方都能 import。** 在从未见过该硬件的主机上 import 也必须成功：模块作用域
+  不碰厂商运行时、不编译、不分配。registry 会 import 每一个厂商来问它是否匹配。
+* **声明，不要实测。** 能力值是预期。数据手册上的数字在探测真正产出它之前只属于
+  ``notes``，因为下游分不清一个声明出来的标志和一个实测出来的标志。
+* **从参考实现起步。** ``build_ops`` 可以返回部分表，解析器会补齐其余每个算子。只有
+  一个内核的厂商也是一个可用的后端。
+* **不要声明未经证明的东西。** 内核能跑之前让 ``has_kernels=False`` 待着。占位实现
+  照样会被发现、照样能按名字解析、照样由 ``describe_all`` 报出来——只是永远不会被
+  自动选中。
 
-==============  ==============  ================================================
-platform        torch space     how a backend recognises it
-==============  ==============  ================================================
-Hygon DCU       cuda            ROCm build marker (hand-written, backends/hip)
-Iluvatar        cuda            device name -- the namespace is shared, so the
-                                name is the only discriminator
-Enflame         gcu             the namespace itself is unique to the vendor
-Moore Threads   musa            the namespace itself is unique to the vendor
-==============  ==============  ================================================
+本引擎瞄准的平台
+
+它们的差异是这条接缝必须吸收的，所以检测返回的是认领强度而不是布尔值：
+
+================  ==============  ==========================================
+平台              torch 命名空间  后端如何识别它
+================  ==============  ==========================================
+Hygon DCU         cuda            ROCm 构建标记（手写，backends/hip）
+Iluvatar          cuda            设备名——命名空间共享，名字是唯一区别依据
+Enflame           gcu             命名空间本身就为该厂商独有
+Moore Threads     musa            命名空间本身就为该厂商独有
+================  ==============  ==========================================
 
 Constraints:
-    * A vendor module's name is the backend name: ``vendors/foo.py`` is selected by
-      ``COFFIN_BACKEND=foo``. Renaming the file renames the backend, so pick the name
-      that matches the vendor, not the product line.
-    * A leading underscore excludes a module from discovery, which is what an
-      in-progress vendor should be called until it is real.
+    * 厂商模块的文件名就是后端名：``vendors/foo.py`` 由 ``COFFIN_BACKEND=foo`` 选中。
+      改文件名就是改后端名，所以选与厂商匹配的名字，而不是产品线名。
+    * 前导下划线让模块被排除在发现之外，一个还在开发中的厂商就该先这么命名。
 """

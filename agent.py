@@ -1,31 +1,27 @@
-"""Tool-calling agent loop against the persistent engine server.
+"""面向常驻引擎服务端的工具调用 agent 循环。
 
-The server answers one assistant turn (``chat``); this client runs whatever tools
-the model asked for and feeds the results back until it stops calling tools or the
-round budget is exhausted.
+服务端应答一个 assistant 回合（``chat``）；这个客户端执行模型要求的所有工具、
+把结果喂回去，直到模型不再调用工具或者轮次预算耗尽。
 
     python agent.py --user "Beijing weather? Also 12 times 8" --tools tools_demo.json
     python agent.py --user "..." --tools tools.json --exec my_tools.py
 
-A tool module exposes ``execute(name, args) -> result``. Without ``--exec`` a small
-built-in weather/multiply executor is used so the loop runs out of the box.
+工具模块暴露 ``execute(name, args) -> result``。不给 ``--exec`` 时用一个内置的
+天气/乘法小执行器，循环开箱即可跑。
 
-Module: ``coffin/agent.py``. Top of the import graph: it imports the resident
-socket transport and its default socket path, and nothing imports it back.
-``utils.tool_call`` and ``run_chat.py`` are separate entry points.
+Module: ``coffin/agent.py``。导入图的最顶层：它导入常驻的 socket 传输及其默认
+socket 路径，没有东西反向导入它。``utils.tool_call`` 和 ``run_chat.py`` 是各自
+独立的入口。
 
 Constraints:
-    * The loop must echo the model's own call structure back, not the parsed
-      ``ToolCall`` objects. The chat template renders ``content`` *and*
-      ``tool_calls`` from the message dict, so it needs ``arguments`` as a dict
-      (it iterates them with ``|items``) while the wire format carries a JSON
-      string.
-    * The natural-language lead-in has to be truncated at ``<tool_call>``: the
-      template re-renders the calls from the structure, and keeping the raw tags
-      in ``content`` would render every call twice.
-    * Every turn is one request/response on the socket; this client holds no
-      engine state, so it can be killed between rounds without leaking a
-      sequence.
+    * 循环必须把模型自己的调用结构原样回显，而不是解析出来的 ``ToolCall`` 对象。
+      chat 模板会从消息字典里同时渲染 ``content`` *和* ``tool_calls``，所以它需要
+      ``arguments`` 是个字典（模板用 ``|items`` 迭代它），而线上格式携带的是
+      JSON 字符串。
+    * 自然语言引子必须在 ``<tool_call>`` 处截断：模板会从结构重新渲染调用，把原始
+      标签留在 ``content`` 里会让每个调用渲染两遍。
+    * 每个回合一进一出走 socket；这个客户端不持有引擎状态，所以轮次之间被杀掉也不会
+      泄漏序列。
 """
 
 from __future__ import annotations
@@ -38,23 +34,23 @@ from pathlib import Path
 from serving.runtime_support import SOCK
 from serving.runtime_transport import call
 
-#: Reusing the runtime default keeps the agent and server on one socket path.
+#: 复用运行时的默认值，agent 和服务端因此落在同一条 socket 路径上。
 
 
 def _builtin(name: str, args: dict):
-    """Stand-in executor so the loop has something to call on a fresh checkout.
+    """占位执行器，让刚 clone 下来的仓库里循环也有东西可调。
 
-    It is deliberately trivial: it exists to show the loop's shape, not to be a
-    useful tool, and ``--exec`` replaces it.
+    它刻意做得很简单：存在的目的是展示循环的形状，不是当
+    有用的工具；``--exec`` 会替换它。
 
     Args:
-        name: Tool name the model asked for.
-        args: Parsed arguments for that tool.
+        name: 模型请求的工具名。
+        args: 该工具解析后的参数。
 
     Returns:
-        A JSON-serialisable result, or an ``{"error": ...}`` dict for an unknown
-        name -- an error the model can read and recover from beats an exception
-        that ends the loop.
+        可 JSON 化的结果；未知工具名返回 ``{"error": ...}`` 字典——
+        一个模型能读到并从中恢复的错误，胜过直接终止循环的
+        异常。
     """
     if name == "get_weather":
         return {"city": args.get("city"), "temp": 24,
@@ -65,17 +61,15 @@ def _builtin(name: str, args: dict):
 
 
 def _load_executor(path: str):
-    """Import a user tool module and hand back its ``execute`` function.
+    """导入用户的工具模块，把它的 ``execute`` 函数交回来。
 
-    Loaded by path rather than by module name: the file is an arbitrary script
-    the user points at, so it is not on ``sys.path``.
+    按路径加载而不是按模块名：那文件是用户随手指定的脚本，不在 ``sys.path`` 上。
 
     Args:
-        path: Python file exposing ``execute(name, args)``.
+        path: 暴露 ``execute(name, args)`` 的 Python 文件。
 
     Returns:
-        The module's ``execute`` callable, unwrapped so the loop's call site
-        does not care where it came from.
+        模块的 ``execute`` 可调用对象，直接取出，循环的调用点不必关心它来自哪里。
     """
     spec = importlib.util.spec_from_file_location("agent_tools", path)
     mod = importlib.util.module_from_spec(spec)
@@ -84,14 +78,13 @@ def _load_executor(path: str):
 
 
 def main() -> None:
-    """Run the round loop: ask the server, execute the calls, feed results back.
+    """跑轮次循环：问服务端、执行调用、把结果喂回去。
 
-    The budget is a round count, not a token count: each round is one full
-    assistant turn plus its tool results, and a model that keeps calling tools
-    has to be stopped by something.
+    预算是轮次数而不是 token 数：一轮是一个完整的 assistant 回合加它的工具结果，
+    一直调工具的模型总得有个东西叫停。
 
     Raises:
-        OSError: No server is listening on ``--sock``; start the runtime CLI first.
+        OSError: ``--sock`` 上没人监听；先把运行时 CLI 起起来。
     """
     ap = argparse.ArgumentParser()
     ap.add_argument("--sock", default=SOCK)
@@ -123,10 +116,8 @@ def main() -> None:
         if not calls:
             break
 
-        # The template renders ``content`` *and* ``tool_calls``, so only the
-        # natural-language lead-in stays in ``content`` and the calls render from
-        # the structure. ``arguments`` must be a dict: the template iterates it
-        # with ``|items``.
+        # 模板会同时渲染 ``content`` *和* ``tool_calls``，所以 ``content`` 里只留自然
+        # 语言引子，调用由结构渲染。``arguments`` 必须是字典：模板用 ``|items`` 迭代它。
         lead = r["text"].split("<tool_call>")[0].strip()
         tcs = [{"function": {"name": c["function"]["name"],
                              "arguments": json.loads(c["function"]["arguments"])}}

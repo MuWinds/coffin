@@ -1,91 +1,82 @@
-"""3-D mRoPE: rotary tables for prompts that contain images.
+"""三维 mRoPE：给带图像 prompt 用的旋转表。
 
-Text-only mRoPE collapses to plain 1-D RoPE, which is why every decode path in
-this engine indexes a ``[max_seq, rotary_dim]`` 1-D table with the token index
-(``ops/rope.py``). A prompt with an image breaks that in two ways:
+纯文本 mRoPE 退化成普通一维 RoPE，所以本引擎的每条解码路径都用 token 下标
+去查 ``[max_seq, rotary_dim]`` 的一维表（``ops/rope.py``）。带图像的 prompt
+从两方面打破这个前提：
 
-* the image's tokens are laid out in a 2-D (H, W) merged grid, so the three
-  position axes (T, H, W) differ *inside* the image -- one table lookup cannot
-  express that;
-* after the image the image block ended at ``current_pos + max(h, w) / merge``
-  while only ``h*w/merge**2`` tokens were consumed, so from then on the mRoPE
-  position is ``token_index + rope_delta`` with a constant, negative
-  ``rope_delta`` (:attr:`mm_input.MMInput.rope_delta`).
+* 图像那些 token 排在二维 (H, W) 的合并网格里，于是三个位置轴 (T, H, W)
+  *在图像内部*各不相同——一次查表表达不了；
+* 图像之后，图像块结束于 ``current_pos + max(h, w) / merge``，而实际只消耗了
+  ``h*w/merge**2`` 个 token，所以此后 mRoPE 位置是 ``token_index + rope_delta``，
+  ``rope_delta`` 是一个恒定的负数（:attr:`mm_input.MMInput.rope_delta`）。
 
-So there are exactly two things here:
+所以这里只有两件事：
 
-* :func:`mrope_cos_sin` -- the interleaved 3-axis composition (the layout
-  ``mrope_interleaved=true`` in the checkpoint means, and the only one
-  ``Qwen3_5TextRotaryEmbedding`` implements). Half the frequencies come from T,
-  then H and W alternate in, so ``i % 3 == 0 -> T``, ``1 -> H``, ``2 -> W``.
-  ``cos`` is finally ``cat(half, half)`` -- the *same* layout the 1-D table uses,
-  so ``rotate_half`` pairs ``i`` with ``i + rotary_dim/2`` and a text-only prompt
-  yields bit-identical rows to ``ops.rope.make_rope_tables``;
-* :func:`scatter_image_embeds` -- the pure-tensor splice that puts the tower's
-  embeddings into a prefill chunk's token embeddings at *absolute* prompt indices.
+* :func:`mrope_cos_sin`——交错的三轴合成（也就是 checkpoint 里
+  ``mrope_interleaved=true`` 的含义，也是 ``Qwen3_5TextRotaryEmbedding``
+  唯一实现的那种布局）。一半频率来自 T，然后 H 和 W 交替插入，于是
+  ``i % 3 == 0 -> T``、``1 -> H``、``2 -> W``。``cos`` 最终仍是
+  ``cat(half, half)``——和一维表*相同的*布局，所以 ``rotate_half`` 把 ``i``
+  与 ``i + rotary_dim/2`` 配对，纯文本 prompt 得到的行与
+  ``ops.rope.make_rope_tables`` 逐位相同；
+* :func:`scatter_image_embeds`——纯张量拼接，把视觉塔的嵌入按*绝对* prompt
+  下标写进一个预填充分块的 token 嵌入里。
 
-The positions themselves (``[3, prompt_len]`` + ``rope_delta``) come from
-:func:`mm_input.mrope_positions`, the integration surface;
-``tests/test_mrope.py`` asserts that helper element-wise against the reference
-``get_rope_index``, so this module can stay a pure "given positions, make angles"
-layer.
+位置本身（``[3, prompt_len]`` 加 ``rope_delta``）来自集成面
+:func:`mm_input.mrope_positions`；``tests/test_mrope.py`` 拿它和参考实现的
+``get_rope_index`` 逐元素比对，本模块因此可以只做「给位置、出角度」这一层。
 
-Decode never comes through here: after prefill the three axes advance together,
-so ``pos + rope_delta`` indexes the 1-D table and the captured graphs stay
-captured.
+解码永远不经过这里：预填充之后三个轴同步前进，``pos + rope_delta`` 直接查
+一维表，capture 过的图也保持 capture 状态。
 
-Module: ``coffin/ops``. Depends on ``ops/rope`` for the shared frequency axis;
-used by ``models/qwen35/model.py`` when a prefill chunk carries image embeds.
+Module: ``coffin/ops``。依赖 ``ops/rope`` 的共用频率轴；当某个预填充分块
+携带图像嵌入时被 ``models/qwen35/model.py`` 调用。
 
 Constraints:
-    * The stride-3 interleave and the 11/11/10 section split are fixed by the
-      checkpoint's ``rope_parameters``; recomputing them differently changes the
-      angles of image tokens only, which is easy to miss in a numeric test.
-    * ``cos``/``sin`` must keep the ``cat(half, half)`` layout so ``rotate_half``
-      pairs the same frequencies as the 1-D path.
-    * ``scatter_image_embeds`` mutates ``x`` in place: the caller owns that
-      buffer, and returning a copy instead would break the caller's aliasing
-      assumptions.
+    * 步长 3 的交错和 11/11/10 的分段由 checkpoint 的 ``rope_parameters``
+      固定；用别的方式重算只会改变图像 token 的角度，数值测试很容易漏掉。
+    * ``cos``/``sin`` 必须保持 ``cat(half, half)`` 布局，``rotate_half`` 才会
+      配到和一维路径相同的频率。
+    * ``scatter_image_embeds`` 就地改写 ``x``：缓冲区归调用方所有，改成返回
+      副本会破坏调用方的别名假设。
 """
 
 from __future__ import annotations
 
 import torch
 
-#: ``rope_parameters.mrope_section`` of Qwen3.5: 11/11/10, summing to
-#: ``rotary_dim/2 = 32`` (the H/W sections are 11 and 10 because T takes the
-#: multiples of three, i.e. 11 of the 32 frequencies).
+#: Qwen3.5 的 ``rope_parameters.mrope_section``：11/11/10，合计
+#: ``rotary_dim/2 = 32``（H 是 11、W 是 10，因为 T 拿走三的倍数，即 32 个
+#: 频率里的 11 个）。
 MROPE_SECTION = (11, 11, 10)
 
 
 def mrope_cos_sin(positions: torch.Tensor, inv_freq: torch.Tensor,
                   mrope_section: tuple[int, int, int] = MROPE_SECTION
                   ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compose ``[3, C]`` position axes into per-token cos/sin for image prompts.
+    """把 ``[3, C]`` 的位置轴合成为图像 prompt 的逐 token cos/sin。
 
-    The composition is the reference one: T fills every frequency, then H
-    overwrites ``slice(1, 3*section_h, 3)`` and W ``slice(2, 3*section_w, 3)`` --
-    a stride-3 interleave in which frequency ``i`` comes from axis ``i % 3``
-    (T, H, W, ...), H reaching index 31 and W index 29. Duplicating the 32
-    composed angles to 64 is what makes the partial-rotary ``rotate_half`` pairs
-    match the 1-D table exactly.
+    合成方式和参考实现一致：T 填满所有频率，然后 H 覆写
+    ``slice(1, 3*section_h, 3)``、W 覆写 ``slice(2, 3*section_w, 3)``——步长 3
+    的交错，频率 ``i`` 取自轴 ``i % 3``（T、H、W…），H 能到下标 31、W 到 29。
+    把 32 个合成角度复制成 64，部分旋转的 ``rotate_half`` 配对才与一维表
+    完全一致。
 
     Args:
-        positions: Position axes, ``[3, C]`` with rows T, H, W; a single
-            position triple as ``[3]`` is accepted too.
-        inv_freq: ``[half]`` fp32 frequency axis from
-            :func:`ops.rope.make_inv_freq`. Passing that shared axis is what
-            keeps a text-only prompt bit-identical to the 1-D table path.
-        mrope_section: Frequencies per axis, summing to ``half``.
+        positions: 位置轴，``[3, C]``，行依次是 T、H、W；也接受单个位置三元组
+            ``[3]``。
+        inv_freq: 来自 :func:`ops.rope.make_inv_freq` 的 ``[half]`` fp32 频率轴。
+            传共用轴才能让纯文本 prompt 与一维表路径逐位相同。
+        mrope_section: 每根轴占的频率数，合计为 ``half``。
 
     Returns:
-        ``(cos, sin)``, each ``[C, 2*half]`` with the duplicated half layout.
+        ``(cos, sin)``，各自 ``[C, 2*half]``，采用复制半区的布局。
     """
     pos = positions
-    if pos.dim() == 1:                      # a single position triple
+    if pos.dim() == 1:                      # 单个位置三元组
         pos = pos.reshape(3, 1)
     freqs = pos.to(torch.float32)[..., None] * inv_freq.to(pos.device)
-    # freqs: [3, C, half]; T is the base, H/W overwrite their interleaved slots.
+    # freqs: [3, C, half]；T 是底，H/W 覆写各自交错的位置。
     out = freqs[0].clone()
     for dim, offset in ((1, 1), (2, 2)):
         length = mrope_section[dim] * 3
@@ -97,26 +88,25 @@ def mrope_cos_sin(positions: torch.Tensor, inv_freq: torch.Tensor,
 
 def scatter_image_embeds(x: torch.Tensor, embeds: torch.Tensor,
                          spans: list[tuple[int, int]], start: int, end: int) -> torch.Tensor:
-    """Overwrite one prefill chunk's image rows with the vision tower's embeddings.
+    """用视觉塔的嵌入覆写某个预填充分块的图像行。
 
-    Only the overlap of each span with the chunk is copied, and the offset into
-    ``embeds`` is the span's own position in the concatenation -- so a chunk that
-    starts or ends inside an image gets exactly its own rows, which is what makes
-    chunked prefill, and a cached prefix boundary, work unchanged.
+    每个 span 与分块的重叠部分才会被拷贝，而写进 ``embeds`` 的偏移是 span 在
+    拼接结果里的自身位置——于是在图像中间开始或结束的分块正好拿到属于它的
+    那几行，分块预填充和命中缓存前缀的边界因此不用做任何特殊处理。
 
     Args:
-        x: The chunk's token embeddings, ``[C, hidden]``, covering the absolute
-            prompt positions ``[start, end)``. Mutated in place: the caller owns
-            this freshly gathered buffer, and copying would only duplicate it.
-        embeds: Every image's embeddings concatenated in prompt order.
-        spans: Absolute ``[s, e)`` token runs of those images, also in prompt
-            order, so the running offset into ``embeds`` stays aligned.
-        start: First absolute prompt position of the chunk, inclusive.
-        end: One past the last absolute prompt position of the chunk.
+        x: 分块的 token 嵌入，``[C, hidden]``，覆盖绝对 prompt 位置
+            ``[start, end)``。就地改写：这块刚 gather 出来的缓冲区归调用方
+            所有，拷贝一份只是多此一举。
+        embeds: 所有图像的嵌入按 prompt 顺序拼接。
+        spans: 这些图像的绝对 ``[s, e)`` token 区间，同样按 prompt 顺序，
+            这样写进 ``embeds`` 的游标偏移才对得上。
+        start: 分块的第一个绝对 prompt 位置（含）。
+        end: 分块最后一个绝对 prompt 位置的下一个。
 
     Returns:
-        ``x`` itself, for chaining. Unchanged when there is no image in the
-        chunk, which is the text-only fast path.
+        ``x`` 本身，便于链式调用。分块里没有图像时原样返回，那是纯文本的
+        快路径。
     """
     if embeds is None or not spans:
         return x

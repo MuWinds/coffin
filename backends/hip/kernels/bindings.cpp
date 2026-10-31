@@ -1,18 +1,14 @@
 // @file bindings.cpp
-// @brief pybind11 module definition: exposes the HIP kernels to ``hip_ops.py``.
+// @brief pybind11 模块定义：把 HIP 内核暴露给 ``hip_ops.py``。
 //
-// Module: coffin/kernels. The outermost layer of the extension, so it may include
-// ``hip_ops.h`` but must define nothing else; the names here are the Python API
-// surface the engine calls.
+// Module: coffin/kernels。扩展的最外层，所以可以 include ``hip_ops.h``，但不得再定义
+// 别的任何东西；这里出现的名字就是引擎调用的 Python API 面。
 //
 // Constraints:
-//   * The registered names are the Python side's contract (``hip_ops.py`` looks
-//     them up by string). Renaming one silently breaks the import until the
-//     Python caller is updated in the same commit.
-//   * The module name comes from ``TORCH_EXTENSION_NAME``: it is whatever the
-//     loader named the extension, so never hard-code it.
-//   * The doc strings are the only in-process API documentation; keep them short
-//     and about the shape contract, not the algorithm.
+//   * 注册的名字就是 Python 侧的契约（``hip_ops.py`` 按字符串查找它们）。改掉其中一个
+//     会在 Python 调用方同步更新之前悄悄弄坏 import。
+//   * 模块名来自 ``TORCH_EXTENSION_NAME``：那是加载器给扩展起的名字，绝不写死。
+//   * 文档字符串是本进程内唯一的 API 文档；保持简短，讲形状契约而不是算法。
 
 #include "hip_ops.h"
 

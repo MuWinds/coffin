@@ -1,16 +1,14 @@
-"""Resident inference runtime.
+"""常驻推理运行时。
 
-Module: ``coffin.serving``. This class provisions the model and delegates
-lifecycle, generation and chat behavior to focused mixins.
+Module: ``coffin.serving``。这个类负责把模型准备好，并把生命周期、生成和对话
+行为分派给各自专门的 mixin。
 
 Constraints:
-    * The model thread remains the only writer of engine state.
-    * The socket protocol stays line-oriented and unchanged.
-    * The device and the graph decision are the backend's, not this file's: the
-      only device-shaped read here is the free-VRAM guard below, and it has to
-      answer "unknown" rather than "zero" on a backend without the query, or the
-      guard would disable batched speculation on a host that never had a budget
-      problem.
+    * 模型线程始终是引擎状态的唯一写者。
+    * socket 协议保持按行，且不改变。
+    * 设备与图相关的决定归后端，不归本文件：这里唯一涉及设备的读取是下面的空闲
+      显存保护，而在没有该查询的后端上它必须回答「未知」而不是「0」，否则这段
+      保护会在一台从来没缺过预算的主机上把批投机关掉。
 """
 
 from __future__ import annotations
@@ -50,64 +48,57 @@ class Server(
                      image_max_pixels: int = 1048576, image_min_pixels: int = 65536,
                      max_images: int = 4, max_image_bytes: int = 8388608,
                      graph: bool = True, prefill_quantum: int = 2048) -> None:
-            """Load the checkpoint, freeze ``EngineConfig`` and build the engine.
+            """加载 checkpoint、定下 ``EngineConfig``，再把引擎建起来。
 
             Args:
-                model_dir: Checkpoint directory; its ``config.json`` picks the
-                    architecture and its tokenizer renders the chat template.
-                max_seq: Context window shared by prompt and output. The KV cache is
-                    allocated up front from this, so it is the dominant VRAM term.
-                bench: Keep the legacy single-stream bench path available.
-                spec_k: Drafts per speculative step, 0 to disable. Silently forced to
-                    0 when the prefix cache is on, because a snapshot does not carry
-                    the drafter's cache.
-                int8: Quantise the 2D weights to int8. The default because the 256k
-                    window and fp16 weights do not both fit in 16 GB.
-                prefix_cache: Enable the paged radix prefix cache.
-                block_size: KV block granularity in tokens; prefix reuse works at
-                    whole-block boundaries only.
-                snapshots: Recurrent-state snapshot budget, ~50 MB each.
-                snapshot_interval: Snapshot every N tokens, rounded to a block.
-                max_seconds: Wall-clock cap on one generation, 0 for none.
-                max_num_seqs: Rows in a batched decode step; 1 keeps the original
-                    single-stream engine.
-                num_blocks: KV pool size in blocks, 0 for
-                    ``max_seq / block_size * max_num_seqs``.
-                spec_batch: Speculate in the batched engine. Opt-in because its
-                    verify costs one weight pass per candidate token.
-                spec_sparse_k: Approximate batched verify: keep the top-k historical
-                    KV blocks per row. Implies ``spec_batch``.
-                spec_min_ctx: Only speculate in the batched engine past this many
-                    cached tokens, 0 to always.
-                vision: Load the checkpoint's vision tower when it has one.
-                vision_int8: Keep the tower's 2D weights int8, dequantised one GEMM
-                    at a time per request.
-                image_max_pixels: Largest image the processor serves; the real
-                    VRAM/latency knob, anything larger is downsampled.
-                image_min_pixels: Smallest image after the processor's upscale, so an
-                    image never costs fewer than 64 tokens.
-                max_images: Images accepted in one request.
-                max_image_bytes: Decoded bytes allowed per image.
-                graph: Capture the decode step into a device graph. The caller
-                    resolves the user's ``--no-graph`` against the backend's own
-                    ``caps.graph`` and passes the effective answer here, because
-                    the value has to reach the engine before ``build()`` captures;
-                    a backend that reports ``caps.graph=False`` stays eager no
-                    matter what was asked for.
-                prefill_quantum: Prompt tokens one request may prefill per step.
-                    With the scheduler's token budget this is what stops one long
-                    prompt from delaying every short request behind it; 0 means
-                    "one chunk may use the whole budget".
+                model_dir: checkpoint 目录；它的 ``config.json`` 决定架构，它的
+                    分词器负责渲染对话模板。
+                max_seq: prompt 和输出共享的上下文窗口。KV 缓存按它预先分配，所以
+                    它是最大的一项显存开销。
+                bench: 保留旧的单流 bench 路径可用。
+                spec_k: 每个投机步的草稿数，0 表示关闭。前缀缓存开着时会被静默
+                    改成 0，因为快照不携带草稿模型的缓存。
+                int8: 把二维权重量化成 int8。作为默认值，是因为 256k 窗口和
+                    fp16 权重没法同时塞进 16 GB。
+                prefix_cache: 启用分页基数前缀缓存。
+                block_size: KV 块的 token 粒度；前缀复用只在整块边界上生效。
+                snapshots: 循环状态快照预算，每份约 50 MB。
+                snapshot_interval: 每 N 个 token 打一次快照，取整到块。
+                max_seconds: 一次生成的墙钟上限，0 表示不限。
+                max_num_seqs: 批解码步里的行数；1 就是原来的单流引擎。
+                num_blocks: KV 池的块数，0 表示用
+                    ``max_seq / block_size * max_num_seqs``。
+                spec_batch: 在批处理引擎里投机。要显式打开，因为它的验证每个候选
+                    token 都要过一遍权重。
+                spec_sparse_k: 近似的批验证：每行只保留历史 KV 块里的 top-k。
+                    隐含 ``spec_batch``。
+                spec_min_ctx: 缓存 token 数超过它才在批处理引擎里投机，0 表示总是。
+                vision: checkpoint 有视觉塔时加载它。
+                vision_int8: 视觉塔的二维权重保持 int8，每个请求一次反量化一个
+                    GEMM。
+                image_max_pixels: 处理器服务的最大图像；真正影响显存和延迟的开关，
+                    更大的都会被降采样。
+                image_min_pixels: 处理器放大之后的最小图像，一张图因此最少也要
+                    64 个 token。
+                max_images: 一个请求接受的图像数。
+                max_image_bytes: 单张图像允许的解码字节数。
+                graph: 把解码步 capture 成设备图。调用方会拿用户的 ``--no-graph``
+                    和后端自己的 ``caps.graph`` 算出实际结论再传进来，因为这个值
+                    必须在 ``build()`` capture 之前到达引擎；报告
+                    ``caps.graph=False`` 的后端，不管要什么都是 eager。
+                prefill_quantum: 一个请求每步最多预填充多少 prompt token。配合
+                    调度器的 token 预算，它才挡住一个长 prompt 把后面每个短请求
+                    都拖慢；0 表示「一个分块可以用掉整份预算」。
 
             Raises:
-                RuntimeError: The checkpoint's ``config.json`` names no registered
-                    architecture, or the weights do not load. Both are startup
-                    failures: fix the ``--model`` path, do not retry in a loop.
+                RuntimeError: checkpoint 的 ``config.json`` 没有点名任何已登记的
+                    架构，或者权重加载不起来。两者都是启动期故障：去修
+                    ``--model`` 路径，不要在循环里重试。
             """
             from transformers import AutoTokenizer
 
             self.model_dir = model_dir
-            # what this server is serving, for the startup log and ``ping``
+            # 这个服务在服务什么，供启动日志和 ``ping`` 使用
             self.info = engine_api.describe(model_dir)
             self.max_seq = max_seq
             self.bench = bench
@@ -117,35 +108,32 @@ class Server(
             self.block_size = block_size
             self.snapshots = snapshots
             self.snapshot_interval = snapshot_interval
-            # hard wall-clock cap per generation (0 = none); a request may lower it
+            # 每次生成的硬墙钟上限（0 = 不限）；单个请求可以把它调低
             self.max_seconds = float(max_seconds)
-            #: Effective graph decision: the caller's request ANDed with what the
-            #: backend can capture. A backend that cannot replay a graph would
-            #: silently produce stale outputs, so the capability wins over the flag.
+            #: 实际的图决定：调用方的要求与后端能 capture 的能力取与。不能回放图
+            #: 的后端会静默产出过期输出，所以能力优先于开关。
             self.graph = bool(graph) and bool(backends.caps().graph)
             self.pc = None
             self.n_req = 0
             self.n_reload = 0
 
-            # images
+            # 图像相关
             self.vision = bool(vision)
             self.vision_int8 = bool(vision_int8)
             self.image_max_pixels = int(image_max_pixels)
             self.image_min_pixels = int(image_min_pixels)
             self.max_images = int(max_images)
             self.max_image_bytes = int(max_image_bytes)
-            #: The checkpoint's own processor (``Qwen3VLProcessor``: image processor +
-            #: tokenizer). Loaded lazily on the first image request, not at startup:
-            #: it costs ~2 s and text-only serving must not pay it -- and a text-only
-            #: container that never sees an image never needs transformers' image
-            #: stack at all. ``_processor_failed`` remembers a load failure so a
-            #: broken checkpoint does not retry (and stall) on every request.
+            #: checkpoint 自带的处理器（``Qwen3VLProcessor``：图像处理器 + 分词器）。
+            #: 第一次带图请求时才加载，不在启动时：它要花约 2 s，纯文本服务不该为
+            #: 它付钱——而且一个从没见过图像的纯文本容器压根不需要 transformers
+            #: 的图像栈。``_processor_failed`` 记住加载失败，坏掉的 checkpoint
+            #: 因此不会在每个请求上重试并卡住。
             self.processor = None
             self._processor_failed: str | None = None
             self.n_image_req = 0
-            #: One engine thread drives every forward pass; connections submit
-            #: requests and drain a per-request queue, so several can be in flight at
-            #: once and the scheduler batches their decode steps.
+            #: 所有前向都由唯一的引擎线程驱动；各连接只提交请求并排空各自队列，
+            #: 所以可以同时有多个请求在飞，由调度器把它们解码步凑成批。
             self._lock = threading.RLock()
             self._cv = threading.Condition(self._lock)
             self._outputs: dict[int, "queue.Queue"] = {}
@@ -153,30 +141,26 @@ class Server(
             self._paused = False
             self._loop_thread: threading.Thread | None = None
             batched = max(1, int(max_num_seqs)) > 1
-            #: Batched speculation is opted into separately: its verify costs one
-            #: weight pass per candidate token, so it is slower than a plain batched
-            #: decode step on this card even though the output is identical.
+            #: 批投机需要单独选择开启：它的验证对每个候选 token 都要过一遍权重，
+            #: 所以在这张卡上比普通批解码步还慢，尽管输出完全一致。
             self.spec_batch = bool((spec_batch or spec_sparse_k > 0) and batched)
             self.spec_sparse_k = int(spec_sparse_k) if self.spec_batch else 0
             self.spec_min_ctx = int(spec_min_ctx)
             if prefix_cache and spec_k and not self.spec_batch:
-                # A prefix snapshot does not carry the MTP drafter's cache, so a hit
-                # would leave the drafter with a stale context (the output stays
-                # exact, the acceptance rate drops). Rather than silently degrade,
-                # spec stays off while the prefix cache is on.
+                # 前缀快照不携带 MTP 草稿模型的缓存，命中之后草稿模型看到的是过期
+                # 上下文（输出仍然精确，接受率下降）。与其静默降级，不如在前缀缓存
+                # 开着时把投机关掉。
                 print("[serve] --spec-k is ignored while the prefix cache is on")
                 self.spec_k = 0
             if spec_k and batched and not self.spec_batch:
                 print("[serve] batched speculation is off; pass --spec-batch to enable it "
                       "(measured 0.79x plain batch decode on this card)")
             if spec_k and not self.graph:
-                # Both the decode step and the verify step are graph replays; with
-                # capture off there is nothing to replay, so speculation would
-                # raise at the first step. Say so instead of failing mid-request.
+                # 解码步和验证步都是图回放；关了 capture 就没有可回放的东西，投机
+                # 会在第一步就抛异常。与其让请求跑到一半才失败，不如现在说清楚。
                 print("[serve] --spec-k is ignored with graph capture off")
                 self.spec_k = 0
-            #: The single source of truth for engine knobs; the LLM engine, its
-            #: scheduler and its runner all read from it.
+            #: 引擎开关的唯一事实来源；LLM 引擎、它的调度器和 runner 都从这里读。
             blocks = int(num_blocks) if num_blocks else (max_seq // block_size) * max(1, max_num_seqs)
             self.cfg = EngineConfig(
                 model_dir=model_dir, max_seq=max_seq, bench=bench, quant=int8,
@@ -188,26 +172,25 @@ class Server(
                 spec_min_ctx=self.spec_min_ctx,
                 max_seconds=self.max_seconds,
                 max_num_seqs=max(1, int(max_num_seqs)),
-                # 0 means "no separate cap": one chunk may use the whole step
-                # budget, which is the pre-chunking behaviour.
+                # 0 表示「不另设上限」：一个分块可以用掉整步预算，也就是分块之前的
+                # 行为。
                 prefill_quantum=(int(prefill_quantum) if prefill_quantum > 0
                                  else EngineConfig.__dataclass_fields__[
                                      "max_num_batched_tokens"].default),
                 graph=self.graph)
             t0 = time.time()
-            # stays resident; int8 halves it (4.0 GiB instead of 8.1), which is what
-            # leaves room for a long-context KV cache on a 16 GB card
+            # 常驻不释放；int8 把它减半（4.0 GiB 而不是 8.1），16 GB 的卡上才腾得出
+            # 空间放下长上下文 KV 缓存
             self.weights = engine_api.load_weights(
                 model_dir, quant=int8, **self._load_weight_kwargs())
             self.load_s = time.time() - t0
             self.tok = AutoTokenizer.from_pretrained(model_dir)
             self.eos = _eos_ids(self.tok)
             if self.cfg.spec_k and self.cfg.spec_batch:
-                # Batched MTP adds ~1.25 GiB of rollback snapshots plus the drafter's
-                # paged KV; refuse it up front rather than OOM inside capture. A
-                # backend that cannot report free memory answers -1, which must not
-                # read as "0 bytes free" -- that would disable the feature on a host
-                # that has the budget.
+                # 批 MTP 要多占约 1.25 GiB 的回滚快照加上草稿模型的分页 KV；宁可
+                # 在这里提前拒绝，也不要到 capture 里面才 OOM。报告不了空闲显存的
+                # 后端回答 -1，这个值绝不能读成「空闲 0 字节」——那会把一个预算充足的
+                # 主机上的功能关掉。
                 free = free_bytes()
                 if 0 <= free < 1.5 * 2**30:
                     print(f"[serve] --spec-batch disabled: only {free / 2**30:.2f} GiB free "

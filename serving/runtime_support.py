@@ -1,17 +1,16 @@
-"""Shared runtime constants, device-runtime shims and multimodal validation helpers.
+"""运行时共享常量、设备运行时垫片和多模态校验辅助。
 
-Module: ``coffin.serving``. This module has no engine lifecycle state; it only
-contains process defaults, the device-runtime accessors every mixin shares, and
-image validation used by the runtime mixins.
+Module: ``coffin.serving``。本模块不持有任何引擎生命周期状态；它只放进程级默认
+值、各个 mixin 共用的设备运行时访问器，以及运行时 mixin 使用的图像校验。
 
 Constraints:
-    * No vendor spelling: the device-runtime namespace and every VRAM/timing call
-      are derived from ``backends.caps().device``, never from a literal. That is
-      what lets the same server code start under ``COFFIN_BACKEND=reference`` on a
-      machine with no accelerator, where the namespace simply does not exist.
-    * Importing this module must not select a backend: the CLI reads ``MODEL`` /
-      ``SOCK`` from here before it applies ``--backend``, so ``backends`` is
-      imported inside the accessors rather than at module scope.
+    * 不出现厂商拼写：设备运行时命名空间和每一处显存/计时调用都从
+      ``backends.caps().device`` 推出来，绝不写字面量。正因如此，同一套服务代码
+      才能在没有任何加速卡的机器上用 ``COFFIN_BACKEND=reference`` 起来——那里
+      这个命名空间根本不存在。
+    * import 本模块不许选定后端：命令行在应用 ``--backend`` 之前就从中读取
+      ``MODEL`` / ``SOCK``，所以 ``backends`` 是在访问器内部 import 的，而不是
+      放在模块作用域。
 """
 
 from __future__ import annotations
@@ -29,26 +28,22 @@ MAX_DECODE_PIXELS = 16 * 1024 * 1024
 
 
 def device_runtime():
-    """Return torch's device-runtime namespace for the selected backend.
+    """返回选中后端对应的 torch 设备运行时命名空间。
 
-    Every timing barrier and VRAM readout in the serving layer needs the same
-    namespace, and on this card that namespace is the one carrying the vendor
-    spelling. Reading it off ``caps.device`` keeps that spelling inside the
-    backend package, and returning ``None`` when there is no usable device is
-    what lets the banner and the diagnostics run on a host with no accelerator
-    instead of raising out of an unguarded device call.
+    服务层每一处计时屏障和显存读数都需要同一个命名空间，而在这张卡上，承载厂商
+    拼写的正是它。从 ``caps.device`` 推出来，就把那个拼写关在后端包里；没有可用
+    设备时返回 ``None``，横幅和诊断代码才能在没有任何加速卡的主机上跑起来，而不
+    是从一次没有保护的设备调用里抛出来。
 
-    Presence of the namespace is not enough to decide. ``torch.cpu`` exists in
-    every build and answers ``is_available()`` with ``True`` -- it means "the CPU
-    is always there", not "a device is attached" -- and a vendor build that
-    implements the CUDA API exposes its device module on a machine with no card.
-    Both would pass a ``hasattr`` test and then fail the first ``synchronize``, so
-    the test is the backend's own device name plus an availability probe.
+    光有命名空间还不够判断。``torch.cpu`` 在每个构建里都存在，而且
+    ``is_available()`` 返回 ``True``——它的意思是「CPU 一直在」，不是「挂着设备」
+    ——而实现了 CUDA API 的厂商构建也会在没卡的机器上暴露设备模块。这两者都能
+    通过 ``hasattr`` 测试，然后倒在第一次 ``synchronize`` 上，所以判断依据是后端
+    自己的设备名加上一次可用性探测。
 
     Returns:
-        The ``torch.<caps.device>`` module, or ``None`` when the selected backend
-        runs on the CPU, torch has no namespace by that name, or it reports no
-        available device.
+        ``torch.<caps.device>`` 模块；选中的后端在 CPU 上跑、torch 没有这个名字
+        的命名空间、或者它报告没有可用设备时返回 ``None``。
     """
     import backends
 
@@ -63,18 +58,17 @@ def device_runtime():
         return None
     try:
         return runtime if probe() else None
-    except Exception:  # noqa: BLE001 - a broken driver must not break the banner
+    # 驱动坏掉不能把启动横幅一起弄挂，所以探测失败按「没有运行时」处理。
+    except Exception:  # noqa: BLE001
         return None
 
 
 def sync() -> None:
-    """Block until every queued device work item has completed.
+    """阻塞到设备上排队的任务全部完成。
 
-    Needed around a timing window: a host-side clock around asynchronous kernel
-    launches measures the launch, not the work, so ``bench`` and ``profile`` would
-    report a few microseconds per step. A CPU backend has no queue and no
-    namespace, so this is a no-op there rather than an early return a caller could
-    forget.
+    计时窗口前后需要它：用主机侧时钟去量异步内核启动，量到的是启动，不是工作，
+    ``bench`` 和 ``profile`` 会报出每步几微秒。CPU 后端既没有队列也没有命名空间，
+    所以这里是空操作，而不是一个调用方可能忘记写的提前返回。
     """
     runtime = device_runtime()
     if runtime is not None:
@@ -82,11 +76,10 @@ def sync() -> None:
 
 
 def empty_cache() -> None:
-    """Release the caching allocator's free segments back to the driver.
+    """把缓存分配器的空闲段还给驱动。
 
-    Called between a teardown and the next build: the pool and the captured
-    graphs are the two largest allocations in the process, and the allocator
-    otherwise keeps their segments, which is exactly the VRAM the rebuild needs.
+    在拆解与下一次构建之间调用：池和 captured 的图是进程里最大的两笔分配，分配器
+    否则会把它们的段留着，而那些显存正是重建要用的。
     """
     runtime = device_runtime()
     if runtime is not None:
@@ -94,12 +87,11 @@ def empty_cache() -> None:
 
 
 def allocated_gib() -> float:
-    """Bytes the caching allocator currently holds live, in GiB.
+    """缓存分配器当前持有的活字节数，单位 GiB。
 
     Returns:
-        The total across all allocator pools, ``0.0`` on a backend without an
-        allocator namespace. Rounded by the caller, since every readout is for a
-        human watching a memory budget rather than for a comparison.
+        所有分配器池的总和；后端没有分配器命名空间时是 ``0.0``。取整由调用方
+        负责，因为这些读数都是给人盯显存预算看的，不用于比较。
     """
     runtime = device_runtime()
     if runtime is None:
@@ -108,12 +100,11 @@ def allocated_gib() -> float:
 
 
 def reserved_gib() -> float:
-    """Bytes the caching allocator has reserved from the driver, in GiB.
+    """缓存分配器从驱动那里预留的字节数，单位 GiB。
 
     Returns:
-        The reserved total, ``0.0`` on a backend without an allocator namespace.
-        Reported next to :func:`allocated_gib` because the difference is the
-        fragmentation a rebuild has to fit into.
+        预留总量；后端没有分配器命名空间时是 ``0.0``。它总是和
+        :func:`allocated_gib` 一起报，因为两者的差额就是重建时必须挤进去的碎片。
     """
     runtime = device_runtime()
     if runtime is None:
@@ -122,12 +113,11 @@ def reserved_gib() -> float:
 
 
 def free_bytes() -> int:
-    """Free device memory the driver reports, in bytes.
+    """驱动报告的设备空闲显存，单位字节。
 
     Returns:
-        The free byte count, or ``-1`` when the backend has no query for it, so a
-        caller can refuse to act on an unknown budget instead of treating it as
-        zero.
+        空闲字节数；后端没有这个查询时返回 ``-1``，调用方因此可以对一个未知
+        预算拒绝行动，而不是把它当成 0。
     """
     runtime = device_runtime()
     if runtime is None:
@@ -140,18 +130,16 @@ def free_bytes() -> int:
 
 
 def profiler_activities(*, device: bool = False) -> list:
-    """Profiler activity list for the selected backend.
+    """选中后端要用的 profiler 活动列表。
 
     Args:
-        device: Also trace device kernels. Passed explicitly because the CPU half
-            is what attributes a decode step to an aten op, and a device-only
-            trace has neither the launch names nor the host time.
+        device: 是否连设备内核一起追踪。必须显式传，因为把解码步归因到某个 aten
+            算子靠的是 CPU 那一半，只追设备的记录既没有启动名也没有主机时间。
 
     Returns:
-        ``[CPU]``, or ``[CPU, CUDA]`` when ``device`` is set and the backend is
-        actually a device backend. The enum member exists in every torch build, so
-        a CPU host would accept it and then report nothing -- which is why the
-        backend is consulted instead of the symbol's presence.
+        ``[CPU]``；``device`` 为真且后端确实是设备后端时是 ``[CPU, CUDA]``。
+        这个枚举成员在每个 torch 构建里都存在，CPU 主机也会照单全收然后什么都不
+        报——所以要问后端，而不是看符号在不在。
     """
     activities = [torch.profiler.ProfilerActivity.CPU]
     if device and device_runtime() is not None:
@@ -160,21 +148,18 @@ def profiler_activities(*, device: bool = False) -> list:
 
 
 def _eos_ids(tok) -> set[int]:
-    """Every id this checkpoint can stop on, not just ``eos_token_id``.
+    """这个 checkpoint 上所有能停的 id，而不只是 ``eos_token_id``。
 
-    The chat template ends an assistant turn with ``<|im_end|>``, which is a
-    different id from the model's ``eos_token_id`` on this checkpoint. Stopping
-    on the model's own id alone would let a finished turn keep generating into
-    the next one.
+    对话模板用 ``<|im_end|>`` 结束 assistant 轮次，在这个 checkpoint 上它和模型的
+    ``eos_token_id`` 是两个不同的 id。只按模型自己的 id 停，轮次结束后还会继续
+    往下生成，把下一轮也吐出来。
 
     Args:
-        tok: The loaded tokenizer; its vocabulary decides which special tokens
-            resolve.
+        tok: 已加载的分词器；哪些特殊 token 能解析出来由它的词表决定。
 
     Returns:
-        The stop ids, always containing ``eos_token_id``. A special token the
-        vocabulary does not know resolves to a negative id and is dropped, since
-        a sequence can never emit it.
+        停止 id 集合，一定包含 ``eos_token_id``。词表不认识的 token 会解析成负数
+        id 并被丢掉，因为序列永远不可能发出它。
     """
     ids = {tok.eos_token_id}
     for t in ("<|im_end|>", "<|endoftext|>"):
@@ -185,12 +170,10 @@ def _eos_ids(tok) -> set[int]:
 
 
 class MMError(Exception):
-    """An image request this server refuses, carrying the HTTP status to answer.
+    """本服务拒绝的一个图像请求，同时带着要回的 HTTP 状态码。
 
-    The status travels with the exception because the refusal happens deep below
-    the transport: the op handlers copy it into the reply, and
-    The OpenAI entry point maps it onto the HTTP status instead of calling every
-    failure a 500.
+    状态码跟着异常走，因为拒绝发生在传输层很下面的位置：各 op 处理器把它抄进
+    回复，OpenAI 入口再把它映射成 HTTP 状态码，而不是把每次失败都算成 500。
     """
 
     def __init__(self, message: str, status: int = 400) -> None:
@@ -199,29 +182,27 @@ class MMError(Exception):
 
 
 def _decode_image(b64: str, mime: str, max_bytes: int):
-    """A ``data:`` URL's payload -> an RGB ``PIL.Image``, oriented and validated.
+    """把 ``data:`` URL 的载荷变成一张摆正、校验过的 RGB ``PIL.Image``。
 
-    Refused with ``MMError`` (400 or 413, never a traceback) when the payload is
-    not decodable, over ``max_bytes``, or over ``MAX_DECODE_PIXELS``. PIL's own
-    decompression-bomb guard is part of that: the container leaves
-    ``MAX_IMAGE_PIXELS`` at its default, so a bomb raises
-    ``DecompressionBombError`` here rather than OOM-killing the server.
+    载荷解不开、超过 ``max_bytes``、或者超过 ``MAX_DECODE_PIXELS`` 时用
+    ``MMError`` 拒绝（400 或 413，绝不会是 traceback）。PIL 自己的解压炸弹防护
+    也算在内：容器没改 ``MAX_IMAGE_PIXELS``，仍是默认值，所以炸弹会在这里抛
+    ``DecompressionBombError``，而不是把服务 OOM 掉。
 
     Args:
-        b64: Base64 payload of the ``data:`` URL, without the ``data:`` header.
-        mime: The declared media type, used only in the error text.
-        max_bytes: Cap on the decoded byte count for this request.
+        b64: ``data:`` URL 的 base64 载荷，不含 ``data:`` 头。
+        mime: 声明的媒体类型，只用在报错文本里。
+        max_bytes: 这个请求允许的解码字节上限。
 
     Returns:
-        ``(image, raw)``: the decoded RGB image and its original bytes. The raw
-        bytes feed the request digest that salts the prefix-cache keys, so two
-        different images can never share a cached KV prefix.
+        ``(image, raw)``：解码后的 RGB 图像和它的原始字节。原始字节用于生成请求
+        digest，给前缀缓存的键加盐，两张不同的图因此永远无法共用同一段缓存 KV。
 
     Raises:
-        MMError: The payload is not base64 (400), decodes to nothing (400),
-            exceeds ``max_bytes`` (413), exceeds ``MAX_DECODE_PIXELS`` (413),
-            trips the decompression-bomb guard (413), or is not a readable image
-            (400). The caller forwards the status; retrying cannot help.
+        MMError: 载荷不是 base64（400）、解码为空（400）、超过 ``max_bytes``
+            （413）、超过 ``MAX_DECODE_PIXELS``（413）、触发解压炸弹防护
+            （413），或者不是能读的图像（400）。调用方原样转发状态码；重试没有
+            帮助。
     """
     from PIL import Image, ImageOps, UnidentifiedImageError
 
@@ -242,13 +223,13 @@ def _decode_image(b64: str, mime: str, max_bytes: int):
                 f"image is {w}x{h} = {w * h / 1e6:.1f} MP; the decoder accepts at most "
                 f"{MAX_DECODE_PIXELS / 1e6:.0f} MP (it is downsampled to the serving "
                 f"size afterwards, but it has to be decoded first)", 413)
-        # JPEGs can be greyscale/CMYK and PNGs paletted or 16-bit; PIL converts
-        # all of them. ``load()`` is what actually decodes, so a truncated file
-        # fails here with a readable message rather than inside the processor.
+        # JPEG 可能是灰度或 CMYK，PNG 可能是调色板或 16 位；PIL 都能转。真正解码
+        # 发生在 ``load()``，所以被截断的文件在这里就会带着可读的报错失败，而不是
+        # 等到处理器内部才炸。
         img.load()
 
-        # A phone photo stores "rotate 90" in EXIF, and a model that reads a
-        # sideways "SCNET" gets the wrong answer.
+        # 手机照片把「旋转 90 度」存在 EXIF 里，模型读到一张横躺着的「SCNET」只会
+        # 给出错误答案。
         img = ImageOps.exif_transpose(img)
         if img.mode != "RGB":
             img = img.convert("RGB")

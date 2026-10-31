@@ -1,45 +1,36 @@
-"""Enflame Enflame GCU: the TopsRider / torch_gcu family, through the gcu namespace.
+"""Enflame GCU：TopsRider / torch_gcu 一族，走 gcu 命名空间。
 
-Placeholder -- no kernels, no hardware. Unlike the Iluvatar declaration this one has no
-first-hand evidence to lean on: there is no Enflame engine in ``reference/``, so almost
-every capability below is a conservative default rather than a measurement. The
-asymmetry is worth keeping visible, because a placeholder docstring that reads as
-confidently as a measured backend is how an unverified number becomes a design
-constraint.
+占位实现——没有内核，没有硬件。与 Iluvatar 那份声明不同，这里没有一手证据可依靠：
+``reference/`` 里没有 Enflame 引擎，所以下面几乎每个能力都是保守默认值而不是实测值。
+这个不对称值得保持可见，因为一段读起来和实测后端同样笃定的占位 docstring，就是一个
+未经验证的数字变成设计约束的老路。
 
-What drove the declaration
---------------------------
-* **The namespace is ``gcu``, and it is unique to this vendor.** torch_gcu's guide is
-  explicit that moving a tensor to the device means changing ``cuda`` to ``gcu``, and
-  that ``torch.cuda.*`` calls become ``torch.gcu.*``. So ``torch.cuda.is_available()``
-  does not answer for this card, and detection needs no name marker: the namespace is
-  the discriminator.
-* **No 64-bit integers.** torch_gcu silently downcasts I64/F64 to 32-bit with a warning,
-  and its documentation adds that ``tensor.data_ptr()`` may be wrong for a 64-bit
-  tensor. The second half matters beyond indexing: a backend whose addresses cannot be
-  trusted cannot support graph capture that replays captured pointers. Hence
-  ``index_dtype=torch.int32`` here, which is the one declared field in this file backed
-  by documentation rather than inference.
-* Everything else -- packed math, graph capture, the extension path, the device name
-  string -- is open. The probes that would settle them are listed in
-  ``.tmp_dsh/platforms/VENDORS.md``.
+声明是怎么定下来的
 
-Deliberately not declared: a ``device_name`` marker. No public source documents what
-``torch.gcu.get_device_name()`` returns, and guessing a substring would create a
-detection rule that silently never matches. The namespace already identifies the
-vendor, so the honest declaration omits it.
+* **命名空间是 ``gcu``，且为该厂商独有。** torch_gcu 的指南写得很清楚：把张量搬到
+  设备上就是把 ``cuda`` 换成 ``gcu``，``torch.cuda.*`` 调用变成 ``torch.gcu.*``。
+  所以 ``torch.cuda.is_available()`` 不会为这张卡作答，检测也就不需要名字标记：命名
+  空间本身就是区别依据。
+* **没有 64 位整数。** torch_gcu 会把 I64/F64 静默降级成 32 位并告警，它的文档还补
+  了一句：对 64 位张量而言 ``tensor.data_ptr()`` 可能是错的。后半句的影响超出索引：
+  一个地址不可信的后端无法支持重放捕获指针的图捕获。因此这里写
+  ``index_dtype=torch.int32``，这也是本文件唯一一个由文档而非推断支撑的声明字段。
+* 其余一切——packed 数学、图捕获、扩展路径、设备名字符串——都还没答案。能定下它们的
+  探测列在 ``.tmp_dsh/platforms/VENDORS.md``。
 
-Module: ``coffin/backends/vendors/enflame``. Declarative: imports only
-``backends.vendor``, plus ``torch`` for the dtype constant. Must be importable where no
-torch_gcu exists -- ``getattr(torch, "gcu", None)`` is how detection avoids assuming
-otherwise.
+刻意不声明的：``device_name`` 标记。没有任何公开来源说明
+``torch.gcu.get_device_name()`` 返回什么，猜一个子串只会造出一条永远匹配不上的检测
+规则。命名空间已经能识别厂商，诚实的声明就该省掉它。
+
+Module: ``coffin/backends/vendors/enflame``。声明式：只 import ``backends.vendor``，
+外加为 dtype 常量 import 的 ``torch``。在不存在 torch_gcu 的环境里也必须能 import
+——检测用 ``getattr(torch, "gcu", None)`` 就是为了不假设它存在。
 
 Constraints:
-    * ``index_dtype`` is ``int32`` and callers must keep indices in range; silently
-      producing wrong positions is the failure mode this field prevents.
-    * Do not add a ``weight_layout`` claim without measuring. It is left at the ``"nk"``
-      default rather than copied from the Iluvatar finding: the two parts have different
-      bandwidth stories and a copied number would be a fiction with a citation.
+    * ``index_dtype`` 是 ``int32``，调用方必须把索引控制在范围内；悄悄产出错误位置
+      正是这个字段要防的失效方式。
+    * 没有实测就不要声明 ``weight_layout``。它保持 ``"nk"`` 默认值，而不是从 Iluvatar
+      的结论抄过来：两颗芯片的带宽故事不同，抄来的数字只是一个带引用的虚构。
 """
 
 from __future__ import annotations
@@ -48,9 +39,9 @@ import torch
 
 from backends.vendor import Detection, VendorSpec
 
-#: Module-level declaration discovered by :mod:`coffin.backends.discovery`.
-#: No ``name_markers``: torch_gcu exposes its own ``gcu`` namespace, so the namespace
-#: already identifies the vendor and a name rule would only add a way to fail.
+#: 由 :mod:`coffin.backends.discovery` 发现的模块级声明。
+#: 不写 ``name_markers``：torch_gcu 暴露自己的 ``gcu`` 命名空间，命名空间已经能识别
+#: 厂商，加一条名字规则只会多一种失败方式。
 SPEC = VendorSpec(
     name="enflame",
     detection=Detection(namespace="gcu"),
@@ -61,8 +52,8 @@ SPEC = VendorSpec(
     int8_weights=False,
     batch_attn=False,
     attn_split=1,
-    # Documented, unlike everything else here: torch_gcu has no I64 and downcasts with a
-    # warning, so indices must be declared 32-bit from the start.
+    # 有文档依据，不同于本文件其余各项：torch_gcu 没有 I64，降级时会告警，
+    # 所以索引必须从一开始就声明成 32 位。
     index_dtype=torch.int32,
     priority=20,
     has_kernels=False,

@@ -1,29 +1,27 @@
 // @file bindings.cpp
-// @brief pybind11 module definition: exposes the CoreX kernels to the host shim.
+// @brief pybind11 模块定义：把 CoreX 内核暴露给主机侧 shim。
 //
-// Module: coffin/backends/corex/kernels. Outermost layer of the extension: it may
-// include ``corex_ops.h`` but defines nothing but the module. The names here are the
-// Python API surface ``backends/corex/kernels/__init__.py`` calls.
+// Module: coffin/backends/corex/kernels。扩展的最外层：它可以 include
+// ``corex_ops.h``，但除了这个模块什么都不定义。这里的名字就是
+// ``backends/corex/kernels/__init__.py`` 调用的 Python API 面。
 //
 // Constraints:
-//   * The registered names are a string contract with the Python shim; renaming one
-//     breaks the import until the caller changes in the same commit.
-//   * The module name comes from ``TORCH_EXTENSION_NAME`` -- it is whatever the loader
-//     named the extension, never hard-coded.
-//   * The docstrings are the only in-process API documentation. Keep them about the shape
-//     and dtype contract, because the algorithm belongs to the ``.cu`` file.
-//   * One entry per op, plus the tuning arguments the shape sweep needs. No debug or A/B
-//     entry points: a knob the Python side cannot name is not a contract, and an extra
-//     binding is an extra signature to keep in step with the kernel.
-//   * ``conv1d_silu`` and the prologues return ``None``: their outputs are caller-owned
-//     buffers, written in place so the capture path keeps their addresses.
+//   * 注册的名字是与 Python shim 之间的字符串契约；改一个名字会直接弄坏 import，
+//     除非调用方在同一个提交里跟着改。
+//   * 模块名来自 ``TORCH_EXTENSION_NAME``，也就是加载器给扩展起的名字，绝不写死。
+//   * 文档字符串是进程内唯一的 API 文档。内容只说形状与 dtype 契约，因为算法属于
+//     ``.cu`` 文件。
+//   * 一个算子一个入口，外加形状扫描需要的调优参数。不放调试或 A/B 入口：Python
+//     侧叫不出名字的旋钮不成其为契约，而多一个绑定就是多一份要跟内核保持同步的签名。
+//   * ``conv1d_silu`` 和几个 prologue 返回 ``None``：它们的输出是调用方自有的缓冲区，
+//     原地写入，这样捕获路径能保住它们的地址。
 
 #include "corex_ops.h"
 
 #include <torch/extension.h>
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    // Projections.
+    // 投影。
     m.def("gemv_kn", &gemv_kn, "decode GEMV over [K, N] weights: x [K] -> y [N]",
           pybind11::arg("wt"), pybind11::arg("x"), pybind11::arg("threads") = 0,
           pybind11::arg("unroll") = 0, pybind11::arg("split") = 0);
@@ -36,14 +34,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("wt"), pybind11::arg("x"), pybind11::arg("scale"),
           pybind11::arg("threads") = 0, pybind11::arg("unroll") = 0,
           pybind11::arg("split") = 0, pybind11::arg("width") = 0);
-    // Bound separately from the single-row entry: a missing registration here is invisible
-    // until something calls it on the card, and then it reads as an AttributeError far from
-    // the dispatch that asked for it (the trap recorded in PERF_COREX section 12.5).
+    // 和单行入口分开绑定：这里漏了注册在卡上没人调用之前是看不见的，一旦调用就显示
+    // 为 AttributeError，而且离真正发起分派的地方很远（PERF_COREX 第 12.5 节记录的
+    // 那个坑）。
     m.def("gemv_kn_i8_m", &gemv_kn_i8_m,
           "batched W8A16 GEMV: int8 [K, N] weights, x [M, K] -> y [M, N]",
           pybind11::arg("wt"), pybind11::arg("x"), pybind11::arg("scale"),
           pybind11::arg("threads") = 0, pybind11::arg("unroll") = 0);
-    // Normalisation.
+    // 归一化。
     m.def("rms_norm", &rms_norm, "fused zero-centred RMSNorm over pitched [M, N] rows",
           pybind11::arg("x"), pybind11::arg("w"), pybind11::arg("stride") = 0,
           pybind11::arg("eps") = 1e-6);
@@ -65,7 +63,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("sin"), pybind11::arg("q_out"), pybind11::arg("k_out"),
           pybind11::arg("rotary_dim"));
 
-    // Attention over the int8 KV cache.
+    // 在 int8 KV 缓存上做注意力。
     m.def("attn_decode", &attn_decode,
           "single-token attention over the dense int8 KV cache");
     m.def("attn_paged", &attn_paged,
@@ -81,7 +79,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("part_acc"), pybind11::arg("part_ml"), pybind11::arg("block_mask"),
           pybind11::arg("mask_block") = 64);
 
-    // Gated DeltaNet.
+    // 门控 DeltaNet。
     m.def("conv1d_silu", &conv1d_silu,
           "depthwise causal conv1d + SiLU for one token, shifts the window in place");
     m.def("conv1d_silu_seq", &conv1d_silu_seq,
@@ -100,7 +98,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("delta_normed", &delta_normed,
           "prologue + recurrence + gated norm for one decode token, one launch");
 
-    // Triangular solve: a replacement for the cuSOLVER path this build cannot load.
+    // 三角求解：替代这份构建加载不了的 cuSOLVER 路径。
     m.def("triangular_solve", &triangular_solve,
           "unit-lower-triangular solve A X = B over a batch of [L, L] systems",
           pybind11::arg("lower"), pybind11::arg("rhs"));

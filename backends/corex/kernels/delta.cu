@@ -1,50 +1,41 @@
 // @file delta.cu
-// @brief The gated-delta-rule decode step: one in-place update of the recurrent state.
+// @brief 门控 delta 规则的解码步：对循环状态做一次原地更新。
 //
-// Module: coffin/backends/corex/kernels. Consumes the fp32 q/k/v/beta/g that
-// ``linear_attn.cu`` produces and updates the state in place; the batched form is
-// ``delta_batch`` in this file. ``delta_normed`` is the decode path: it takes the raw
-// conv output instead and does the head preparation, the recurrence and the gated output
-// norm in one launch, so nothing crosses kernel boundaries between them.
+// Module: coffin/backends/corex/kernels。消费 ``linear_attn.cu`` 产出的 fp32
+// q/k/v/beta/g 并原地更新状态；批处理形式是本文件里的 ``delta_batch``。
+// ``delta_normed`` 是解码路径：它接收原始卷积输出，在一次启动里做完头预处理、递推和
+// 门控输出归一化，所以它们之间不跨内核边界。
 //
-// The recurrence per token is
+// 每个 token 的递推是
 //     st  = st * exp(g)[:, None, None]
 //     kv  = (st * k[:, :, None]).sum(-2)
 //     st  = st + k[:, :, None] * ((v - kv) * beta)[:, None, :]
 //     out = (st * q[:, :, None]).sum(-2)
-// As a chain of torch ops that is ~140 us per layer on the DCU, which over 24 layers is
-// about a tenth of a decode step. The state has no closed-form rewind, so it is the one
-// piece of layer memory that prefix reuse has to snapshot.
+// 写成一条 torch 算子链，在 DCU 上每层约 140 us，24 层就是解码步的十分之一。状态没有
+// 闭式回滚，所以它是前缀复用必须打快照的那一块层内内存。
 //
 // Constraints:
-//   * One thread owns one value column and one block covers a head, with the threads of a
-//     block addressed as consecutive ``j``. That is forced by the state layout: column
-//     ``j`` of a head lives at ``st[head*dk*dv + i*dv + j]``, so consecutive ``j`` at the
-//     same ``i`` is the only assignment that coalesces. The earlier ``(column, dk index)``
-//     mapping read one column per lane at a stride of ``dv`` floats and pulled 32x the
-//     bytes it used, which is why it measured 294 us against a 7 us floor.
-//   * Both ``dk`` reductions are per-thread register loops, so there is no cross-lane
-//     communication and no shared scratch. This relies on the recurrence coupling ``i``
-//     only within a column; a version that needed a sum across columns would have to
-//     reintroduce a tree -- and a written-for-32 butterfly would combine the wrong
-//     partners here, because this part's warp is 64 lanes wide.
-//   * The state is fp32 and updated in place, and the output is read from the *updated*
-//     state so a token sees its own write. Any other order changes the recurrence rather
-//     than merely the rounding.
-//   * The decay is re-applied on the second pass instead of being written back twice:
-//     ``k^T (e^g S) == e^g (k^T S)``, which removes one read-modify-write of the state
-//     per layer per token.
-//   * The kernel must not allocate a replacement for ``st``: the capture path holds that
-//     address fixed, so a new buffer would leave the graph writing to a dead tensor.
-//   * Inputs are fp32 and contiguous. The prologue has already normalised and scaled q
-//     and k, so this kernel applies no per-element fix-up.
-//   * ``delta_normed`` is bit-identical to the ``conv1d_silu`` -> ``delta_prologue`` ->
-//     ``delta`` -> ``rms_norm_gated`` chain, not merely close. That forces two things the
-//     other kernels in this file do not need: the block-wide reductions must reproduce the
-//     chain's shared-tree pairing exactly (hence the same ``block_sum2`` shape and the same
-//     block size), and the recurrence's output is rounded to the activation dtype before it
-//     is normalised, because ``RMSNormGated`` casts the fp32 ``delta_out`` to bf16 before
-//     its reduction. The greedy ids are the acceptance bar and this is what keeps them.
+//   * 一个线程独占一列值，一个 block 覆盖一个头，块内线程按连续的 ``j`` 编址。这由状态
+//     布局逼出来：一个头的第 ``j`` 列位于 ``st[head*dk*dv + i*dv + j]``，所以同一 ``i``
+//     上连续的 ``j`` 是唯一能合并的分配方式。早先的 ``(列, dk 下标)`` 映射让每个通道按
+//     ``dv`` 个 float 的步长读一列，拉进来 32 倍于实际用到的字节，这就是它实测 294 us
+//     而启动下限只有 7 us 的原因。
+//   * 两次 ``dk`` 归约都是每线程的寄存器循环，所以没有跨通道通信，也没有共享暂存。这依赖
+//     递推只在一列内部耦合 ``i``；如果需要跨列求和，就得重新引入树——而为 32 写的蝶形在
+//     这里会把错误的伙伴组合起来，因为本部件的 warp 是 64 通道宽。
+//   * 状态是 fp32 且原地更新，输出从 *更新后* 的状态读出，这样一个 token 能看到自己写
+//     进去的值。换任何别的顺序都会改变递推本身，而不只是舍入。
+//   * 衰减在第二趟重新施加，而不是写回两次：``k^T (e^g S) == e^g (k^T S)``，这省掉了
+//     每层每 token 对状态的一次读改写。
+//   * 内核不得为 ``st`` 分配替代缓冲区：捕获路径要求那个地址固定，新缓冲区会让图写到一个
+//     已死的张量上。
+//   * 输入是 fp32 且连续。预处理已经归一化并缩放好 q 和 k，所以本内核不做任何逐元素修正。
+//   * ``delta_normed`` 与 ``conv1d_silu`` -> ``delta_prologue`` -> ``delta`` ->
+//     ``rms_norm_gated`` 那条链逐位相同，而不只是接近。这逼出两件本文件其它内核不需要的
+//     事：块级归约必须精确复现那条链的共享树配对（因此用同样的 ``block_sum2`` 形状和同样
+//     的块大小），而且递推的输出在归一化之前要先舍入成激活 dtype，因为 ``RMSNormGated``
+//     在做归约之前把 fp32 的 ``delta_out`` 转成 bf16。贪心 id 是验收标准，这正是保住它们
+//     的东西。
 
 #include "corex_ops.h"
 #include "corex_scalar.h"
@@ -55,47 +46,42 @@
 
 namespace {
 
-//: Threads per block. Each thread owns one value column and walks the whole ``dk`` axis
-//: in registers, so a block covers ``THREADS`` columns and the block count falls by 32x
-//: against the old shape (32 heads x 128/THREADS column tiles).
+//: 每块线程数。每个线程独占一列值，并在寄存器里走完整个 ``dk`` 轴，所以一个 block 覆盖
+//: ``THREADS`` 列，block 数相对旧形状（32 头 x 128/THREADS 个列分块）降到三十二分之一。
 //:
-//: The mapping is the whole optimisation and it is worth stating why. The state is
-//: ``[heads, dk, dv]``, so column ``j`` of a head is ``st[head*dk*dv + i*dv + j]``: fixed
-//: ``i``, contiguous in ``j``. Threads are therefore addressed as consecutive ``j`` at the
-//: same ``i``, which makes a 64-lane wavefront read 64 consecutive floats -- one 256-byte
-//: transaction. The previous mapping put the threads of a column group on consecutive
-//: ``i`` instead, so every lane in a warp touched a different 128-byte line and used four
-//: bytes of it: 32x the traffic for the same answer, measured at 294 us per layer against
-//: a 7.3 us floor.
+//: 这个映射就是全部优化，值得说清为什么。状态是 ``[heads, dk, dv]``，一个头的第 ``j`` 列
+//: 是 ``st[head*dk*dv + i*dv + j]``：``i`` 固定时在 ``j`` 上连续。所以线程按同一 ``i`` 上
+//: 连续的 ``j`` 编址，一个 64 通道的 wavefront 读 64 个连续 float——一次 256 字节的事务。
+//: 早先的映射把一列组的线程放在连续的 ``i`` 上，于是 warp 里每个通道都碰一条不同的
+//: 128 字节行、只用到其中四个字节：同样的答案，32 倍的流量，实测每层 294 us 而启动下限
+//: 是 7.3 us。
 //:
-//: 128 keeps a whole head's value axis (``dv``) inside one block for this model, so the
-//: shared copies of q and k are loaded once and reused by every column. It is also four
-//: wavefronts per block on a 64-lane part, which leaves enough warps to hide latency.
+//: 128 让这个模型里整个头的值轴（``dv``）待在一个 block 里，所以 q 和 k 的共享副本只加载
+//: 一次、被每一列复用。在 64 通道的部件上它也是每块四个 wavefront，留下的 warp 足够掩盖
+//: 延迟。
 constexpr int THREADS = 128;
 
-// @brief One step of the gated delta rule: one thread per value column, one block per head.
+// @brief 门控 delta 规则的一步：每列值一个线程，每个头一个 block。
 //
-// Each thread owns column ``j`` outright and walks ``i`` over ``dk`` in a register loop,
-// so both reductions across ``dk`` are local to that thread and no cross-lane
-// communication happens at all. That is only correct because the two sums are independent
-// per column -- the recurrence couples ``i`` within a column, never across columns.
+// 每个线程独占第 ``j`` 列，并在寄存器循环里把 ``i`` 走过 ``dk``，所以两次跨 ``dk`` 的归约
+// 都是那个线程本地的事，完全不发生跨通道通信。这之所以正确，只因为两个和在各列之间独立
+// ——递推在一列内部耦合 ``i``，从不跨列。
 //
-// Grid ``z`` is the batch row. Every row is an independent ``[heads, dk, dv]`` slab, so the
-// block simply offsets its pointers and touches nothing another row owns; there is no
-// cross-row communication to add. Measured, this is worth far more than the launch it
-// replaces: ``delta_batch`` ran one launch per row and each launch had only ``heads`` = 32
-// blocks in flight, and this part sustains ~3.0 GB/s per block, so a row's 6.29 MB moved at
-// 101.7 GB/s (61.89 us). Rows on the ``z`` axis put ``32 * rows`` blocks in flight instead.
+// 网格的 ``z`` 是批行。每一行都是独立的 ``[heads, dk, dv]`` 板，所以 block 只是偏移它的
+// 指针，不去碰别的行拥有的东西；没有需要补的跨行通信。实测这一点远比它替代的那次启动
+// 值得：``delta_batch`` 每行一次启动，每次只有 ``heads`` = 32 个 block 在飞，而本部件每个
+// block 只跑得动约 3.0 GB/s，于是一行的 6.29 MB 以 101.7 GB/s 走完（61.89 us）。把行放到
+// ``z`` 轴上就能让 ``32 * rows`` 个 block 同时在飞。
 //
-// @param q,k [rows, heads, dk] fp32, already L2-normalised (and q scaled) by the prologue.
-// @param v [rows, heads, dv] fp32.
-// @param beta,g [rows, heads] fp32 write strength and log decay.
-// @param st [rows, heads, dk, dv] fp32 state, updated in place.
-// @param out [rows, heads, dv] fp32, written from the updated state.
-// @param heads Heads per row, which is also the ``x`` grid extent; the row strides below are
-//        derived from it and are what the previous per-row host loop used to apply itself.
-// @param dk Reduction length, also the stride between successive value columns.
-// @param dv Value columns per head.
+// @param q,k [rows, heads, dk] fp32，已经由预处理做过 L2 归一化（q 还做了缩放）。
+// @param v [rows, heads, dv] fp32。
+// @param beta,g [rows, heads] fp32，写强度和对数衰减。
+// @param st [rows, heads, dk, dv] fp32 状态，原地更新。
+// @param out [rows, heads, dv] fp32，从更新后的状态写出。
+// @param heads 每行的头数，也是 ``x`` 方向的网格长度；下面的行步长由它推出，而早先的
+//        每行主机循环是自己施加这些步长的。
+// @param dk 归约长度，同时也是相邻值列之间的步长。
+// @param dv 每个头的值列数。
 __global__ void delta_kernel(const float* __restrict__ q, const float* __restrict__ k,
                              const float* __restrict__ v, const float* __restrict__ beta,
                              const float* __restrict__ g, float* __restrict__ st,
@@ -103,28 +89,26 @@ __global__ void delta_kernel(const float* __restrict__ q, const float* __restric
     const int head = blockIdx.x;
     const int j = (int)(blockIdx.y * blockDim.x + threadIdx.x);
 
-    // Row offsets, not pointer arithmetic on the host: the buffers are dense and the row
-    // strides are the shapes themselves, so the kernel can name row ``b`` with no pitch
-    // argument and no second launch. ``z`` is 1 for the single-row decode entry, and row 0
-    // then adds zero to every pointer, so that path reads the identical bytes it always did.
+    // 行偏移在设备侧算，不在主机侧做指针算术：缓冲区是稠密的，行步长就是形状本身，所以
+    // 内核不用间距参数、也不用第二次启动就能命名第 ``b`` 行。单行解码入口下 ``z`` 是 1，
+    // 第 0 行给每个指针加零，所以那条路径读到的字节和以前完全一样。
     const size_t row = blockIdx.z;
-    const size_t oq = row * heads * dk;          // q and k, [heads, dk] per row
-    const size_t ov = row * heads * dv;          // v and out, [heads, dv] per row
-    const size_t ob = row * heads;               // beta and g, [heads] per row
-    const size_t os = row * heads * dk * dv;     // state, [heads, dk, dv] per row
+    const size_t oq = row * heads * dk;          // q 和 k，每行 [heads, dk]
+    const size_t ov = row * heads * dv;          // v 和 out，每行 [heads, dv]
+    const size_t ob = row * heads;               // beta 和 g，每行 [heads]
+    const size_t os = row * heads * dk * dv;     // 状态，每行 [heads, dk, dv]
 
-    // A thread past ``dv`` must NOT return here.``__syncthreads()`` below is reached by
-    // every thread of the block, so an early exit leaves the rest waiting on a thread
-    // that is gone -- a device-side deadlock with no traceback, which is exactly the
-    // symptom that once hung a card for a full job limit. An out-of-range column instead
-    // runs the barriers and skips only its own state and output access.
+    // 超出 ``dv`` 的线程绝不能在 *这里* 返回。下面的 ``__syncthreads()`` 要由块内每个线程
+    // 走到，提前退出会让其余线程等一个已经不在的线程——设备侧死锁，没有 traceback，正是
+    // 曾经把一张卡挂满整个任务时限的那种症状。越界的列改为走完屏障，只跳过它自己的状态和
+    // 输出访问。
     const bool active = j < dv;
 
     extern __shared__ float sh[];
-    float* ks = sh;                  // [dk] this head's key, shared by every column
-    float* qs = sh + dk;             // [dk] this head's query
-    // Every column needs all of ``dk``, so the copy is shared rather than repeated per
-    // thread. Threads cooperate on the load, which is contiguous either way.
+    float* ks = sh;                  // [dk] 本头的 key，所有列共用
+    float* qs = sh + dk;             // [dk] 本头的 query
+    // 每一列都需要整个 ``dk``，所以这份拷贝是共享的而不是每线程各来一遍。加载时线程协作，
+    // 两种方式下都是连续的。
     for (int i = (int)threadIdx.x; i < dk; i += (int)blockDim.x) {
         ks[i] = k[oq + (size_t)head * dk + i];
         qs[i] = q[oq + (size_t)head * dk + i];
@@ -143,9 +127,9 @@ __global__ void delta_kernel(const float* __restrict__ q, const float* __restric
     const float value = v[ov + (size_t)head * dv + j];
     float* column = st + os + (size_t)head * dk * dv + j;
 
-    // Decay applied on read and again on write, so the state is touched once per step.
-    // Threads at the same ``i`` are adjacent in ``j``, so each ``i`` step is one coalesced
-    // transaction per wavefront: this is the access pattern the old mapping lacked.
+    // 读的时候施加一次衰减、写的时候再施加一次，这样状态每步只被碰一次。同一 ``i`` 上的
+    // 线程在 ``j`` 上相邻，所以每个 ``i`` 步对每个 wavefront 就是一次合并事务：这正是旧
+    // 映射缺的访问模式。
     float kv_mem = 0.f;
     for (int i = 0; i < dk; ++i) {
         kv_mem = fmaf(column[(size_t)i * dv] * decay, ks[i], kv_mem);
@@ -161,23 +145,22 @@ __global__ void delta_kernel(const float* __restrict__ q, const float* __restric
     out[ov + (size_t)head * dv + j] = result;
 }
 
-// @brief Launch the recurrence over ``rows`` independent state slabs.
+// @brief 在 ``rows`` 块独立状态板上启动递推。
 //
-// One block per (head, column tile, row). The ``z`` extent is the row, and it is 1 for the
-// single-row decode entry, so both entry points share this one launch shape and the decode
-// path is unchanged by construction rather than by a separate code path.
+// 每个（头，列分块，行）一个 block。``z`` 方向就是行，单行解码入口下为 1，所以两个入口
+// 共用这同一种启动形状，解码路径是靠构造保持不变，而不是靠另一条代码路径。
 //
-// The grid is deliberately the row axis rather than a host loop: this part sustains ~3.0 GB/s
-// per block in flight (``docs/DESIGN.md`` §2.2), a row here is only ``heads`` = 32 blocks, and
-// a loop therefore runs every row at 32-block bandwidth no matter how many rows there are.
+// 网格故意取行轴而不是主机循环：本部件每个在飞的 block 跑得动约 3.0 GB/s
+// （``docs/DESIGN.md`` §2.2），这里一行只有 ``heads`` = 32 个 block，所以循环不管多少行
+// 都只能以 32-block 的带宽跑每一行。
 //
-// @param q,k [rows, heads, dk] fp32.
-// @param v [rows, heads, dv] fp32.
-// @param beta,g [rows, heads] fp32.
-// @param st [rows, heads, dk, dv] fp32, updated in place.
-// @param out [rows, heads, dv] fp32.
-// @param rows Batch rows; becomes the grid's ``z`` extent.
-// @param stream Stream to launch on.
+// @param q,k [rows, heads, dk] fp32。
+// @param v [rows, heads, dv] fp32。
+// @param beta,g [rows, heads] fp32。
+// @param st [rows, heads, dk, dv] fp32，原地更新。
+// @param out [rows, heads, dv] fp32。
+// @param rows 批行数；成为网格的 ``z`` 方向长度。
+// @param stream 启动所用的流。
 void launch_rows(const float* q, const float* k, const float* v, const float* beta,
                  const float* g, float* st, float* out, int rows, int heads, int dk, int dv,
                  cudaStream_t stream) {
@@ -190,18 +173,16 @@ void launch_rows(const float* q, const float* k, const float* v, const float* be
 
 }  // namespace
 
-// @brief One gated-delta-rule decode step, advancing the recurrent state in place.
+// @brief 门控 delta 规则的一个解码步，原地推进循环状态。
 //
-// @param q,k [heads, dk] fp32, already L2-normalised by the prologue with q additionally
-//        scaled, so this kernel applies no per-element fix-up.
-// @param v [heads, dv] fp32.
-// @param beta,g [heads] fp32 rate and log decay; ``g <= 0`` or the recurrence grows.
-// @param st [heads, dk, dv] fp32 state, updated in place -- the caller owns the snapshot
-//        discipline that prefix reuse depends on.
-// @param out [heads, dv] fp32, written from the updated state.
-// @return ``out``, for call chaining.
-// @throws c10::Error when a non-beta/g input is non-contiguous, a dtype is not fp32, or
-//         the head counts disagree with the state.
+// @param q,k [heads, dk] fp32，已经由预处理做过 L2 归一化，q 还额外缩放过，所以本内核
+//        不做任何逐元素修正。
+// @param v [heads, dv] fp32。
+// @param beta,g [heads] fp32，速率和对数衰减；``g <= 0``，否则递推会发散。
+// @param st [heads, dk, dv] fp32 状态，原地更新——前缀复用所依赖的快照纪律归调用方负责。
+// @param out [heads, dv] fp32，从更新后的状态写出。
+// @return ``out``，便于调用链串接。
+// @throws c10::Error 非 beta/g 的输入不连续、dtype 不是 fp32，或头数与状态不一致。
 torch::Tensor delta(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor beta,
                     torch::Tensor g, torch::Tensor st, torch::Tensor out) {
     TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous()
@@ -222,32 +203,30 @@ torch::Tensor delta(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Te
     return out;
 }
 
-// @brief Batched gated-delta step: one independent state row per batch entry.
+// @brief 批处理门控 delta 步：每个批条目一行独立状态。
 //
-// Row ``b`` is identical to :func:`delta` on that row alone, which is the property the
-// conformance check measures. The rows stay independent because each gets its own grid
-// slice; no cross-row synchronisation exists at all. It is one launch for every row: the
-// grid's ``z`` axis is the batch, so the rows that used to cost a launch each now cost one
-// launch between them and run ``rows`` times as many blocks concurrently.
+// 第 ``b`` 行和单独对那一行调 :func:`delta` 完全一致，一致性检查测的就是这个性质。各行
+// 保持独立，因为每一行拿到自己的网格切片；根本不存在跨行同步。所有行只用一次启动：网格
+// 的 ``z`` 轴就是批，所以以前每行一次启动的那些行现在合起来一次启动，并发在飞的 block
+// 是 ``rows`` 倍。
 //
-// @param q,k [B, heads, dk] fp32.
-// @param v [B, heads, dv] fp32.
-// @param beta,g [B, heads] fp32.
-// @param st [B, heads, dk, dv] fp32, updated in place.
-// @param out [B, heads, dv] fp32, written in place.
-// @return ``out``, for call chaining.
-// @throws c10::Error when a dtype contradicts the layout.
+// @param q,k [B, heads, dk] fp32。
+// @param v [B, heads, dv] fp32。
+// @param beta,g [B, heads] fp32。
+// @param st [B, heads, dk, dv] fp32，原地更新。
+// @param out [B, heads, dv] fp32，原地写入。
+// @return ``out``，便于调用链串接。
+// @throws c10::Error dtype 与布局矛盾。
 torch::Tensor delta_batch(torch::Tensor q, torch::Tensor k, torch::Tensor v,
                           torch::Tensor beta, torch::Tensor g, torch::Tensor st,
                           torch::Tensor out) {
     TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous()
                 && beta.is_contiguous() && g.is_contiguous(),
                 "contiguous inputs required");
-    // The state and output are checked too, and that is not symmetry for its own sake.
-    // The kernel's row offsets are ``b * heads * dk * dv`` and ``b * heads * dv``, which name
-    // row ``b`` only when the batch axis has exactly those strides. A caller that handed in a
-    // widened view would have every row read from the wrong place, and the symptom would be a
-    // small relative error on the batched path whose single-row form is exact.
+    // 状态和输出也要检查，这不是为了对称而对称。内核的行偏移是 ``b * heads * dk * dv`` 和
+    // ``b * heads * dv``，只有当批轴的步长恰好是这些值时它们才指向第 ``b`` 行。调用方传一个
+    // 加宽的视图进来，每一行都会从错的地方读，而症状是批处理路径上一个很小的相对误差，
+    // 可它的单行形式却是精确的。
     TORCH_CHECK(st.is_contiguous() && out.is_contiguous(),
                 "state and output must be contiguous: the per-row stride assumes it");
     TORCH_CHECK(q.scalar_type() == torch::kFloat && st.scalar_type() == torch::kFloat,

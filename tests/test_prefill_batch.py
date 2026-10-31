@@ -1,38 +1,33 @@
-"""Group prefill: several prompts in one forward.
+"""group 预填充：一次前向里跑多个 prompt。
 
-Module: ``coffin/tests``. Drives ``Qwen35.prefill_group`` through the batched
-model API (paging, batch capture, per-row decode); the scheduler-level use of the
-same path is covered by ``test_spec_batch.py`` and ``test_prefix_batch.py``.
+Module: ``coffin/tests``。它经批处理模型 API（分页、批捕获、逐行解码）驱动
+``Qwen35.prefill_group``；同一条路径在调度器层的用法由 ``test_spec_batch.py``
+和 ``test_prefix_batch.py`` 覆盖。
 
 Constraints:
-    * Agreement is argued in bf16 ULPs, never bit equality across batch sizes: the
-      GEMM's M changed, so the fp32 accumulation order changed too, and
-      bit-identical simply is not on the table. Only the one-sequence case is
-      bitwise, because it takes the same M.
-    * The model has ``capacity = max_bucket + 1`` rows, the last being the prefill
-      staging row; a test that decodes on that row corrupts the next prefill, so
-      states are always moved off it first.
-    * Every block allocated here is freed in a ``finally``; a leak would make the
-      later prefix-reuse assertions pass for the wrong reason (a full pool).
-    * ``_solo`` is the oracle for every test: comparing group prefill against
-      anything else would not separate a batching bug from a model bug.
+    * 一致性用 bf16 ULP 论证，绝不跨 batch size 要求按位相等：GEMM 的 M 变了，
+      fp32 累加顺序也跟着变，按位相同根本不在选项里。只有单序列那种情形能按位
+      比较，因为它用的 M 不变。
+    * 模型有 ``capacity = max_bucket + 1`` 行，最后一行是预填充暂存行；在这一
+      行上解码会把下一次预填充改坏，所以状态总是先搬离它。
+    * 这里分配的每个块都在 ``finally`` 里释放；泄漏会让后面的前缀复用断言因为
+      错误的原因通过（池已满）。
+    * ``_solo`` 是所有测试的对照实现：拿 group 预填充跟别的实现比，分不清是批处理
+      的 bug 还是模型的 bug。
 
-The batched engine prefills each admitted request on its own, so a burst of k
-requests pays the weight read k times.  ``Qwen35.prefill_group`` concatenates the
-prompts, runs each layer's projection / MLP once over all the tokens, and slices
-the result back per sequence for the parts that are genuinely per sequence
-(attention over its own KV window and positions, the delta-net scan on its own
-recurrent row).  The weights are read once per layer instead of once per prompt.
+批处理引擎让每个被准入的请求各自预填充，k 个请求就要把权重读 k 遍。
+``Qwen35.prefill_group`` 把 prompt 拼起来，每层的投影、MLP 在所有 token 上只
+跑一次，再按序列切回去处理真正逐序列的部分（各自 KV 窗口和位置上的注意力、
+各自循环行上的 delta-net 扫描）。权重从每个 prompt 读一次变成每层读一次。
 
-The acceptance contract:
+验收契约：
 
-1. a group prefill must agree with running the same prompts one at a time:
-   argmax identical and logits within bf16 noise;
-2. with one sequence the group path *is* bit-identical to ``prefill``;
-3. the states are routed to the right rows: after a group prefill each sequence
-   keeps decoding into tokens that match its own solo run;
-4. the single-sequence ``prefill`` path itself is unchanged (covered by the rest
-   of the suite).
+1. group 预填充必须与逐个跑同样 prompt 一致：argmax 相同，logits 落在 bf16
+   噪声以内；
+2. 只有一个序列时，group 路径与 ``prefill`` 按位相同；
+3. 状态落到正确的行上：group 预填充之后，每个序列继续解码出的 token 与自己
+   单独跑时一致；
+4. 单序列的 ``prefill`` 路径本身不变（由套件其余部分覆盖）。
 """
 
 from __future__ import annotations
@@ -46,7 +41,7 @@ import torch
 
 BLOCK = 64
 DECODE_CAP = 8
-BATCH_CAP = DECODE_CAP + 1     # + the prefill/verify staging row
+BATCH_CAP = DECODE_CAP + 1     # 多出的一行留给预填充/校验暂存
 BUCKETS = (1, 2, 4, 8)
 STEPS = 4
 NUM_BLOCKS = 256
@@ -61,7 +56,7 @@ def _tokens(n: int, off: int = 0) -> list[int]:
 
 @support.needs_model
 class PrefillBatchTest(support.ModelTestCase):
-    """Group prefill must reproduce the per-sequence solo run, states and all."""
+    """group 预填充必须复现逐序列单独跑的结果，状态和后续解码一并算数。"""
 
     QUANT = True
     MAX_SEQ = 2048
@@ -69,7 +64,7 @@ class PrefillBatchTest(support.ModelTestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        """Paged, batched and bucketed: the group path only exists in this configuration."""
+        """分页、批处理、桶捕获三者齐备：group 路径只在这个配置下存在。"""
         super().setUpClass()
         cls.model = support.ModelFixture.get(quant=cls.QUANT, max_seq=cls.MAX_SEQ,
                                              paged=True, bench=False)
@@ -80,27 +75,27 @@ class PrefillBatchTest(support.ModelTestCase):
 
     @classmethod
     def tearDownClass(cls) -> None:
-        """Return the model and its VRAM; the shared fixture outlives this class."""
+        """归还模型及其显存；共享 fixture 活得比这个类久，不能在这里关。"""
         support.ModelFixture.close()
 
     def _alloc(self, n_tokens: int, extra: int = STEPS) -> list[int]:
-        """Allocate blocks for ``n_tokens`` plus room for the decode steps that follow."""
+        """为 ``n_tokens`` 个 token 再加后续解码步预留空间申请块。"""
         nb = -(-(n_tokens + extra) // BLOCK)
         return [self.pool.alloc() for _ in range(nb)]
 
     def _free(self, blocks: list[int]) -> None:
-        """Return blocks to the pool; every ``_alloc`` has to be paired with this."""
+        """把块还给池；每个 ``_alloc`` 都必须配一次这个调用，否则池会耗尽。"""
         self.pool.free_blocks(blocks)
 
     def _solo(self, ids: list[int]):
-        """One sequence end to end: solo prefill, then ``STEPS`` solo decode steps."""
+        """单序列端到端：单独预填充，再走 ``STEPS`` 步单独解码。"""
         blocks = self._alloc(len(ids))
         try:
             self.model.reset()
             self.pool.assign_table(blocks, 0, row=self.prefill_row)
             logits = self.model.prefill(ids).float().clone()
-            # Hand the prompt state to decode row 0 and decode through bucket 1
-            # (which is bit-identical to the single-stream graph).
+            # 把 prompt 的状态交给解码行 0，再经桶 1 解码：桶 1 与单流图按位
+            # 相同，单独跑出来的结果才可以拿来对照。
             self.model.zero_linear_states(0)
             self.model.move_linear_states(self.prefill_row, 0)
             tok = int(logits.argmax())
@@ -115,7 +110,7 @@ class PrefillBatchTest(support.ModelTestCase):
             self._free(blocks)
 
     def _group(self, prompts: list[list[int]], snapshot_interval=None):
-        """Group-prefill ``prompts`` on decode rows 0..k-1, then ``STEPS`` decode."""
+        """在解码行 0..k-1 上对 ``prompts`` 做 group 预填充，然后 ``STEPS`` 步解码。"""
         k = len(prompts)
         blocks = [self._alloc(len(p)) for p in prompts]
         try:
@@ -142,10 +137,10 @@ class PrefillBatchTest(support.ModelTestCase):
 
     def _assert_close(self, got: torch.Tensor, ref: torch.Tensor, label: str,
                       max_ulps: float = 16.0):
-        """Assert argmax equality plus a ULP bound, so a tolerance failure names which one broke."""
+        """同时断言 argmax 相等与 ULP 上界，失败时能指出破的是哪一条。"""
         self.assertEqual(tuple(got.shape), tuple(ref.shape), label)
         diff = float((got - ref).abs().max())
-        unit = max(float(ref.abs().max()), 1e-6) * 2.0 ** -8    # one bf16 ULP
+        unit = max(float(ref.abs().max()), 1e-6) * 2.0 ** -8    # 一个 bf16 ULP
         self.assertEqual(int(got.argmax()), int(ref.argmax()),
                          f"{label}: argmax changed (max abs diff {diff:.4f})")
         self.assertLessEqual(
@@ -154,7 +149,7 @@ class PrefillBatchTest(support.ModelTestCase):
             f"{int((got != ref).sum())} of {got.numel()} differ)")
 
     def test_group_prefill_matches_solo(self):
-        """Every group size must reproduce the solo prefill and the next STEPS decoded tokens."""
+        """每种 group 大小都必须复现单独预填充的结果，以及随后 STEPS 个解码 token。"""
         lengths = [37, 53, 71, 44, 89, 64, 102, 47]
         for k in (1, 2, 4, 8):
             with self.subTest(k=k):
@@ -168,7 +163,7 @@ class PrefillBatchTest(support.ModelTestCase):
                                      f"k={k} seq={i}: decode tokens diverged")
 
     def test_same_prompt_grouped(self):
-        """Identical prompts must give identical rows: a row-indexing bug shows up as two rows disagreeing."""
+        """相同 prompt 必须给出相同的行：行索引的 bug 会表现为两行结果不一致。"""
         ids = _tokens(96)
         ref_logits, ref_chain = self._solo(ids)
         logits, chains, _states = self._group([list(ids) for _ in range(DECODE_CAP)])
@@ -177,7 +172,7 @@ class PrefillBatchTest(support.ModelTestCase):
             self.assertEqual(chains[row], ref_chain, f"row={row}: decode tokens diverged")
 
     def test_single_sequence_group_is_bitwise_prefill(self):
-        """With one sequence the GEMM shape is unchanged, so this case can and must be bit-identical."""
+        """只有一个序列时 GEMM 形状不变，所以这种情形能也必须按位相同。"""
         ids = _tokens(88, off=3)
         blocks = self._alloc(len(ids))
         try:
@@ -196,7 +191,7 @@ class PrefillBatchTest(support.ModelTestCase):
 
 
     def test_prefix_snapshots_and_matched_suffix(self):
-        """Phase 2b shape: snapshots come out of the group run, a later (matched) suffix reuses them."""
+        """Phase 2b 的形态：快照由 group 运行产出，之后（已匹配的）后缀复用它。"""
         prefix = _tokens(192, off=11)
         ids_a = prefix + _tokens(16, off=1)
         ids_b = prefix + _tokens(24, off=2)
@@ -227,9 +222,8 @@ class PrefillBatchTest(support.ModelTestCase):
             self.assertEqual(chains[0], ref_a[1], "prefix seq=0 decode diverged")
             self.assertEqual(chains[1], ref_b[1], "prefix seq=1 decode diverged")
 
-            # A third sequence shares the first three blocks and the snapshot they
-            # produced: prefilling only its tail (positions 192..) must reproduce
-            # the solo run over the whole prompt.
+            # 第三个序列共享前三个块和它们产出的快照：只预填充它的尾部
+            # （位置 192 起），结果必须与在整个 prompt 上单独跑一致。
             ids_c = prefix + _tokens(20, off=3)
             ref_logits_c, ref_chain_c = self._solo(ids_c)
             tail_blocks = self._alloc(len(ids_c) - len(prefix))

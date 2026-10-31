@@ -1,43 +1,33 @@
-"""Static-batch decode (B in 1/2/4/8) must return the single-stream numbers.
+"""静态批解码（B 取 1/2/4/8）必须复现单流解码的数字。
 
-Module: ``coffin/tests``. Drives the batched model API directly (paging, batch
-capture, per-row state moves) rather than through ``llm_engine``; the
-scheduler-level version of the same claim lives in ``test_engine.py``.
+Module: ``coffin/tests``。直接驱动批处理模型 API（分页、批捕获、按行搬移状态），
+不经过 ``llm_engine``；同一条断言在调度器层面的版本放在 ``test_engine.py``。
 
 Constraints:
-    * The comparison is bit-for-bit, never a tolerance:
-      ``models/qwen35/batch.py`` replays the same GEMV unroll the single-stream
-      kernel picked for each shape, so the partial sums are identical and no bf16
-      rounding may drift. A tolerance would hide exactly the class of bug this
-      test exists for.
-    * Every batch run is compared against a solo ``decode_step`` reference, per
-      row: two batched runs agreeing with each other would pass with a shared bug.
-    * The last row is the staging row, so decode rows stop at ``capacity-2``; a
-      state snapshotted after a decode must be restored before the next bucket,
-      because the graph writes in place.
-    * Blocks are freed in ``finally``; the pool is small enough that a leak
-      changes which bucket fits.
+    * 比较是逐位相等，绝不放宽成容差：``models/qwen35/batch.py`` 对每种形状重放
+      单流内核选中的同一份 GEMV 展开，部分和因此完全一致，bf16 舍入没有漂移的
+      余地。容差恰好会掩盖这个测试要抓的那类 bug。
+    * 每次批运行都按行对照单独 ``decode_step`` 的参考结果：两次批运行互相吻合
+      时，共用的 bug 一样能通过。
+    * 最后一行是暂存行，解码行到 ``capacity-2`` 为止；解码后打的状态快照必须在
+      下一个 bucket 之前恢复，因为计算图是原地写入的。
+    * 块在 ``finally`` 里释放；池小到泄漏一次就会改变哪个 bucket 还装得下。
 
-The stage-1 batch path batches only the projections -- the weight reads -- and
-runs attention / the delta-net recurrence once per row through the *same*
-kernels the single-stream engine uses, on row slices of per-row state buffers.
+stage-1 的批处理路径只批投影——也就是权重的读取——注意力和 delta-net 循环按行
+经由单流引擎所用的同一批内核，在按行状态缓冲的行切片上执行。
 
-Rows: ``enable_batching(capacity)`` reserves the last row for the single-stream
-prefill/verify path (``prefill_row``); decode rows are ``0 .. capacity-2``.  A
-new request is prefilled on the staging row and its recurrent state is moved to
-a decode row with ``move_linear_states`` -- so a prefill between decode steps
-cannot disturb a live decode row.
+行：``enable_batching(capacity)`` 把最后一行留给单流的预填充/校验路径
+（``prefill_row``）；解码行是 ``0 .. capacity-2``。新请求先在暂存行上预填充，
+再用 ``move_linear_states`` 把它的循环状态搬到某个解码行——这样解码步骤之间的
+预填充不会扰动正在解码的行。
 
-Five claims:
+五条断言：
 
-1. the single-stream graph (``decode_step``) equals ``decode_batch(1, 1)``;
-2. the same prompt copied into B rows: every row equals the solo decode;
-3. B rows with different prompt lengths (different block tables and positions):
-   each row equals *its own* solo decode;
-4. a bucket larger than the number of real rows: sentinel padding rows do not
-   disturb the real rows, and different buckets agree;
-5. interleaving: prefilling a new request in the middle of a decode does not
-   disturb the rows already decoding.
+1. 单流计算图（``decode_step``）等于 ``decode_batch(1, 1)``；
+2. 同一 prompt 复制进 B 行：每一行都等于单独解码；
+3. B 行使用不同 prompt 长度（块表和位置各不相同）：每行等于它自己的单独解码；
+4. bucket 大于真实行数：哨兵填充行不扰动真实行，且不同 bucket 结果一致；
+5. 交叉执行：在解码中途预填充新请求，不影响已经在解码的行。
 """
 
 from __future__ import annotations
@@ -49,8 +39,8 @@ import support
 import torch
 
 BLOCK = 64
-DECODE_CAP = 8            # real decode rows
-BATCH_CAP = DECODE_CAP + 1   # + the single-stream prefill/verify staging row
+DECODE_CAP = 8            # 真实的解码行数
+BATCH_CAP = DECODE_CAP + 1   # 再加上单流预填充/校验的暂存行
 BUCKETS = (1, 2, 4, 8)
 STEPS = 6
 NUM_BLOCKS = 192
@@ -65,7 +55,7 @@ def _tokens(n: int, off: int = 0) -> list[int]:
 
 @support.needs_model
 class BatchDecodeTest(support.ModelTestCase):
-    """A batched decode row must be bit-identical to that sequence decoding alone."""
+    """批解码中的一行必须与该序列单独解码的结果逐位相同。"""
 
     QUANT = True
     MAX_SEQ = 2048
@@ -73,43 +63,42 @@ class BatchDecodeTest(support.ModelTestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        """Build paging, buckets and both graphs: the comparison needs batch and solo captures side by side."""
+        """建好分页、bucket 与两张计算图：比较需要批捕获和单流捕获同时在场。"""
         super().setUpClass()
         cls.model = support.ModelFixture.get(quant=cls.QUANT, max_seq=cls.MAX_SEQ,
                                              paged=True, bench=False)
         cls.pool = cls.model.enable_paging(num_blocks=NUM_BLOCKS, block_size=BLOCK)
         cls.model.enable_batching(BATCH_CAP)
         cls.model.capture_batch(BUCKETS)
-        # The single-stream engine's own graph (``decode_step``); ``_forward``
-        # writes the staging row, so it is independent of the decode rows.
+        # 单流引擎自己的图（``decode_step``）。``_forward`` 写的是暂存行，
+        # 因此它和解码行互不干扰。
         cls.model.capture()
         cls.prefill_row = cls.model.prefill_row
         assert cls.prefill_row == BATCH_CAP - 1
 
     @classmethod
     def tearDownClass(cls) -> None:
-        """Return the model and its VRAM before the next module asks for its own."""
+        """在下一个模块申请自己的显存之前，把模型和它占用的显存交还回去。"""
         support.ModelFixture.close()
 
     def _alloc(self, n_tokens: int) -> list[int]:
-        """Blocks covering ``n_tokens`` at the pool's block size."""
+        """按池的块大小分配足以覆盖 ``n_tokens`` 的块。"""
         return [self.pool.alloc() for _ in range(-(-n_tokens // BLOCK))]
 
     def _free(self, blocks: list[int]) -> None:
-        """Return blocks to the pool; every ``_alloc`` is paired with this."""
+        """把块还回池；每个 ``_alloc`` 都配一次本调用。"""
         self.pool.free_blocks(blocks)
 
     def _zero_prefill_row(self) -> None:
-        """Clear the staging row, or the previous request's position leaks into this prefill."""
+        """清空暂存行，否则上一个请求的位置会漏进这次预填充。"""
         self.model.pos1.zero_()
         self.model.zero_linear_states(self.prefill_row)
 
     def _stage(self, ids: list[int], row: int) -> tuple[list[int], torch.Tensor]:
-        """Prefill ``ids`` on the staging row, then move its state to ``row``.
+        """在暂存行上预填充 ``ids``，再把它的状态搬到 ``row``。
 
-        The KV lands in the sequence's own blocks (written through the staging
-        row's slot map); the recurrent state is copied into the decode row that
-        will carry on generating.
+        KV 落在序列自己的块里（经由暂存行的槽位表写入）；循环状态则拷进接下来
+        继续生成的那个解码行。
         """
         blocks = self._alloc(len(ids))
         self._zero_prefill_row()
@@ -119,7 +108,7 @@ class BatchDecodeTest(support.ModelTestCase):
         return blocks, logits
 
     def _reference(self, ids: list[int]) -> tuple[list[int], list[torch.Tensor]]:
-        """Solo decode of ``ids``: ``STEPS+1`` tokens and one logit tensor per step."""
+        """``ids`` 的单独解码：``STEPS+1`` 个 token，每一步一个 logits 张量。"""
         blocks = self._alloc(len(ids))
         try:
             self.model.reset()
@@ -138,20 +127,20 @@ class BatchDecodeTest(support.ModelTestCase):
             self._free(blocks)
 
     def _snapshot(self, rows: int):
-        """Copy every row's recurrent state; the graphs write in place, so a bucket run must be undoable."""
+        """拷出每一行的循环状态；计算图原地写入，所以一次 bucket 运行必须可撤销。"""
         return [self.model.snapshot_linear_states(row) for row in range(rows)]
 
     def _restore(self, snap) -> None:
-        """Put the snapshotted states back, so the next bucket starts from the same point."""
+        """把快照里的状态放回去，让下一个 bucket 从同一起点开始。"""
         for row, states in enumerate(snap):
             self.model.restore_linear_states(states, row)
 
     def _batch_decode(self, rows: int, bucket: int, blocks: list[list[int]],
                       first_tokens: list[int], first_pos: list[int]):
-        """Run ``rows`` sequences through ``bucket``'s graph.
+        """让 ``rows`` 条序列走 ``bucket`` 对应的计算图。
 
-        Returns ``STEPS+1`` generated tokens per row and, per step, the logits of
-        the valid rows (``STEPS`` tensors).
+        每行返回 ``STEPS+1`` 个已生成 token，并按步骤返回有效行的 logits
+        （``STEPS`` 个张量）。
         """
         tokens: list[list[int]] = [list(first_tokens)]
         logits_out: list[torch.Tensor] = []
@@ -167,7 +156,7 @@ class BatchDecodeTest(support.ModelTestCase):
     def _batch_decode_rows(self, live_rows: list[int], bucket: int,
                            blocks: dict[int, list[int]], first: dict[int, int],
                            pos: dict[int, int]):
-        """Decode with fixed, possibly non-contiguous live rows (row holes)."""
+        """在固定、可能不连续的活动行上解码（行空洞）。"""
         tokens: dict[int, list[int]] = {r: [first[r]] for r in live_rows}
         logits_out: list[torch.Tensor] = []
         pad = [r for r in range(bucket) if r not in live_rows]
@@ -185,7 +174,7 @@ class BatchDecodeTest(support.ModelTestCase):
         return tokens, logits_out
 
     def _assert_exact(self, got: torch.Tensor, ref: torch.Tensor, label: str) -> None:
-        """Bit equality, reported as a count so one stray ULP is distinguishable from total divergence."""
+        """逐位相等，并用数量报告差异：一个 ULP 的偏差和整体发散能区分开。"""
         self.assertEqual(tuple(got.shape), tuple(ref.shape), label)
         diff = float((got - ref).abs().max())
         differing = int((got != ref).sum())
@@ -194,7 +183,7 @@ class BatchDecodeTest(support.ModelTestCase):
                          f"(max abs diff {diff:.3e}, {got.numel()} values)")
 
     def test_single_stream_graph_matches_bucket1(self):
-        """Bucket 1 is the batch path's degenerate case; if it differs, every larger bucket is suspect."""
+        """Bucket 1 是批处理路径的退化情形；它一旦对不上，更大的 bucket 都不必信。"""
         ids = _tokens(48)
         ref_tokens, ref_logits = self._reference(ids)
         blocks, logits = self._stage(ids, 0)
@@ -211,7 +200,7 @@ class BatchDecodeTest(support.ModelTestCase):
             self._free(blocks)
 
     def test_same_prompt_every_row_matches_solo(self):
-        """Identical rows must stay identical: a per-row state or slot-map mix-up shows up as two rows diverging."""
+        """内容相同的行必须保持相同：按行状态或槽位表串了行，会表现为两行分叉。"""
         ids = _tokens(48)
         ref_tokens, ref_logits = self._reference(ids)
         blocks: list[list[int]] = []
@@ -241,7 +230,7 @@ class BatchDecodeTest(support.ModelTestCase):
                 self._free(blk)
 
     def test_different_prefix_lengths_match_their_own_solo(self):
-        """Different lengths mean different positions and block tables, which is where a shared position buffer would break."""
+        """长度不同意味着位置和块表都不同，共用位置缓冲正是在这里露出破绽。"""
         lengths = [40, 57, 71, 96, 130, 66, 85, 112]
         prompts = [_tokens(n, off=i) for i, n in enumerate(lengths)]
         refs = [self._reference(p) for p in prompts]
@@ -273,7 +262,7 @@ class BatchDecodeTest(support.ModelTestCase):
                 self._free(blk)
 
     def test_bucket_padding_does_not_disturb_valid_rows(self):
-        """A bucket is chosen by the highest live row, so most steps carry sentinel rows; a sentinel that writes real state corrupts a neighbour."""
+        """bucket 由最高的活动行决定，所以多数步骤都带着哨兵行；哨兵若写了真实状态就会污染相邻行。"""
         rows = 3
         lengths = [45, 70, 120]
         prompts = [_tokens(n, off=3 * i) for i, n in enumerate(lengths)]
@@ -289,8 +278,8 @@ class BatchDecodeTest(support.ModelTestCase):
         snap = self._snapshot(rows)
         runs = {}
         try:
-            # two different buckets for the same 3 real rows: 4 (1 sentinel row)
-            # and 8 (5 sentinel rows).  Padding must be invisible.
+            # 同样 3 个真实行用两个不同的 bucket：4（1 个哨兵行）和 8（5 个哨兵行）。
+            # 填充必须完全不可见。
             for bucket in (4, 8):
                 with self.subTest(bucket=bucket):
                     self._restore(snap)
@@ -307,13 +296,13 @@ class BatchDecodeTest(support.ModelTestCase):
         finally:
             for blk in blocks:
                 self._free(blk)
-        # and the two padded runs agree with each other on the valid rows
+        # 这两次带填充的运行在有效行上也必须彼此吻合
         for s in range(STEPS):
             self._assert_exact(runs[8][1][s][:rows], runs[4][1][s][:rows],
                                f"bucket 8 vs 4 step={s}")
 
     def test_interleaved_prefill_does_not_disturb_decode_rows(self):
-        """The continuous-batching shape: decode a batch, insert a prefill, go on."""
+        """连续批处理的形态：先解码一批，中途插入一次预填充，再继续解码。"""
         prompts = [_tokens(45, 0), _tokens(57, 1), _tokens(70, 2)]
         refs = [self._reference(p) for p in prompts]
         blocks: list[list[int]] = []
@@ -325,7 +314,7 @@ class BatchDecodeTest(support.ModelTestCase):
             first.append(int(logits.argmax()))
             pos.append(len(ids))
         try:
-            # two steps with the first two rows only (bucket 2)
+            # 只用前两行先走两步（bucket 2）
             toks = list(first)
             for s in range(2):
                 self.model.set_rows(toks, [p + s for p in pos], blocks)
@@ -334,14 +323,14 @@ class BatchDecodeTest(support.ModelTestCase):
                     self._assert_exact(logits[row], refs[row][1][s],
                                        f"pre-insert row={row} step={s}")
                 toks = [int(t) for t in logits.argmax(-1).tolist()]
-            # insert a third request: prefill on the staging row, move to row 2
+            # 插入第三个请求：在暂存行上预填充，再搬到第 2 行
             blk, logits = self._stage(prompts[2], 2)
             blocks.append(blk)
             first.append(int(logits.argmax()))
             pos.append(len(prompts[2]))
             self.assertEqual(int(logits.argmax()), refs[2][0][0],
                              "inserted request's first token differs")
-            # continue: rows 0/1 are at step 2, row 2 is at step 0
+            # 继续：第 0/1 行已到第 2 步，第 2 行还在第 0 步
             tok2 = [toks[0], toks[1], first[2]]
             for k in range(STEPS - 2):
                 self.model.set_rows(tok2, [pos[0] + 2 + k, pos[1] + 2 + k, pos[2] + k],
@@ -359,7 +348,7 @@ class BatchDecodeTest(support.ModelTestCase):
 
 
     def test_row_holes_are_padded_with_sentinels(self):
-        """Runner shape: live rows 0 and 2, row 1 a hole; two decodes must match solo."""
+        """Runner 的形态：活动行是 0 和 2，第 1 行是空洞；两次解码都必须等于单独解码。"""
         prompts = [_tokens(45, 0), _tokens(70, 2)]
         refs = [self._reference(p) for p in prompts]
         live_rows = [0, 2]
@@ -372,10 +361,10 @@ class BatchDecodeTest(support.ModelTestCase):
                 blocks[r] = blk
                 first[r] = int(logits.argmax())
                 pos[r] = len(ids)
-            # row 1 is a hole: make sure whatever state it holds is finite, then
-            # let decode_batch overwrite its token/pos/slot map with the sentinel.
+            # 第 1 行是空洞：先让它持有的状态变成有限值，再让 decode_batch
+            # 用哨兵覆盖它的 token/pos/槽位表。
             self.model.zero_linear_states(1)
-            bucket = 4                       # min power of two > max(live row)
+            bucket = 4                       # 大于 max(live row) 的最小 2 的幂
             tokens, logits = self._batch_decode_rows(
                 live_rows, bucket, blocks, first, pos)
             for i, r in enumerate(live_rows):

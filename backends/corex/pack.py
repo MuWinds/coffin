@@ -1,36 +1,31 @@
-"""Turn the checkpoint's ``[N, K]`` projections into the ``[K, N]`` layout this card streams at full bandwidth.
+"""把 checkpoint 的 ``[N, K]`` 投影转成本卡全带宽流式读取的 ``[K, N]`` 布局。
 
-``Caps.weight_layout == "kn"`` is a promise the backend keeps on the loader's
-behalf: the op contract stays in the checkpoint's ``[N, K]`` layout, and the one
-transpose happens here instead of on every call. The layout is worth 14-22x on
-decode on a BI-V100 (``[N, K]`` measured 19-30 GB/s against 362-410 GB/s for
-``[K, N]``, COREX_PORT.md §0), so this file is a performance-critical part of the
-backend rather than a reshaping helper.
+``Caps.weight_layout == "kn"`` 是后端替加载器兑现的一句承诺：算子契约仍然是
+checkpoint 的 ``[N, K]`` 布局，唯一一次转置挪到这里做，而不是每次调用都做。
+在 BI-V100 上这个布局对解码值 14-22 倍（``[N, K]`` 实测 19-30 GB/s，
+``[K, N]`` 是 362-410 GB/s，COREX_PORT.md §0），所以本文件是后端的性能关键
+部分，不是一个整理形状的辅助工具。
 
-Module: ``coffin/backends/corex``. Imports ``torch`` and the leaf module
-``int8_weights``, and nothing else from ``coffin``. ``backends/corex/__init__.py``
-calls :func:`as_kn` on every projection; a model loader that wants the resident
-set to stay at one copy calls :func:`repack_state_dict` once at load.
+Module: ``coffin/backends/corex``。只 import ``torch`` 和叶子模块
+``int8_weights``，不 import ``coffin`` 里的任何东西。
+``backends/corex/__init__.py`` 对每个投影调用 :func:``as_kn``；希望常驻集
+保持单份拷贝的模型加载器在加载时调用一次 :func:``repack_state_dict``。
 
 Constraints:
-    * Peak VRAM, not speed, decides how the transpose is done. Transposing a whole
-      state dict with ``w.t().contiguous()`` holds both layouts at once and turns
-      8.8 GB of bf16 weights into 17.6 GB; :func:`repack_state_dict` converts one
-      tensor at a time and drops its source immediately, so the transient is twice
-      the *largest single* weight (1.3 GB for ``lm_head``) and the resident set
-      stays at one copy. An in-place transpose is not an option: it does not exist
-      for a non-square matrix, and the chunked version has the same src+dst peak.
-    * A raw ``[N, K]`` tensor is always read as the checkpoint layout. That is why
-      the packed form is a wrapper type (:class:`KnWeight`) instead of a bare
-      ``[K, N]`` tensor: shape alone cannot distinguish the two, and a square
-      weight would transpose silently in the wrong direction.
-    * :func:`as_kn` memoises per source tensor so a caller that ignores
-      ``weight_layout`` still gets one transpose per weight rather than one per
-      decode step. The cache holds only the packed copy and is keyed by object
-      identity, so a weight is packed again only if it is a fresh tensor.
-    * The kernel reads one dtype; :data:`WEIGHT_DTYPE` is that dtype. bf16 because
-      the prefill GEMM reaches the same 32.6 TFLOP/s on bf16 and fp16 here, so the
-      checkpoint's own dtype needs no conversion at load.
+    * 决定转置怎么写的是峰值显存，而不是速度。用 ``w.t().contiguous()`` 转整个
+      state dict 会同时持有两份布局，8.8 GB 的 bf16 权重变成 17.6 GB；
+      :func:``repack_state_dict`` 一次转一个张量并立刻丢掉源，所以瞬时峰值是
+      *最大单个* 权重的两倍（``lm_head`` 是 1.3 GB），常驻集始终只有一份。
+      原地转置不是选项：非方阵没有这种操作，分块写法同样有 src+dst 的峰值。
+    * 裸 ``[N, K]`` 张量一律按 checkpoint 布局解读。打包形式用包装类型
+      （:class:``KnWeight``）而不是裸 ``[K, N]`` 张量就是为了这个：只看形状
+      区分不了两者，方阵权重会不声不响地朝反方向转置。
+    * :func:``as_kn`` 按源张量记忆化，这样忽略 ``weight_layout`` 的调用方也是
+      每个权重只转置一次，而不是每个解码步一次。缓存只装打包后的拷贝，键是
+      对象身份，所以只有新张量才会重新打包。
+    * 内核只读一种 dtype，就是 :data:``WEIGHT_DTYPE``。选 bf16 是因为预填充
+      GEMM 在本卡上 bf16 和 fp16 都到 32.6 TFLOP/s，checkpoint 自己的 dtype
+      加载时不必转换。
 """
 
 from __future__ import annotations
@@ -42,57 +37,52 @@ import torch
 
 from int8_weights import QWeight, is_quantizable
 
-#: Storage dtype of a packed weight. Must agree with ``Caps.weight_dtype`` of this
-#: backend; the kernels are compiled for the pair (weight dtype, bf16 activation).
+#: 打包权重的存储 dtype。必须与本后端的 ``Caps.weight_dtype`` 一致；内核按
+#: （权重 dtype，bf16 激活）这一对编译。
 WEIGHT_DTYPE = torch.bfloat16
 
-#: Widest ``N`` that may be handed to the library GEMM. Measured on this card:
-#: ``N = 131072`` is correct, ``N = 196608`` and ``N = 248320`` (``lm_head``) return
-#: NaN. The prefill path chunks along ``N`` at this width; the decode path does not
-#: call the library at all, so this bound shapes prefill only. It is a property of the
-#: card's GEMM, not a tuning knob, which is why it lives next to the layout decision.
+#: 能交给库 GEMM 的最大 ``N``。本卡实测：``N = 131072`` 正确，
+#: ``N = 196608`` 和 ``N = 248320``（``lm_head``）返回 NaN。预填充路径按这个
+#: 宽度沿 ``N`` 分块；解码路径根本不调库，所以这个上限只约束预填充。它是这张
+#: 卡 GEMM 的性质而不是可调参数，因此和布局决定放在一起。
 LIB_MAX_N = 131072
 
-#: Ceiling on the identity cache. A model has a few hundred projections, so the
-#: limit only ever trips in a diagnostic that packs freshly generated tensors in a
-#: loop; the sweep then drops entries whose source has already been collected.
+#: 身份缓存的上限。一个模型只有几百个投影，所以只有不断把新建张量打包的循环
+#: 诊断才会撞到上限；届时清扫会丢掉源已被回收的条目。
 _CACHE_LIMIT = 4096
 
-#: ``(id(source), dtype) -> (weakref to source, packed weight)``. Collected
-#: eagerly through the weakref callback, so a weight that the loader drops does not
-#: pin its packed copy.
+#: ``(id(source), dtype) -> (源的 weakref, 打包后的权重)``。通过 weakref 回调
+#: 及时回收，加载器丢掉的权重不会把它的打包副本钉住。
 _CACHE: dict[tuple[int, torch.dtype], tuple[weakref.ref, "KnWeight"]] = {}
 
 
 class KnQWeight:
-    """An ``[N, K]`` projection stored as int8 ``[K, N]`` plus one fp32 scale per column.
+    """以 int8 ``[K, N]`` 加每列一个 fp32 scale 存储的 ``[N, K]`` 投影。
 
-    The int8 counterpart of :class:`KnWeight`, and it exists for one reason: decode is
-    bandwidth-bound, so halving the bytes read per weight is the only lever left on the
-    projections, which dominate the step (``../../../PERF_COREX.md`` §8).
+    这是 :class:``KnWeight`` 的 int8 对应物，存在的理由只有一个：解码受带宽
+    限制，把每个权重读的字节数减半是投影上仅剩的杠杆，而投影占了这个步骤的
+    大头（``../../../PERF_COREX.md`` §8）。
 
-    The scale is per *output column*, which is the same thing as the checkpoint's per-row
-    scale -- rows of ``[N, K]`` are columns of ``[K, N]``. It is stored alongside the
-    matrix rather than multiplied into it, because applying it once per column after the
-    ``K`` sum is both cheaper and what the quantiser's error model assumes.
+    scale 按 *输出列* 给，和 checkpoint 的按行 scale 是一回事——``[N, K]`` 的
+    行就是 ``[K, N]`` 的列。它存在矩阵旁边而不是预先乘进去：在 ``K`` 求和之后
+    每列乘一次既更便宜，也正是量化器的误差模型所假设的。
     """
 
     __slots__ = ("scale", "wt", "n", "k")
 
-    #: Distinguishes this form from :class:`KnWeight` without a type check at every call.
+    #: 用来区分本形式与 :class:``KnWeight``，不必每次调用都做类型检查。
     int8 = True
 
     def __init__(self, wt: torch.Tensor, scale: torch.Tensor) -> None:
-        """Wrap an already-transposed int8 matrix and its column scales.
+        """包装一个已经转置好的 int8 矩阵及其列 scale。
 
         Args:
-            wt: ``[K, N]`` contiguous int8 matrix.
-            scale: ``[N]`` fp32 scales, one per output column.
+            wt: ``[K, N]`` 连续存放的 int8 矩阵。
+            scale: ``[N]`` 个 fp32 scale，每个输出列一个。
 
         Raises:
-            ValueError: ``wt`` is not 2-D int8, the scale is not 1-D fp32, or their
-                lengths disagree. Each of those produces plausible numbers from the wrong
-                elements instead of failing.
+            ValueError: ``wt`` 不是二维 int8、scale 不是一维 fp32，或两者长度
+                对不上。这几种都会拿错元素算出看着合理的数，而不是直接失败。
         """
         if wt.dim() != 2:
             raise ValueError(f"packed weight must be 2-D, got {tuple(wt.shape)}")
@@ -109,57 +99,53 @@ class KnQWeight:
         self.scale = scale
 
     def nbytes(self) -> int:
-        """Resident size in bytes: the int8 matrix plus its fp32 column scales.
+        """常驻字节数：int8 矩阵加它的 fp32 列 scale。
 
         Returns:
-            ``K * N + 4 * N``.
+            ``K * N + 4 * N``。
         """
         return self.wt.numel() + self.scale.numel() * 4
 
     def to(self, dtype: torch.dtype) -> torch.Tensor:
-        """Return the checkpoint layout ``[N, K]`` as a plain dequantised tensor.
+        """按 checkpoint 布局 ``[N, K]`` 返回一个反量化后的普通张量。
 
-        The escape hatch for paths this backend serves with the bf16 kernels or the
-        reference implementation. It is a real dequantisation, so it costs the full fp
-        size of the weight -- callers on the decode path must not use it.
+        给由 bf16 内核或参考实现承担的路径留的逃生口。这是真反量化，代价是权重的
+        完整浮点大小——解码路径上的调用方不许用它。
 
         Args:
-            dtype: Dtype the caller's arithmetic runs in.
+            dtype: 调用方算术所用的 dtype。
 
         Returns:
-            A fresh ``[N, K]`` contiguous tensor.
+            新的 ``[N, K]`` 连续存放张量。
         """
         return (self.wt.float() * self.scale.view(1, -1)).to(dtype).t().contiguous()
 
     def dequant_kn(self, dtype: torch.dtype = WEIGHT_DTYPE) -> "KnWeight":
-        """Dequantise in place of a transpose, keeping the ``[K, N]`` layout.
+        """不转置，只反量化，保持 ``[K, N]`` 布局。
 
-        The ``[K, N]`` sibling of :meth:`to`: this is what the bf16 kernels need, so a
-        caller that cannot use the int8 path converts with one multiply instead of a
-        transpose.
+        :meth:``to`` 的 ``[K, N]`` 版本：bf16 内核要的就是它，所以用不了 int8
+        路径的调用方用一次乘法就能转换，不必转置。
 
-        Written as cast-then-scale, not scale-then-cast. The obvious spelling
-        ``(wt.float() * scale).to(dtype)`` materialises a ``[K, N]`` fp32 temporary, twice
-        the size of the answer it is immediately narrowed to; over this model's 128
-        projections that is a *fixed* 174.8 ms per prefill request, which was 3.1x the
-        whole prefill at n=128 (``../../../PERF_COREX.md`` §13.2b).
+        写成先 cast 再 scale，不是先 scale 再 cast。直觉写法
+        ``(wt.float() * scale).to(dtype)`` 会实体化一个 ``[K, N]`` 的 fp32 临时
+        张量，是它马上要被窄化成的结果的两倍大；在这个模型的 128 个投影上，那是
+        每个预填充请求 *固定的* 174.8 ms，在 n=128 时是整个预填充的 3.1 倍
+        （``../../../PERF_COREX.md`` §13.2b）。
 
-        ``mul_`` on a bf16 destination with an fp32 scale computes in fp32 and rounds
-        once, the same single rounding the old spelling did, so the weights stay
-        bit-identical. Narrowing the scale first (``scale.to(dtype)``) is 1.88x instead of
-        1.70x but moves every weight by one bf16 ULP, and a weight feeds 32 layers; that
-        is not a trade to make for 10% of one operator.
+        在 bf16 目标上用 fp32 scale 做 ``mul_`` 以 fp32 计算、只舍入一次，和旧
+        写法是同一次舍入，权重保持逐位相同。先窄化 scale
+        （``scale.to(dtype)``）是 1.88x 而不是 1.70x，但会把每个权重挪动一个
+        bf16 ULP，而一个权重会喂 32 层；为一个算子的 10% 做这种取舍不值得。
 
         Args:
-            dtype: Storage dtype of the result.
+            dtype: 结果的存储 dtype。
 
         Returns:
-            A :class:`KnWeight` over the dequantised matrix.
+            覆盖反量化矩阵的 :class:``KnWeight``。
 
         Raises:
-            TypeError: ``dtype`` is not a float type. Scaling into an integer destination
-                wraps instead of raising, which surfaces as a corrupt checkpoint much
-                further downstream.
+            TypeError: ``dtype`` 不是浮点类型。往整数目标里缩放会回绕而不报错，
+                那会在下游很远的地方表现为 checkpoint 损坏。
         """
         if not dtype.is_floating_point:
             raise TypeError(f"dequant_kn needs a float dtype, got {dtype}")
@@ -172,31 +158,29 @@ class KnQWeight:
 
 
 class KnWeight:
-    """An ``[N, K]`` projection stored as the contiguous ``[K, N]`` matrix the kernels index.
+    """以内核索引的连续 ``[K, N]`` 矩阵存储的 ``[N, K]`` 投影。
 
-    The wrapper, rather than a bare tensor, is what keeps the layout unambiguous:
-    the op contract hands out ``[N, K]``, and a square weight would otherwise be
-    transposed a second time without any shape change to give it away.
+    用包装类型而不是裸张量，是为了让布局不产生歧义：算子契约交出的是
+    ``[N, K]``，方阵权重否则会被再转置一次，形状上看不出任何异常。
     """
 
     __slots__ = ("wt", "n", "k")
 
-    #: Both packed forms answer these, so a caller can ask "is this int8" and "what is its
-    #: scale" without an isinstance against every subclass.
+    #: 两种打包形式都回答这两项，调用方不必对每个子类做 isinstance 就能问
+    #: 「这是不是 int8」和「它的 scale 是多少」。
     int8 = False
     scale = None
 
     def __init__(self, wt: torch.Tensor) -> None:
-        """Wrap a matrix that is already transposed; nothing is copied here.
+        """包装一个已经转置好的矩阵；这里不拷贝任何东西。
 
         Args:
-            wt: ``[K, N]`` contiguous matrix. Ownership stays with the caller, so
-                passing a view would make the kernels read the wrong geometry.
+            wt: ``[K, N]`` 连续矩阵。所有权仍归调用方，传视图进来会让内核读到
+                错误的几何形状。
 
         Raises:
-            ValueError: ``wt`` is not 2-D or not contiguous. Both produce plausible
-                numbers from the wrong elements, which is the failure mode this
-                class exists to prevent.
+            ValueError: ``wt`` 不是二维或不是连续存放。两者都会拿错元素算出看着
+                合理的数，而本类存在的目的就是挡掉这种失败模式。
         """
         if wt.dim() != 2:
             raise ValueError(f"packed weight must be 2-D, got {tuple(wt.shape)}")
@@ -206,31 +190,30 @@ class KnWeight:
         self.k, self.n = int(wt.shape[0]), int(wt.shape[1])
 
     def nbytes(self) -> int:
-        """Resident size in bytes, for the loader's VRAM accounting.
+        """常驻字节数，供加载器核算显存。
 
         Returns:
-            ``K * N * element_size``: the packed matrix and nothing else, because
-            the source it was made from is expected to be dropped.
+            ``K * N * element_size``：只有打包后的矩阵，因为它来自的源预期已被
+            丢掉。
         """
         return self.wt.numel() * self.wt.element_size()
 
     def to(self, dtype: torch.dtype) -> torch.Tensor:
-        """Return the checkpoint layout ``[N, K]`` in ``dtype``, as a plain tensor.
+        """以 ``dtype`` 按 checkpoint 布局 ``[N, K]`` 返回普通张量。
 
-        This is the escape hatch for the one path that must not see the packed form:
-        an op this backend has no kernel for is served by :mod:`backends.reference`,
-        and its ``linear`` does ``w.to(dtype)`` on whatever it is handed. Without this
-        method that fallback raises ``AttributeError`` in the middle of a decode step,
-        which reads as a corrupt checkpoint rather than as an unimplemented kernel.
+        这是给唯一一个绝不能看到打包形式的路径留的逃生口：本后端没有内核的算子由
+        :mod:``backends.reference`` 承担，它的 ``linear`` 会对拿到的任何东西做
+        ``w.to(dtype)``。没有这个方法，回退会在解码步中途抛
+        ``AttributeError``，看起来像 checkpoint 损坏，而不是内核未实现。
 
-        The transpose is not cached: this path has already accepted a copy, and keeping
-        one per weight would undo the single-copy property the packer exists for.
+        转置结果不进缓存：这条路径已经接受了一次拷贝，按权重缓存会把打包器存在
+        的意义（单份拷贝）抵消掉。
 
         Args:
-            dtype: Dtype the caller's arithmetic runs in.
+            dtype: 调用方算术所用的 dtype。
 
         Returns:
-            A fresh ``[N, K]`` contiguous tensor.
+            新的 ``[N, K]`` 连续存放张量。
         """
         return self.wt.t().to(dtype).contiguous()
 
@@ -239,44 +222,42 @@ class KnWeight:
 
 
 def is_packed(w: Any) -> bool:
-    """Report whether a weight is already in this backend's layout.
+    """报告一个权重是否已经处于本后端的布局。
 
     Args:
-        w: A projection weight of any accepted storage form.
+        w: 任意可接受存储形式的投影权重。
 
     Returns:
-        ``True`` for a :class:`KnWeight`. A plain tensor is always ``False``: the
-        raw form is the contract's ``[N, K]``.
+        :class:``KnWeight`` 返回 ``True``。裸张量永远是 ``False``：裸形式是契约
+        规定的 ``[N, K]``。
     """
     return isinstance(w, (KnWeight, KnQWeight))
 
 
 def to_kn(w: torch.Tensor | QWeight | KnWeight | KnQWeight,
           dtype: torch.dtype = WEIGHT_DTYPE) -> KnWeight | KnQWeight:
-    """Transpose one projection into the layout the kernels read.
+    """把一个投影转置成内核读取的布局。
 
     Args:
-        w: ``[N, K]`` weight: a plain tensor in any float dtype, an
-            ``int8_weights.QWeight`` (dequantised first, because this backend
-            declares ``int8_weights=False``), or a :class:`KnWeight`, which is
-            returned unchanged so the function is idempotent.
-        dtype: Storage dtype of the packed matrix; matches ``caps.weight_dtype``.
+        w: ``[N, K]`` 权重：任意浮点 dtype 的普通张量、一个
+            ``int8_weights.QWeight``（先反量化，因为本后端声明
+            ``int8_weights=False``），或一个 :class:``KnWeight``（原样返回，
+            因此本函数是幂等的）。
+        dtype: 打包矩阵的存储 dtype，与 ``caps.weight_dtype`` 一致。
 
     Returns:
-        The ``[K, N]`` weight. It is a fresh allocation except when ``w`` is
-        already packed.
+        ``[K, N]`` 权重。除非 ``w`` 已经打包，否则是新分配。
 
     Raises:
-        ValueError: ``w`` is not 2-D. A 1-D norm weight reaching here means a
-            caller packed the wrong tensor, and transposing it would fail later
-            with a shape error far from the cause.
+        ValueError: ``w`` 不是二维。一维归一化权重走到这里，说明调用方打包错了
+            张量，转置它只会在离原因很远的地方报形状错误。
     """
     if isinstance(w, (KnWeight, KnQWeight)):
         return w
     if isinstance(w, QWeight):
-        # Already int8 in the checkpoint layout, so the cheap move is to keep it int8 and
-        # transpose one byte per element rather than expanding to two bytes first. The
-        # transpose peak is half of what the bf16 path pays for the same weight.
+        # 在 checkpoint 布局里已经是 int8，所以便宜的做法是保持 int8、按每元素
+        # 一字节转置，而不是先扩成两字节。同一个权重，转置峰值只有 bf16 路径的
+        # 一半。
         wq = w.wq.t().contiguous()
         return KnQWeight(wq, w.scale.contiguous())
     if w.dim() != 2:
@@ -285,14 +266,13 @@ def to_kn(w: torch.Tensor | QWeight | KnWeight | KnQWeight,
 
 
 def _evictor(key: tuple[int, torch.dtype]) -> Any:
-    """Build the weakref callback that drops one cache entry.
+    """构造丢弃单个缓存条目的 weakref 回调。
 
     Args:
-        key: Cache key the callback is responsible for.
+        key: 该回调负责的缓存键。
 
     Returns:
-        A callback that removes that key. Closing over the key rather than over the
-        weight keeps the callback from extending the weight's lifetime.
+        删除该键的回调。闭包只捕获 key 而不捕获权重，避免回调延长权重的生命周期。
     """
 
     def _drop(_dead: weakref.ref) -> None:
@@ -302,11 +282,10 @@ def _evictor(key: tuple[int, torch.dtype]) -> Any:
 
 
 def _sweep() -> None:
-    """Drop cache entries whose source tensor has already been collected.
+    """丢掉源张量已被回收的缓存条目。
 
-    The weakref callback normally removes an entry as soon as its source dies, but
-    a callback delayed by the collector leaves a dead entry behind; the sweep makes
-    the ceiling a hard bound rather than a suggestion.
+    weakref 回调通常在源一死就删掉条目，但被回收器延迟的回调会留下死条目；清扫
+    让这个上限成为硬边界而不是建议。
     """
     for key, (ref, _packed) in list(_CACHE.items()):
         if ref() is None:
@@ -315,24 +294,22 @@ def _sweep() -> None:
 
 def as_kn(w: torch.Tensor | QWeight | KnWeight | KnQWeight,
           dtype: torch.dtype = WEIGHT_DTYPE) -> KnWeight | KnQWeight:
-    """Return the packed form of a weight, transposing it once per source object.
+    """返回权重的打包形式，按源对象只转置一次。
 
-    The op table calls this on every projection. The cost of a transpose is
-    milliseconds and the decode step is a fraction of one, so doing it per call
-    would dominate the step; memoising by identity makes the first call pay and
-    every later one a dictionary hit.
+    算子表对每个投影都调用它。一次转置是毫秒级，解码步只有一毫秒的零头，每次
+    调用都做会主导这个步骤；按对象身份记忆化让第一次调用付账，之后每次都是字典
+    命中。
 
     Args:
-        w: Projection weight in contract layout, or an already packed one.
-        dtype: Storage dtype of the packed matrix.
+        w: 契约布局下的投影权重，或已经打包的权重。
+        dtype: 打包矩阵的存储 dtype。
 
     Returns:
-        The packed weight. The returned object is the cache's own, so a caller must
-        not mutate ``wt`` in place; a weight that is not weak-referenceable is
-        packed per call instead of cached, which is correct but slow.
+        打包后的权重。返回的对象归缓存所有，调用方不得原地改 ``wt``；不能被弱
+        引用的权重每次调用都重新打包，正确但慢。
 
     Raises:
-        ValueError: ``w`` is not 2-D; see :func:`to_kn`.
+        ValueError: ``w`` 不是二维；见 :func:``to_kn``。
     """
     if isinstance(w, (KnWeight, KnQWeight)):
         return w
@@ -345,8 +322,8 @@ def as_kn(w: torch.Tensor | QWeight | KnWeight | KnQWeight,
     try:
         ref = weakref.ref(source, _evictor(key))
     except TypeError:
-        # A tensor subclass with no ``__weakref__`` slot. Caching it would pin it
-        # forever, so this one weight is repacked per call.
+        # 没有 ``__weakref__`` 槽位的张量子类。缓存它会被永久钉住，所以这一个
+        # 权重每次调用都重新打包。
         return packed
     if len(_CACHE) >= _CACHE_LIMIT:
         _sweep()
@@ -355,26 +332,24 @@ def as_kn(w: torch.Tensor | QWeight | KnWeight | KnQWeight,
 
 
 def repack_state_dict(sd: dict, dtype: torch.dtype = WEIGHT_DTYPE) -> dict[str, int]:
-    """Transpose every projection of a loaded state dict in place, one at a time.
+    """就地把已加载 state dict 的每个投影转置，一次一个。
 
-    This is the loader's entry point for ``weight_layout="kn"``: it keeps the
-    resident set at one copy of the weights by dropping each source as its packed
-    replacement takes its place, and it uses the same 2-D-ness rule as the int8
-    quantiser, so the tensors it touches are exactly the projections and never the
-    norms, ``A_log`` or the conv kernel.
+    这是加载器对 ``weight_layout="kn"`` 的入口：每份打包副本就位时立刻丢掉对应
+    的源，让常驻集只有一份权重；它沿用和 int8 量化器一样的二维判定，所以碰到的
+    张量正好是投影，永远不是归一化权重、``A_log`` 或 conv 内核。
 
     Args:
-        sd: State dict of bf16 tensors and/or ``QWeight`` objects, consumed and
-            rewritten in place. Tensors that are not projections are left alone.
-        dtype: Storage dtype of the packed matrices.
+        sd: bf16 张量和/或 ``QWeight`` 对象的 state dict，会被消费并原地改写。
+            不是投影的张量保持不动。
+        dtype: 打包矩阵的存储 dtype。
 
     Returns:
-        ``{"packed": n, "bytes_before": b, "bytes_after": a}`` for the loader's
-        startup log. The byte counts cover only the converted entries, so the
-        difference is what the conversion changed, not the model's total.
+        ``{"packed": n, "bytes_before": b, "bytes_after": a}``，供加载器的启动
+        日志用。字节数只覆盖被转换的条目，所以差值反映的是转换改了什么，而不是
+        模型总量。
 
     Raises:
-        ValueError: A projection is not 2-D; see :func:`to_kn`.
+        ValueError: 某个投影不是二维；见 :func:``to_kn``。
     """
     packed_count = 0
     bytes_before = 0
@@ -398,15 +373,14 @@ def repack_state_dict(sd: dict, dtype: torch.dtype = WEIGHT_DTYPE) -> dict[str, 
 
 
 def unpacked_keys(sd: dict) -> list[str]:
-    """Report which entries of a state dict are still in the checkpoint layout.
+    """报告 state dict 里还有哪些条目处于 checkpoint 布局。
 
     Args:
-        sd: State dict, as loaded or already repacked.
+        sd: state dict，刚加载的或已重打包的都行。
 
     Returns:
-        The projection keys not yet packed, in dict order. Empty means the loader
-        did its part; a non-empty answer after loading means every call for that
-        weight pays a cached transpose instead of using the resident one.
+        尚未打包的投影键，按字典顺序。空表示加载器做完了自己那部分；加载后仍非空
+        意味着每次用到该权重都要付一次缓存转置，而不是用常驻的那份。
     """
     return [key for key, w in sd.items()
             if not isinstance(w, KnWeight)

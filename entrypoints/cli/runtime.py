@@ -1,18 +1,15 @@
-"""Command-line client for the resident inference runtime.
+"""常驻推理运行时的命令行客户端。
 
-Module: ``coffin.entrypoints.cli``. CLI parsing is isolated from model
-construction so importing the runtime does not also define a large command
-parser.
+Module: ``coffin.entrypoints.cli``。参数解析与模型构造隔开，导入本模块不会
+连带着构造一个巨大的参数解析器。
 
 Constraints:
-    * This is the only place that parses runtime flags, so it is also the only
-      place ``--backend`` can take effect: the backend is selected at import of
-      ``coffin.backends``, so the flag has to be written into
-      ``COFFIN_BACKEND`` *before* the serving modules that bind the op table are
-      imported. That is why the imports below the flag parsing are deferred.
-    * ``--no-graph`` cannot be an environment variable: the decision has to
-      reach ``EngineConfig`` before the engine captures, and a backend that
-      cannot capture must win over the flag.
+    * 这里是唯一解析运行时开关的地方，所以也是 ``--backend`` 唯一能生效的
+      地方：后端在 import ``coffin.backends`` 时就已经选定了，开关必须在
+      绑定算子表的 serving 模块被导入*之前*写进 ``COFFIN_BACKEND``。下面
+      那些 import 之所以延迟到解析之后，就是为此。
+    * ``--no-graph`` 不能做成环境变量：这个决定必须在引擎 capture 之前
+      传到 ``EngineConfig``，而且不支持 capture 的后端优先级必须高于开关。
 """
 
 from __future__ import annotations
@@ -25,11 +22,10 @@ from pathlib import Path
 from serving.runtime_support import MAX_SEQ, MODEL, SOCK
 
 def main() -> None:
-    """CLI entry point: serve in this process, or act as a client of one.
+    """命令行入口：要么在本进程里起服务，要么作为客户端去连一个服务。
 
-    ``--serve`` owns the socket and the model; every other invocation is a thin
-    client that prints the reply, so the two roles never share a code path and a
-    client cannot accidentally load weights.
+    ``--serve`` 独占 socket 和模型；其余调用都是薄客户端，只把回包打印出来。
+    两种角色不共用代码路径，客户端就不可能顺手把权重加载起来。
     """
     ap = argparse.ArgumentParser()
     ap.add_argument("--serve", action="store_true")
@@ -105,7 +101,8 @@ def main() -> None:
                          "long prompt from blocking a short one; it is not the GEMM "
                          "tile (that is --max-num-batched-tokens' chunk)")
 
-    # images
+    # 图像相关开关集中在这里，因为它们互相关联：像素上限决定图像 token 数，
+    # 而图像 token 数才是真正吃显存和延迟的那一项。
     ap.add_argument("--no-vision", dest="vision", action="store_false",
                     help="do not load the vision tower (saves ~0.62 GiB); image "
                          "requests then answer 503 instead of being served")
@@ -133,8 +130,8 @@ def main() -> None:
     ap.add_argument("--temperature", type=float, default=0.0)
     args = ap.parse_args()
 
-    # Written before anything binds the op table: ``coffin.backends`` selects its
-    # backend at import, so a later assignment would change nothing.
+    # 必须在任何模块绑定算子表之前写入：``coffin.backends`` 在 import 时就选好
+    # 后端，之后再赋值不会改变任何东西。
     if args.backend:
         os.environ["COFFIN_BACKEND"] = args.backend
     from serving.runtime_transport import call, serve

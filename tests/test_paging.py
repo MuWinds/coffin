@@ -1,34 +1,28 @@
-"""Paged attention and radix prefix reuse must not change the answers.
+"""分页注意力与基数前缀复用不得改变答案。
 
-Module: ``coffin/tests``. Drives ``prefix_engine.PrefixCacheEngine``,
-``paged_cache`` and ``radix_cache`` over a shared paged model; it swaps the
-fixture between the paged and dense configurations, so it pays two model loads.
+Module: ``coffin/tests``。驱动 ``prefix_engine.PrefixCacheEngine``、
+``paged_cache`` 与 ``radix_cache``，跑在同一个分页模型上；fixture 会在分页与
+dense 两种配置之间切换，所以这里要付两次模型加载。
 
 Constraints:
-    * The equality tests are token-for-token, not approximate: paging changes
-      where the int8 rows live, not the arithmetic, so any token drift is a bug.
-    * On the hybrid model reused KV is only valid together with the recurrent
-      state that produced it; a KV-only hit would silently corrupt everything
-      after it, which is why the state snapshot is asserted, not assumed.
-    * ``_ENGINE`` is module-global: the block pool and the tree are the state
-      under test, so a fresh engine per test would hide leaks and make eviction
-      assertions meaningless.
-    * The pool sizes are small on purpose so eviction is reachable; a large pool
-      would never exercise the unreferenced-leaf path.
+    * 相等性断言按 token 逐个比对，不做近似：分页只改变 int8 行存在哪里，不改
+      算术，任何 token 漂移都是 bug。
+    * 混合模型上，复用的 KV 只有配上产生它的循环状态才有效；只命中 KV 会让它
+      之后的一切静默出错，所以状态快照是断言出来的，不是假定的。
+    * ``_ENGINE`` 是模块级全局：块池和树就是被测的状态，每个测试新建一个引擎会
+      把泄漏藏起来，淘汰断言也就失去意义。
+    * 池容量故意设得很小，好让淘汰真的能发生；池一大就永远走不到无引用叶子那
+      条路径。
 
-Four things have to hold:
+四件事必须成立：
 
-1. paged decode == dense decode, token for token (the paged kernel addresses the
-   same int8 rows through a slot map);
-2. a prefix cache *hit* == a cold full prefill -- the important one for a hybrid
-   model;
-3. copy-on-write protects a shared block, and decoding past a matched prefix
-   leaves every block the tree holds untouched;
-4. the pool survives pressure: eviction takes only unreferenced leaves and every
-   block comes back on release.
+1. 分页解码 == dense 解码，逐 token 相等（分页内核通过槽位表寻址同样的 int8 行）；
+2. 前缀缓存命中 == 冷的完整预填充——混合模型上这一条最关键；
+3. 写时复制保护共享块，越过已匹配前缀继续解码不动树持有的任何块；
+4. 池扛得住压力：淘汰只拿走无引用的叶子，释放时每个块都回来。
 
-Port of ``diag/check_paged.py``: only functional assertions (the timing prints
-stay in that probe -- tests assert *what* the cache reuses, not how fast).
+移植自 ``diag/check_paged.py``：只保留功能断言（计时打印留在那个探针里——测试
+断言缓存复用了什么，不关心它有多快）。
 """
 
 from __future__ import annotations
@@ -52,7 +46,7 @@ _ENGINE = None
 
 
 def _engine():
-    """One paged PrefixCacheEngine for the module, rebuilt if the fixture moved."""
+    """全模块共用一个分页 ``PrefixCacheEngine``；fixture 换了才重建。"""
     global _ENGINE
     from engine.prefix_engine import PrefixCacheEngine
     model = support.ModelFixture.get(quant=False, max_seq=8192, paged=True)
@@ -65,18 +59,18 @@ def _engine():
 
 @functools.lru_cache(maxsize=1)
 def _tokenizer():
-    """Load the tokenizer once; it is 10 MB of JSON and every test re-encodes text."""
+    """分词器只加载一次：它是 10 MB 的 JSON，而每个测试都要重新编码文本。"""
     from transformers import AutoTokenizer
     return AutoTokenizer.from_pretrained(str(support.MODEL_DIR))
 
 
 def _ids(text: str) -> list[int]:
-    """Token ids of one prompt fragment."""
+    """把一段 prompt 片段编成 token id。"""
     return _tokenizer().encode(text)
 
 
 def _greedy(model, ids: list[int], n: int) -> list[int]:
-    """Dense baseline: greedy ``n`` tokens through the plain (unpaged) model path."""
+    """dense 基线：走未分页的普通路径贪心生成 ``n`` 个 token。"""
     model.reset()
     logits = model.prefill(ids)
     out: list[int] = []
@@ -88,11 +82,10 @@ def _greedy(model, ids: list[int], n: int) -> list[int]:
 
 
 def _tree_fingerprint(eng) -> str:
-    """Hash every block the radix tree currently holds.
+    """对基数树当前持有的每个块内容取哈希。
 
-    A fingerprint rather than a block-id set: copy-on-write may move or refcount
-    a block without changing the KV bytes, and that is fine, whereas overwriting
-    a block in place changes the hash.
+    取指纹而不是块 id 集合：写时复制可能挪动块或改引用计数而不改 KV 字节，那是
+    允许的；原地覆写块才会改变哈希。
     """
     digest = hashlib.sha256()
     pool = eng.pool
@@ -109,17 +102,17 @@ def _tree_fingerprint(eng) -> str:
 
 @support.needs_model
 class PagedDecodeTest(unittest.TestCase):
-    """The paged kernel must address exactly the rows dense attention would."""
+    """分页内核必须寻址到 dense 注意力会寻址的那些行，一行不多一行不少。"""
 
     def test_paged_decode_matches_dense(self):
-        """A wrong slot map still produces plausible tokens, so the two paths are compared token for token."""
+        """槽位表错了照样能吐出像样的 token，所以两条路径必须逐 token 比对。"""
         ids = _ids(SYS_A) + _ids(" When was it founded?")
         dense_model = support.ModelFixture.get(quant=False, max_seq=8192, paged=False)
         support.ensure_captured(dense_model)
         dense = _greedy(dense_model, ids, 24)
 
         eng = _engine()
-        eng.generate(ids, 4)                       # warm the page table
+        eng.generate(ids, 4)                       # 先把页表预热
         run = eng.generate(ids, 24)
         self.assertEqual(run["tokens"], dense,
                          f"paged vs dense: {sum(a == b for a, b in zip(run['tokens'], dense))}/24 tokens")
@@ -127,10 +120,10 @@ class PagedDecodeTest(unittest.TestCase):
 
 @support.needs_model
 class PrefixReuseTest(unittest.TestCase):
-    """A cache hit must be indistinguishable from a cold prefill of the same tokens."""
+    """缓存命中必须和同样 token 的冷预填充分辨不出区别。"""
 
     def test_prefix_hit_reproduces_the_cold_answer(self):
-        """The second request is the oracle: same prompt, cached prefix, must decode identically."""
+        """第二次请求就是对照实现：同样的 prompt、带缓存的前缀，解码结果必须一致。"""
         q1 = _ids(" Which river runs through it?")
         ids = _ids(SYS_B) + q1
         eng = _engine()
@@ -143,36 +136,36 @@ class PrefixReuseTest(unittest.TestCase):
                          "cache hit changed the greedy answer")
 
     def test_warm_prefill_reuses_the_prefix_and_keeps_the_answer(self):
-        """Long prompts are chunked, so the reuse must survive several prefill chunks, not just one."""
+        """长 prompt 会被分块，所以复用要跨过好几个预填充分块，而不只是一个。"""
         q1 = _ids(" When was it founded?")
         q2 = _ids(" Which river runs through it?")
         base = _ids(SYS_A) + q1 + q2 + _ids(PROMPT)
-        long_prompt = [base[i % len(base)] for i in range(6000)]   # 3 prefill chunks
+        long_prompt = [base[i % len(base)] for i in range(6000)]   # 3 个预填充分块
         eng = _engine()
         cold = eng.prefill(long_prompt).float().clone()
         warm = eng.prefill(long_prompt).float().clone()
-        # Functional claim: the cache covers the prompt and the reused path returns
-        # the same next token as the full prefill (what it saves is the probe's job).
+        # 只断言功能：缓存覆盖了 prompt，复用路径给出的下一个 token 和完整预填充
+        # 相同（省下多少时间由探针去量）。
         self.assertGreaterEqual(eng.last_matched, len(long_prompt) - 1024,
                                 f"matched {eng.last_matched} of {len(long_prompt)}")
         self.assertEqual(int(cold.argmax()), int(warm.argmax()),
                          "warm prefill picked a different next token")
-        unit = max(float(cold.abs().max()), 1e-6) * 2.0 ** -8    # one bf16 ULP
+        unit = max(float(cold.abs().max()), 1e-6) * 2.0 ** -8    # 一个 bf16 ULP
         self.assertLess(float((cold - warm).abs().max()), 4.0 * unit)
 
 
 @support.needs_gpu
 class CopyOnWriteTest(unittest.TestCase):
-    """A second reference to a block must never be written through in place."""
+    """一个块的第二个引用绝不允许被原地写穿。"""
 
     def test_shared_block_is_not_overwritten_and_writer_copies(self):
-        """Writing a shared block in place would corrupt the tree's copy while still looking correct to the writer."""
+        """原地写共享块会改坏树里那份拷贝，而写者自己还觉得一切正常。"""
         from cache.paged_cache import PagedKVCache, SeqKV
         pool = PagedKVCache(1, 2, 8, num_blocks=4, block_size=4, max_seq=16)
         block = pool.alloc()
         pool.k[0, block * 4:(block + 1) * 4] = 7
-        pool.incref(block)                         # a second holder (the tree)
-        seq = SeqKV(pool, [block], num_tokens=3)   # partial tail, still shared
+        pool.incref(block)                         # 第二个持有者（树）
+        seq = SeqKV(pool, [block], num_tokens=3)   # 尾部只写了一部分，仍是共享的
         before = pool.k[0, block * 4:(block + 1) * 4].clone()
         seq.reserve(1)
         self.assertTrue(torch.equal(before, pool.k[0, block * 4:(block + 1) * 4]),
@@ -183,31 +176,31 @@ class CopyOnWriteTest(unittest.TestCase):
 
 @support.needs_model
 class TreeBlocksTest(unittest.TestCase):
-    """The tree owns its blocks; a decoding sequence may only read them."""
+    """树拥有自己的块；解码中的序列只能读它们。"""
 
     def test_decoding_past_a_matched_prefix_leaves_the_tree_untouched(self):
-        """Decoding beyond the match writes new blocks, and any in-place write would poison the shared prefix."""
+        """越过命中点继续解码要写新块，任何原地写入都会毒化共享前缀。"""
         ids = _ids(SYS_A) + _ids(" When was it founded?")
         eng = _engine()
-        eng.generate(ids, 8)                       # make sure the prefix is in the tree
+        eng.generate(ids, 8)                       # 先让前缀进入树
         before = _tree_fingerprint(eng)
-        eng.generate(ids, 16)                      # decode past the matched prefix
+        eng.generate(ids, 16)                      # 越过已匹配前缀继续解码
         self.assertEqual(before, _tree_fingerprint(eng))
 
 
 @support.needs_gpu
 class PoolEvictionTest(unittest.TestCase):
-    """Eviction and release must both leave the refcounts consistent."""
+    """淘汰和释放之后引用计数都必须仍然自洽。"""
 
     def test_eviction_spares_live_blocks_and_release_returns_them(self):
-        """Evicting a live sequence's block is data loss; a leaked refcount is a pool that never grows back."""
+        """淘汰活序列的块就是数据丢失；引用计数泄漏则等于池再也长不回来。"""
         from cache.paged_cache import PagedKVCache, SeqKV
         from cache.radix_cache import RadixCache
         pool = PagedKVCache(2, 4, 32, num_blocks=4, block_size=8, max_seq=64)
         radix = RadixCache(pool, max_state_snapshots=2)
         live = SeqKV(pool)
         live.reserve(16)
-        live.commit_upto(16)                       # 2 of the 4 blocks are held
+        live.commit_upto(16)                       # 4 个块里占了 2 个
         radix.evict(4)
         self.assertEqual(pool.num_used, 2, "eviction touched a live sequence's blocks")
         live.free()

@@ -37,7 +37,7 @@
 8. **目录结构**：`coffin/backends/{protocol,vendor,discovery,registry}.py` + `backends/{reference,hip}/` + `backends/vendors/`；厂商平台只登记在 `vendors/` 下，一个文件一个平台。
    `hip_ops.py` 与 `kernels/` **整体搬进 `backends/hip/`**，顶层同名模块**删除**（用户已定：不留兼容 shim）。
    HIP 专有探针搬进 `backends/hip/diag/`，与模型/服务探针分开。
-9. **一次性全量改名，但分 6 步落地，每步树都是绿的**（S0 骨架 → S1 搬核 → S2 设备/dtype → S3 删 fallback 分支
+9. **一次性全量改名，但分 6 步落地，每步树都是绿的**（S0 骨架 → S1 搬核 → S2 设备/dtype → S3 删回退分支
    → S4 探针归位 → S5 收紧门禁 + CPU 冒烟）。门禁用 `tests/test_backends_purity.py`（纯扫描），
    违规清单从"当前全量"收敛到空，迁移进度可量化。
 10. **目标是国产加速卡**：天数智芯（`cuda` 命名空间 + 设备名识别）、燧原（`gcu`）、摩尔线程（`musa`）。
@@ -96,7 +96,7 @@ coffin/
 └─ layers/                      删除（已无人 import 的兼容壳，与"不留 shim"冲突）
 ```
 
-为什么 `hip` 是手写的、其它是声明的：`hip` 有真实 kernel、核内 tiling、autotune 和构建路径，
+为什么 `hip` 是手写的、其它是声明的：`hip` 有真实内核、核内 tiling、autotune 和构建路径，
 这些不是一个声明能表达的东西；其余平台在拿到机器之前只有"事实与期望"，正好是声明能表达的。
 
 依赖方向（单向，门禁强制）：
@@ -179,9 +179,9 @@ SPEC = VendorSpec(
 | 投影 | `linear(w, x)` | 单/少 token 权重读：`x [K]` 或 `[C,K]` → `[N]` / `[C,N]`；`w` 可为 `QWeight` | `gemv` / `gemv_w8a16` |
 | | `linear_m(w, x)` | 小 M 批投影，一次权重流出 M 行 | `gemv_m` / `gemv_w8a16_m` / `gemv_w8a16_wide*` |
 | | `linear_prefill(w, x)` | prefill 分块 GEMM（大 M） | `F.linear` + `dequant`（现状） |
-| Norm | `rms_norm(x, g, stride, eps)` | 零中心 RMSNorm，支持行跨步 | `rms_norm` |
+| 归一化 | `rms_norm(x, g, stride, eps)` | 零中心 RMSNorm，支持行跨步 | `rms_norm` |
 | | `rms_norm_gated(x, w, gate, eps)` | 标准 RMSNorm × silu(gate) | `rms_norm_gated` |
-| Attention | `attn_decode(q, gate, cache, pos, ...)` | 单 token 全注意力（dense 缓存） | `attn` |
+| 注意力 | `attn_decode(q, gate, cache, pos, ...)` | 单 token 全注意力（dense 缓存） | `attn` |
 | | `attn_paged(q, gate, pool, pos2slot, pos, ...)` | 分页池上的单 token 注意力 | `attn_paged` |
 | | `attn_paged_batch(...)` | B 行一次 launch，按行 `context_lens` | `attn_paged_batch` |
 | | `attn_paged_multi_q(...)` | verify：c 个 query 共享一次历史 KV | `attn_paged_multi_q` |
@@ -199,7 +199,7 @@ SPEC = VendorSpec(
 **不进契约的**：`gemv_w8a16_wide_dbg`、`gemv_w8a16_wide_dot2_dbg`（A/B 调试）、`_load()`、`_error`。
 
 **已知重复，本期不动**：`attn_decode`（dense 缓存）与 `attn_paged` 只差寻址方式；dense 路径是单流遗留，
-真正的合并方式是"永远走分页池，不启用 paging 时给一张单位 slot map"。这会把 4 个 attention 算子降到 3 个，
+真正的合并方式是"永远走分页池，不启用 paging 时给一张单位槽位表"。这会把 4 个注意力算子降到 3 个，
 但要改 `full_attn` 的缓冲与 `capture`，放到 S5 之后单独一轮，避免和平台迁移混在一起。
 
 ### 3.3 全量表格 + reference 兜底
@@ -342,9 +342,9 @@ S1 之前所有工作都不改生产代码，所以"方案评审 → S0/S1"可�
 
 **第 2 步是关键**：一个算子就够跑通，因为其余 16 个由 reference 补。不要等"全实现完"再接。
 
-### 7.2 各平台已知硬事实（决定 kernel 怎么写）
+### 7.2 各平台已知硬事实（决定内核怎么写）
 
-| 平台 | 必须按这个写 kernel | 出处 |
+| 平台 | 必须按这个写内核 | 出处 |
 | --- | --- | --- |
 | 天数智芯 | 权重用 `[K, N]` + `x @ Wt`（`weight_layout="kn"`）。`[N, K]` 行主序在本卡只有 19–30 GB/s，占 decode 时延 92%；`[K, N]` 有 362–410 GB/s | `reference/biv100_llm_engine/core/linear.py` |
 | 天数智芯 | `N > 131072` 的 row-major-B GEMV **返回 NaN**（131072 好、196608 坏）。`lm_head` 正好超宽，必须分块投影 | 同上 `MAX_GEMV_N` |
@@ -359,8 +359,8 @@ S1 之前所有工作都不改生产代码，所以"方案评审 → S0/S1"可�
 
 - **`device_name` 不是日志字段**：在共用 `cuda` 命名空间里它是唯一区分依据。`Caps.device_name`
   的 docstring 已经把这点写死，防止后来者把探测改回 `torch.cuda.is_available()`。
-- **`recurrent_state` 不是"有没有原生快照核"**：recurrent state 的快照/恢复是引擎侧
-  `clone()`/`copy_()`，没有 kernel 参与（`reference/biv100_llm_engine/cache/kv_cache.py` 就是这么做的）。
+- **`recurrent_state` 不是"有没有原生快照核"**：循环状态的快照/恢复是引擎侧
+  `clone()`/`copy_()`，没有内核参与（`reference/biv100_llm_engine/cache/kv_cache.py` 就是这么做的）。
   新平台如果因为"我没写快照核"报 `False`，会白白丢掉前缀复用这个最大的 TTFT 收益。
 
 ---
@@ -372,7 +372,7 @@ S1 之前所有工作都不改生产代码，所以"方案评审 → S0/S1"可�
   这不是"不做自动发现"——目录扫描已经做到了"加文件即生效"；只是不引入 Python entry-point
   那套安装期注册，因为它会引入一个当前不存在的部署步骤。
 - **不留兼容 shim**：顶层 `hip_ops` 直接删除，`layers/`（已无人 import）删除。用户已拍板。
-- **本期不合并 dense/paged 两套 attention**（见 §3.2 末尾），单独一轮。
+- **本期不合并 dense/paged 两套注意力**（见 §3.2 末尾），单独一轮。
 - **本期不做视频 / 新平台的视觉塔优化**：`vision.py` 走 reference 就能跑，性能后置。
 
 ---
@@ -383,7 +383,7 @@ S1 之前所有工作都不改生产代码，所以"方案评审 → S0/S1"可�
 | --- | --- | --- |
 | Q1 | `D`/`WF` 从 `ops/dtypes.py` 搬进 `caps`，但在 `ops/dtypes.py` **保留同名再导出** | 备选：全量改名成 `caps.act_dtype`（200+ 处 import 要改）。再导出是"能力位是唯一来源、导入点不变"的折中，代价是模块名与内容略不符名 |
 | Q2 | `ATTN_SPLIT` 迁到 `backends/hip/tuning.py`，由 `caps.attn_split` 驱动 `part_acc`/`part_ml` 的尺寸 | 备选：留在 `models/qwen35/tuning.py`。那等于承认"模型族知道这块卡的 split-K 宽度"，换平台必错 |
-| Q3 | dense/paged 两套 attention 本期**不合并** | 合并能减 1 个算子、少 2 个缓冲，但要动 `capture()` 与 `full_attn` 的缓冲布局，和平台迁移混在一起会掩盖回归 |
+| Q3 | dense/paged 两套注意力本期**不合并** | 合并能减 1 个算子、少 2 个缓冲，但要动 `capture()` 与 `full_attn` 的缓冲布局，和平台迁移混在一起会掩盖回归 |
 | Q4 | 删除 `layers/__init__.py`（全仓库无人 import，是对 `ops` 的兼容壳） | 保留则与"不留 shim"矛盾；删除无风险（grep 确认 0 引用） |
 | Q5 | 各厂商第一期 `caps.graph=False`，decode 走 eager | 代价：decode 明显慢于 gfx906 的 graph 路径（gfx906 上 graph 是 3.1x）。收益：模型层零改动即可出文本；graph 支持单独一轮 |
 | Q6 | S5 加"无卡 CPU 冒烟"（`COFFIN_BACKEND=reference` 跑 `run_chat --no-graph`） | 需要一条 `reference` 后端能跑的极小 checkpoint 或合成权重；好处是本地/CI 无需 DCU 就能验证结构改动 |
@@ -500,7 +500,7 @@ prod 侧 75 处属性引用、25 个符号，归并到 17 个算子名：
 1. **int8 KV 布局是契约，不是后端自由**：`[nslots, nkv, hd]` int8 + `[nslots, nkv]` fp32 scale，
    `round(x/s)` clamp 到 `[-127, 127]`。后端必须接受这个布局，因为模型侧的 `paged_cache` 写的就是它。
 2. **`caps.graph=False` 的语义是"允许 eager"**，不是"允许在默认流上假装捕获"——后者会让捕获出的图
-   静默丢 kernel（`hip_ops` 的约束里记过这个坑）。同时要写明没有 `graph_pool_handle` 等价物时显存翻倍的代价。
+   静默丢内核（`hip_ops` 的约束里记过这个坑）。同时要写明没有 `graph_pool_handle` 等价物时显存翻倍的代价。
 3. **`caps.autotune=False` 是"后端给固定选路"**，不是"运行时测一组候选"；并且 `bench=False` 的构造路径
    必须保留，无卡测试依赖它跳过 sweep。
 4. **`D`/`WF` 再导出只是省改名**：语义来源必须唯一是 `caps`，`ops/dtypes.py` 里不能再有第二个字面量。

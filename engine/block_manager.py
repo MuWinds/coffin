@@ -1,20 +1,17 @@
-"""Block ownership: the paged pool, its refcounts and the radix prefix tree.
+"""块的归属：分页池、它的引用计数和基数前缀树。
 
-Module: ``coffin/`` (top level), used by ``llm_engine`` and ``prefix_engine``.
-The pool (``paged_cache.PagedKVCache``) hands out and shares blocks; the radix
-tree (``radix_cache.RadixCache``) knows which prefixes are worth keeping. This
-is the object that owns both and answers what a scheduler actually asks: can
-this request be admitted, which blocks can it reuse, and who still holds the
-blocks it is about to release.
+Module: ``coffin/``（顶层），由 ``llm_engine`` 和 ``prefix_engine`` 使用。池
+（``paged_cache.PagedKVCache``）负责发放和共享块；基数树
+（``radix_cache.RadixCache``）知道哪些前缀值得留。本对象同时持有两者，回答
+调度器真正在意的问题：这个请求能不能准入、它能复用哪些块、它马上要释放的
+块还有谁拿着。
 
 Constraints:
-    * A block id is only valid while it is referenced by the radix tree, by a
-      ``Sequence.block_table``, or both. ``free`` drops the pool reference, so
-      calling it on a block the tree still caches is a corruption bug, not a
-      leak.
-    * ``assign`` only rewrites the pool's slot map; it does not take a
-      reference. The caller must already own the blocks.
-    * No locking. The engine's step loop is the only writer.
+    * 块 id 只有在被基数树或某个 ``Sequence.block_table`` 引用时（或两者都有）
+      才有效。``free`` 丢掉的是池里的那份引用，对树仍在缓存的块调它会造成
+      数据损坏，而不是泄漏。
+    * ``assign`` 只重写池里的槽位表，不取引用。调用方必须已经持有这些块。
+    * 不加锁。引擎的步进循环是唯一的写者。
 """
 
 from __future__ import annotations
@@ -26,26 +23,25 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from cache.radix_cache import RadixCache
 
 
-#: Default block granularity; the runtime CLI exposes it as ``--block-size``.
-#: 64 matches the snapshot interval floor, so a recurrent-state snapshot never
-#: lands mid-block.
+#: 默认块粒度；运行时命令行把它暴露成 ``--block-size``。64 与快照间隔的下限
+#: 一致，循环状态快照因此永远不会落在块中间。
 DEFAULT_BLOCK_SIZE = 64
 
 
 class BlockManager:
-    """The pool plus its prefix tree, and the refcount bookkeeping between them."""
+    """池、它的前缀树，以及两者之间的引用计数簿记。"""
 
     def __init__(self, pool: "PagedKVCache", radix: "RadixCache | None" = None,
                  block_size: int = DEFAULT_BLOCK_SIZE) -> None:
-        """Wrap an already-built pool.
+        """包装一个已经建好的池。
 
         Args:
-            pool: The paged KV pool, normally built by :meth:`attach` calling
-                ``model.enable_paging``.
-            radix: Prefix tree over the same pool, or ``None`` for the
-                batched-decode pool that does not share prefixes.
-            block_size: Tokens per block. Must agree with the pool's own block
-                size, since it is used to translate token counts into blocks.
+            pool: 分页 KV 池，通常由 :meth:`attach` 调 ``model.enable_paging``
+                建出来。
+            radix: 建在同一池上的前缀树；批处理解码用的池不共享前缀，传
+                ``None``。
+            block_size: 每块的 token 数。必须与池自己的块大小一致，因为它要
+                用来把 token 数换算成块数。
         """
         self.pool = pool
         self.radix = radix
@@ -54,20 +50,19 @@ class BlockManager:
     @classmethod
     def attach(cls, model, num_blocks: int, block_size: int = DEFAULT_BLOCK_SIZE,
                snapshots: int = 8, with_radix: bool = True) -> "BlockManager":
-        """Create the paged pool on ``model`` and wrap it with a radix tree.
+        """在 ``model`` 上建分页池，再用基数树把它包起来。
 
         Args:
-            model: A ``PagedModel``; ``enable_paging`` must exist on it.
-            num_blocks: Physical blocks in the pool. ``-1`` is resolved by the
-                config layer, not here.
-            block_size: Tokens per block.
-            snapshots: Recurrent-state snapshot budget handed to the radix tree.
-            with_radix: ``False`` builds the batched-decode pool — same storage
-                and refcounts, no prefix reuse. The batched scheduler allocates
-                a sequence's blocks itself until per-sequence prefixes exist.
+            model: 一个 ``PagedModel``，必须带 ``enable_paging``。
+            num_blocks: 池里的物理块数。``-1`` 由配置层解析，不在这里处理。
+            block_size: 每块的 token 数。
+            snapshots: 交给基数树的循环状态快照预算。
+            with_radix: 传 ``False`` 建的是批处理解码用的池——存储和引用计数
+                一样，但不做前缀复用。在有按序列前缀之前，批调度器自己分配
+                序列的块。
 
         Returns:
-            The manager owning the new pool.
+            持有新建池的管理器。
         """
         from cache.radix_cache import RadixCache
 
@@ -75,24 +70,23 @@ class BlockManager:
         radix = RadixCache(pool, snapshots) if with_radix else None
         return cls(pool, radix, block_size)
 
-    # Per-sequence allocation, used by the batched path.
+    # 按序列分配，批处理路径使用。
     def ensure_blocks(self, seq, num_tokens: int) -> list[int]:
-        """Allocate blocks until ``seq`` can hold ``num_tokens`` positions.
+        """分配块，直到 ``seq`` 放得下 ``num_tokens`` 个位置。
 
-        Only ever grows the table. Shrinking here would drop the tail of a
-        sequence that is still decoding, so release is a separate call.
+        只增不减。在这里缩减会把一条还在解码的序列的尾巴丢掉，所以释放是另一个
+        单独的调用。
 
         Args:
-            seq: Sequence whose ``block_table`` is extended in place.
-            num_tokens: Positions the sequence must be able to hold.
+            seq: ``block_table`` 被就地扩展的序列。
+            num_tokens: 序列必须能容纳的位置数。
 
         Returns:
-            The sequence's block table, extended as needed.
+            该序列的块表，按需扩展过。
 
         Raises:
-            OutOfBlocks: The pool is empty. The caller must evict the prefix
-                cache and, if that is not enough, preempt a sequence; the request
-                cannot grow here.
+            OutOfBlocks: 池空了。调用方必须先淘汰前缀缓存，还不够就抢占一条
+                序列；这个请求没法在这里长大。
         """
         need = (num_tokens + self.block_size - 1) // self.block_size
         while len(seq.block_table) < need:
@@ -100,46 +94,43 @@ class BlockManager:
         return seq.block_table
 
     def release(self, seq) -> None:
-        """Drop ``seq``'s reference on every block it holds.
+        """丢掉 ``seq`` 在它持有的每个块上的引用。
 
-        The tree keeps its own reference on anything it caches, so a preempting
-        sequence can call this and still leave every block-aligned prefix reusable
-        by the next admission. A block with no other holder returns to the pool.
+        树对自己缓存的东西另有一份引用，所以被抢占的序列调完这个，按块对齐的
+        前缀仍然能被下一次准入复用。没有别的持有者的块回到池里。
 
         Args:
-            seq: Sequence being retired or preempted. Its table is cleared, so a
-                second call frees nothing rather than freeing the same ids twice.
+            seq: 正在退休或被抢占的序列。它的块表会被清空，所以再调一次不会
+                重复释放同一批 id。
         """
         self.free(seq.block_table)
         seq.block_table.clear()
 
     def reserve(self, blocks_needed: int) -> None:
-        """Evict cached prefixes until ``blocks_needed`` free blocks exist.
+        """淘汰缓存前缀，直到空出 ``blocks_needed`` 个块。
 
         Args:
-            blocks_needed: Blocks the next prefill requires. Called *before*
-                allocating so eviction can still pick unreferenced leaves;
-                afterwards the request itself would occupy the only candidates.
+            blocks_needed: 下一次预填充需要的块数。必须在*分配之前*调用，这样
+                淘汰时还有无人引用的叶子可挑；分配之后，请求自己就占住了唯一
+                的候选。
         """
         if self.radix is not None:
             self.radix.reserve(blocks_needed)
 
     def match_prefix(self, token_ids: list[int], require_states: bool = False,
                      mm=None):
-        """Longest cached block prefix of ``token_ids``.
+        """``token_ids`` 里最长的已缓存块前缀。
 
         Args:
-            token_ids: Full request tokens.
-            require_states: Require a recurrent-state snapshot at the hit point
-                (mandatory for the hybrid model, where KV alone is not enough).
-            mm: The request's image payload (``mm_input.MMInput | None``). The
-                radix tree salts block keys with it, so a prompt carrying a
-                *different* image cannot reuse this prefix's KV. ``None`` is the
-                plain text path and costs nothing extra.
+            token_ids: 完整的请求 token。
+            require_states: 要求命中点处有循环状态快照（混合模型上这是必须的，
+                那里光有 KV 不够）。
+            mm: 请求的图像载荷（``mm_input.MMInput | None``）。基数树拿它给
+                块键加盐，所以带*不同*图像的 prompt 无法复用这段前缀的 KV。
+                ``None`` 是纯文本路径，不额外花代价。
 
         Returns:
-            ``(blocks, length, states)``; ``([], 0, None)`` when no prefix tree
-            is attached.
+            ``(blocks, length, states)``；没挂前缀树时是 ``([], 0, None)``。
         """
         if self.radix is None:
             return [], 0, None
@@ -148,28 +139,27 @@ class BlockManager:
 
     def insert(self, token_ids: list[int], blocks: list[int], states,
                mm=None) -> None:
-        """Record a prefilled prefix in the tree.
+        """把一段已预填充的前缀记进树里。
 
         Args:
-            token_ids: Tokens the prefix covers, block-aligned.
-            blocks: Physical blocks holding that prefix's KV.
-            states: Recurrent-state snapshots for the block boundaries, or
-                ``None`` when none were captured.
-            mm: Media payload to salt the keys with; must match what
-                :meth:`match_prefix` will be called with.
+            token_ids: 这段前缀覆盖的 token，按块对齐。
+            blocks: 存着该前缀 KV 的物理块。
+            states: 块边界处的循环状态快照，没打到任何快照时为 ``None``。
+            mm: 用来给键加盐的媒体载荷；必须与之后调用 :meth:`match_prefix`
+                时传的一致。
         """
         if self.radix is not None:
             self.radix.insert(token_ids, blocks, states, mm=mm)
 
     def assign(self, blocks: list[int], row: int = 0) -> None:
-        """Point the pool's slot map for ``row`` at ``blocks``.
+        """把池里第 ``row`` 行的槽位表指向 ``blocks``。
 
-        Row 0 is the single-stream path and skips the row argument entirely, so
-        that path pays no extra dispatch on the hot decode loop.
+        ``row == 0`` 是单流路径，直接省掉行参数，热解码循环因此不必多付一次
+        分派。
 
         Args:
-            blocks: Block ids to map. The caller must already hold references.
-            row: Batch row to map them onto.
+            blocks: 要映射的块 id。调用方必须已经持有引用。
+            row: 映射到哪一行批槽位。
         """
         if row == 0:
             self.pool.assign_table(blocks, 0)
@@ -177,19 +167,18 @@ class BlockManager:
             self.pool.assign_table(blocks, 0, row=row)
 
     def free(self, blocks: list[int]) -> None:
-        """Return blocks to the pool.
+        """把块还给池。
 
         Args:
-            blocks: Ids to release. Must not include blocks the radix tree still
-                caches — evict them through the tree instead.
+            blocks: 要释放的 id。不能包含基数树仍在缓存的块——那种块要通过树
+                去淘汰。
         """
         self.pool.free_blocks(blocks)
 
     def clear_prefix_cache(self) -> None:
-        """Drop every cached prefix.
+        """丢掉所有缓存前缀。
 
-        Used by A/B cold-start measurements and by tests that need a known-cold
-        engine without rebuilding the pool.
+        A/B 冷启动测量用它，需要已知冷引擎但不想重建池的测试也用它。
         """
         if self.radix is not None:
             self.radix.clear()
@@ -207,12 +196,11 @@ class BlockManager:
         return self.pool.num_free
 
     def stats(self) -> dict:
-        """Prefix-cache counters, as reported by the runtime ``ping``.
+        """前缀缓存的计数器，运行时 ``ping`` 上报的就是这些。
 
         Returns:
-            Block totals always; the radix counters only when a tree is
-            attached. ``snapshot_mib`` is rounded to one decimal because it is
-            read by humans watching the 16 GB budget.
+            块总数总是有；基数树的计数器只在挂了树时才有。``snapshot_mib``
+            保留一位小数，因为看它的人是在盯 16 GB 预算。
         """
         out = {"blocks_used": self.num_used, "blocks_total": self.num_blocks}
         if self.radix is not None:

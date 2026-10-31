@@ -1,35 +1,28 @@
 // @file norm.cu
-// @brief Fused RMSNorm, residual-add RMSNorm and gated RMSNorm for the CoreX backend.
+// @brief CoreX 后端的融合 RMSNorm、残差相加 RMSNorm 与门控 RMSNorm。
 //
-// Module: coffin/backends/corex/kernels. Bound as ``rms_norm`` /
-// ``add_rms_norm`` / ``rms_norm_gated`` and called only from
-// ``backends/corex/__init__.py``.
+// Module: coffin/backends/corex/kernels。绑定成 ``rms_norm`` / ``add_rms_norm`` /
+// ``rms_norm_gated``，只由 ``backends/corex/__init__.py`` 调用。
 //
-// Why fused rather than the decomposition: the CoreX torch build is 2.1, which has
-// no ``F.rms_norm`` at all, and the eager equivalent is a reduce plus separate
-// rsqrt/multiply kernels. The model calls a norm ~105 times per decode step, so one
-// block per row that sums, scales and multiplies in a single pass is what keeps the
-// norm off the launch list.
+// 为什么融合而不是拆开：CoreX 的 torch 构建是 2.1，根本没有 ``F.rms_norm``，而 eager
+// 等价写法是一次归约加独立的 rsqrt／乘法内核。模型每个解码步要调约 105 次归一化，所以
+// 每行一个 block、一趟里完成求和、缩放和乘法，才能让归一化不出现在启动清单上。
 //
 // Constraints:
-//   * The reduction is a shared-memory tree, not a ``__shfl_down_sync`` butterfly.
-//     This part's warp is 64 lanes wide, and a shuffle reduction written for 32
-//     would sum half the block and return a plausible but wrong scale -- the exact
-//     silent failure COREX_PORT.md §0 records. A shared tree is width-agnostic, and
-//     the temporary is sized from ``blockDim`` at launch, so the block size stays a
-//     free parameter.
-//   * ``x`` rows are pitched: ``q_norm``/``k_norm`` normalise a slice of a wider
-//     buffer, so the pitch is a parameter and is never assumed equal to ``N``.
-//   * bf16 in and out, fp32 for the sum and the rsqrt. Summing squares in bf16 would
-//     drop the small-magnitude terms, which is the whole difference between this and
-//     the reference.
-//   * One block per row, so the row width must fit the block limit; rows wider than
-//     the block are walked with a strided loop rather than by growing the block.
-//   * The gain already carries the checkpoint's ``1 + w`` offset -- the caller folds
-//     it at load. Adding it here would apply it twice and shift every logit.
-//   * The gated variant normalises over the last axis only, i.e. per head. It is not
-//     the flattened width: the gate scales the already-normalised result, so letting
-//     it into the reduction would divide every head by the RMS of all of them.
+//   * 归约走共享内存树，不用 ``__shfl_down_sync`` 蝶形。本部件的 warp 是 64 通道，为 32
+//     写的 shuffle 归约只会加一半 block 就返回一个看着合理但错误的 scale——正是
+//     COREX_PORT.md §0 记录的那种静默失败。共享树与宽度无关，临时空间在启动时按
+//     ``blockDim`` 定尺寸，所以块大小保持自由参数。
+//   * ``x`` 的行带间距：``q_norm``/``k_norm`` 归一化的是更宽缓冲区的一个切片，所以间距
+//     是参数，永不假定等于 ``N``。
+//   * 进出 bf16，求和与 rsqrt 用 fp32。用 bf16 求平方和会丢掉小量级的项，而那正是这里
+//     与参考实现的全部差异。
+//   * 每行一个 block，所以行宽必须装得进块上限；比块更宽的行用带步长的循环走完，而不是
+//     把块放大。
+//   * 增益已经带着 checkpoint 的 ``1 + w`` 偏移——调用方在加载时折进去。在这里再加一次
+//     会施加两遍，并让每个 logit 都偏移。
+//   * 门控变体只在最后一轴上归一化，即按头。它不是展平后的宽度：门缩放的是已经归一化
+//     的结果，让它进归约会拿所有头的 RMS 去除每一个头。
 
 #include "corex_ops.h"
 #include "corex_scalar.h"
@@ -40,27 +33,24 @@
 
 namespace {
 
-//: Wavefront width of this part. Used only to round the block size up; the
-//: reduction itself does not depend on it (see the file header).
+//: 本部件的 wavefront 宽度。只用来把块大小向上取整；归约本身不依赖它（见文件头）。
 constexpr int WAVEFRONT = 64;
 
-//: Widest block this file launches. A row of 2560 needs 2560 lanes of work but not
-//: 2560 threads: the strided loop covers the rest with better occupancy.
+//: 本文件启动的最宽块。2560 宽的一行需要 2560 条通道的工作量，但不需要 2560 个线程：
+//: 带步长的循环用更好的占用率把剩下的覆盖掉。
 constexpr int MAX_THREADS = 1024;
 
-// @brief Sum ``v`` across the block through a shared tree.
+// @brief 通过共享树在块内对 ``v`` 求和。
 //
-// @param v This thread's contribution.
-// @param red Caller-provided shared scratch of ``blockDim.x`` floats; clobbered.
-// @return The block-wide sum, valid in every thread after the final sync.
+// @param v 本线程的贡献。
+// @param red 调用方提供的、``blockDim.x`` 个 float 的共享暂存；会被覆写。
+// @return 整个块的和，在最后一次同步之后每个线程都拿得到。
 //
-// The closing barrier is required. Every thread reads the result out of ``red[0]``, and
-// nothing stops another thread from starting the next piece of shared work -- which writes
-// ``red`` -- before that read lands. Each caller in this file reduces only once, so the
-// barrier is not load-bearing here today, but the same helper shape in ``delta.cu`` is
-// called twice per step and produced a 4.5e-02 error without it. Keeping one shape across
-// every reduction in this directory is what stops that bug from being reintroduced by a
-// second caller.
+// 结尾那道屏障是必需的。每个线程都要从 ``red[0]`` 把结果读出去，而没有东西能阻止另一个
+// 线程在这次读取落地之前就开始下一段写 ``red`` 的共享工作。本文件里每个调用方只归约一次，
+// 所以屏障今天在这里还不承重，但 ``delta.cu`` 里同形状的辅助函数每步被调两次，去掉它
+// 会产生 4.5e-02 的误差。让本目录里每一次归约都保持同一个形状，才能防止第二个调用方
+// 把这个 bug 重新引进来。
 __device__ __forceinline__ float block_sum(float v, float* red) {
     red[threadIdx.x] = v;
     __syncthreads();
@@ -73,21 +63,20 @@ __device__ __forceinline__ float block_sum(float v, float* red) {
     return total;
 }
 
-// @brief Threads for a row of width ``N``, rounded up to the wavefront width.
+// @brief 宽度为 ``N`` 的一行要用多少线程，向上取整到 wavefront 宽度。
 //
-// Rounding to 64 matters on this part: a block whose size is not a wavefront
-// multiple leaves the last wavefront partly idle, and every norm in the model sits
-// on the decode critical path.
+// 在本部件上取整到 64 是有意义的：块大小不是 wavefront 整数倍时，最后一个 wavefront
+// 会部分空转，而模型里每个归一化都在解码关键路径上。
 //
-// @param N Row width.
-// @return ``min(MAX_THREADS, round_up(N, WAVEFRONT))``, never below one wavefront.
+// @param N 行宽。
+// @return ``min(MAX_THREADS, round_up(N, WAVEFRONT))``，至少一个 wavefront。
 __host__ int rms_threads(int N) {
     int t = N < WAVEFRONT ? WAVEFRONT : N;
     t = ((t + WAVEFRONT - 1) / WAVEFRONT) * WAVEFRONT;
     return t > MAX_THREADS ? MAX_THREADS : t;
 }
 
-// @brief ``y = x * rsqrt(mean(x^2) + eps) * w``, one block per row.
+// @brief ``y = x * rsqrt(mean(x^2) + eps) * w``，每行一个 block。
 template <typename T>
 __global__ void rms_norm_kernel(const T* __restrict__ x, const T* __restrict__ w,
                                 T* __restrict__ y, int N, long stride, float eps) {
@@ -108,39 +97,33 @@ __global__ void rms_norm_kernel(const T* __restrict__ x, const T* __restrict__ w
     }
 }
 
-// @brief ``x += add`` then ``y = rms(x) * w``, one block per row.
+// @brief 先 ``x += add``，再 ``y = rms(x) * w``，每行一个 block。
 //
-// The residual is accumulated *in place* in ``x``, which is the buffer the layer keeps
-// live for the rest of the step, and the normalised result goes to a separate ``y``.
-// That is the whole reason the two operations fuse: the separate spelling writes the
-// sum to ``x`` and then re-reads ``x`` from the norm, and both passes are one launch
-// each at this card's 5.75 us floor.
+// 残差 *原地* 累加进 ``x``，也就是这一层在整步剩下的时间里要继续用的那个缓冲区；归一化
+// 结果写进单独的 ``y``。两个操作之所以融合，原因全在这里：拆开的写法把和写进 ``x``，
+// 然后归一化再读一遍 ``x``，而按本卡 5.75 us 的启动下限，两趟各要一次启动。
 //
-// Two details make the result bit-identical to the two-op spelling rather than merely
-// close, and neither is optional:
+// 两个细节让结果与两算子写法逐位相同而不只是接近，且两者都不是可选项：
 //
-//   * The sum is rounded to ``T`` before its square enters the reduction. Bf16 storage
-//     of the sum is what the second launch would have read, so accumulating the *un*
-//     rounded fp32 sum here would give a different mean square.
-//   * The gain is applied in pass 2 from ``x`` read back through ``to_float``, exactly
-//     as ``rms_norm_kernel`` does. Folding the multiply into pass 1 would change the
-//     order of the two roundings.
+//   * 和在它的平方进入归约之前先舍入成 ``T``。第二次启动读到的正是 bf16 存储的和，
+//     所以这里累加 *未* 舍入的 fp32 和会算出不同的均方。
+//   * 增益在第 2 趟施加，值是从 ``x`` 经 ``to_float`` 读回来的，和 ``rms_norm_kernel``
+//     完全一样。把乘法折进第 1 趟会改变两次舍入的先后顺序。
 //
-// @param add Mixer output to accumulate, rows pitched ``stride`` like ``x``. May alias
-//        ``y``: the notes on aliasing in the wrapper below say why that is allowed and
-//        why the two pointers must therefore stay non-``__restrict__``.
-// @param x Residual stream, accumulated in place; rows pitched ``stride``.
-// @param w [N] gain, already carrying the checkpoint's ``1 + w`` offset.
-// @param y [M, N] densely packed output; must not alias ``x``.
-// @param N Row width.
-// @param stride Element pitch of both ``x`` and ``add`` between rows.
-// @param eps Variance floor.
+// @param add 待累加的混合器输出，行间距与 ``x`` 一样是 ``stride``。可以与 ``y`` 重叠：
+//        下面包装层里关于重叠的说明解释了为什么允许，以及为什么这两个指针因此必须保持
+//        非 ``__restrict__``。
+// @param x 残差流，原地累加；行间距 ``stride``。
+// @param w [N] 增益，已经带着 checkpoint 的 ``1 + w`` 偏移。
+// @param y [M, N] 稠密打包的输出；不得与 ``x`` 重叠。
+// @param N 行宽。
+// @param stride ``x`` 和 ``add`` 行之间的元素间距。
+// @param eps 方差下限。
 //
-// ``add`` and ``y`` are deliberately *not* ``__restrict__``. The wrapper allows them to
-// share storage, and ``__restrict__`` would license the compiler to keep a load of
-// ``add`` live across the stores to ``y`` in pass 1 -- a miscompile that only appears on
-// the card, because the host check runs one lane at a time. ``x`` and ``w`` stay
-// restricted: the wrapper rejects ``y`` aliasing ``x``, and ``w`` is a read-only gain.
+// ``add`` 和 ``y`` 故意 *不* 是 ``__restrict__``。包装层允许它们共享存储，而
+// ``__restrict__`` 会授权编译器把 ``add`` 的一次加载保留到第 1 趟对 ``y`` 的存储之外
+// ——这是只在卡上才出现的误编译，因为主机侧检查一次只跑一条通道。``x`` 和 ``w`` 保持
+// restrict：包装层拒绝 ``y`` 与 ``x`` 重叠，而 ``w`` 是只读增益。
 template <typename T>
 __global__ void add_rms_norm_kernel(const T* add, T* x, const T* __restrict__ w, T* y,
                                     int N, long stride, float eps) {
@@ -149,8 +132,8 @@ __global__ void add_rms_norm_kernel(const T* add, T* x, const T* __restrict__ w,
     const int t = threadIdx.x;
     const T* ar = add + (size_t)row * stride;
     T* xr = x + (size_t)row * stride;
-    // One block owns the whole row, so writing the sum back here and reading it again
-    // below is safe: the reduction's own barriers separate the two passes.
+    // 一个 block 独占整行，所以把和写回这里、下面再读一遍是安全的：归约自带的屏障把
+    // 两趟隔开了。
     float ss = 0.f;
     for (int i = t; i < N; i += blockDim.x) {
         const float s = CxScalar<T>::to_float(xr[i]) + CxScalar<T>::to_float(ar[i]);
@@ -167,7 +150,7 @@ __global__ void add_rms_norm_kernel(const T* add, T* x, const T* __restrict__ w,
     }
 }
 
-// @brief ``y = rms(x) * w * silu(gate)``, one block per row.
+// @brief ``y = rms(x) * w * silu(gate)``，每行一个 block。
 template <typename T>
 __global__ void rms_norm_gated_kernel(const T* __restrict__ x, const T* __restrict__ w,
                                       const T* __restrict__ gate, T* __restrict__ y,
@@ -194,21 +177,20 @@ __global__ void rms_norm_gated_kernel(const T* __restrict__ x, const T* __restri
 
 }  // namespace
 
-// @brief Fused RMSNorm over pitched rows.
+// @brief 带行间距的融合 RMSNorm。
 //
-// @param x [M, N] activations, contiguous, bf16 (as uint16) or fp32; the row pitch
-//        is ``stride`` and may exceed ``N`` so a column slice normalises in place.
-// @param w [N] gain, already carrying the checkpoint's ``1 + w`` offset.
-// @param stride Element pitch between rows; ``0`` means ``N``.
-// @param eps Variance floor, added before the rsqrt.
-// @return [M, N], densely packed, in ``x``'s dtype.
-// @throws c10::Error when ``x`` is not 2-D and contiguous, ``w`` is not ``N``
-//         elements long, the dtypes differ, or ``stride < N`` (rows would overlap).
+// @param x [M, N] 激活，连续存放，bf16（以 uint16 承载）或 fp32；行间距是 ``stride``，
+//        可以大于 ``N``，这样一个列切片能原地归一化。
+// @param w [N] 增益，已经带着 checkpoint 的 ``1 + w`` 偏移。
+// @param stride 行之间的元素间距；``0`` 表示 ``N``。
+// @param eps 方差下限，在 rsqrt 之前相加。
+// @return [M, N]，稠密打包，dtype 同 ``x``。
+// @throws c10::Error ``x`` 不是二维或不是连续存放、``w`` 不是 ``N`` 个元素、dtype 不一致，
+//         或 ``stride < N``（行会重叠）。
 torch::Tensor rms_norm(torch::Tensor x, torch::Tensor w, int64_t stride, double eps) {
     TORCH_CHECK(x.dim() == 2, "activation must be 2-D [M, N]");
-    // Not ``is_contiguous()``: the pitched case is exactly a column slice of a wider
-    // buffer, which is never contiguous. What the kernel indexes by is the row pitch,
-    // so unit innermost stride is the real requirement.
+    // 不是 ``is_contiguous()``：带间距的情形恰恰是更宽缓冲区的一个列切片，它永远不连续。
+    // 内核索引靠的是行间距，所以真正的需求是最内层步长为 1。
     TORCH_CHECK(x.stride(-1) == 1, "activation must have unit innermost stride");
     const int M = (int)x.size(0), N = (int)x.size(1);
     const long pitch = stride > 0 ? (long)stride : (long)N;
@@ -235,26 +217,23 @@ torch::Tensor rms_norm(torch::Tensor x, torch::Tensor w, int64_t stride, double 
     return y;
 }
 
-// @brief Residual add into ``x``, then the zero-centred RMSNorm of the sum into ``out``.
+// @brief 把残差加进 ``x``，再把和做零中心 RMSNorm 写进 ``out``。
 //
-// Collapses the layer's ``x = x + h`` followed by ``rms_norm(x)`` into one launch. The
-// two are one operation in every sense that matters here: the sum is the norm's only
-// input, so materialising it in a separate kernel buys a second launch and a second
-// read of the whole row for nothing.
+// 把这一层的 ``x = x + h`` 接 ``rms_norm(x)`` 收成一次启动。在这里所有要紧的意义上它们
+// 就是同一个操作：和是归一化唯一的输入，所以把它在单独一个内核里实体化，白白换来第二次
+// 启动和整行的第二遍读取。
 //
-// @param x [M, N] residual stream, accumulated in place. It has to be writable and it
-//        must not be ``out``: the sum outlives the norm as the next residual input.
-// @param add [M, N] mixer output to accumulate, pitched ``stride`` like ``x``.
-// @param w [N] gain, already carrying the checkpoint's ``1 + w`` offset.
-// @param out [M, N] destination, densely packed. It may alias ``add`` and must not
-//        alias ``x``.
-// @param stride Element pitch of ``x``/``add`` between rows; ``0`` means ``N``.
-// @param eps Variance floor, added before the rsqrt.
-// @return ``out``, for call chaining.
-// @throws c10::Error when a dtype, a shape, a pitch or an aliasing contradicts the
-//         kernel. The alias check is the important one: ``x`` and ``out`` sharing
-//         storage would overwrite the residual mid-row, and the result reads as a
-//         numerical drift rather than as a bug.
+// @param x [M, N] 残差流，原地累加。它必须可写，而且不能是 ``out``：和要活过归一化，
+//        作为下一份残差输入。
+// @param add [M, N] 待累加的混合器输出，行间距与 ``x`` 一样是 ``stride``。
+// @param w [N] 增益，已经带着 checkpoint 的 ``1 + w`` 偏移。
+// @param out [M, N] 目的地，稠密打包。可以与 ``add`` 重叠，不得与 ``x`` 重叠。
+// @param stride ``x``/``add`` 行之间的元素间距；``0`` 表示 ``N``。
+// @param eps 方差下限，在 rsqrt 之前相加。
+// @return ``out``，便于调用链串接。
+// @throws c10::Error dtype、形状、间距或重叠与内核矛盾。重叠检查是最要紧的那一项：
+//         ``x`` 和 ``out`` 共享存储会在行中途覆写残差，而结果读起来像数值漂移而不是
+//         bug。
 torch::Tensor add_rms_norm(torch::Tensor x, torch::Tensor add, torch::Tensor w,
                            torch::Tensor out, int64_t stride, double eps) {
     TORCH_CHECK(x.dim() == 2 && add.dim() == 2 && out.dim() == 2,
@@ -275,19 +254,16 @@ torch::Tensor add_rms_norm(torch::Tensor x, torch::Tensor add, torch::Tensor w,
     TORCH_CHECK(w.scalar_type() == x.scalar_type(), "gain dtype must match activation");
     TORCH_CHECK(x.scalar_type() == torch::kBFloat16 || x.scalar_type() == torch::kFloat,
                 "activation must be bf16 or fp32");
-    // Aliasing, in the two directions that matter and no more.
+    // 重叠，只处理真正要紧的两个方向，不多做。
     //
-    // ``out`` may alias ``add``. The addend is consumed entirely in pass 1, before any
-    // write to ``out``, and a thread touches only the indices it read -- so the layer can
-    // hand the mixer's output buffer back as the destination once the sum has consumed
-    // it, which is what keeps the fold allocation-free. It is allowed only at a dense
-    // pitch: ``add`` is addressed by ``stride`` and ``out`` by ``N``, so two different
-    // pitches over one allocation would let a row's write land on another row's
-    // still-unread addend.
+    // ``out`` 可以与 ``add`` 重叠。加数在第 1 趟就被完全消费，早于任何对 ``out`` 的写入，
+    // 而一个线程只碰它读过的下标——所以一旦和消费掉混合器的输出缓冲区，这一层就可以把
+    // 它当目的地交回来，这正是让折叠无需分配的原因。只允许在稠密间距下这么做：``add``
+    // 用 ``stride`` 寻址而 ``out`` 用 ``N``，同一块分配上两种间距会让一行的写入落到另一
+    // 行尚未读取的加数上。
     //
-    // ``out`` may never alias ``x``. The residual sum stays live for the rest of the
-    // layer, and ``is_alias_of`` catches a view of it as well as the tensor itself, which
-    // a ``data_ptr`` comparison would not.
+    // ``out`` 永远不能与 ``x`` 重叠。残差和在这层剩下的部分里还要活着，而 ``is_alias_of``
+    // 连它的视图一起抓住，``data_ptr`` 比较做不到这一点。
     if (add.is_alias_of(out)) {
         TORCH_CHECK(pitch == (long)N,
                     "destination may alias the addend only at a dense row pitch");
@@ -313,19 +289,18 @@ torch::Tensor add_rms_norm(torch::Tensor x, torch::Tensor add, torch::Tensor w,
     return out;
 }
 
-// @brief Fused gated RMSNorm: ``y = rms(x) * w * silu(gate)``, normalised per head.
+// @brief 融合门控 RMSNorm：``y = rms(x) * w * silu(gate)``，按头归一化。
 //
-// @param x [M, N] activations, contiguous, bf16 or fp32.
-// @param w [N] per-head gain.
-// @param gate [M, N] gate in the same layout and dtype as ``x``.
-// @param eps Variance floor.
-// @return [M, N] in ``x``'s dtype.
-// @throws c10::Error when the shapes disagree or a dtype is unsupported.
+// @param x [M, N] 激活，连续存放，bf16 或 fp32。
+// @param w [N] 按头的增益。
+// @param gate [M, N] 门，布局和 dtype 同 ``x``。
+// @param eps 方差下限。
+// @return [M, N]，dtype 同 ``x``。
+// @throws c10::Error 形状不一致或 dtype 不受支持。
 torch::Tensor rms_norm_gated(torch::Tensor x, torch::Tensor w, torch::Tensor gate,
                              double eps) {
     TORCH_CHECK(x.dim() == 2, "activation must be 2-D [M, N]");
-    // The gated form has no pitch argument, so both operands are read densely and
-    // contiguity is what that requires.
+    // 门控形式没有间距参数，所以两个操作数都是稠密读取的，而连续存放正是它的要求。
     TORCH_CHECK(x.is_contiguous() && gate.is_contiguous(),
                 "activation and gate must be contiguous");
     TORCH_CHECK(x.sizes() == gate.sizes(), "gate shape must match the activation");

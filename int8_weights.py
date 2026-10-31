@@ -1,126 +1,115 @@
-"""Weight-only int8 quantisation (W8A16), the encoder that feeds the GEMV kernels.
+"""只量化权重的 int8 量化（W8A16），喂给 GEMV 内核的编码器。
 
-Module: ``coffin/int8_weights.py``. Leaf of the import graph: it imports only
-``torch``. ``models/qwen35/weights.py`` quantises through it while loading a
-checkpoint, ``ops/gemv.py`` consumes the resulting ``QWeight``, and both
-``ops/embed.py`` and ``models/qwen35/vision.py`` understand the same object.
+Module: ``coffin/int8_weights.py``。导入图的叶子：只 import ``torch``。
+``models/qwen35/weights.py`` 在加载 checkpoint 时经它量化，``ops/gemv.py`` 消费
+产出的 ``QWeight``，``ops/embed.py`` 和 ``models/qwen35/vision.py`` 认的是同一个
+对象。
 
-Why: decode is bandwidth-bound. On the accelerator this engine was first written
-for, the projections ran at 540-680 GB/s against a ~700 GB/s copy ceiling and
-accounted for ~48% of a step; the library's GEMV at M=1 was unusable (55-296
-GB/s, and it changed kernel per shape), and Triton had no backend for that part.
-Halving the bytes every projection reads is therefore the largest remaining
-lever, and it is cheap to take because the dequantise can hide behind the memory
-traffic: the weights are stored as int8 with one fp32 scale per output row, and
-the kernel applies that scale once to the accumulated dot product instead of per
-element.
+为什么这么做：解码受带宽限制。在本引擎最初针对的加速器上，投影跑在 540-680 GB/s，
+而对着一道约 700 GB/s 的拷贝天花板，占了单步的约 48%；库里的 M=1 GEMV 完全不能用
+（55-296 GB/s，而且按形状换内核），Triton 对那颗芯片又没有后端。于是把每个投影要读
+的字节数减半成了剩下最大的杠杆，而且代价便宜，因为反量化能藏在访存背后：权重存成
+int8、每输出行一个 fp32 scale，内核把这一个 scale 的乘法施加在累加完的点积上，而不是
+逐元素施加。
 
-Scheme: symmetric, per output row (per output channel), absmax.
+方案：对称、按输出行（按输出通道）、absmax。
 
     s[n]     = max_k |w[n, k]| / 127
     wq[n, k] = round(w[n, k] / s[n]) clamped to [-127, 127]
 
-Rows are independent, so the error stays local to a row and the scale folds into
-the kernel's final multiply. Activations stay bf16 -- quantising them too (W8A8)
-would need a second quantiser on the critical path and would start to move the
-error into the attention scores.
+行与行独立，所以误差局限在一行之内，而 scale 折进内核的最后一次乘法。激活保持
+bf16——连激活一起量化（W8A8）要在关键路径上再加一个量化器，还会开始把误差推进
+注意力分数。
 
-``embed_tokens`` is included: it is the tied lm_head, and its matmul is the
-single largest weight read of a decode step. ``conv1d.weight`` stays bf16 (its
-kernel consumes fp32 taps and it is 32 KB), as do all the 1-D norms.
+``embed_tokens`` 也在其中：它就是绑定的 lm_head，它的矩阵乘是一次解码步里最大的一笔
+权重读取。``conv1d.weight`` 保持 bf16（它的内核消费 fp32 抽头，而且只有 32 KB），
+所有一维归一化权重同样保留。
 
 Constraints:
-    * Weights stay row-major ``[N, K]``, the layout the checkpoint ships and the
-      HIP kernels index; only the dtype changes here, never the layout.
-    * Stored weights are int8 with one fp32 scale per output row, and the math
-      depends on that pairing: dequantising without the row scale, or scaling per
-      tensor, reintroduces the drift this scheme avoids.
-    * ``dequant`` materialises a dense copy. It exists for the prefill GEMM path
-      only; calling it per decode step would undo the bandwidth saving.
-    * ``quantize_state_dict`` mutates its dict in place and drops each bf16
-      tensor as it goes, because peak VRAM during a load is the binding
-      constraint on a 16 GB card.
+    * 权重保持行主序 ``[N, K]``，那是 checkpoint 发出的、HIP 内核索引的布局；这里
+      只换 dtype，绝不换布局。
+    * 存储的是 int8 加每输出行一个 fp32 scale，数学依赖这一配对：不带行 scale 反量化，
+      或者按张量缩放，都会重新引入本方案避开的漂移。
+    * ``dequant`` 会实体化一份稠密拷贝。它只为预填充 GEMM 路径存在；在解码循环里
+      每次调用会把这笔带宽收益吐回去。
+    * ``quantize_state_dict`` 就地改写它的字典，并在过程中逐个丢掉 bf16 张量，因为
+      加载时的显存峰值是 16 GB 卡上的绑定约束。
 """
 
 from __future__ import annotations
 
 import torch
 
-#: Local copy of the activation dtype rather than an import of ``ops.dtypes``:
-#: ``ops/`` imports this module, so reaching back into it would close a cycle.
+#: 本地复制一份激活 dtype，而不是 import ``ops.dtypes``：``ops/`` 会 import 本
+#: 模块，反向伸手过去就成环了。
 D = torch.bfloat16
 
-#: Rows quantised per fp32 temporary. 4096 rows of a 5120-wide matrix is a 80 MB
-#: temporary, which is small next to the int8 output it feeds, while still enough rows
-#: that the per-chunk overhead disappears. The value matters only for very wide
-#: matrices: an unchunked ``lm_head`` on a 27B checkpoint needs a 4.7 GiB fp32 copy and
-#: fails on a 32 GiB card during load.
+#: 每份 fp32 临时量覆盖的量化行数。5120 宽的矩阵取 4096 行是 80 MB 临时量，相对
+#: 它喂出的 int8 输出很小，行数又足够多到让分块开销消失。这个值只对很宽的矩阵才
+#: 重要：27B checkpoint 上不分块的 ``lm_head`` 需要 4.7 GiB 的 fp32 拷贝，加载时在
+#: 32 GiB 的卡上就会挂掉。
 _QUANT_CHUNK_ROWS = 4096
 
 
 def is_quantizable(key: str, w: torch.Tensor) -> bool:
-    """Whether one checkpoint tensor is a projection this scheme may take.
+    """判断某个 checkpoint 张量是不是本方案可以接手的投影。
 
-    The test is 2-D-ness plus the ``conv1d.weight`` exclusion, not a key list:
-    every 2-D matrix in this checkpoint is read as a ``[N, K]`` weight at decode
-    time, whereas the convolution's kernel consumes fp32 taps and is 32 KB, so
-    quantising it would cost accuracy for no bandwidth.
+    判据是「二维」加上排除 ``conv1d.weight``，不是一张键名单：这个 checkpoint 里
+    每个二维矩阵在解码时都按 ``[N, K]`` 权重读取，而卷积的内核消费 fp32 抽头且只有
+    32 KB，量化它只会白丢精度、换不来带宽。
 
     Args:
-        key: Checkpoint tensor name; the suffix decides the exclusion.
-        w: The tensor as loaded, before any cast.
+        key: checkpoint 张量名；后缀决定它是否被排除。
+        w: 加载得到的张量，尚未做任何类型转换。
 
     Returns:
-        ``True`` when ``w`` should be stored as a :class:`QWeight`.
+        ``w`` 应当存成 :class:`QWeight` 时为 ``True``。
     """
     return w.dim() == 2 and not key.endswith("conv1d.weight")
 
 
 class QWeight:
-    """An ``[N, K]`` weight held as int8 plus a per-row fp32 scale.
+    """以 int8 加逐行 fp32 scale 持有的 ``[N, K]`` 权重。
 
-    The two tensors travel together: ``ops/gemv.py`` and ``ops/embed.py`` read
-    ``wq`` and ``scale`` directly rather than going through a method, so any
-    replacement object must expose the same pair.
+    两个张量总是结伴出现：``ops/gemv.py`` 和 ``ops/embed.py`` 直接读 ``wq`` 和
+    ``scale`` 而不是走方法，所以任何替代对象都必须暴露同一对属性。
     """
 
     __slots__ = ("wq", "scale", "n", "k")
 
     def __init__(self, wq: torch.Tensor, scale: torch.Tensor) -> None:
-        """Wrap an already-quantised matrix; it is not re-quantised here.
+        """包住一个已量化好的矩阵；这里不会再量化一次。
 
         Args:
-            wq: ``[N, K]`` int8 values. Public attributes, not copies: the
-                caller must hand over owned, contiguous storage.
-            scale: ``[N]`` fp32 absmax scales, one per output row.
+            wq: ``[N, K]`` 的 int8 值。是公开属性而不是拷贝：调用方必须交出自己
+                拥有、连续的存储。
+            scale: ``[N]`` 的 fp32 absmax scale，每输出行一个。
         """
-        self.wq = wq                      # [N, K] int8, contiguous
-        self.scale = scale                # [N] fp32, contiguous
+        self.wq = wq                      # [N, K] int8，连续
+        self.scale = scale                # [N] fp32，连续
         self.n, self.k = wq.shape
 
     @classmethod
     def quantize(cls, w: torch.Tensor, chunk_rows: int = _QUANT_CHUNK_ROWS) -> "QWeight":
-        """Quantise a dense ``[N, K]`` weight, symmetric per output row.
+        """量化一个稠密的 ``[N, K]`` 权重，按输出行对称。
 
-        The absmax scale is clamped at ``1e-8`` so an all-zero row divides
-        instead of producing ``inf``/NaN; such a row then quantises to zeros and
-        decodes back to zeros.
+        absmax scale 在 ``1e-8`` 处被夹住，全零行于是照常做除法而不会产生
+        ``inf``/NaN；这样的行量化成零，解码回来也是零。
 
-        Rows are independent, so the work is done in row chunks. That is not a
-        throughput decision -- it is what lets a wide weight be quantised at all: an
-        fp32 copy of ``lm_head`` on a 27B checkpoint is ``248320 * 5120 * 4`` B = 4.7 GiB
-        alive at once, on top of the int8 rows already emitted, and it raised
-        ``OutOfMemoryError`` while the model was being loaded. A chunk bounds that
-        temporary to ``chunk_rows * K * 4`` whatever the matrix's height.
+        行与行独立，所以工作按行分块做。这不是吞吐决策——它是宽权重能被量化的前提：
+        27B checkpoint 上 ``lm_head`` 的 fp32 拷贝是 ``248320 * 5120 * 4`` B = 4.7 GiB
+        一次性活着，还叠在已经产出的 int8 行之上，模型加载期间直接抛
+        ``OutOfMemoryError``。分块把这份临时量限制在 ``chunk_rows * K * 4``，与矩阵
+        高度无关。
 
         Args:
-            w: Dense weight, row-major ``[N, K]``, any float dtype.
-            chunk_rows: Rows per fp32 temporary. Large enough to keep the kernels
-                saturated, small enough that the temporary stays a few hundred MB.
+            w: 稠密权重，行主序 ``[N, K]``，任意浮点 dtype。
+            chunk_rows: 每份 fp32 临时量覆盖的行数。大到让内核吃饱，小到让临时量
+                停在几百 MB。
 
         Returns:
-            The int8 rows and their absmax scales, both made contiguous so the
-            HIP kernels can take a flat pointer over them.
+            int8 行和它们的 absmax scale，两者都做成连续，HIP 内核才能在上面取一个
+            扁平指针。
         """
         n = w.shape[0]
         if n <= chunk_rows:
@@ -129,8 +118,7 @@ class QWeight:
             q = (wf / scale[:, None]).round().clamp_(-127, 127).to(torch.int8)
             return cls(q.contiguous(), scale.contiguous())
 
-        # The destination is allocated once and filled per chunk: building N chunk
-        # tensors and concatenating them would need both each chunk and the whole.
+        # 目标只分配一次、按块填充：先建 N 个分块张量再拼接，等于每块和整体都要同时活着。
         q = torch.empty(w.shape, dtype=torch.int8, device=w.device)
         scale = torch.empty(n, dtype=torch.float32, device=w.device)
         for start in range(0, n, chunk_rows):
@@ -142,65 +130,62 @@ class QWeight:
         return cls(q, scale)
 
     def dequant(self, dtype: torch.dtype = D) -> torch.Tensor:
-        """Materialise weights in ``dtype``; used by the prefill GEMM path only.
+        """把权重实体化成 ``dtype``；只给预填充 GEMM 路径用。
 
-        fp16 is what prefill asks for: this part has no packed bf16 math, so the
-        same GEMM runs ~7x faster on fp16 weights.
+        预填充要的是 fp16：这颗芯片没有 packed bf16 计算，同一个 GEMM 在 fp16 权重
+        上快约 7x。
 
         Args:
-            dtype: Output dtype; the caller picks it to match the GEMM it feeds.
+            dtype: 输出 dtype；调用方按它要喂的 GEMM 来选。
 
         Returns:
-            A fresh dense ``[N, K]`` tensor. It is not cached, so calling this
-            in the decode loop would rebuild the weight every step.
+            一份新的稠密 ``[N, K]`` 张量。它不被缓存，所以在解码循环里调用等于每步
+            重建一次权重。
         """
         return (self.wq.float() * self.scale[:, None]).to(dtype)
 
     def rows(self, idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Gather rows: returns ``(int8 [T, K], fp32 scale [T])`` for embeddings.
+        """按行 gather：给嵌入返回 ``(int8 [T, K], fp32 scale [T])``。
 
         Args:
-            idx: Row indices to gather, in the order the caller wants them.
+            idx: 要 gather 的行下标，顺序随调用方。
 
         Returns:
-            The matching int8 rows and their scales, both still scaled per row
-            so the caller can dequantise only the rows it looked up.
+            对应的 int8 行和它们的 scale，仍按行带 scale，调用方因此只反量化它查到
+            的那些行。
         """
         return self.wq.index_select(0, idx), self.scale.index_select(0, idx)
 
     def nbytes(self) -> int:
-        """Resident size in bytes, for the loader's VRAM accounting.
+        """常驻字节数，供加载器做显存核算。
 
         Returns:
-            The int8 rows plus their fp32 row scales. The dense weight this
-            replaced would have cost twice the rows' element count in bf16.
+            int8 行加上它们的 fp32 行 scale。被它替换掉的稠密权重若用 bf16，光元素
+            数就要两倍字节。
         """
         return self.wq.numel() + self.scale.numel() * 4
 
-    # Excluded from coverage: nothing in the runtime calls a repr, so a test that
-    # exercised it would only be testing f-strings.
+    # 排除在覆盖率之外：运行时没有任何地方调 repr，为它写测试只是在测 f-string。
     def __repr__(self) -> str:  # pragma: no cover - debug aid
         return f"QWeight({self.n}x{self.k} int8)"
 
 
 def quantize_state_dict(sd: dict) -> dict:
-    """Replace every quantisable 2-D weight in ``sd`` with a :class:`QWeight`.
+    """把 ``sd`` 里每个可量化的二维权重替换成 :class:`QWeight`。
 
-    Mutates ``sd`` in place and drops each bf16 tensor as soon as it has been
-    quantised (so the resident copy shrinks instead of doubling: 9 GB of bf16
-    weights become ~4.5 GB, which is what leaves room on a 16 GB card for a longer
-    context and a paged KV pool).
+    就地改写 ``sd``，并且一个 bf16 张量量化完就立刻丢掉（常驻拷贝因此是缩小而不是
+    翻倍：9 GB 的 bf16 权重变成约 4.5 GB，16 GB 卡上腾出的这块地方正好给更长的上下文
+    和分页 KV 池）。
 
-    ``load_weights`` quantises during the load instead and does not use this; it
-    stays for a caller that already holds bf16 tensors in VRAM.
+    ``load_weights`` 改为在加载过程中量化、不用这个函数；它留给已经把 bf16 张量放在
+    显存里的调用方。
 
     Args:
-        sd: State dict, consumed and rewritten in place.
+        sd: state dict，会被消费并就地改写。
 
     Returns:
-        A byte-count report, ``{"bf16_bytes": ..., "int8_bytes": ...}``, for the
-        loader's startup log. It counts only the tensors that were converted, so
-        the pair difference is the VRAM the conversion actually freed.
+        字节数报告 ``{"bf16_bytes": ..., "int8_bytes": ...}``，供加载器启动日志使用。
+        它只统计被转换的张量，所以两者之差就是转换实际释放的显存。
     """
     n_before = n_after = 0
     for k in list(sd):
@@ -216,13 +201,12 @@ def quantize_state_dict(sd: dict) -> dict:
 
 
 def quantized_keys(sd: dict) -> list[str]:
-    """Report which entries of a state dict are int8, for the loader's log.
+    """报告 state dict 里哪些条目是 int8，供加载器打日志。
 
     Args:
-        sd: State dict, either as loaded or already converted by
-            :func:`quantize_state_dict`.
+        sd: state dict，刚加载的或已被 :func:`quantize_state_dict` 转换过的均可。
 
     Returns:
-        The quantised names in dict order; empty for a fully dense state dict.
+        按字典顺序排列的已量化名字；全稠密的 state dict 返回空。
     """
     return [k for k, v in sd.items() if isinstance(v, QWeight)]

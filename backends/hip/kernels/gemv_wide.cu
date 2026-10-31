@@ -1,47 +1,39 @@
 // @file gemv_wide.cu
-// @brief Wide-M int8 W8A16 GEMV for speculative verify (M in {16, 24, 32}).
+// @brief 投机校验用的 Wide-M int8 W8A16 GEMV（M 取 {16, 24, 32}）。
 //
-// Module: coffin/kernels. Verify-only fast path behind ``hip_ops.py``; it extends
-// the M <= 8 family in ``gemv_int8.cu`` and must stay bit-compatible with it.
+// Module: coffin/kernels。``hip_ops.py`` 后面的校验专用快路径；它扩展了
+// ``gemv_int8.cu`` 里 M <= 8 那一族，必须与之保持逐位兼容。
 //
-// Why this exists: a verify step projects K+1 activation vectors per sequence
-// row in one weight pass; at B=8, K=1 that is M=16 and at K=3 it is M=32.  The
-// engine has no batched kernel past M=8 (``gemv_w8a16_m`` covers {2,4,8}), so
-// verify either splits into several M=8 passes (the weight bytes are then read
-// again per pass) or falls into the prefill GEMM path (int8 -> fp16 dequant +
-// hipBLAS, 250-290 ms for the projection segment).  This kernel covers M=16/24/32
-// in one pass, without dequantisation and without hipBLAS.
+// 这个文件为什么存在：一个校验步要为每个序列行的一次权重读取投影 K+1 个激活向量；B=8、
+// K=1 时就是 M=16，K=3 时是 M=32。M=8 以上引擎没有批处理内核（``gemv_w8a16_m`` 只覆盖
+// {2,4,8}），所以校验要么拆成若干次 M=8（权重字节每趟重读一遍），要么落进预填充 GEMM 路径
+// （int8 -> fp16 反量化 + hipBLAS，投影这一段 250-290 ms）。本内核一趟覆盖 M=16/24/32，
+// 不反量化、不走 hipBLAS。
 //
-// How it is parallelised: M is split into groups of MW activations; one warp
-// owns R output rows and MW activation vectors of those rows.  The MT/MW warps
-// of a row group read the same weight rows, so the extra groups are cache hits
-// rather than extra HBM passes (the group lives inside one block).  ``acc`` is
-// R*MW*8 fp32 values, so register pressure stays bounded for every shipped combo
-// (64 for all of them).
+// 并行方式：M 被切成每组 MW 个激活；一个 warp 独占 R 个输出行和这些行里的 MW 个激活向量。
+// 一个行组内的 MT/MW 个 warp 读同一批权重行，所以多出来的组命中缓存而不是多走一趟 HBM
+// （组在同一个 block 内）。``acc`` 是 R*MW*8 个 fp32，所以随版本发布的每个组合寄存器压力都
+// 有界（全部都是 64）。
 //
 // Constraints:
-//   * Bit-exactness is the hard acceptance: the arithmetic per (row, activation)
-//     is the M=8 kernel's, token for token. The probe checks a wide call against
-//     the concatenation of M=8 calls, so any arithmetic change fails it.
-//   * Weights are INT8 row-major [N, K] with a per-row fp32 scale; a new
-//     quantisation layout would need both this kernel and its probe updated.
-//   * The block grid must divide evenly into row groups (``wpb % GM == 0``);
-//     the dispatchers reject the rest instead of launching a half-covered grid.
+//   * 逐位一致是硬性验收条件：每个（行，激活）的算术就是 M=8 内核的算术，token 级一致。
+//     探针拿一次 wide 调用的结果与若干次 M=8 调用拼接后的结果对比，任何算术改动都过不了。
+//   * 权重是 INT8 行主序 [N, K] 配每行一个 fp32 scale；新的量化布局要同时改这个内核和它的
+//     探针。
+//   * block 的 grid 必须能均匀分进行组（``wpb % GM == 0``）；其余情况分派器直接拒绝，而不是
+//     启动一个覆盖不全的 grid。
 //
-// Bit-exactness, in detail. The kernel keeps the M=8 kernel's *exact* arithmetic
-// per (row, activation):
+// 逐位一致，细说。内核为每个（行，激活）保持 M=8 内核*精确*的算术：
 //
-//   * K is walked in 8-int8 chunks and lane l owns chunks l, l+32, l+64, ...
-//     -- the same chunk->lane mapping as ``gemv_w8a16_m_kernel``, so each lane
-//     accumulates the same K positions into the same eight chains;
-//   * chain j takes the j-th int8 of the chunk in ascending chunk order;
-//   * the final reduction adds the chains 0..7 sequentially (after the scalar
-//     K%8 tail) and then does the same __shfl_down tree, and the per-row scale
-//     is applied last.
+//   * K 以 8 个 int8 为一块遍历，lane l 拥有编号 l、l+32、l+64……的块——与
+//     ``gemv_w8a16_m_kernel`` 相同的「块到 lane」映射，所以每个 lane 把同样的 K 位置累加进
+//     同样的八条链；
+//   * 第 j 条链按块号升序取该块的第 j 个 int8；
+//   * 最后的归约按顺序相加 0..7 号链（在标量 K%8 尾数之后），然后做同一棵 __shfl_down 归约
+//     树，逐行 scale 最后才乘。
 //
-// A row is therefore bit-identical to calling ``gemv_w8a16_m`` on that row's
-// 8-activation slice, whatever U, R or MW is used (U only changes how many
-// chunks are prefetched, not their order).
+// 因此单独看一行，无论用哪个 U、R 或 MW，结果都与对该行的 8 激活切片调用
+// ``gemv_w8a16_m`` 逐位一致（U 只改变预取多少块，不改变块的顺序）。
 
 #include "hip_ops.h"
 
@@ -58,11 +50,11 @@ __device__ __forceinline__ float bf16_to_float(unsigned short h) {
 
 __device__ __forceinline__ unsigned short float_to_bf16(float f) {
     unsigned u = __float_as_uint(f);
-    u += 0x7fffu + ((u >> 16) & 1u);   // round to nearest even
+    u += 0x7fffu + ((u >> 16) & 1u);   // 就近舍入到偶数（round to nearest even）
     return (unsigned short)(u >> 16);
 }
 
-// Four int8 from one 32-bit word -> four floats (vector type: stays in VGPRs).
+// 一个 32 位字里的四个 int8 -> 四个 float（用向量类型：留在 VGPR 里）。
 __device__ __forceinline__ float4 i8x4(unsigned w) {
     float4 f;
     f.x = (float)(int)(signed char)(w & 0xffu);
@@ -72,22 +64,22 @@ __device__ __forceinline__ float4 i8x4(unsigned w) {
     return f;
 }
 
-// Two bf16 in one 32-bit word -> two floats.
+// 一个 32 位字里的两个 bf16 -> 两个 float。
 __device__ __forceinline__ float2 bf16x2(unsigned u) {
     return make_float2(bf16_to_float((unsigned short)(u & 0xffffu)),
                        bf16_to_float((unsigned short)(u >> 16)));
 }
 
-// Eight FMA chains of one (row, activation) pair, as two float4s.
+// 一个（行，激活）对的八条 FMA 链，放在两个 float4 里。
 struct Acc8 {
     float4 a, b;
 };
 
-// One 8-int8 weight chunk applied to one 8-bf16 activation chunk.
-// ``w0`` holds weights 0..3 (chunk bytes 0..3), ``w1`` weights 4..7.
+// 一个 8 个 int8 的权重块施加到一个 8 个 bf16 的激活块上。
+// ``w0`` 装着权重 0..3（块里第 0..3 个字节），``w1`` 装着权重 4..7。
 __device__ __forceinline__ void fma8(Acc8& acc, const float4& w0, const float4& w1,
                                      const uint4& xb) {
-    const float2 p0 = bf16x2(xb.x);   // activations 0,1
+    const float2 p0 = bf16x2(xb.x);   // 激活 0,1
     const float2 p1 = bf16x2(xb.y);   // 2,3
     const float2 p2 = bf16x2(xb.z);   // 4,5
     const float2 p3 = bf16x2(xb.w);   // 6,7
@@ -101,14 +93,14 @@ __device__ __forceinline__ void fma8(Acc8& acc, const float4& w0, const float4& 
     acc.b.w += w1.w * p3.y;
 }
 
-// Grid: warp ``wid`` owns activation group ``wid % GM`` and row group
-// ``blockIdx.x * (wpb / GM) + wid / GM``; a row group is R consecutive rows.
-// The block layout is a function of MT, R, MW and U only -- every shipped combo
-// instantiates it at compile time so ``acc``/``tail`` stay in VGPRs.
+// grid：warp ``wid`` 独占激活组 ``wid % GM`` 和行组
+// ``blockIdx.x * (wpb / GM) + wid / GM``；一个行组是 R 个连续行。
+// block 布局只是 MT、R、MW、U 的函数——随版本发布的每个组合都编译期实例化，好让
+// ``acc``/``tail`` 留在 VGPR 里。
 //
-// @param W [N, K] int8 row-major; row ``n`` is scaled by ``S[n]`` afterwards.
-// @param X [M, K] bf16 activations; M is MT, one weight pass serves all of them.
-// @param Y [M, N] bf16 output; row-major, written by lane 0 of each warp.
+// @param W [N, K] int8 行主序；第 ``n`` 行随后乘 ``S[n]``。
+// @param X [M, K] bf16 激活；M 即 MT，一次权重读取服务全部。
+// @param Y [M, N] bf16 输出；行主序，由每个 warp 的 lane 0 写出。
 template <int MT, int R, int MW, int U>
 __global__ void gemv_w8a16_wide_kernel(const int8_t* __restrict__ W,
                                        const float* __restrict__ S,
@@ -177,8 +169,7 @@ __global__ void gemv_w8a16_wide_kernel(const int8_t* __restrict__ W,
             for (int m = 0; m < MW; ++m) fma8(acc[r][m], w0, w1, xb[m]);
         }
     }
-    // K not a multiple of 8: scalar tail, added before the chains like the M=8
-    // kernel does.
+    // K 不是 8 的整数倍时走标量尾循环，并且与 M=8 内核一样在链求和之前加进来。
     for (int k = (nvec << 3) + lane; k < K; k += 32) {
 #pragma unroll
         for (int r = 0; r < R; ++r) {
@@ -241,43 +232,39 @@ bool dispatch_ru(int U, int threads, const int8_t* wp, const float* sp,
     return false;
 }
 
-// (R, MW) combos per M.  All keep acc = R*MW*8 = 64 floats, which is the
-// register budget; an extra combo would spill or fail to launch.
+// 每个 M 的 (R, MW) 组合。全部保持 acc = R*MW*8 = 64 个 float，也就是寄存器预算；再加一个
+// 组合就会溢出或启动失败。
 template <int MT>
 bool dispatch(int rows, int mw, int U, int threads, const int8_t* wp, const float* sp,
               const uint16_t* xp, uint16_t* yp, int N, int K, hipStream_t stream) {
-    if (mw <= 0 || MT % mw != 0 || mw > MT) return false;   // must cover all M
+    if (mw <= 0 || MT % mw != 0 || mw > MT) return false;   // 必须覆盖全部 M
     if (rows == 1 && mw == 8) return dispatch_ru<MT, 1, 8>(U, threads, wp, sp, xp, yp, N, K, stream);
     if (rows == 2 && mw == 4) return dispatch_ru<MT, 2, 4>(U, threads, wp, sp, xp, yp, N, K, stream);
     if (rows == 4 && mw == 2) return dispatch_ru<MT, 4, 2>(U, threads, wp, sp, xp, yp, N, K, stream);
     return false;
 }
 
-// Default tiling per M: two rows per warp with four activations keeps four warps
-// per row group (more parallelism); one row/eight activations is the fallback.
+// 每个 M 的默认切块：每个 warp 两行配四个激活，能让一个行组里有四个 warp（并行度更高）；
+// 每 warp 一行配八个激活是兜底。
 inline void default_tiling(int M, int& rows, int& mw) {
     rows = 2;
     mw = 4;
-    if (M == 24) { rows = 1; mw = 8; }     // 3 warps/row group: even warp split
+    if (M == 24) { rows = 1; mw = 8; }     // 3 个 warp 一个行组：warp 能均分
 }
 
 }  // namespace
 
-// @brief Wide-M int8 W8A16 GEMV: one weight pass for M in {16, 24, 32}.
+// @brief Wide-M int8 W8A16 GEMV：一次权重读取服务 M 取 {16, 24, 32}。
 //
-// Picks the per-M tiling from ``default_tiling``; use the ``_dbg`` entry to
-// sweep rows/mw from the probe.
+// 按 ``default_tiling`` 挑每个 M 的切块；要从探针里扫 rows/mw 就用 ``_dbg`` 入口。
 //
-// @param W [N, K] int8 row-major.
-// @param S [N] fp32 per-row scale, applied once after the reduction.
-// @param X [M, K] bf16 contiguous; M must be 16, 24 or 32 and K a multiple of 8.
-// @param U K-loop unroll: 2 or 4 chunks prefetched per lane.
-// @param threads Block size, multiple of 32 in 32..256; the warps must divide
-//                evenly into row groups.
-// @return [M, N] bf16, bit-identical to running ``gemv_w8a16_m`` on each
-//         row's 8-activation slice.
-// @throws c10::Error (TORCH_CHECK) when the shape or tiling is unsupported;
-//         check M, K%8 and the warp count before calling.
+// @param W [N, K] int8 行主序。
+// @param S [N] fp32 每行 scale，在归约之后统一乘一次。
+// @param X [M, K] bf16 连续存放；M 必须是 16、24 或 32，且 K 是 8 的整数倍。
+// @param U K 循环展开：每个 lane 预取 2 或 4 个块。
+// @param threads 块大小，32 的整数倍且落在 32..256；warp 必须能均匀分进行组。
+// @return [M, N] bf16，与对该行 8 激活切片逐个调用 ``gemv_w8a16_m`` 逐位一致。
+// @throws c10::Error（TORCH_CHECK）：形状或切块不受支持；调用前先检查 M、K%8 和 warp 数。
 torch::Tensor gemv_w8a16_wide(torch::Tensor W, torch::Tensor S, torch::Tensor X,
                               int64_t U, int64_t threads) {
     TORCH_CHECK(W.is_contiguous() && S.is_contiguous() && X.is_contiguous(),
@@ -292,15 +279,14 @@ torch::Tensor gemv_w8a16_wide(torch::Tensor W, torch::Tensor S, torch::Tensor X,
     return gemv_w8a16_wide_dbg(W, S, X, U, rows, mw, threads);
 }
 
-// @brief A/B entry for ``gemv_w8a16_wide`` with the tiling exposed.
+// @brief ``gemv_w8a16_wide`` 的 A/B 入口，把切块参数暴露出来。
 //
-// @param rows Output rows per warp: 1, 2 or 4.
-// @param mw   Activation vectors per warp: must divide MT and cover all M.
-// @param threads Block size; <= 0 picks the smallest multiple of the group count
-//             that still makes 8 warps when they divide evenly.
-// @return [M, N] bf16, same arithmetic as ``gemv_w8a16_wide`` for any tiling.
-// @throws c10::Error (TORCH_CHECK) when (M, rows, mw, U, threads) has no
-//         instantiated kernel; the message names the entry point.
+// @param rows 每个 warp 的输出行数：1、2 或 4。
+// @param mw   每个 warp 的激活向量数：必须能整除 MT 并覆盖全部 M。
+// @param threads 块大小；<= 0 时取能均分时凑够 8 个 warp 的最小组合数的倍数。
+// @return [M, N] bf16，任何切块下的算术都与 ``gemv_w8a16_wide`` 相同。
+// @throws c10::Error（TORCH_CHECK）：(M, rows, mw, U, threads) 没有已实例化的内核；消息会
+//         点名入口。
 torch::Tensor gemv_w8a16_wide_dbg(torch::Tensor W, torch::Tensor S, torch::Tensor X,
                                   int64_t U, int64_t rows, int64_t mw,
                                   int64_t threads) {
@@ -313,7 +299,7 @@ torch::Tensor gemv_w8a16_wide_dbg(torch::Tensor W, torch::Tensor S, torch::Tenso
     TORCH_CHECK(K % 8 == 0, "K must be a multiple of 8");
     if (threads <= 0) {
         const int gm = (int)(M / mw);
-        // 8 warps where they divide evenly, else the smallest multiple of gm.
+        // 能均分就凑 8 个 warp，否则取组数的最小倍数。
         threads = 8 / gm >= 1 ? (8 / gm) * gm * 32 : gm * 32;
     }
     TORCH_CHECK(threads % 32 == 0 && threads >= 32 && threads <= 256,
@@ -335,18 +321,14 @@ torch::Tensor gemv_w8a16_wide_dbg(torch::Tensor W, torch::Tensor S, torch::Tenso
     return Y;
 }
 
-// @brief Packed fp16 variant: ``v_dot2_f32_f16`` does two fp16 multiplies per
-//        instruction with an fp32 accumulator.
+// @brief packed fp16 变体：``v_dot2_f32_f16`` 在一条指令里做两次 fp16 乘，累加器是 fp32。
 //
-// int8 weights convert to fp16 exactly (all values in [-127,127] are
-// representable), activations are converted bf16 -> fp16 once per call (exact
-// while |x| <= 65504; clamped above that, fp16 denormals flush only below
-// ~6e-8).  That halves the arithmetic instructions per weight element versus the
-// scalar int8 path, which is where the wide-M kernel was losing.
+// int8 权重转 fp16 是精确的（[-127,127] 内的值都能表示），激活每次调用只做一次 bf16 -> fp16
+// 转换（|x| <= 65504 时精确；超过则钳制，fp16 的非规格化数只在约 6e-8 以下被冲刷掉）。相对
+// 标量 int8 路径，这把每个权重元素的算术指令数减半，而 wide-M 内核之前正是输在这里。
 //
-// This variant is *close* to the int8 kernel, not bit-identical: the chains are
-// packed and combined differently. It exists for throughput on the verify path,
-// where the caller accepts a rounding difference.
+// 这个变体与 int8 内核*接近*，并不逐位一致：链的打包和合并方式不同。它为校验路径的吞吐而
+// 存在，那里调用方接受这点舍入差异。
 namespace {
 
 union H2U {
@@ -360,7 +342,7 @@ __device__ __forceinline__ float dot2(float acc, unsigned a, unsigned b) {
     return r;
 }
 
-// Four int8 (one 32-bit word) -> two packed half2 values (two 32-bit words).
+// 四个 int8（一个 32 位字）-> 两个 packed half2 值（两个 32 位字）。
 __device__ __forceinline__ void i8x4_to_h2(unsigned w, unsigned& o0, unsigned& o1) {
     const float f0 = (float)(int)(signed char)(w & 0xffu);
     const float f1 = (float)(int)(signed char)((w >> 8) & 0xffu);
@@ -373,8 +355,7 @@ __device__ __forceinline__ void i8x4_to_h2(unsigned w, unsigned& o0, unsigned& o
     o1 = b.u;
 }
 
-// One bf16 -> fp16 conversion pass over the activations, clamped to the fp16
-// range so an out-of-range activation cannot become inf and poison the dot.
+// 对激活做一次 bf16 -> fp16 转换，并钳制到 fp16 的范围，免得越界的激活变成 inf 毒化点积。
 __global__ void bf16_to_fp16_kernel(const uint16_t* __restrict__ x,
                                     uint16_t* __restrict__ y, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -386,19 +367,18 @@ __global__ void bf16_to_fp16_kernel(const uint16_t* __restrict__ x,
     y[i] = (uint16_t)(h.u & 0xffffu);
 }
 
-// Per warp: R output rows, MW activation vectors, four fp32 dot2 accumulators
-// per (row, activation) pair.  Same row-group/M-group structure as the int8
-// kernel; the arithmetic is packed but the per-row sums stay in fp32.
+// 每个 warp：R 个输出行、MW 个激活向量，每个（行，激活）对四个 fp32 dot2 累加器。行组/M 组
+// 结构与 int8 内核相同；算术是打包的，但逐行的和仍是 fp32。
 //
-// @param Xh [M, K] fp16 activations (converted by ``bf16_to_fp16_kernel``).
-// @param K  Must be a multiple of 16: the loop consumes 16 int8 per lane step.
+// @param Xh [M, K] fp16 激活（由 ``bf16_to_fp16_kernel`` 转换）。
+// @param K  必须是 16 的整数倍：循环每个 lane 步消耗 16 个 int8。
 template <int MT, int R, int MW, int U>
 __global__ void gemv_w8a16_dot2_kernel(const int8_t* __restrict__ W,
                                        const float* __restrict__ S,
                                        const uint16_t* __restrict__ Xh,
                                        uint16_t* __restrict__ Y, int N, int K) {
     constexpr int GM = MT / MW;
-    constexpr int CH = 4;                    // fp32 chains per (row, activation)
+    constexpr int CH = 4;                    // 每个（行，激活）的 fp32 链数
     const int lane = threadIdx.x & 31;
     const int wid = threadIdx.x >> 5;
     const int wpb = blockDim.x >> 5;
@@ -409,8 +389,8 @@ __global__ void gemv_w8a16_dot2_kernel(const int8_t* __restrict__ W,
     if (r0 >= N) return;
 
     const int am0 = mg * MW;
-    const int nvec = K >> 4;                 // 16 int8 (uint4) per lane per step
-    const int nvec8 = K >> 3;                // uint4 units of the fp16 activations
+    const int nvec = K >> 4;                 // 每 lane 每步 16 个 int8（uint4）
+    const int nvec8 = K >> 3;                // fp16 激活的 uint4 单位数
     const uint4* wv = reinterpret_cast<const uint4*>(W + (size_t)r0 * K);
     const uint4* xv = reinterpret_cast<const uint4*>(Xh);
 
@@ -437,7 +417,7 @@ __global__ void gemv_w8a16_dot2_kernel(const int8_t* __restrict__ W,
 #pragma unroll
         for (int u = 0; u < U; ++u) {
             const size_t i = (size_t)(base + u * 32 + lane);
-            const size_t xi = i * 2;         // two uint4 (16 fp16) per 16 weights
+            const size_t xi = i * 2;         // 每 16 个权重对应两个 uint4（16 个 fp16）
 #pragma unroll
             for (int r = 0; r < R; ++r) {
                 unsigned h[8];
@@ -486,7 +466,7 @@ __global__ void gemv_w8a16_dot2_kernel(const int8_t* __restrict__ W,
             }
         }
     }
-    // K not a multiple of 16: scalar fp32 tail (exact int8 -> float path).
+    // K 不是 16 的整数倍时走标量 fp32 尾循环（精确的 int8 -> float 路径）。
     for (int k = (nvec << 4) + lane; k < K; k += 32) {
 #pragma unroll
         for (int r = 0; r < R; ++r) {
@@ -548,8 +528,8 @@ template <int MT>
 bool dispatch_dot2(int rows, int mw, int U, int threads, const int8_t* wp,
                    const float* sp, const uint16_t* xp, uint16_t* yp, int N, int K,
                    hipStream_t stream) {
-    if (mw <= 0 || MT % mw != 0 || mw > MT) return false;   // must cover all M
-    // Per-M tiling set; every combo keeps R*MW*4 <= 64 accumulator floats.
+    if (mw <= 0 || MT % mw != 0 || mw > MT) return false;   // 必须覆盖全部 M
+    // 每个 M 的切块集合；每个组合都保持 R*MW*4 <= 64 个累加器 float。
     if (MT == 1) {
         if (rows == 1 && mw == 1) return dispatch_dot2_ru<1, 1, 1>(U, threads, wp, sp, xp, yp, N, K, stream);
         if (rows == 2 && mw == 1) return dispatch_dot2_ru<1, 2, 1>(U, threads, wp, sp, xp, yp, N, K, stream);
@@ -588,10 +568,9 @@ bool dispatch_dot2(int rows, int mw, int U, int threads, const int8_t* wp,
 }
 
 inline void default_dot2_tiling(int M, int& rows, int& mw) {
-    // These are the tiling points the probe picked as fastest per M (rows per
-    // warp, activation vectors per warp; acc = rows*mw*4 = 64 floats for the
-    // M>=4 cases).  Every combo keeps the per-row fp32 sum in the same order, so
-    // the choice only affects speed.
+    // 这些是探针对每个 M 实测选出最快的切块点（每 warp 的行数、每 warp 的激活向量数；
+    // M>=4 时 acc = rows*mw*4 = 64 个 float）。每个组合保持逐行 fp32 求和的顺序不变，所以
+    // 这个选择只影响速度。
     if (M == 1) { rows = 1; mw = 1; }
     else if (M == 2) { rows = 2; mw = 2; }
     else if (M == 4) { rows = 4; mw = 2; }
@@ -600,15 +579,13 @@ inline void default_dot2_tiling(int M, int& rows, int& mw) {
 
 }  // namespace
 
-// @brief Wide-M GEMV with packed fp16 math, tiling picked per M.
+// @brief 用 packed fp16 数学的 Wide-M GEMV，切块按 M 挑选。
 //
-// @param X [M, K] bf16 or fp16; a bf16 input is converted once per call, and M
-//          may be anything in 1..32 (not just 16/24/32) and K must be a
-//          multiple of 16.
-// @return [M, N] bf16. Close to the int8 kernel's result, not bit-identical:
-//         same fp32 per-row sum, different rounding.
-// @throws c10::Error (TORCH_CHECK) when the dtype, M or K%16 is unsupported;
-//         fix the caller's shape rather than the kernel.
+// @param X [M, K] bf16 或 fp16；bf16 输入每次调用转换一次，M 可以是 1..32 里任意值（不只是
+//          16/24/32），K 必须是 16 的整数倍。
+// @return [M, N] bf16。接近 int8 内核的结果而不逐位一致：逐行仍是 fp32 求和，只是舍入不同。
+// @throws c10::Error（TORCH_CHECK）：dtype、M 或 K%16 不受支持；去改调用方的形状而不是改
+//         内核。
 torch::Tensor gemv_w8a16_wide_dot2(torch::Tensor W, torch::Tensor S, torch::Tensor X,
                                    int64_t U, int64_t threads) {
     int rows = 1, mw = 16;
@@ -620,7 +597,7 @@ torch::Tensor gemv_w8a16_wide_dot2(torch::Tensor W, torch::Tensor S, torch::Tens
 torch::Tensor gemv_w8a16_wide_dot2_dbg(torch::Tensor W, torch::Tensor S,
                                        torch::Tensor X, int64_t U, int64_t rows,
                                        int64_t mw, int64_t threads) {
-    // A/B entry: same arithmetic for any tiling, so the sweep only measures speed.
+    // A/B 入口：任何切块下的算术都相同，所以这轮扫描只是在量速度。
     TORCH_CHECK(W.is_contiguous() && S.is_contiguous() && X.is_contiguous(),
                 "contiguous inputs required");
     TORCH_CHECK(W.scalar_type() == at::kChar, "W must be int8");
@@ -632,9 +609,8 @@ torch::Tensor gemv_w8a16_wide_dot2_dbg(torch::Tensor W, torch::Tensor S,
     TORCH_CHECK(K % 16 == 0, "K must be a multiple of 16");
     hipStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    // Activations in fp16: exact bf16 -> fp16 conversion, done once per call.
-    // Skipped when the caller already passes fp16, so the arithmetic below is
-    // the same either way.
+    // 激活转成 fp16：bf16 -> fp16 精确转换，每次调用只做一次。调用方本来就传 fp16 时跳过，
+    // 于是下面的算术两种情况下完全一样。
     torch::Tensor Xh;
     if (X.scalar_type() == at::kHalf) {
         Xh = X;

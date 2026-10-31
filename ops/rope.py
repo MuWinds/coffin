@@ -1,25 +1,23 @@
-"""Rotary position embeddings: the 1-D tables and the shared primitives.
+"""旋转位置编码：一维表以及共用的原语。
 
-Text-only mRoPE collapses to plain 1-D RoPE, so the tables use the simple
-``cos = cat(cos_half, cos_half)`` layout. They are built once at load time as
-``[max_seq, rotary_dim]`` and indexed by position. A prompt *with images* needs
-three positions per token instead of one, and that path lives in
-:mod:`ops.mrope` -- it reuses :func:`make_inv_freq` and the same
-``cat(half, half)`` layout, so a text-only prompt through it is bit-identical to
-a table row.
+纯文本的 mRoPE 退化成普通一维 RoPE，所以表就是简单的
+``cos = cat(cos_half, cos_half)`` 布局。它们在加载时一次性建好，形状
+``[max_seq, rotary_dim]``，按位置索引。*带图像*的 prompt 每个 token 要三个
+位置而不是一个，那条路径在 :mod:`ops.mrope`——它复用
+:func:`make_inv_freq` 和同样的 ``cat(half, half)`` 布局，所以纯文本 prompt
+走那条路得到的 cos/sin 与查表逐位相同。
 
-Module: ``coffin/ops``. Pure tensor math over ``torch``; called by the attention
-modules in ``models/qwen35`` and by :mod:`ops.mrope`.
+Module: ``coffin/ops``。基于 ``torch`` 的纯张量计算；由 ``models/qwen35`` 下的
+注意力模块和 :mod:`ops.mrope` 调用。
 
 Constraints:
-    * The ``cat(half, half)`` layout is a contract with ``rotate_half``, which
-      pairs frequency ``i`` with ``i + rotary_dim/2``. A table laid out any other
-      way rotates the wrong axes without any shape error.
-    * Only the leading ``rotary_dim`` channels rotate; the trailing ``head_dim -
-      rotary_dim`` channels of each head pass through untouched, so partial
-      rotary checkpoints must keep that split.
-    * Tables are built in fp32 and cast at the use site: bf16 table values lose
-      enough angle precision at long context to change the logits.
+    * ``cat(half, half)`` 布局是与 ``rotate_half`` 的契约，后者把频率 ``i`` 与
+      ``i + rotary_dim/2`` 配对。换成任何别的布局都会转动错误的轴，而且形状
+      检查不会报错。
+    * 只有前 ``rotary_dim`` 个通道旋转；每个头尾部 ``head_dim -
+      rotary_dim`` 个通道原样通过，所以部分旋转的 checkpoint 必须保持这个切分。
+    * 表用 fp32 构建、在使用处转换：长上下文下 bf16 的表值损失的角度精度
+      足以改变 logits。
 """
 
 from __future__ import annotations
@@ -28,25 +26,22 @@ import torch
 
 
 def make_inv_freq(head_dim: int, rotary_dim: int, theta: float, device) -> torch.Tensor:
-    """Build the ``[rotary_dim/2]`` fp32 angle-per-position axis.
+    """构建 ``[rotary_dim/2]`` 的 fp32 每位置角度轴。
 
-    The single source of the frequency axis: the 1-D tables below and the 3-D
-    mRoPE tables in :mod:`ops.mrope` both start from here, which is what makes
-    their cos/sin agree bit-for-bit on a text-only prompt. Diverging them would
-    silently change the logits of every image-free request that took the mRoPE
-    path.
+    频率轴只有这一个来源：下面的一维表和 :mod:`ops.mrope` 里的三维 mRoPE 表
+    都从这里出发，纯文本 prompt 上它们的 cos/sin 才能逐位一致。两者一旦分家，
+    每个走 mRoPE 路径的无图请求的 logits 都会被悄悄改掉。
 
     Args:
-        head_dim: Attention head width; carried so the frequency count is read in
-            the same units as the checkpoint config.
-        rotary_dim: Rotated channels per head, the actual determinant of the
-            table width.
-        theta: RoPE base (``rope_theta`` from the checkpoint config).
-        device: Torch device to build the tensor on.
+        head_dim: 注意力头宽度；带着它是为了让频率个数和 checkpoint 配置按同一
+            单位读取。
+        rotary_dim: 每个头被旋转的通道数，真正决定表宽的是它。
+        theta: RoPE 底数（来自 checkpoint 配置的 ``rope_theta``）。
+        device: 构建张量所在的 torch 设备。
 
     Returns:
-        Angular frequencies, ``1/theta**(j/(rotary_dim/2))`` for even ``j``,
-        ascending from ``1.0`` down towards ``1/theta``.
+        角频率，偶数 ``j`` 对应 ``1/theta**(j/(rotary_dim/2))``，从 ``1.0``
+        向 ``1/theta`` 递减。
     """
     return 1.0 / (theta ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32,
                                          device=device) / rotary_dim))
@@ -56,22 +51,21 @@ def make_rope_tables(head_dim: int, rotary_dim: int, theta: float,
                      max_seq: int, device,
                      inv_freq: torch.Tensor | None = None
                      ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pre-compute the ``[max_seq, rotary_dim]`` cos/sin tables indexed by position.
+    """预先算好按位置索引的 ``[max_seq, rotary_dim]`` cos/sin 表。
 
     Args:
-        head_dim: Attention head width, read for symmetry with the config.
-        rotary_dim: Rotated channels per head.
-        theta: RoPE base (``rope_theta`` from the checkpoint config).
-        max_seq: Positions to tabulate; decoding past this index reads out of
-            bounds, so it must cover the engine's maximum sequence length.
-        device: Torch device to build the tables on.
-        inv_freq: Optional pre-built frequency axis. Passing the mRoPE path's
-            axis here is what keeps a text-only prompt bit-identical whichever
-            path computes its cos/sin.
+        head_dim: 注意力头宽度，读取它是为了和配置保持对称。
+        rotary_dim: 每个头被旋转的通道数。
+        theta: RoPE 底数（来自 checkpoint 配置的 ``rope_theta``）。
+        max_seq: 制表的位置数；解码越过这个上标就会读越界，所以它必须覆盖
+            引擎的最大序列长度。
+        device: 构建表的 torch 设备。
+        inv_freq: 可选的现成频率轴。把 mRoPE 路径的频率轴传进来，纯文本
+            prompt 无论由哪条路径计算 cos/sin 都逐位相同。
 
     Returns:
-        ``(cos, sin)``, each ``[max_seq, rotary_dim]`` fp32 and duplicated across
-        the two halves as ``rotate_half`` expects.
+        ``(cos, sin)``，各自 ``[max_seq, rotary_dim]`` 的 fp32，并按
+        ``rotate_half`` 的期望在两个半区重复一份。
     """
     if inv_freq is None:
         inv_freq = make_inv_freq(head_dim, rotary_dim, theta, device)
@@ -82,19 +76,18 @@ def make_rope_tables(head_dim: int, rotary_dim: int, theta: float,
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    """Rotate the two halves of a head against each other for RoPE.
+    """把头部的前后两半相对旋转，供 RoPE 使用。
 
-    The second half is negated so ``x * cos + rotate_half(x) * sin`` reproduces
-    the complex rotation the reference applies. It only lines up with the
-    ``cat(half, half)`` table layout; with any other layout it rotates pairs of
-    the wrong frequencies.
+    后半区取负，这样 ``x * cos + rotate_half(x) * sin`` 就能复现参考实现施加的
+    复数旋转。它只和 ``cat(half, half)`` 的表布局对得上；换任何别的布局，
+    配对的就是错误频率的两半。
 
     Args:
-        x: Tensor whose last axis is the full ``rotary_dim``, normally
-            ``[..., S, heads, rotary_dim]``.
+        x: 最后一维是完整 ``rotary_dim`` 的张量，通常是
+            ``[..., S, heads, rotary_dim]``。
 
     Returns:
-        Same shape as ``x``, rotated by half the last axis.
+        与 ``x`` 同形状，按最后一维的一半完成旋转。
     """
     h = x.shape[-1] // 2
     return torch.cat([-x[..., h:], x[..., :h]], dim=-1)
@@ -102,21 +95,21 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 def apply_rope(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
                rotary_dim: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Rotate the leading ``rotary_dim`` channels of every q/k head.
+    """旋转每个 q/k 头最前面的 ``rotary_dim`` 个通道。
 
-    Applied to q and k in one call so the two can never drift into different
-    tables: a mismatch there degrades attention scores without raising anything.
+    q 和 k 在一次调用里一起处理，两者就不可能漂到不同的表上去：那里一旦
+    不匹配，注意力分数会退化，却什么都不会抛出。
 
     Args:
-        q: Query tensor, last axis a head of ``head_dim`` channels.
-        k: Key tensor shaped like ``q``.
-        cos: Cosine values, broadcastable to ``q[..., :rotary_dim]``.
-        sin: Sine values, same layout as ``cos``.
-        rotary_dim: Channels to rotate; the remaining ones pass through
-            unchanged, which is what partial-rotary checkpoints rely on.
+        q: 查询张量，最后一维是一个 ``head_dim`` 通道的头。
+        k: 与 ``q`` 同形状的键张量。
+        cos: 余弦值，可广播到 ``q[..., :rotary_dim]``。
+        sin: 正弦值，布局与 ``cos`` 相同。
+        rotary_dim: 要旋转的通道数；其余通道原样通过，部分旋转的 checkpoint
+            依赖的正是这一点。
 
     Returns:
-        ``(q, k)`` rotated and concatenated back to ``head_dim`` channels.
+        ``(q, k)``，旋转后拼回 ``head_dim`` 个通道。
     """
     cos = cos.to(q.dtype)
     sin = sin.to(q.dtype)

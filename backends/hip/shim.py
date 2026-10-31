@@ -1,31 +1,24 @@
-"""Build and expose the HIP kernels in ``backends/hip/kernels/``.
+"""编译并暴露 ``backends/hip/kernels/`` 里的 HIP 内核。
 
-Module: ``coffin/backends/hip``, bottom of the dependency graph next to
-``backends/hip/__init__.py``, which is the only importer. The kernels are C++/HIP
-sources compiled once into a cached extension under ``TORCH_EXTENSIONS_DIR``;
-this module is only the build/loader shim, so it must stay free of model, op-table
-and protocol dependencies.
+Module: ``coffin/backends/hip``，与 ``backends/hip/__init__.py`` 一起位于依赖图底部，
+后者是唯一的 import 方。内核是 C++/HIP 源码，一次性编译进 ``TORCH_EXTENSIONS_DIR``
+下的缓存扩展；本模块只是编译/加载的 shim，所以必须不依赖模型、算子表和协议。
 
 Constraints:
-    * Launch on ``at::cuda::getCurrentCUDAStream()`` (the legacy default stream is
-      not part of a ``torch.cuda.graph`` capture, so kernels launched there
-      vanish from the graph and the decode step silently reads stale outputs).
-    * Keep every shape static: the decode step is captured once and replayed for
-      every position, so a shape that varies with the token index cannot be
-      captured.
-    * Buffers the kernels write (split partials, KV state, conv state) are
-      caller-owned and must stay at fixed addresses for the same reason.
-    * The extension targets gfx906 only (``PYTORCH_ROCM_ARCH`` /
-      ``--offload-arch``). A different part gets its own backend, not another arch
-      string here.
-    * ``TORCH_EXTENSIONS_DIR`` must be isolated per deployment. A shared cache
-      dir makes every new checkout trigger a full HIP rebuild and fight over the
-      same build lock; concurrent deploys then wait forever on it.
-    * The two ``os.environ`` writes stay above the ``torch`` import, because the
-      extension loader reads them at import time. They are process-wide side
-      effects: keeping them inside a backend (rather than at the package root)
-      is what stops ``PYTORCH_ROCM_ARCH=gfx906`` from leaking into a process that
-      selected a different backend.
+    * 在 ``at::cuda::getCurrentCUDAStream()`` 上启动（旧的默认流不属于
+      ``torch.cuda.graph`` 捕获范围，在那里启动的内核会从图里消失，解码步就会静默读到
+      过期输出）。
+    * 所有形状保持静态：解码步只捕获一次然后对每个位置重放，所以随 token 索引变化的
+      形状无法被捕获。
+    * 内核写入的缓冲区（split 部分和、KV 状态、卷积状态）归调用方所有，出于同样的理由
+      必须保持地址固定。
+    * 扩展只针对 gfx906（``PYTORCH_ROCM_ARCH`` / ``--offload-arch``）。换一颗芯片就该
+      有自己的后端，而不是在这里多写一个 arch 字符串。
+    * ``TORCH_EXTENSIONS_DIR`` 必须按部署隔离。共享缓存目录会让每个新 checkout 都触发
+      一次完整 HIP 重编，并争抢同一把构建锁；并发的部署随后会一直等下去。
+    * 两处 ``os.environ`` 写入留在 ``torch`` 的 import 之上，因为扩展加载器在 import 时
+      就会读它们。它们是进程级副作用：把它们关在一个后端里（而不是放在包根目录），
+      才不至于让 ``PYTORCH_ROCM_ARCH=gfx906`` 泄漏进一个选了别的后端的进程。
 """
 
 from __future__ import annotations
@@ -48,18 +41,15 @@ _error: str | None = None
 
 
 def _load():
-    """Compile (or attach to the cached build of) the kernel extension once.
+    """编译一次内核扩展（或挂到它的缓存构建上）。
 
-    The result is memoised in ``_mod`` and the failure in ``_error``, so a broken
-    toolchain costs one build attempt per process instead of one per call -- the
-    engine calls into this module thousands of times per request.
+    结果记忆化在 ``_mod``，失败记忆化在 ``_error``，于是坏掉的工具链每进程只花一次
+    编译尝试而不是每次调用一次——引擎每个请求要进这个模块成千上万次。
 
     Returns:
-        The extension module, or ``None`` when the build failed. Callers must
-        treat ``None`` as "use the eager path", never as an empty module. The
-        build exception itself is kept in ``_error`` for :func:`last_error`,
-        because a missing toolchain has to degrade to the hipBLAS fallback
-        rather than take the process down at import.
+        扩展模块；编译失败时为 ``None``。调用方必须把 ``None`` 当成「走即时执行路径」，
+        绝不能当成空模块。失败异常本身留在 ``_error`` 里供 :func:`last_error` 使用，
+        因为缺少工具链时必须退化成 hipBLAS 兜底，而不是在 import 阶段把进程带崩。
     """
     global _mod, _error
     if _mod is None and _error is None:
@@ -78,48 +68,45 @@ def _load():
 
 
 def available() -> bool:
-    """True if the extension built (or was already cached).
+    """扩展是否已编译（或本来就在缓存里）。
 
     Returns:
-        ``False`` when the toolchain is missing or the build failed. Callers
-        branch on this to pick the eager fallback; the value is stable for the
-        life of the process because the load is memoised.
+        工具链缺失或编译失败时为 ``False``。调用方据此挑选即时执行的兜底路径；因为加载
+        做了记忆化，这个值在进程整个生命周期内不变。
     """
     return _load() is not None
 
 
 def last_error() -> str | None:
-    """Report why the extension is unavailable, for the startup log.
+    """报告扩展为什么不可用，供启动日志使用。
 
     Returns:
-        ``"<ExceptionType>: <message>"`` from the failed build, or ``None`` when
-        the build succeeded or was never attempted. The engine logs this once at
-        boot; without it a silent fallback to hipBLAS looks like a slow model
-        rather than a broken deployment.
+        编译失败时的 ``"<ExceptionType>: <message>"``；编译成功或从未尝试时为 ``None``。
+        引擎在启动时打一次这条信息；没有它，一次悄悄回退到 hipBLAS 看起来就像模型慢，
+        而不是部署坏了。
     """
     return _error
 
 
 def gemv(w: torch.Tensor, x: torch.Tensor, R: int = 1, U: int = 2) -> torch.Tensor:
-    """``w`` [N, K] fp16 or bf16 contiguous, ``x`` [K] bf16, returns ``y`` [N] bf16.
+    """``w`` [N, K] fp16 或 bf16 连续存放，``x`` [K] bf16，返回 ``y`` [N] bf16。
 
-    Weights are fp16 in practice (see ``models/qwen35/weights.py``); the bf16
-    entry point stays for a caller that holds bf16 tensors.
+    实践中权重是 fp16（见 ``models/qwen35/weights.py``）；保留 bf16 入口是为了手里拿着
+    bf16 张量的调用方。
 
     Args:
-        w: Weight matrix ``[N, K]``, row-major, fp16 or bf16, contiguous.
-        x: Activation vector ``[K]`` in bf16.
-        R: Rows of output computed per thread block; the tuning knob from
-            ``models/qwen35/tuning.py``.
-        U: K unroll factor (2 or 4). Higher halves the loop overhead and needs
-            the K dim to stay a multiple of it.
+        w: 权重矩阵 ``[N, K]``，行主序，fp16 或 bf16，连续存放。
+        x: 激活向量 ``[K]``，bf16。
+        R: 每个线程块计算多少行输出；调优旋钮来自 ``models/qwen35/tuning.py``。
+        U: K 方向展开因子（2 或 4）。取大能减半循环开销，代价是 K 维必须保持它的
+            整数倍。
 
     Returns:
-        ``[N]`` bf16 output.
+        ``[N]`` bf16 输出。
 
     Raises:
-        RuntimeError: The extension is unavailable. Fall back to
-            ``ops/gemv``'s eager path; the numbers must match.
+        RuntimeError: 扩展不可用。回退到 ``ops/gemv`` 的即时执行路径；两边数值必须
+            一致。
     """
     module = _load()
     if module is None:
@@ -130,20 +117,19 @@ def gemv(w: torch.Tensor, x: torch.Tensor, R: int = 1, U: int = 2) -> torch.Tens
 
 
 def gemv_m(w: torch.Tensor, x: torch.Tensor, U: int = 2) -> torch.Tensor:
-    """``w`` [N, K] fp16/bf16, ``x`` [M, K] bf16 (M in 2/4/8), returns ``y`` [M, N].
+    """``w`` [N, K] fp16/bf16，``x`` [M, K] bf16（M 为 2/4/8），返回 ``y`` [M, N]。
 
     Args:
-        w: Weight matrix ``[N, K]``, row-major, contiguous.
-        x: Activation matrix ``[M, K]`` bf16. ``M`` must be 2, 4 or 8: the kernel
-            is compiled for those widths, so any other M silently reads the wrong
-            number of rows.
-        U: K unroll factor (2 or 4).
+        w: 权重矩阵 ``[N, K]``，行主序，连续存放。
+        x: 激活矩阵 ``[M, K]`` bf16。``M`` 必须是 2、4 或 8：内核就是按这几个宽度编译
+            的，别的 M 会静默读错行数。
+        U: K 方向展开因子（2 或 4）。
 
     Returns:
-        ``[M, N]`` bf16 output, one weight pass for all M rows.
+        ``[M, N]`` bf16 输出，全部 M 行共用一次权重读取。
 
     Raises:
-        RuntimeError: The extension is unavailable.
+        RuntimeError: 扩展不可用。
     """
     module = _load()
     if module is None:
@@ -155,21 +141,21 @@ def gemv_m(w: torch.Tensor, x: torch.Tensor, U: int = 2) -> torch.Tensor:
 
 def gemv_w8a16(w: torch.Tensor, scale: torch.Tensor, x: torch.Tensor,
                R: int = 1, U: int = 2) -> torch.Tensor:
-    """``w`` [N, K] int8 with per-row ``scale`` [N], ``x`` [K] bf16 -> [N] bf16.
+    """``w`` [N, K] int8 配每行 ``scale`` [N]，``x`` [K] bf16 -> [N] bf16。
 
     Args:
-        w: int8 weight matrix ``[N, K]``, row-major, dequantised in-kernel.
-        scale: Per-row fp32 dequantisation scale, ``[N]``.
-        x: Activation vector ``[K]`` bf16.
-        R: Rows of output per thread block.
-        U: K unroll factor (2 or 4).
+        w: int8 权重矩阵 ``[N, K]``，行主序，在内核里反量化。
+        scale: 每行的 fp32 反量化 scale，``[N]``。
+        x: 激活向量 ``[K]`` bf16。
+        R: 每个线程块的输出行数。
+        U: K 方向展开因子（2 或 4）。
 
     Returns:
-        ``[N]`` bf16 output. Materialising the weight as bf16 instead would cost
-        ``[N, K]`` resident bytes, which is what the int8 layout exists to avoid.
+        ``[N]`` bf16 输出。改成把权重实体化成 bf16 会多占 ``[N, K]`` 的常驻字节，而
+        int8 布局存在的意义正是省掉这些。
 
     Raises:
-        RuntimeError: The extension is unavailable.
+        RuntimeError: 扩展不可用。
     """
     module = _load()
     if module is None:
@@ -179,19 +165,19 @@ def gemv_w8a16(w: torch.Tensor, scale: torch.Tensor, x: torch.Tensor,
 
 def gemv_w8a16_m(w: torch.Tensor, scale: torch.Tensor, x: torch.Tensor,
                  U: int = 2) -> torch.Tensor:
-    """``w`` [N, K] int8, ``x`` [M, K] bf16 (M in 2/4/8) -> [M, N] bf16.
+    """``w`` [N, K] int8，``x`` [M, K] bf16（M 为 2/4/8）-> [M, N] bf16。
 
     Args:
-        w: int8 weight matrix ``[N, K]``.
-        scale: Per-row fp32 scale, ``[N]``.
-        x: Activation matrix ``[M, K]`` bf16, ``M`` in 2/4/8.
-        U: K unroll factor (2 or 4).
+        w: int8 权重矩阵 ``[N, K]``。
+        scale: 每行的 fp32 scale，``[N]``。
+        x: 激活矩阵 ``[M, K]`` bf16，``M`` 为 2/4/8。
+        U: K 方向展开因子（2 或 4）。
 
     Returns:
-        ``[M, N]`` bf16 output.
+        ``[M, N]`` bf16 输出。
 
     Raises:
-        RuntimeError: The extension is unavailable.
+        RuntimeError: 扩展不可用。
     """
     module = _load()
     if module is None:
@@ -201,24 +187,23 @@ def gemv_w8a16_m(w: torch.Tensor, scale: torch.Tensor, x: torch.Tensor,
 
 def delta(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, beta: torch.Tensor,
           g: torch.Tensor, st: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
-    """Gated delta rule decode step; updates ``st`` in place and returns ``out``.
+    """gated delta 规则的一步解码；原地更新 ``st`` 并返回 ``out``。
 
     Args:
-        q: Normalised query per value head, ``[num_v, dk]`` fp32.
-        k: Normalised key per value head, ``[num_v, dk]`` fp32.
-        v: Value per value head, ``[num_v, dv]`` fp32.
-        beta: Per-head write strength in ``[0, 1]``, ``[num_v]`` fp32.
-        g: Per-head log decay, ``<= 0``, ``[num_v]`` fp32.
-        st: Recurrent state ``[num_v, dk, dv]`` fp32, updated in place. It is the
-            layer's only cross-token memory, so a caller that needs rollback must
-            snapshot it first.
-        out: Output buffer ``[num_v, dv]`` fp32, written in place.
+        q: 每个 value 头归一化后的查询，``[num_v, dk]`` fp32。
+        k: 每个 value 头归一化后的 key，``[num_v, dk]`` fp32。
+        v: 每个 value 头的 value，``[num_v, dv]`` fp32。
+        beta: 每头的写入强度，取值在 ``[0, 1]``，``[num_v]`` fp32。
+        g: 每头的对数衰减，``<= 0``，``[num_v]`` fp32。
+        st: 循环状态 ``[num_v, dk, dv]`` fp32，原地更新。它是本层唯一的跨 token
+            记忆，需要回滚的调用方必须先给它打快照。
+        out: 输出缓冲区 ``[num_v, dv]`` fp32，原地写。
 
     Returns:
-        ``out`` itself, for call chaining.
+        ``out`` 本身，便于链式调用。
 
     Raises:
-        RuntimeError: The extension is unavailable.
+        RuntimeError: 扩展不可用。
     """
     module = _load()
     if module is None:
@@ -232,33 +217,32 @@ def delta_prologue(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                    q_out: torch.Tensor, k_out: torch.Tensor, v_out: torch.Tensor,
                    beta: torch.Tensor, g: torch.Tensor,
                    qscale: float, rep: int) -> None:
-    """L2-normalise q/k, expand key->value heads, build beta/g into fp32 buffers.
+    """对 q/k 做 L2 归一化、把 key 头扩成 value 头、把 beta/g 建进 fp32 缓冲区。
 
-    One kernel replaces ~16 small elementwise ops (mul, sum, rsqrt, sigmoid,
-    softplus, add, repeat_interleave), which at decode were most of the mixer's
-    launch count.
+    一个内核替代约 16 个小的逐元素算子（mul、sum、rsqrt、sigmoid、softplus、add、
+    repeat_interleave），解码时它们占了混合器启动次数的大部分。
 
     Args:
-        q: Query per key head, ``[num_k, dk]``.
-        k: Key per key head, ``[num_k, dk]``.
-        v: Value per value head, ``[num_v, dv]``.
-        b: Beta logits, ``[num_v]``; sigmoid is applied here.
-        a: Decay logits, ``[num_v]``; softplus plus ``dt_bias`` is applied here.
-        neg_expA: ``-exp(A_log)``, ``[num_v]`` fp32.
-        dt_bias: Decay bias, ``[num_v]`` fp32.
-        q_out: Output query, ``[num_v, dk]`` fp32, head-expanded and scaled.
-        k_out: Output key, ``[num_v, dk]`` fp32.
-        v_out: Output value, ``[num_v, dv]`` fp32.
-        beta: Output write strength, ``[num_v]`` fp32.
-        g: Output log decay ``<= 0``, ``[num_v]`` fp32.
-        qscale: ``dk ** -0.5``, applied to the query only.
-        rep: Value heads per key head, i.e. how far to expand.
+        q: 每个 key 头的查询，``[num_k, dk]``。
+        k: 每个 key 头的 key，``[num_k, dk]``。
+        v: 每个 value 头的 value，``[num_v, dv]``。
+        b: beta 的 logits，``[num_v]``；sigmoid 在这里施加。
+        a: 衰减的 logits，``[num_v]``；softplus 加 ``dt_bias`` 在这里施加。
+        neg_expA: ``-exp(A_log)``，``[num_v]`` fp32。
+        dt_bias: 衰减偏置，``[num_v]`` fp32。
+        q_out: 输出查询，``[num_v, dk]`` fp32，已完成头扩展和缩放。
+        k_out: 输出 key，``[num_v, dk]`` fp32。
+        v_out: 输出 value，``[num_v, dv]`` fp32。
+        beta: 输出的写入强度，``[num_v]`` fp32。
+        g: 输出的对数衰减 ``<= 0``，``[num_v]`` fp32。
+        qscale: ``dk ** -0.5``，只施加到查询上。
+        rep: 每个 key 头对应的 value 头数，即扩多少倍。
 
     Returns:
-        Nothing. Every output buffer is written in place.
+        无。每个输出缓冲区都是原地写入。
 
     Raises:
-        RuntimeError: The extension is unavailable.
+        RuntimeError: 扩展不可用。
     """
     module = _load()
     if module is None:
@@ -269,22 +253,21 @@ def delta_prologue(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
 
 def conv1d_silu(conv_w: torch.Tensor, x: torch.Tensor, conv_state: torch.Tensor,
                 out: torch.Tensor) -> torch.Tensor:
-    """Fused depthwise causal conv1d (kernel 4) + SiLU; shifts ``conv_state``.
+    """融合的深度因果 conv1d（卷积核 4）+ SiLU；平移 ``conv_state``。
 
     Args:
-        conv_w: Depthwise kernel taps ``[conv_dim, 4]`` fp32.
-        x: Current token's projection, ``[conv_dim]``.
-        conv_state: Previous 3 tokens, ``[conv_dim, 3]`` fp32. Shifted in place,
-            so it is the mixer's short-term memory and must be snapshotted with
-            the recurrent state.
-        out: Output buffer ``[conv_dim]`` fp32, written in place.
+        conv_w: 深度卷积的抽头系数 ``[conv_dim, 4]`` fp32。
+        x: 当前 token 的投影，``[conv_dim]``。
+        conv_state: 前 3 个 token，``[conv_dim, 3]`` fp32。原地平移，所以它是混合器的
+            短期记忆，必须与循环状态一起打快照。
+        out: 输出缓冲区 ``[conv_dim]`` fp32，原地写。
 
     Returns:
-        ``out`` itself, for call chaining.
+        ``out`` 本身，便于链式调用。
 
     Raises:
-        RuntimeError: The extension is unavailable. The eager path in
-            ``linear_attn.__call__`` does cat + copy_ + mul + sum + silu instead.
+        RuntimeError: 扩展不可用。``linear_attn.__call__`` 里的即时执行路径改用
+            cat + copy_ + mul + sum + silu。
     """
     module = _load()
     if module is None:
@@ -294,20 +277,19 @@ def conv1d_silu(conv_w: torch.Tensor, x: torch.Tensor, conv_state: torch.Tensor,
 
 def conv1d_silu_seq(conv_w: torch.Tensor, x: torch.Tensor,
                     conv_state: torch.Tensor) -> torch.Tensor:
-    """Same conv over a prefill chunk: ``x`` [T, C] bf16 -> [T, C] fp32.
+    """同样的卷积跑在预填充分块上：``x`` [T, C] bf16 -> [T, C] fp32。
 
     Args:
-        conv_w: Depthwise kernel taps ``[C, 4]`` fp32.
-        x: Chunk projections ``[T, C]``, one row per token.
-        conv_state: Conv window carried across chunks, ``[C, 3]`` fp32, shifted in
-            place so a chunked prefill and a one-shot prefill agree exactly.
+        conv_w: 深度卷积的抽头系数 ``[C, 4]`` fp32。
+        x: 分块的投影 ``[T, C]``，每行一个 token。
+        conv_state: 跨块携带的卷积窗口 ``[C, 3]`` fp32，原地平移，使分块预填充与一次性
+            预填充结果完全一致。
 
     Returns:
-        ``[T, C]`` fp32 conv+SiLU output. fp32 because the delta scan downstream
-        accumulates across the chunk.
+        ``[T, C]`` fp32 的卷积 + SiLU 输出。用 fp32 是因为下游的 delta 扫描要跨块累加。
 
     Raises:
-        RuntimeError: The extension is unavailable.
+        RuntimeError: 扩展不可用。
     """
     module = _load()
     if module is None:
@@ -320,31 +302,30 @@ def delta_prep_seq(qkv: torch.Tensor, b: torch.Tensor, a: torch.Tensor,
                    q_out: torch.Tensor, k_out: torch.Tensor, v_out: torch.Tensor,
                    beta: torch.Tensor, g: torch.Tensor,
                    qscale: float, rep: int) -> None:
-    """Fused prefill head prep, writing q/k/v as [H, T, d] and beta/g as [H, T].
+    """融合的预填充头准备，把 q/k/v 写成 [H, T, d]、beta/g 写成 [H, T]。
 
-    The head-major layout is the point of the fusion: the chunked delta scan
-    reads ``[H, T, d]`` directly, so producing it here saves a transposed copy of
-    the whole chunk.
+    头主序布局正是这次融合的意义：分块 delta 扫描直接读 ``[H, T, d]``，在这里产出它就
+    省掉了整个分块的一次转置拷贝。
 
     Args:
-        qkv: Conv output ``[T, conv_dim]`` fp32, the fused q/k/v projection.
-        b: Beta logits, ``[T, num_v]``.
-        a: Decay logits, ``[T, num_v]``.
-        neg_expA: ``-exp(A_log)``, ``[num_v]`` fp32.
-        dt_bias: Decay bias, ``[num_v]`` fp32.
-        q_out: Output query, ``[num_v, T, dk]`` fp32.
-        k_out: Output key, ``[num_v, T, dk]`` fp32.
-        v_out: Output value, ``[num_v, T, dv]`` fp32.
-        beta: Output write strength, ``[num_v, T]`` fp32.
-        g: Output log decay ``<= 0``, ``[num_v, T]`` fp32.
-        qscale: ``dk ** -0.5``, applied to the query only.
-        rep: Value heads per key head.
+        qkv: 卷积输出 ``[T, conv_dim]`` fp32，即融合的 q/k/v 投影。
+        b: beta 的 logits，``[T, num_v]``。
+        a: 衰减的 logits，``[T, num_v]``。
+        neg_expA: ``-exp(A_log)``，``[num_v]`` fp32。
+        dt_bias: 衰减偏置，``[num_v]`` fp32。
+        q_out: 输出查询，``[num_v, T, dk]`` fp32。
+        k_out: 输出 key，``[num_v, T, dk]`` fp32。
+        v_out: 输出 value，``[num_v, T, dv]`` fp32。
+        beta: 输出的写入强度，``[num_v, T]`` fp32。
+        g: 输出的对数衰减 ``<= 0``，``[num_v, T]`` fp32。
+        qscale: ``dk ** -0.5``，只施加到查询上。
+        rep: 每个 key 头对应的 value 头数。
 
     Returns:
-        Nothing. Every output buffer is written in place.
+        无。每个输出缓冲区都是原地写入。
 
     Raises:
-        RuntimeError: The extension is unavailable.
+        RuntimeError: 扩展不可用。
     """
     module = _load()
     if module is None:
@@ -357,33 +338,32 @@ def attn(q: torch.Tensor, gate: torch.Tensor, kcache: torch.Tensor, vcache: torc
          kscale: torch.Tensor, vscale: torch.Tensor, out: torch.Tensor,
          pos: torch.Tensor, rep: int, scale: float,
          part_acc: torch.Tensor, part_ml: torch.Tensor) -> torch.Tensor:
-    """Fused single-token attention over the int8 KV cache; returns ``out``.
+    """在 int8 KV 缓存上做融合的单 token 注意力；返回 ``out``。
 
-    ``part_acc``/``part_ml`` are the per-key-slice partials of the online softmax
-    (``[nh, ATTN_SPLIT, hd]`` fp32 and ``[nh, ATTN_SPLIT, 2]`` fp32): the kernel
-    runs ``ATTN_SPLIT`` blocks per head, so the caller owns these buffers and keeps
-    them static for graph capture.
+    ``part_acc``/``part_ml`` 是 online softmax 按 key 切片的部分和
+    （``[nh, ATTN_SPLIT, hd]`` fp32 与 ``[nh, ATTN_SPLIT, 2]`` fp32）：内核在每头上跑
+    ``ATTN_SPLIT`` 个块，所以这些缓冲区归调用方所有，并为图捕获保持静止。
 
     Args:
-        q: Query for this token, ``[nh, hd]``, already scaled and rotated.
-        gate: Output gate, ``[nh, hd]``; the kernel applies ``sigmoid``.
-        kcache: int8 keys ``[nkv, max_seq, hd]``.
-        vcache: int8 values ``[nkv, max_seq, hd]``.
-        kscale: Per-(head, token) fp32 K scale, ``[nkv, max_seq]``.
-        vscale: Per-(head, token) fp32 V scale, ``[nkv, max_seq]``.
-        out: Output buffer ``[nh, hd]``, written in place.
-        pos: 1-element long tensor with this token's index; also the causal bound,
-            so entries past it are masked rather than excluded from the loop.
-        rep: Query heads per KV head (GQA group size).
-        scale: ``hd ** -0.5``, folded into the K scale by the kernel.
-        part_acc: Split-K accumulator, ``[nh, ATTN_SPLIT, hd]`` fp32, caller-owned.
-        part_ml: Split-K running max/denominator, ``[nh, ATTN_SPLIT, 2]`` fp32.
+        q: 本 token 的查询，``[nh, hd]``，已完成缩放和旋转。
+        gate: 输出门控，``[nh, hd]``；``sigmoid`` 由内核施加。
+        kcache: int8 key，``[nkv, max_seq, hd]``。
+        vcache: int8 value，``[nkv, max_seq, hd]``。
+        kscale: 每 (头, token) 的 fp32 K scale，``[nkv, max_seq]``。
+        vscale: 每 (头, token) 的 fp32 V scale，``[nkv, max_seq]``。
+        out: 输出缓冲区 ``[nh, hd]``，原地写。
+        pos: 单元素 long 张量，装本 token 的索引；它同时是因果边界，越过它的条目被掩掉
+            而不是从循环里排除。
+        rep: 每个 KV 头对应的查询头数（GQA 组大小）。
+        scale: ``hd ** -0.5``，由内核折进 K scale。
+        part_acc: split-K 累加器，``[nh, ATTN_SPLIT, hd]`` fp32，归调用方所有。
+        part_ml: split-K 的滑动最大值/分母，``[nh, ATTN_SPLIT, 2]`` fp32。
 
     Returns:
-        ``out`` itself, for call chaining.
+        ``out`` 本身，便于链式调用。
 
     Raises:
-        RuntimeError: The extension is unavailable.
+        RuntimeError: 扩展不可用。
     """
     module = _load()
     if module is None:
@@ -397,30 +377,29 @@ def attn_paged(q: torch.Tensor, gate: torch.Tensor, kpool: torch.Tensor,
                pos2slot: torch.Tensor, out: torch.Tensor, pos: torch.Tensor,
                max_pos: int, rep: int, scale: float,
                part_acc: torch.Tensor, part_ml: torch.Tensor) -> torch.Tensor:
-    """Same fused attention over one layer of the paged int8 pool.
+    """同样的融合注意力，跑在某层分页 int8 池上。
 
     Args:
-        q: Query for this token, ``[nh, hd]``.
-        gate: Output gate, ``[nh, hd]``.
-        kpool: This layer's int8 K pool, ``[nslots, nkv, hd]``.
-        vpool: This layer's int8 V pool, ``[nslots, nkv, hd]``.
-        kscale: Per-slot fp32 K scale, ``[nslots, nkv]``.
-        vscale: Per-slot fp32 V scale, ``[nslots, nkv]``.
-        pos2slot: This row's slot map, read only for the first ``pos + 1``
-            entries.
-        out: Output buffer ``[nh, hd]``, written in place.
-        pos: 1-element long tensor with this token's index; the causal bound.
-        max_pos: Window length, i.e. the stride of the slot the kernel scans to.
-        rep: Query heads per KV head.
-        scale: ``hd ** -0.5``.
-        part_acc: Split-K accumulator, ``[nh, ATTN_SPLIT, hd]`` fp32.
-        part_ml: Split-K running max/denominator, ``[nh, ATTN_SPLIT, 2]`` fp32.
+        q: 本 token 的查询，``[nh, hd]``。
+        gate: 输出门控，``[nh, hd]``。
+        kpool: 本层的 int8 K 池，``[nslots, nkv, hd]``。
+        vpool: 本层的 int8 V 池，``[nslots, nkv, hd]``。
+        kscale: 每槽位的 fp32 K scale，``[nslots, nkv]``。
+        vscale: 每槽位的 fp32 V scale，``[nslots, nkv]``。
+        pos2slot: 本行的槽位表，只读它的前 ``pos + 1`` 项。
+        out: 输出缓冲区 ``[nh, hd]``，原地写。
+        pos: 单元素 long 张量，装本 token 的索引；即因果边界。
+        max_pos: 窗口长度，即内核扫描到的那个槽位的行距。
+        rep: 每个 KV 头对应的查询头数。
+        scale: ``hd ** -0.5``。
+        part_acc: split-K 累加器，``[nh, ATTN_SPLIT, hd]`` fp32。
+        part_ml: split-K 的滑动最大值/分母，``[nh, ATTN_SPLIT, 2]`` fp32。
 
     Returns:
-        ``out`` itself, for call chaining.
+        ``out`` 本身，便于链式调用。
 
     Raises:
-        RuntimeError: The extension is unavailable.
+        RuntimeError: 扩展不可用。
     """
     module = _load()
     if module is None:
@@ -431,20 +410,20 @@ def attn_paged(q: torch.Tensor, gate: torch.Tensor, kpool: torch.Tensor,
 
 
 def rms_norm(x: torch.Tensor, w: torch.Tensor, stride: int, eps: float = 1e-6) -> torch.Tensor:
-    """Fused ``x * rsqrt(mean(x^2)+eps) * w`` over [M, N] rows.
+    """在 [M, N] 的多行上做融合的 ``x * rsqrt(mean(x^2)+eps) * w``。
 
     Args:
-        x: Input rows ``[M, N]``.
-        w: Gain, ``[N]`` (or strided, see ``stride``).
-        stride: Element stride between consecutive rows of ``x``, so a view into a
-            wider buffer normalises the same rows without a copy.
-        eps: Variance floor, matching the checkpoint's ``layer_norm_eps``.
+        x: 输入行 ``[M, N]``。
+        w: 增益，``[N]``（也可以是带间距的，见 ``stride``）。
+        stride: ``x`` 相邻两行之间的元素间距，让指向更宽缓冲区的视图不必拷贝就能归一化
+            同样的这些行。
+        eps: 方差下限，与 checkpoint 的 ``layer_norm_eps`` 对齐。
 
     Returns:
-        Normalised tensor with the same shape as ``x``.
+        归一化后的张量，形状同 ``x``。
 
     Raises:
-        RuntimeError: The extension is unavailable.
+        RuntimeError: 扩展不可用。
     """
     module = _load()
     if module is None:
@@ -454,21 +433,20 @@ def rms_norm(x: torch.Tensor, w: torch.Tensor, stride: int, eps: float = 1e-6) -
 
 def rms_norm_gated(x: torch.Tensor, w: torch.Tensor, gate: torch.Tensor,
                    eps: float = 1e-6) -> torch.Tensor:
-    """Fused ``rms(x) * w * silu(gate)``.
+    """融合的 ``rms(x) * w * silu(gate)``。
 
     Args:
-        x: Input ``[num_v, dv]``, one row per value head.
-        w: Per-head gain ``[dv]``. It is not ``[num_v*dv]``: the norm is
-            per-head, so passing the flattened width runs off the end of the
-            tensor.
-        gate: Gate projection ``[num_v, dv]``; silu is applied here.
-        eps: Variance floor.
+        x: 输入 ``[num_v, dv]``，每个 value 头一行。
+        w: 每头增益 ``[dv]``。它**不是** ``[num_v*dv]``：归一化是按头做的，传展平后的
+            宽度会读到张量边界之外。
+        gate: 门控投影 ``[num_v, dv]``；silu 在这里施加。
+        eps: 方差下限。
 
     Returns:
-        Gated normalised tensor, same shape as ``x``.
+        带门控的归一化张量，形状同 ``x``。
 
     Raises:
-        RuntimeError: The extension is unavailable.
+        RuntimeError: 扩展不可用。
     """
     module = _load()
     if module is None:
@@ -476,12 +454,11 @@ def rms_norm_gated(x: torch.Tensor, w: torch.Tensor, gate: torch.Tensor,
     return module.rms_norm_gated(x, w, gate, eps)
 
 
-# Batched decode entry points for ``kernels/batch.cu``.
+# ``kernels/batch.cu`` 的批处理解码入口。
 #
-# One launch for B sequences instead of B launches; the single-row entry points
-# above stay the B = 1 / speculative-verify path.  A row of the batch kernels is
-# numerically identical to the matching single-row kernel, and the attention
-# kernel loops each row only over that row's own ``context_lens[b]`` keys.
+# B 个序列一次启动而不是 B 次；上面的单行入口保留为 B = 1 / 投机校验路径。批内核里
+# 的每一行都与对应的单行内核数值一致，注意力内核每行只遍历该行自己的
+# ``context_lens[b]`` 个 key。
 
 
 def attn_paged_batch(q: torch.Tensor, gate: torch.Tensor,
@@ -490,39 +467,37 @@ def attn_paged_batch(q: torch.Tensor, gate: torch.Tensor,
                      slots: torch.Tensor, context_lens: torch.Tensor,
                      out: torch.Tensor, max_seq: int, rep: int, scale: float,
                      part_acc: torch.Tensor, part_ml: torch.Tensor) -> torch.Tensor:
-    """Batched paged attention over per-row int8 pool windows.
+    """按行在 int8 池窗口上做批处理分页注意力。
 
-    ``q``/``gate``/``out`` are ``[B, nh, hd]`` (bf16), ``kpool``/``vpool`` are
-    ``[nslots, nkv, hd]`` int8 with ``[nslots, nkv]`` fp32 scales, ``slots`` is
-    the ``[B, max_seq]`` device slot map (only the first ``context_lens[b]``
-    entries of row ``b`` are read) and ``context_lens`` is ``[B]`` int32.
-    ``part_acc``/``part_ml`` are the split-K online-softmax partials,
-    ``[B, nh, split, hd]`` and ``[B, nh, split, 2]`` fp32, caller-owned so the
-    shapes stay static for graph capture.
+    ``q``/``gate``/``out`` 是 ``[B, nh, hd]``（bf16），``kpool``/``vpool`` 是
+    ``[nslots, nkv, hd]`` int8 配 ``[nslots, nkv]`` fp32 scale，``slots`` 是
+    ``[B, max_seq]`` 的设备侧槽位表（只读第 ``b`` 行的前 ``context_lens[b]`` 项），
+    ``context_lens`` 是 ``[B]`` int32。``part_acc``/``part_ml`` 是 split-K 的
+    online-softmax 部分和，``[B, nh, split, hd]`` 与 ``[B, nh, split, 2]`` fp32，归
+    调用方所有，形状因此为图捕获保持静态。
 
     Args:
-        q: Queries ``[B, nh, hd]`` bf16, already rotated and scaled.
-        gate: Output gates ``[B, nh, hd]`` bf16.
-        kpool: This layer's int8 K pool, ``[nslots, nkv, hd]``.
-        vpool: This layer's int8 V pool, ``[nslots, nkv, hd]``.
-        kscale: Per-slot fp32 K scale, ``[nslots, nkv]``.
-        vscale: Per-slot fp32 V scale, ``[nslots, nkv]``.
-        slots: Per-row device slot map, ``[B, max_seq]``.
-        context_lens: Per-row context length ``[B]`` int32. Row ``b`` reads only
-            the first ``context_lens[b]`` entries of its own slot map, which is
-            what lets a bucket with mixed prompt lengths share one launch.
-        out: Output buffer ``[B, nh, hd]``, written in place.
-        max_seq: Window length, i.e. the row stride of ``slots``.
-        rep: Query heads per KV head.
-        scale: ``hd ** -0.5``.
-        part_acc: Split-K accumulator, ``[B, nh, split, hd]`` fp32.
-        part_ml: Split-K running max/denominator, ``[B, nh, split, 2]`` fp32.
+        q: 查询 ``[B, nh, hd]`` bf16，已完成旋转和缩放。
+        gate: 输出门控 ``[B, nh, hd]`` bf16。
+        kpool: 本层的 int8 K 池，``[nslots, nkv, hd]``。
+        vpool: 本层的 int8 V 池，``[nslots, nkv, hd]``。
+        kscale: 每槽位的 fp32 K scale，``[nslots, nkv]``。
+        vscale: 每槽位的 fp32 V scale，``[nslots, nkv]``。
+        slots: 每行的设备侧槽位表，``[B, max_seq]``。
+        context_lens: 每行的上下文长度 ``[B]`` int32。第 ``b`` 行只读它自己槽位表的前
+            ``context_lens[b]`` 项，混合 prompt 长度的批桶因此能共用一次启动。
+        out: 输出缓冲区 ``[B, nh, hd]``，原地写。
+        max_seq: 窗口长度，即 ``slots`` 的行距。
+        rep: 每个 KV 头对应的查询头数。
+        scale: ``hd ** -0.5``。
+        part_acc: split-K 累加器，``[B, nh, split, hd]`` fp32。
+        part_ml: split-K 的滑动最大值/分母，``[B, nh, split, 2]`` fp32。
 
     Returns:
-        ``out`` itself, for call chaining.
+        ``out`` 本身，便于链式调用。
 
     Raises:
-        RuntimeError: The extension is unavailable.
+        RuntimeError: 扩展不可用。
     """
     module = _load()
     if module is None:
@@ -540,43 +515,41 @@ def attn_paged_multi_q(q: torch.Tensor, gate: torch.Tensor,
                        part_acc: torch.Tensor, part_ml: torch.Tensor,
                        block_mask: torch.Tensor | None = None,
                        mask_block: int = 64) -> torch.Tensor:
-    """Verify attention: ``c`` draft queries per row share one history KV pass.
+    """校验注意力：每行的 ``c`` 个草稿查询共享一次历史 KV 遍历。
 
-    ``q``/``gate``/``out`` are ``[B, c, nh, hd]`` bf16, ``ctx_lens`` is the
-    history length per row (query ``j`` sees ``ctx + j + 1`` keys, i.e. history
-    plus the first ``j+1`` new tokens).  Each query gets the same split-K /
-    online-softmax / gate arithmetic as ``attn_paged_batch``, so it is
-    bit-identical to decoding that token on its own.  ``part_acc``/``part_ml``
-    are ``[B*c, nh, split, hd]`` / ``[B*c, nh, split, 2]`` fp32.
+    ``q``/``gate``/``out`` 是 ``[B, c, nh, hd]`` bf16，``ctx_lens`` 是每行的历史长度
+    （查询 ``j`` 看到 ``ctx + j + 1`` 个 key，即历史加上前 ``j+1`` 个新 token）。每个
+    查询拿到与 ``attn_paged_batch`` 相同的 split-K / online-softmax / 门控运算，所以
+    与单独解码该 token 逐位一致。``part_acc``/``part_ml`` 是
+    ``[B*c, nh, split, hd]`` / ``[B*c, nh, split, 2]`` fp32。
 
-    ``block_mask`` (uint8 ``[B, n_blocks]``, 1 = keep, block size ``mask_block``)
-    selects which KV blocks take part; ``None`` is exact full attention.
+    ``block_mask``（uint8 ``[B, n_blocks]``，1 表示保留，块大小为 ``mask_block``）选定
+    哪些 KV 块参与；``None`` 是精确的全注意力。
 
     Args:
-        q: Draft queries ``[B, c, nh, hd]`` bf16, already rotated and scaled.
-        gate: Output gates, same shape.
-        kpool: This layer's int8 K pool, ``[nslots, nkv, hd]``.
-        vpool: This layer's int8 V pool, ``[nslots, nkv, hd]``.
-        kscale: Per-slot fp32 K scale, ``[nslots, nkv]``.
-        vscale: Per-slot fp32 V scale, ``[nslots, nkv]``.
-        slots: Per-row device slot map, ``[B, max_seq]``.
-        ctx_lens: Per-row history length, ``[B]`` int32. Query ``j`` sees
-            ``ctx_lens[b] + j + 1`` keys, i.e. history plus the new tokens up to
-            and including its own.
-        out: Output buffer ``[B, c, nh, hd]``, written in place.
-        max_seq: Window length, i.e the row stride of ``slots``.
-        rep: Query heads per KV head.
-        scale: ``hd ** -0.5``.
-        part_acc: Split-K accumulator, ``[B*c, nh, split, hd]`` fp32.
-        part_ml: Split-K running max/denominator, ``[B*c, nh, split, 2]`` fp32.
-        block_mask: Optional uint8 block keep-mask, ``[B, n_blocks]``.
-        mask_block: Block size the mask is expressed in.
+        q: 草稿查询 ``[B, c, nh, hd]`` bf16，已完成旋转和缩放。
+        gate: 输出门控，形状同上。
+        kpool: 本层的 int8 K 池，``[nslots, nkv, hd]``。
+        vpool: 本层的 int8 V 池，``[nslots, nkv, hd]``。
+        kscale: 每槽位的 fp32 K scale，``[nslots, nkv]``。
+        vscale: 每槽位的 fp32 V scale，``[nslots, nkv]``。
+        slots: 每行的设备侧槽位表，``[B, max_seq]``。
+        ctx_lens: 每行的历史长度 ``[B]`` int32。查询 ``j`` 看到 ``ctx_lens[b] + j + 1``
+            个 key，即历史加上截至并包含它自己的新 token。
+        out: 输出缓冲区 ``[B, c, nh, hd]``，原地写。
+        max_seq: 窗口长度，即 ``slots`` 的行距。
+        rep: 每个 KV 头对应的查询头数。
+        scale: ``hd ** -0.5``。
+        part_acc: split-K 累加器，``[B*c, nh, split, hd]`` fp32。
+        part_ml: split-K 的滑动最大值/分母，``[B*c, nh, split, 2]`` fp32。
+        block_mask: 可选的 uint8 块保留掩码，``[B, n_blocks]``。
+        mask_block: 掩码所表达的块大小。
 
     Returns:
-        ``out`` itself, for call chaining.
+        ``out`` 本身，便于链式调用。
 
     Raises:
-        RuntimeError: The extension is unavailable.
+        RuntimeError: 扩展不可用。
     """
     module = _load()
     if module is None:
@@ -590,22 +563,21 @@ def attn_paged_multi_q(q: torch.Tensor, gate: torch.Tensor,
 
 def conv1d_silu_batch(conv_w: torch.Tensor, x: torch.Tensor,
                       conv_state: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
-    """Batched fused depthwise causal conv1d + SiLU.
+    """批处理的融合深度因果 conv1d + SiLU。
 
-    ``x`` [B, C] bf16, ``conv_state`` [B, C, 3] fp32 (shifted in place),
-    ``out`` [B, C] fp32.
+    ``x`` [B, C] bf16，``conv_state`` [B, C, 3] fp32（原地平移），``out`` [B, C] fp32。
 
     Args:
-        conv_w: Depthwise kernel taps ``[C, 4]`` fp32.
-        x: One token per row, ``[B, C]``.
-        conv_state: Per-row conv window ``[B, C, 3]`` fp32, shifted in place.
-        out: Output buffer ``[B, C]`` fp32, written in place.
+        conv_w: 深度卷积的抽头系数 ``[C, 4]`` fp32。
+        x: 每行一个 token，``[B, C]``。
+        conv_state: 每行的卷积窗口 ``[B, C, 3]`` fp32，原地平移。
+        out: 输出缓冲区 ``[B, C]`` fp32，原地写。
 
     Returns:
-        ``out`` itself, for call chaining.
+        ``out`` 本身，便于链式调用。
 
     Raises:
-        RuntimeError: The extension is unavailable.
+        RuntimeError: 扩展不可用。
     """
     module = _load()
     if module is None:
@@ -619,30 +591,30 @@ def delta_prologue_batch(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                          q_out: torch.Tensor, k_out: torch.Tensor,
                          v_out: torch.Tensor, beta: torch.Tensor,
                          g: torch.Tensor, qscale: float, rep: int) -> None:
-    """Batched q/k norm + head expand + beta/g (see ``delta_prologue``).
+    """批处理的 q/k 归一化 + 头扩展 + beta/g 构建（见 ``delta_prologue``）。
 
     Args:
-        q: Query per key head, ``[B, num_k, dk]``.
-        k: Key per key head, ``[B, num_k, dk]``.
-        v: Value per value head, ``[B, num_v, dv]``.
-        b: Beta logits, ``[B, num_v]``.
-        a: Decay logits, ``[B, num_v]``.
-        neg_expA: ``-exp(A_log)``, ``[num_v]`` fp32, shared by every row.
-        dt_bias: Decay bias, ``[num_v]`` fp32, shared by every row.
-        q_out: Output query, ``[B, num_v, dk]`` fp32.
-        k_out: Output key, ``[B, num_v, dk]`` fp32.
-        v_out: Output value, ``[B, num_v, dv]`` fp32.
-        beta: Output write strength, ``[B, num_v]`` fp32.
-        g: Output log decay ``<= 0``, ``[B, num_v]`` fp32.
-        qscale: ``dk ** -0.5``.
-        rep: Value heads per key head.
+        q: 每个 key 头的查询，``[B, num_k, dk]``。
+        k: 每个 key 头的 key，``[B, num_k, dk]``。
+        v: 每个 value 头的 value，``[B, num_v, dv]``。
+        b: beta 的 logits，``[B, num_v]``。
+        a: 衰减的 logits，``[B, num_v]``。
+        neg_expA: ``-exp(A_log)``，``[num_v]`` fp32，所有行共享。
+        dt_bias: 衰减偏置，``[num_v]`` fp32，所有行共享。
+        q_out: 输出查询，``[B, num_v, dk]`` fp32。
+        k_out: 输出 key，``[B, num_v, dk]`` fp32。
+        v_out: 输出 value，``[B, num_v, dv]`` fp32。
+        beta: 输出的写入强度，``[B, num_v]`` fp32。
+        g: 输出的对数衰减 ``<= 0``，``[B, num_v]`` fp32。
+        qscale: ``dk ** -0.5``。
+        rep: 每个 key 头对应的 value 头数。
 
     Returns:
-        Nothing. Every output buffer is written in place; each row is
-        bit-identical to :func:`delta_prologue` on that row.
+        无。每个输出缓冲区都是原地写入；单独看每一行，结果与 :func:`delta_prologue`
+        逐位一致。
 
     Raises:
-        RuntimeError: The extension is unavailable.
+        RuntimeError: 扩展不可用。
     """
     module = _load()
     if module is None:
@@ -654,22 +626,22 @@ def delta_prologue_batch(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
 def delta_batch(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                 beta: torch.Tensor, g: torch.Tensor,
                 st: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
-    """Batched gated delta update; updates ``st`` [B, nv, dk, dv] in place.
+    """批处理的 gated delta 更新；原地更新 ``st`` [B, nv, dk, dv]。
 
     Args:
-        q: Normalised query per value head, ``[B, num_v, dk]`` fp32.
-        k: Normalised key per value head, ``[B, num_v, dk]`` fp32.
-        v: Value per value head, ``[B, num_v, dv]`` fp32.
-        beta: Write strength in ``[0, 1]``, ``[B, num_v]``.
-        g: Log decay ``<= 0``, ``[B, num_v]``.
-        st: Per-row recurrent state ``[B, num_v, dk, dv]`` fp32, updated in place.
-        out: Output buffer ``[B, num_v, dv]`` fp32, written in place.
+        q: 每个 value 头归一化后的查询，``[B, num_v, dk]`` fp32。
+        k: 每个 value 头归一化后的 key，``[B, num_v, dk]`` fp32。
+        v: 每个 value 头的 value，``[B, num_v, dv]`` fp32。
+        beta: 写入强度，取值在 ``[0, 1]``，``[B, num_v]``。
+        g: 对数衰减 ``<= 0``，``[B, num_v]``。
+        st: 每行的循环状态 ``[B, num_v, dk, dv]`` fp32，原地更新。
+        out: 输出缓冲区 ``[B, num_v, dv]`` fp32，原地写。
 
     Returns:
-        ``out`` itself, for call chaining.
+        ``out`` 本身，便于链式调用。
 
     Raises:
-        RuntimeError: The extension is unavailable.
+        RuntimeError: 扩展不可用。
     """
     module = _load()
     if module is None:
@@ -679,26 +651,24 @@ def delta_batch(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
 
 def gemv_w8a16_wide(w: torch.Tensor, scale: torch.Tensor, x: torch.Tensor,
                     U: int = 2, threads: int = 0) -> torch.Tensor:
-    """Wide-M int8 W8A16 GEMV: ``w`` [N, K] int8, ``scale`` [N], ``x`` [M, K] bf16.
+    """Wide-M 的 int8 W8A16 GEMV：``w`` [N, K] int8，``scale`` [N]，``x`` [M, K] bf16。
 
-    ``M`` must be 16, 24 or 32; one weight pass, no dequantisation.  Every row is
-    bit-identical to calling ``gemv_w8a16_m`` on that row's 8-activation slice.
-    ``U`` is the K unroll (2 or 4); ``threads=0`` picks a block size that splits
-    the warps evenly into activation groups (192 for M=24, 256 otherwise).
+    ``M`` 必须是 16、24 或 32；一次权重读取，不做反量化。每一行都与对该行的 8 激活切片
+    调用 ``gemv_w8a16_m`` 逐位一致。``U`` 是 K 方向展开（2 或 4）；``threads=0`` 选一个
+    能把 warp 均匀分进各激活组的块大小（M=24 时为 192，其余为 256）。
 
     Args:
-        w: int8 weight matrix ``[N, K]``, row-major.
-        scale: Per-row fp32 scale, ``[N]``.
-        x: Activations ``[M, K]`` bf16, ``M`` in {16, 24, 32}.
-        U: K unroll factor (2 or 4).
-        threads: Threads per block; ``0`` selects the even-split default above.
+        w: int8 权重矩阵 ``[N, K]``，行主序。
+        scale: 每行的 fp32 scale，``[N]``。
+        x: 激活 ``[M, K]`` bf16，``M`` 取 {16, 24, 32}。
+        U: K 方向展开因子（2 或 4）。
+        threads: 每块线程数；``0`` 表示采用上面那个均匀切分的默认值。
 
     Returns:
-        ``[M, N]`` bf16 output. Materialising the weight instead would cost
-        ``[N, K]`` resident bytes per call.
+        ``[M, N]`` bf16 输出。改成实体化权重则每次调用要多占 ``[N, K]`` 的常驻字节。
 
     Raises:
-        RuntimeError: The extension is unavailable.
+        RuntimeError: 扩展不可用。
     """
     module = _load()
     if module is None:
@@ -708,24 +678,23 @@ def gemv_w8a16_wide(w: torch.Tensor, scale: torch.Tensor, x: torch.Tensor,
 
 def gemv_w8a16_wide_dbg(w: torch.Tensor, scale: torch.Tensor, x: torch.Tensor,
                         U: int, rows: int, mw: int, threads: int = 0) -> torch.Tensor:
-    """A/B entry: ``rows`` output rows and ``mw`` activation vectors per warp.
+    """A/B 入口：每个 warp 处理 ``rows`` 行输出和 ``mw`` 个激活向量。
 
     Args:
-        w: int8 weight matrix ``[N, K]``.
-        scale: Per-row fp32 scale, ``[N]``.
-        x: Activations ``[M, K]`` bf16.
-        U: K unroll factor (2 or 4).
-        rows: Output rows each block covers, overriding the tuned default.
-        mw: Activation vectors per warp, overriding the tuned default.
-        threads: Threads per block; ``0`` keeps the compiled default.
+        w: int8 权重矩阵 ``[N, K]``。
+        scale: 每行的 fp32 scale，``[N]``。
+        x: 激活 ``[M, K]`` bf16。
+        U: K 方向展开因子（2 或 4）。
+        rows: 每块覆盖的输出行数，覆盖调优后的默认值。
+        mw: 每个 warp 的激活向量数，覆盖调优后的默认值。
+        threads: 每块线程数；``0`` 保持编译时的默认值。
 
     Returns:
-        ``[M, N]`` bf16 output with the same maths as
-        :func:`gemv_w8a16_wide`; only the launch shape differs, so the two are
-        bit-identical and can gate each other in a benchmark.
+        ``[M, N]`` bf16 输出，算术与 :func:`gemv_w8a16_wide` 相同；只有启动形状不同，
+        所以两者逐位一致，可以在基准测试里互相卡住对方。
 
     Raises:
-        RuntimeError: The extension is unavailable.
+        RuntimeError: 扩展不可用。
     """
     module = _load()
     if module is None:
@@ -735,26 +704,25 @@ def gemv_w8a16_wide_dbg(w: torch.Tensor, scale: torch.Tensor, x: torch.Tensor,
 
 def gemv_w8a16_wide_dot2(w: torch.Tensor, scale: torch.Tensor, x: torch.Tensor,
                          U: int = 2, threads: int = 0) -> torch.Tensor:
-    """Wide-M int8-weight GEMV with packed fp16 ``v_dot2_f32_f16`` math.
+    """用 packed fp16 ``v_dot2_f32_f16`` 数学做的 Wide-M int8 权重 GEMV。
 
-    ``M`` must be 16, 24 or 32; fp32 accumulation, activations converted to fp16
-    once per call.  Numerically close to ``gemv_w8a16_wide`` (not bit-identical).
+    ``M`` 必须是 16、24 或 32；fp32 累加，激活每次调用只转一次 fp16。数值上接近
+    ``gemv_w8a16_wide``（不逐位一致）。
 
     Args:
-        w: int8 weight matrix ``[N, K]``, row-major.
-        scale: Per-row fp32 scale, ``[N]``.
-        x: Activations ``[M, K]`` bf16, ``M`` in {16, 24, 32}.
-        U: K unroll factor (2 or 4).
-        threads: Threads per block; ``0`` keeps the compiled default.
+        w: int8 权重矩阵 ``[N, K]``，行主序。
+        scale: 每行的 fp32 scale，``[N]``。
+        x: 激活 ``[M, K]`` bf16，``M`` 取 {16, 24, 32}。
+        U: K 方向展开因子（2 或 4）。
+        threads: 每块线程数；``0`` 保持编译时的默认值。
 
     Returns:
-        ``[M, N]`` bf16 output. The packed ``v_dot2_f32_f16`` path halves the
-        arithmetic instructions per weight element versus the scalar int8 path,
-        but it is not bit-identical to :func:`gemv_w8a16_wide`, so it may only be
-        enabled where the caller accepts that rounding difference.
+        ``[M, N]`` bf16 输出。packed 的 ``v_dot2_f32_f16`` 路径相对标量 int8 路径把每个
+        权重元素的算术指令数减半，但它与 :func:`gemv_w8a16_wide` 不逐位一致，所以只在
+        调用方能接受这点舍入差异的地方启用。
 
     Raises:
-        RuntimeError: The extension is unavailable.
+        RuntimeError: 扩展不可用。
     """
     module = _load()
     if module is None:
@@ -765,23 +733,23 @@ def gemv_w8a16_wide_dot2(w: torch.Tensor, scale: torch.Tensor, x: torch.Tensor,
 def gemv_w8a16_wide_dot2_dbg(w: torch.Tensor, scale: torch.Tensor, x: torch.Tensor,
                              U: int, rows: int, mw: int,
                              threads: int = 0) -> torch.Tensor:
-    """A/B entry: ``rows`` output rows and ``mw`` activation vectors per warp.
+    """A/B 入口：每个 warp 处理 ``rows`` 行输出和 ``mw`` 个激活向量。
 
     Args:
-        w: int8 weight matrix ``[N, K]``.
-        scale: Per-row fp32 scale, ``[N]``.
-        x: Activations ``[M, K]`` bf16.
-        U: K unroll factor (2 or 4).
-        rows: Output rows each block covers, overriding the tuned default.
-        mw: Activation vectors per warp, overriding the tuned default.
-        threads: Threads per block; ``0`` keeps the compiled default.
+        w: int8 权重矩阵 ``[N, K]``。
+        scale: 每行的 fp32 scale，``[N]``。
+        x: 激活 ``[M, K]`` bf16。
+        U: K 方向展开因子（2 或 4）。
+        rows: 每块覆盖的输出行数，覆盖调优后的默认值。
+        mw: 每个 warp 的激活向量数，覆盖调优后的默认值。
+        threads: 每块线程数；``0`` 保持编译时的默认值。
 
     Returns:
-        ``[M, N]`` bf16 output, the same maths as
-        :func:`gemv_w8a16_wide_dot2` with only the launch shape changed.
+        ``[M, N]`` bf16 输出，算术与 :func:`gemv_w8a16_wide_dot2` 相同，只有启动形状
+        变了。
 
     Raises:
-        RuntimeError: The extension is unavailable.
+        RuntimeError: 扩展不可用。
     """
     module = _load()
     if module is None:

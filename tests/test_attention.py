@@ -1,31 +1,26 @@
-"""Blocked attention paths must agree with the unblocked ones.
+"""分块注意力路径必须与未分块的路径给出相同结果。
 
-Module: ``coffin/tests``. Loads the model and the HIP extension, then swaps the
-attention entry point under the running model; nothing else in the suite may
-monkey-patch ``hip_ops`` like this.
+Module: ``coffin/tests``。加载模型和 HIP 扩展，然后在运行中的模型上替换注意力
+入口；套件里其他测试不得这样 monkey-patch ``hip_ops``。
 
 Constraints:
-    * Agreement is judged in bf16 ULPs, not fp32 relative error: everything this
-      engine emits is bf16, so two identical fp32 computations that differ only
-      in accumulation order still land on different bf16 values at rounding
-      boundaries. A tighter bound would fail on rounding, not on a bug.
-    * The kernel globals patched here are module state, so every patch is undone
-      in a ``finally``; a leaked patch would silently redefine what the later
-      tests measure.
-    * The prompt must exceed the largest block under test, otherwise the block
-      sweep never crosses a boundary and proves nothing.
+    * 一致性按 bf16 ULP 判定，而不是 fp32 相对误差：这个引擎吐出的张量全是
+      bf16，两次完全相同的 fp32 计算只要累加顺序不同，就会在舍入边界上落到
+      不同的 bf16 值。把界收紧只会让它因为舍入失败，而不是因为 bug。
+    * 这里替换的内核全局量是模块状态，所以每次替换都在 ``finally`` 里还原；
+      泄漏的替换会悄悄改掉后面测试实际测量的东西。
+    * prompt 必须长于被测的最大块，否则块扫描永远跨不过边界，什么也证明不了。
 
-Long context needed two restructurings, and neither may move a single number:
+长上下文逼出过两次重构，两次都不许移动任何一个数字：
 
-* prefill streams keys in blocks of ``PREFILL_ATTN_KB`` with a running max
-  (online softmax) -- the score block used to be O(context), 8.6 GB at 256k;
-* the decode kernel streams its window in blocks of ``ATTN_KEY_BLOCK`` with
-  online softmax -- it used to hold the whole window in ``[S]`` floats in shared
-  memory, which does not fit past ~15k.
+* 预填充按 ``PREFILL_ATTN_KB`` 分块流式读取 key，配一个滚动最大值（online
+  softmax）—— 原来的分数块是 O(context)，256k 时要 8.6 GB；
+* 解码内核按 ``ATTN_KEY_BLOCK`` 分块流式处理窗口，同样用 online softmax ——
+  原来把整个窗口放进共享内存的 ``[S]`` 个 float 里，超过约 15k 就放不下。
 
-So this is an A/B on the same model and the same prompt. Port of
-``diag/check_attn_block.py``; the batched-vs-sequential prefill check is the
-port of ``diag/check_prefill.py``.
+于是这里是同一模型、同一 prompt 上的 A/B 对比。移植自
+``diag/check_attn_block.py``；批处理与逐 token 预填充的对照移植自
+``diag/check_prefill.py``。
 """
 
 from __future__ import annotations
@@ -36,11 +31,11 @@ import support
 
 import torch
 
-#: >1024 so a decode through the cache spans several kernel blocks, and >2048 so
-#: the last prefill chunk still has a full-width score block to mask.
+#: 取大于 1024 是为了让一次经过缓存的解码跨过好几个内核块；大于 2048 是
+#: 为了让最后一个预填充分块里还有满宽的分数块可以被 mask 掉。
 PREFILL_TOKENS = 2048
-KB_SWEEP = (4096, 1024, 256, 64, 32)     # 4096 covers the whole 2048-token prompt
-ATTN_KEY_BLOCK = 1024                     # keep in sync with kernels/attn.cu
+KB_SWEEP = (4096, 1024, 256, 64, 32)     # 4096 能覆盖整个 2048 token 的 prompt
+ATTN_KEY_BLOCK = 1024                     # 与 kernels/attn.cu 保持一致
 
 BASE = [9707, 11, 1879, 3671, 374, 264, 3449, 315, 9847, 13,
         3838, 374, 279, 6722, 315, 9625, 323, 11751, 13]
@@ -51,12 +46,12 @@ def _tokens(n: int) -> list[int]:
 
 
 def _ulp(x: torch.Tensor) -> float:
-    """One bf16 ULP at the magnitude of the largest entry of ``x``."""
+    """``x`` 绝对值最大的那个元素所在量级上的一个 bf16 ULP。"""
     return max(float(x.abs().max()), 1e-6) * 2.0 ** -8
 
 
 def _compare(a: torch.Tensor, b: torch.Tensor, max_ulps: float = 4.0):
-    """(agree, max_diff, differing, argmax_same) of two logit tensors."""
+    """比较两个 logits 张量，返回 ``(agree, max_diff, differing, argmax_same)``。"""
     unit = _ulp(b)
     diff = float((a - b).abs().max())
     differing = int((a != b).sum())
@@ -67,13 +62,13 @@ def _compare(a: torch.Tensor, b: torch.Tensor, max_ulps: float = 4.0):
 @support.needs_hip
 @support.needs_model
 class AttnBlockTest(support.ModelTestCase):
-    """A block width is a performance knob: changing it must not move one bf16 value."""
+    """块宽是性能旋钮：改它不许挪动任何一个 bf16 值。"""
 
     QUANT = False
     MAX_SEQ = 4096
 
     def test_prefill_key_block_width_is_a_no_op(self):
-        """The online-softmax prefill must land on the same logits at every block width."""
+        """用 online softmax 的预填充在每个块宽下都必须落到同一份 logits 上。"""
         from models.qwen35 import full_attn
 
         toks = _tokens(PREFILL_TOKENS)
@@ -101,14 +96,14 @@ class AttnBlockTest(support.ModelTestCase):
             full_attn.PREFILL_ATTN_KB = 1024
 
     def test_decode_kernel_matches_eager_attention(self):
-        """The blocked decode kernel vs the unblocked eager reference."""
+        """分块的解码内核对手写未分块的 eager 参考实现。"""
         import hip_ops
         from models.qwen35 import full_attn
         from ops.dtypes import D, NEG_INF
 
         def eager_attn(q, gate, kcache, vcache, kscale, vscale, out, pos, rep,
                        scale, part_acc=None, part_ml=None):
-            """Whole-window attention: the maths the kernel replaced."""
+            """整窗注意力：内核替换掉的那套算法，作为对照留在这里。"""
             nh, hd = q.shape
             nkv = kcache.shape[0]
             seq = kcache.shape[1]
@@ -152,13 +147,13 @@ class AttnBlockTest(support.ModelTestCase):
 
 @support.needs_model
 class PrefillEquivalenceTest(support.ModelTestCase):
-    """Batched prefill must pick the same next token as walking the prompt."""
+    """批处理预填充必须挑出跟逐 token 走完 prompt 一样的下一个 token。"""
 
     QUANT = False
     MAX_SEQ = 4096
 
     def test_batched_matches_token_by_token(self):
-        """Batched prefill must pick the same next token as walking the prompt one call at a time."""
+        """批处理预填充和一次一个 token 地走完 prompt，必须挑出同一个下一个 token。"""
         for n in (5, 100, 700):
             with self.subTest(n=n):
                 toks = _tokens(n)

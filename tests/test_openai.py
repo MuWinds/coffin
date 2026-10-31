@@ -1,32 +1,28 @@
-"""Self-test for the OpenAI entry point against a fake engine socket (no GPU needed).
+"""用一个假引擎套接字自测 OpenAI 入口，不需要 GPU。
 
-Module: ``coffin/tests``. The only test that speaks HTTP: it imports
-the OpenAI adapter and ``utils.tool_call``, points them at a stub engine and asserts the
-OpenAI wire format, so it runs on a box with no DCU.
+Module: ``coffin/tests``。唯一走 HTTP 的测试：它导入 OpenAI 适配器和
+``utils.tool_call``，接到桩引擎上，断言 OpenAI 报文格式，所以没有 DCU 的机器
+也能跑。
 
 Constraints:
-    * The stub engine speaks TCP rather than ``AF_UNIX``: a dev box without
-      ``AF_UNIX`` can still connect, and only ``_open`` differs from the shipped
-      client, so everything above the transport is the real line protocol.
-    * ``SEEN`` is module-global and the tests read its last entry to assert what
-      the server sent downstream; requests must therefore stay serial, which
-      unittest already guarantees.
-    * One HTTP server and one stub engine per module (``setUpModule``), because
-      binding ports per test is slow and would leave sockets in TIME_WAIT.
-    * The canned token streams deliberately split markers and arguments across
-      pieces; a stream that only ever carries whole markers cannot test the
-      hold-back path.
+    * 桩引擎讲 TCP 而不是 ``AF_UNIX``：没有 ``AF_UNIX`` 的开发机也能连上，与真正
+      的客户端相比只有 ``_open`` 不同，传输层以上仍是真实的行协议。
+    * ``SEEN`` 是模块级全局，测试读它的最后一条来断言服务端往下游发了什么；
+      请求因此必须串行，这一点 unittest 已经保证。
+    * 整个模块只有一个 HTTP 服务和一个桩引擎（``setUpModule``）：每个测试各绑
+      一次端口既慢，又会留下 TIME_WAIT 状态的套接字。
+    * 预置 token 流故意把标记和参数拆到不同片段里；只发完整标记的流测不到
+      扣住不发的路径。
 
-The HTTP/SSE layer is pure protocol code, so it can be checked anywhere: a stub
-engine socket plays the canned token stream, the OpenAI adapter is pointed at it,
-and the OpenAI responses are asserted -- including the two things that are easy to
-get wrong and invisible in a passing generation:
+HTTP/SSE 这一层是纯协议代码，在哪都能验：桩引擎套接字播预置 token 流，把 OpenAI
+适配器接上去，再断言 OpenAI 侧的响应——包括两处容易写错、生成正常时又看不出来
+的地方：
 
-* the reasoning block is suppressed when the *prompt* opened ``<think>``;
-* the ``<tool_call>`` markup never leaks into ``content``, even when the marker is
-  split across two token pieces (the filter holds back a partial marker).
+* prompt 自己打开了 ``<think>`` 时，推理块要被抑制；
+* ``<tool_call>`` 标记绝不漏进 ``content``，即使标记被拆到两个 token 片段里
+  （过滤器把不完整的标记扣住不发）。
 
-Port of ``diag/check_openai.py``.
+移植自 ``diag/check_openai.py``。
 """
 
 from __future__ import annotations
@@ -38,7 +34,7 @@ import time
 import unittest
 import urllib.request
 
-# Side-effect import: sets MKL_THREADING_LAYER and puts coffin/ on sys.path.
+# 副作用导入：设置 MKL_THREADING_LAYER，并把 coffin/ 加进 sys.path。
 import support  # noqa: F401
 
 from entrypoints.openai import server as srv
@@ -46,7 +42,7 @@ from utils.tool_call import parse_tool_calls, split_thinking
 
 
 class TcpEngine(srv.EngineClient):
-    """``EngineClient`` over TCP instead of AF_UNIX."""
+    """把 ``EngineClient`` 的传输层换成 TCP，而不是 AF_UNIX。"""
 
     def _open(self):
         conn = socket.create_connection(("127.0.0.1", int(self.sock_path)),
@@ -62,8 +58,8 @@ CALL = ("<tool_call>\n<function=get_weather>\n<parameter=city>\n北京\n"
         "</parameter>\n</function>\n</tool_call>")
 CALL2 = ("<tool_call>\n<function=multiply>\n<parameter=a>\n12\n</parameter>\n"
          "<parameter=b>\n8\n</parameter>\n</function>\n</tool_call>")
-# With tool_choice: required the engine finds the opener already in the prompt, so
-# what it generates -- and streams -- is only the body of the call.
+# tool_choice: required 时引擎在 prompt 里已经看到开标记，所以它生成并流式发出的
+# 只是这次调用的正文部分。
 CALL_BODY = CALL[len("<tool_call>"):]
 TOOLS = ["Let", " me", " check", ".", CALL]
 TOOLS_SPLIT = ["Let", " me", " check", ".", "<tool_ca", "ll>" + CALL[len("<tool_call>"):]]
@@ -74,16 +70,15 @@ CALL_FRAG_INT = ["<tool_call>", "\n<function=multiply>\n<parameter=a>\n1", "2\n<
 CALL_FRAG_ESC = ["<tool_call>", "\n<function=multiply>\n<parameter=x>\n", 'he said "hi"',
                  "\nline2\\path", "\n</parameter>\n</function>\n</tool_call>"]
 
-SEEN: list[dict] = []          # every request the fake engine received
+SEEN: list[dict] = []          # 假引擎收到的每个请求
 _MODULE: dict = {}
 
 
 def _pieces(req: dict) -> tuple[list[str], bool]:
-    """The canned stream plus the "prompt opened ``<think>``" flag for a request.
+    """给一条请求挑出预置 token 流，外加「prompt 自己打开了 ``<think>``」标志。
 
-    The prompt text is the only switch: the stub has no model, so the test cases
-    are selected by marker words ("fragcity", "two", "split", ...) rather than by
-    what the server computed.
+    唯一的开关是 prompt 文本：桩引擎里没有模型，所以用例靠标记词（``"fragcity"``、
+    ``"two"``、``"split"`` 等）来选，而不是看服务端算出了什么。
     """
     text = " ".join(str(m.get("content") or "") for m in req.get("messages") or [])
     if req.get("tool_prefix"):
@@ -110,18 +105,18 @@ def _pieces(req: dict) -> tuple[list[str], bool]:
 
 
 def _reply(req: dict) -> dict:
-    """The non-stream reply the stub engine returns, shaped like the real ``done`` payload.
+    """桩引擎返回的非流式应答，形状与真实的 ``done`` payload 一致。
 
-    ``_reply`` mirrors the runtime chat split's "prompt opened the thought"
-    rule, so the test asserts the server's output rather than re-deriving it.
+    ``_reply`` 复刻运行时 chat 拆分的那条「prompt 打开了思考」规则，这样测试断言的
+    是服务端的输出，而不是自己重算一遍。
     """
     pieces, opens = _pieces(req)
     prefix = str(req.get("tool_prefix") or "")
-    raw = prefix + "".join(pieces)              # the opener lives in the prompt
+    raw = prefix + "".join(pieces)              # 开标记已经落在 prompt 里
     thinking, answer = split_thinking(raw)
     if (req.get("enable_thinking") and not prefix
             and not thinking and "</think>" not in raw):
-        thinking, answer = answer, ""           # same rule as the runtime chat split
+        thinking, answer = answer, ""           # 与运行时 chat 拆分同一条规则
     return {"ok": True, "text": answer, "thinking": thinking, "raw": raw,
             "tool_calls": [c.to_openai_dict() for c in parse_tool_calls(answer)],
             "forced_tool": bool(prefix),
@@ -132,10 +127,10 @@ def _reply(req: dict) -> dict:
 
 
 def _fake_engine(port: int, stop: threading.Event) -> None:
-    """Serve the line protocol of the real engine on ``port`` until ``stop`` is set.
+    """在 ``port`` 上按真实引擎的行协议应答，直到 ``stop`` 被置位。
 
-    It binds with a 0.5 s accept timeout so the loop can notice ``stop``; a
-    blocking accept would hang ``tearDownModule`` and leave the port held.
+    accept 超时设成 0.5 s，循环才有机会看到 ``stop``；阻塞式 accept 会卡住
+    ``tearDownModule``，端口一直占着不放。
     """
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -180,7 +175,7 @@ def _fake_engine(port: int, stop: threading.Event) -> None:
 
 
 def post(port: int, body: dict) -> dict:
-    """POST one non-stream ``/v1/chat/completions`` request and decode the JSON reply."""
+    """发一条非流式的 ``/v1/chat/completions`` 请求，并解出 JSON 应答。"""
     req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions",
                                  data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
@@ -189,10 +184,9 @@ def post(port: int, body: dict) -> dict:
 
 
 def sse(port: int, body: dict) -> list[dict]:
-    """POST a streaming request and return the parsed ``data:`` chunks, minus the terminator.
+    """发一条流式请求，返回解析后的 ``data:`` 块，不含终止符。
 
-    The ``[DONE]`` sentinel is dropped here: it carries no JSON and every caller
-    only inspects the decoded chunk list.
+    ``[DONE]`` 哨兵在这里就被丢掉：它不带 JSON，而每个调用方只看解出来的块列表。
     """
     req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions",
                                  data=json.dumps({**body, "stream": True}).encode(),
@@ -207,7 +201,7 @@ def sse(port: int, body: dict) -> list[dict]:
 
 
 def get(port: int, path: str) -> dict:
-    """GET one path from the server under test and decode the JSON body."""
+    """向被测服务 GET 一个路径，并解出 JSON 正文。"""
     with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=30) as r:
         return json.loads(r.read())
 
@@ -223,7 +217,7 @@ def reasoning_of(chunks: list[dict]) -> str:
 
 
 def tool_calls_of(chunks: list[dict]) -> list[dict]:
-    """Accumulate streamed tool_calls fragments the way an OpenAI client does."""
+    """按 OpenAI 客户端的做法累积流式 ``tool_calls`` 片段。"""
     acc: dict[int, dict] = {}
     for chunk in chunks:
         if not chunk["choices"]:
@@ -253,10 +247,10 @@ TOOLS_SCHEMA = [{"type": "function",
 
 
 def setUpModule() -> None:
-    """Start one stub engine and one HTTP server for the whole module.
+    """整个模块只用一套桩引擎和 HTTP 服务。
 
-    The stub thread is waited for before any request is sent: the HTTP layer
-    would otherwise race the bind and fail intermittently on a slow box.
+    发第一条请求之前要先等桩线程起来：否则 HTTP 层会和 bind 抢跑，在慢机器上
+    间歇性失败。
     """
     probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     probe.bind(("127.0.0.1", 0))
@@ -265,7 +259,7 @@ def setUpModule() -> None:
     stop = threading.Event()
     thread = threading.Thread(target=_fake_engine, args=(engine_port, stop), daemon=True)
     thread.start()
-    for _ in range(50):                       # wait for the stub to bind
+    for _ in range(50):                       # 等桩引擎完成绑定
         if getattr(stop, "server_sock", None) is not None:
             break
         time.sleep(0.05)
@@ -282,7 +276,7 @@ def setUpModule() -> None:
 
 
 def tearDownModule() -> None:
-    """Stop the stub engine and close the HTTP server, so a rerun can bind the same state."""
+    """停掉桩引擎、关掉 HTTP 服务，让重跑能绑到同样的状态。"""
     _MODULE["stop"].set()
     _MODULE["httpd"].shutdown()
     _MODULE["httpd"].server_close()
@@ -290,15 +284,16 @@ def tearDownModule() -> None:
 
 
 class OpenAIServerTest(unittest.TestCase):
-    """The OpenAI-compatible surface must match the wire format clients parse, not just produce text."""
+    """OpenAI 兼容面必须对上客户端解析的报文格式，而不只是产出文本。"""
 
     @property
     def port(self) -> int:
-        """HTTP port of the server started by ``setUpModule``."""
+        """``setUpModule`` 启动的服务的 HTTP 端口。"""
         return _MODULE["port"]
 
     def test_health_and_models(self):
-        """``/health`` reports the graph state a load balancer polls, and ``/v1/models`` reports the served name clients select on."""
+        """``/health`` 要报出负载均衡器轮询的图状态，``/v1/models`` 要报出客户端
+        据以选模型的服务名。"""
         health = get(self.port, "/health")
         self.assertEqual(health.get("status"), "ok", json.dumps(health))
         self.assertTrue(health.get("graph") is True)
@@ -307,7 +302,7 @@ class OpenAIServerTest(unittest.TestCase):
         self.assertEqual(models["data"][0]["id"], "qwen3.5-4b")
 
     def test_chat_completion(self):
-        """The non-stream shape: content, ``finish_reason`` and usage must all be populated, since clients branch on each."""
+        """非流式形状：``content``、``finish_reason`` 和 usage 都得填上，客户端对每一项都会分支处理。"""
         r = post(self.port, {"model": "qwen3.5-4b",
                              "messages": [{"role": "user", "content": "hi"}]})
         msg = r["choices"][0]["message"]
@@ -316,20 +311,20 @@ class OpenAIServerTest(unittest.TestCase):
         self.assertEqual(r["usage"]["completion_tokens"], len(PLAIN))
 
     def test_content_parts_are_joined(self):
-        """The multipart content form is what vision-capable clients send; a dropped part loses the prompt."""
+        """多段 ``content`` 是视觉类客户端发的东西；丢掉其中一段就等于丢掉 prompt。"""
         r = post(self.port, {"messages": [{"role": "user", "content": [
             {"type": "text", "text": "hi"}]}]})
         self.assertTrue(r["choices"][0]["message"]["content"].endswith("Paris."))
 
     def test_max_tokens_sets_finish_length(self):
-        """``finish_reason`` is how a client learns the answer was cut; reporting ``stop`` would make a truncated reply look complete."""
+        """客户端靠 ``finish_reason`` 得知回答被截断；报成 ``stop`` 会让截断的回复看起来完整。"""
         r = post(self.port, {"messages": [{"role": "user", "content": "hi"}],
                              "max_tokens": 3})
         self.assertEqual(r["choices"][0]["finish_reason"], "length")
         self.assertEqual(r["usage"]["completion_tokens"], 3)
 
     def test_sse_plain(self):
-        """The stream must open with the role delta and close with the finish chunk, or client accumulators never terminate."""
+        """流必须以 role delta 开头、以 finish 块收尾，否则客户端的累积器永远等不到结束。"""
         ch = sse(self.port, {"messages": [{"role": "user", "content": "hi"}]})
         self.assertEqual(content_of(ch), "The capital of France is Paris.")
         self.assertEqual(ch[0]["choices"][0]["delta"].get("role"), "assistant")
@@ -337,7 +332,8 @@ class OpenAIServerTest(unittest.TestCase):
         self.assertEqual(ch[-1]["usage"]["total_tokens"], 11 + len(PLAIN))
 
     def test_thinking_is_suppressed_from_content(self):
-        """Reasoning must go to ``reasoning_content``: leaking it into ``content`` puts the model's scratch work in the user's answer."""
+        """推理内容必须走 ``reasoning_content``：漏进 ``content`` 就会把模型的草稿
+        过程塞进用户看到的答案里。"""
         ch = sse(self.port, {"messages": [{"role": "user", "content": "hi"}],
                              "enable_thinking": True})
         self.assertEqual(content_of(ch), "The capital is Paris.")
@@ -352,7 +348,7 @@ class OpenAIServerTest(unittest.TestCase):
         self.assertTrue(message["reasoning_content"].startswith("We need"))
 
     def test_cut_off_reasoning_is_not_passed_off_as_the_answer(self):
-        """A reply that hit the token cap mid-thought has no answer, so ``content`` must be empty rather than a truncated thought."""
+        """在思考中途撞上 token 上限的回复没有答案，``content`` 必须为空，而不是塞一段被截断的思考。"""
         r = post(self.port, {"messages": [{"role": "user", "content": "trunc"}],
                              "enable_thinking": True, "max_tokens": 8})
         message = r["choices"][0]["message"]
@@ -365,7 +361,7 @@ class OpenAIServerTest(unittest.TestCase):
         self.assertTrue(reasoning_of(ch).startswith("We need to think"))
 
     def test_tool_call_is_parsed_and_not_leaked(self):
-        """The ``<tool_call>`` markup is an internal dialect: it must become ``tool_calls`` and never appear in ``content``."""
+        """``<tool_call>`` 标记是内部方言：必须转成 ``tool_calls``，且绝不出现在 ``content`` 里。"""
         r = post(self.port, {"messages": [{"role": "user", "content": "北京?"}],
                              "tools": TOOLS_SCHEMA})
         message = r["choices"][0]["message"]
@@ -375,7 +371,8 @@ class OpenAIServerTest(unittest.TestCase):
         self.assertEqual(json.loads(call["arguments"])["city"], "北京")
 
     def test_sse_tool_fragments_accumulate_to_the_non_stream_call(self):
-        """A client reassembles the call from fragments, so the accumulation must equal the non-stream call exactly; a different split would break argument JSON."""
+        """客户端从片段拼回调用，因此累积结果必须与非流式调用逐字相同；切法不同
+        就会把参数 JSON 拼坏。"""
         ch = sse(self.port, {"messages": [{"role": "user", "content": "北京?"}],
                              "tools": TOOLS_SCHEMA})
         once = post(self.port, {"messages": [{"role": "user", "content": "北京?"}],
@@ -395,7 +392,7 @@ class OpenAIServerTest(unittest.TestCase):
         self.assertNotIn("<tool_call>", content_of(ch))
 
     def test_split_marker_is_held_back(self):
-        """The marker arrives in pieces, so the filter has to buffer a partial ``<tool_call>`` instead of streaming it out."""
+        """标记是分片到达的，过滤器必须把不完整的 ``<tool_call>`` 扣在缓冲区里，而不是直接发出去。"""
         r = post(self.port, {"messages": [{"role": "user", "content": "split it please"}],
                              "tools": TOOLS_SCHEMA})
         self.assertEqual((r["choices"][0]["message"].get("tool_calls") or [{}])[0]
@@ -405,7 +402,7 @@ class OpenAIServerTest(unittest.TestCase):
         self.assertEqual(content_of(ch), "Let me check.")
 
     def test_fragmented_arguments_match_the_non_stream_arguments(self):
-        """The three fragmentation cases are the ones that broke JSON before: a split string value, a split integer, and escapes."""
+        """这三种分片正是以前把 JSON 搞坏的情形：字符串值被拆开、整数被拆开，以及转义。"""
         cases = (("string value split across tokens", "fragcity"),
                  ("integer values", "fragint"),
                  ("value with quotes/backslash/newline", "fragesc"))
@@ -420,10 +417,11 @@ class OpenAIServerTest(unittest.TestCase):
                 self.assertEqual([c["function"]["arguments"] for c in got],
                                  [c["function"]["arguments"] for c in want])
                 self.assertEqual(len(got), len(want))
-                json.loads(got[0]["function"]["arguments"])   # valid JSON, no duplicates
+                json.loads(got[0]["function"]["arguments"])   # 解析得动，且参数没有重复
 
     def test_tool_choice_none_drops_tools(self):
-        """``tool_choice: none`` must strip the tools before the engine sees them, or the prompt still steers the model toward a call."""
+        """``tool_choice: none`` 必须在引擎看到之前就把 tools 摘掉，否则 prompt 仍会
+        把模型往调用上引。"""
         r = post(self.port, {"messages": [{"role": "user", "content": "北京?"}],
                              "tools": TOOLS_SCHEMA, "tool_choice": "none"})
         message = r["choices"][0]["message"]
@@ -433,7 +431,8 @@ class OpenAIServerTest(unittest.TestCase):
         self.assertFalse(SEEN[-1].get("tools"))
 
     def test_tool_choice_required_forces_the_opener_and_returns_the_call(self):
-        """``required`` is implemented by seeding the opener in the prompt, so the server must not echo it back as content or duplicate it."""
+        """``required`` 靠把开标记种进 prompt 实现，所以服务端不能再把它当 content
+        回显，也不能重复一遍。"""
         r = post(self.port, {"messages": [{"role": "user", "content": "北京?"}],
                              "tools": TOOLS_SCHEMA, "tool_choice": "required"})
         self.assertEqual(SEEN[-1].get("tool_prefix"), "<tool_call>\n")
@@ -453,7 +452,7 @@ class OpenAIServerTest(unittest.TestCase):
         self.assertGreaterEqual(len(fragments_of(ch)), 2)
 
     def test_named_tool_choice_forces_that_function(self):
-        """A named choice seeds opener plus function name, so the model cannot pick a different tool."""
+        """具名选择会种下开标记加函数名，模型就没法改挑别的工具。"""
         r = post(self.port, {"messages": [{"role": "user", "content": "北京?"}],
                              "tools": TOOLS_SCHEMA,
                              "tool_choice": {"type": "function",
@@ -463,7 +462,8 @@ class OpenAIServerTest(unittest.TestCase):
                          ["function"]["name"], "get_weather")
 
     def test_legacy_functions_pair_maps_onto_tools(self):
-        """The deprecated ``functions`` / ``function_call`` pair must map onto ``tools``; clients still send it and a silent drop loses the call."""
+        """已弃用的 ``functions`` / ``function_call`` 组合必须映射到 ``tools``；
+        还有客户端在发，悄悄丢掉就会丢失这次调用。"""
         r = post(self.port, {
             "messages": [{"role": "user", "content": "北京?"}],
             "functions": [{"name": "get_weather", "parameters": {"type": "object"}}],
@@ -474,7 +474,8 @@ class OpenAIServerTest(unittest.TestCase):
                          ["function"]["name"], "get_weather")
 
     def test_parallel_tool_calls_flag(self):
-        """``parallel_tool_calls: false`` must truncate to one call; the flag is the only way a client can forbid parallel calls."""
+        """``parallel_tool_calls: false`` 必须截到单个调用；客户端要禁止并行调用
+        只有这一个开关。"""
         r = post(self.port, {"messages": [{"role": "user", "content": "two calls"}],
                              "tools": TOOLS_SCHEMA})
         self.assertEqual(len(r["choices"][0]["message"]["tool_calls"]), 2)
@@ -483,7 +484,8 @@ class OpenAIServerTest(unittest.TestCase):
         self.assertEqual(len(r["choices"][0]["message"]["tool_calls"]), 1)
 
     def test_stream_include_usage(self):
-        """With ``include_usage`` the usage rides one extra choice-less chunk; putting it on a content chunk would break clients that index ``choices[0]``."""
+        """开了 ``include_usage`` 之后，usage 搭在一个额外的无 choice 块上；挂在
+        内容块上会打断按 ``choices[0]`` 取值的客户端。"""
         ch = sse(self.port, {"messages": [{"role": "user", "content": "hi"}],
                              "stream_options": {"include_usage": True}})
         usage_chunks = [c for c in ch if c["choices"] == []]

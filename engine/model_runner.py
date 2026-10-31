@@ -1,49 +1,41 @@
-"""Drives one model forward for the scheduler.
+"""为调度器驱动一次模型前向。
 
-Module: ``coffin/`` (middle layer), owned by ``llm_engine``. Keeping the runner
-separate is what makes batching possible: the runner owns *how* a step is
-executed (prefill path, paged write window, graph replay, sampling) and the
-scheduler owns *which* sequences go into the step.
+Module: ``coffin/``（中间层），由 ``llm_engine`` 持有。把 runner 独立出来正是
+批处理得以成立的原因：runner 负责一步*怎么*执行（预填充路径、分页写入窗口、
+图回放、采样），调度器负责*哪些*序列进入这一步。
 
-Two execution modes live here:
+这里有两种执行模式：
 
-* single stream (``batching=False``) — the pre-refactor path: one sequence, one
-  token, the decode graph captured for one slot map;
-* static batch (``batching=True``) — up to ``max_num_batched`` sequences share
-  one forward. The projections are batched (one weight read serves every row)
-  while attention and the delta-net recurrence run the existing single-token
-  kernels once per row.
+* 单流（``batching=False``）——重构前的路径：一条序列、一个 token，解码图按
+  一张槽位表 capture；
+* 静态批（``batching=True``）——最多 ``max_num_batched`` 条序列共用一个前向。
+  投影部分走批处理（一次权重读取服务所有行），而注意力和 delta-net 递推仍然
+  按行跑现有的单 token 内核。
 
 Constraints:
-    * Row layout is fixed: rows ``0..capacity-2`` are decode rows and row
-      ``capacity-1`` is the prefill staging row. That reserve is why
-      interleaving a prefill with running decodes cannot clobber a decode row's
-      recurrent state.
-    * A sequence keeps its row until it finishes. Rows may therefore have holes,
-      and every batched step runs the smallest bucket above the highest live row
-      with the holes padded by the model's sentinel row. Never compact rows: the
-      saving is not worth permuting recurrent state every step.
-    * ``seq.num_cached_tokens`` is refreshed from ``model.pos1`` after every
-      forward, never incremented locally — a speculative step advances the model
-      by more than one token.
-    * A prompt may be prefilled over several steps (chunked prefill). The
-      sequence's recurrent state lives on its own decode row between chunks and
-      only visits the staging row for the duration of one chunk, so a paused
-      request costs no extra VRAM: a copy of the state is ~50 MB.
-    * Decode may not capture a graph (``EngineConfig.graph`` is a correctness
-      switch, not a tuning knob). Both decode entries produce the same numbers,
-      so the only difference is which one is called.
+    * 行布局固定：``0..capacity-2`` 是解码行，行 ``capacity-1`` 是预填充暂存
+      行。留这一行，才使得把一个预填充插进在跑的解码之间时不会踩坏某个解码行
+      的循环状态。
+    * 序列一直占着自己的行直到结束。行因此可能有空洞，每个批处理步都跑「高于
+      最高活跃行的最小桶」，空洞用模型的哨兵行填上。永远不要压缩行：省下来的
+      那点空间不值得每一步都去置换循环状态。
+    * ``seq.num_cached_tokens`` 在每次前向之后从 ``model.pos1`` 刷新，绝不在
+      本地自增——一个投机步会让模型前进不止一个 token。
+    * 一个 prompt 可以跨多个步预填充（分块预填充）。序列的循环状态在分块之间
+      住在它自己的解码行上，只在某一个分块期间借用暂存行，所以被暂停的请求不
+      额外占显存：一份状态拷贝约 50 MB。
+    * 解码可以不做图 capture（``EngineConfig.graph`` 是正确性开关，不是调优
+      项）。两个解码入口产出的数字一样，区别只在于调的是哪一个。
 
-Chunked prefill is three calls, and the split is what makes it resumable:
+分块预填充是三个调用，拆开才让它可中断：
 
-    begin_prefill(seq)      claim a row, adopt a radix prefix, place the state
-    prefill_chunk(seq, n)   advance the cursor by at most n tokens
-    finish_prefill(seq)     record the last logits, insert the prefix, go RUNNING
+    begin_prefill(seq)      认领一行、沿用基数前缀、把状态放好
+    prefill_chunk(seq, n)   把游标推进最多 n 个 token
+    finish_prefill(seq)     记下最后的 logits、插入前缀、转入 RUNNING
 
-``begin_prefill`` runs once per admission and ``prefill_chunk`` as often as the
-scheduler grants budget; everything the second call needs is on the sequence, so
-a step boundary is a legal place to pause. A preempted request goes through the
-same three calls again from whatever prefix the radix tree still holds.
+``begin_prefill`` 每次准入跑一次，``prefill_chunk`` 则按调度器给的预算跑任意
+多次；第二次调用需要的东西全在序列上，所以步边界是合法的暂停点。被抢占的请求
+会从基数树仍然持有的那段前缀开始，把这三个调用再走一遍。
 """
 
 from __future__ import annotations
@@ -62,22 +54,20 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from .sequence import Sequence
 
 
-#: Batch sizes the model captures one graph per; a step runs the smallest bucket
-#: that fits (the rest are sentinel rows whose logits are dropped). Powers of two
-#: keep the padding waste under 100% at every bucket boundary.
+#: 模型为每种批大小各 capture 一张图；一步跑能装下的最小桶（其余是哨兵行，其
+#: logits 会被丢弃）。取 2 的幂，是为了让每个桶边界上的填充浪费都低于 100%。
 BATCH_BUCKETS = (1, 2, 4, 8)
 
 
 class ModelRunner:
-    """Execution of one step of the engine's model."""
+    """执行引擎模型的一步。"""
 
     def __init__(self, model, cfg: "EngineConfig") -> None:
-        """Bind a runner to one loaded model.
+        """把一个 runner 绑到一个已加载的模型上。
 
         Args:
-            model: A ``engine_api.Model`` / ``PagedModel`` implementation.
-            cfg: Engine configuration; the prefill chunk size, the prefill
-                quantum and the snapshot budget are read from it.
+            model: ``engine_api.Model`` / ``PagedModel`` 的一个实现。
+            cfg: 引擎配置；预填充分块大小、预填充 quantum 和快照预算都从这里读。
         """
         self.model = model
         self.cfg = cfg
@@ -85,80 +75,74 @@ class ModelRunner:
         self.bm: "BlockManager | None" = None
         self.batching = False
         self.buckets: tuple[int, ...] = ()
-        #: Whether the decode step may replay a captured graph. ``False`` routes
-        #: every token through the model's eager forward instead: the numbers are
-        #: the same, but nothing is recorded, which is the only safe path on a
-        #: backend whose capture is untrusted (a graph replaying stale outputs is a
-        #: silent wrong answer). Set from ``EngineConfig.graph`` by the engine.
+        #: 解码步是否可以回放 capture 下来的图。``False`` 时每个 token 都走模型的
+        #: eager 前向：数字一样，但什么都不录，这是 capture 不可信的后端上唯一
+        #: 安全的路（回放过期输出的图会静默给出错误答案）。由引擎从
+        #: ``EngineConfig.graph`` 设置。
         self.graph = cfg.graph
-        #: Batch-friendly speculative decoding (MTP), off unless the engine asks.
+        #: 批友好的投机解码（MTP），引擎不要求就是关的。
         self.spec = False
         self.spec_k = 0
         self.spec_sparse_k = 0
-        #: decode row -> seq_id. Rows are stable for a sequence's lifetime, which
-        #: is what lets a batched step skip permuting recurrent state.
+        #: 解码行 -> seq_id。行在序列存活期间是稳定的，批处理步因此可以不做循环
+        #: 状态的置换。
         self._row_owner: dict[int, int] = {}
-        #: Set by the engine when a prefix cache is attached; used by ``ping``.
+        #: 挂上前缀缓存时由引擎设置；``ping`` 会读它。
         self.last_prefill_s = 0.0
-        #: Tokens one chunk may cover. Kept here rather than read from the
-        #: scheduler so a runner-only caller (tests, probes) chunks identically.
+        #: 一个分块可覆盖的 token 数。放在这里而不是从调度器读，是为了让只驱动
+        #: runner 的调用方（测试、探针）切出完全相同的分块。
         self.prefill_quantum = max(cfg.block_size, cfg.prefill_quantum)
 
     def attach_prefix_cache(self, pc: "PrefixCacheEngine") -> None:
-        """Drive prefills through a prefix-cache engine.
+        """让预填充走某个前缀缓存引擎。
 
         Args:
-            pc: The cache engine. It also supplies the block manager, so the
-                two can never disagree about which blocks a sequence holds.
+            pc: 缓存引擎。块管理器也由它提供，两者因此不会对「一条序列持有
+                哪些块」产生分歧。
         """
         self.pc = pc
         self.bm = pc.bm
 
     def attach_blocks(self, bm: "BlockManager") -> None:
-        """Attach a block manager without a prefix cache (batched path).
+        """挂一个没有前缀缓存的块管理器（批处理路径）。
 
         Args:
-            bm: Manager built with ``with_radix=False``; blocks are allocated
-                per sequence and never shared.
+            bm: 用 ``with_radix=False`` 建的管理器；块按序列分配，从不共享。
         """
         self.bm = bm
 
     def can_chunk_prefill(self) -> bool:
-        """Whether this engine can advance a prompt in pieces.
+        """这个引擎能不能把 prompt 分片推进。
 
-        The single-stream prefix engine prefills a prompt in one call and keeps
-        its own cache bookkeeping, so a token budget cannot bound it; the batched
-        path allocates per sequence and therefore can.
+        单流的前缀引擎一次调用就把 prompt 预填充完，缓存记账也自己管，token 预算
+        限不住它；批处理路径按序列分配，所以可以。
 
         Returns:
-            ``True`` for the batched runner with a block manager attached.
+            挂了块管理器的批处理 runner 返回 ``True``。
         """
         return self.batching and self.bm is not None
 
     def free_blocks(self) -> int:
-        """Blocks the pool can hand out right now.
+        """池现在能发出去的块数。
 
-        The scheduler asks this before admitting a request, so a client that
-        cannot be given the blocks its next chunk needs waits in the queue
-        instead of being admitted, found unrunnable and evicted again. Without
-        the question the two requests trade the pool every step and neither
-        finishes.
+        调度器在准入之前会问这一句，这样拿不到下一个分块所需块的客户端就在
+        队列里等着，而不是被准入、发现跑不动、又被淘汰一次。不问这一句，两个
+        请求就会每一步互换一次池子，谁也跑不完。
 
         Returns:
-            Free block count, or a large number when no pool is attached (the
-            single-stream engines allocate nothing per request).
+            空闲块数；没挂池时返回一个很大的数（单流引擎不按请求分配）。
         """
         bm = self.bm
         return 1 << 30 if bm is None else bm.num_free
 
     def blocks_for(self, tokens: int) -> int:
-        """Blocks needed to hold ``tokens`` positions.
+        """容纳 ``tokens`` 个位置需要的块数。
 
         Args:
-            tokens: Positions the caller is about to occupy.
+            tokens: 调用方即将占用的位置数。
 
         Returns:
-            Block count at the configured block size.
+            按配置的块大小算出的块数。
         """
         bm = self.bm
         if bm is None:
@@ -166,19 +150,17 @@ class ModelRunner:
         return (tokens + bm.block_size - 1) // bm.block_size
 
     def reserve_for(self, tokens: int) -> int:
-        """Evict cached prefixes until ``tokens`` positions can be held.
+        """淘汰缓存前缀，直到能容纳 ``tokens`` 个位置。
 
-        The scheduler asks this before admitting a request, because the pool's
-        free count alone understates what is available: most of a full pool is
-        usually cached prefix that nobody is reading from and that eviction can
-        return. Checking without evicting first would leave a request waiting
-        behind blocks the tree could have given up.
+        调度器在准入之前问这一句，因为只看池的空闲数会低估可用量：满池子里装的
+        大多是没人读的缓存前缀，淘汰能把它们还回来。先不淘汰就去检查，请求会
+        被树本可以让出的块挡在后面干等。
 
         Args:
-            tokens: Positions the request needs to hold.
+            tokens: 请求需要容纳的位置数。
 
         Returns:
-            Free blocks after the eviction pass.
+            淘汰之后剩下的空闲块数。
         """
         bm = self.bm
         if bm is None:
@@ -187,29 +169,28 @@ class ModelRunner:
         return bm.num_free
 
     def release_row(self, seq: "Sequence") -> None:
-        """Free the batch row a finished sequence held.
+        """释放一条已结束序列占着的批行。
 
         Args:
-            seq: Finished sequence. Its ``row`` is reset to ``-1`` so a late
-                second call cannot free somebody else's row.
+            seq: 已结束的序列。它的 ``row`` 会被重置成 ``-1``，这样迟到的第二次
+                调用不会去释放别人的行。
         """
         if seq.row >= 0:
             self._row_owner.pop(seq.row, None)
             seq.row = -1
 
     def _claim_row(self, seq: "Sequence") -> int:
-        """Give ``seq`` the lowest free decode row for its whole lifetime.
+        """给 ``seq`` 分一个最低的空闲解码行，整个生命周期都用它。
 
         Args:
-            seq: Sequence being admitted.
+            seq: 正在准入的序列。
 
         Returns:
-            The claimed row index.
+            认领到的行号。
 
         Raises:
-            RuntimeError: Every row is taken. That means the scheduler admitted
-                past ``max_num_seqs``, and running with a shared row would
-                corrupt recurrent state rather than merely slow down.
+            RuntimeError: 所有行都被占了。这说明调度器准入时越过了
+                ``max_num_seqs``；共用一行会破坏循环状态，而不只是变慢。
         """
         capacity = int(getattr(self.model, "decode_capacity", 1))
         for row in range(capacity):
@@ -222,41 +203,39 @@ class ModelRunner:
 
     def enable_batching(self, max_batch: int,
                         buckets: tuple[int, ...] = BATCH_BUCKETS) -> None:
-        """Prepare the batched decode path, capturing one graph per bucket.
+        """把批解码路径准备好，每个桶 capture 一张图。
 
-        With capture on, each bucket is a recorded replay. With it off the model
-        allocates the same row buffers and staging blocks but records nothing,
-        and :meth:`_decode_batch` calls the eager entry instead -- so the two
-        modes agree and a backend that must not capture still batches.
+        capture 打开时，每个桶都是一次录制好的回放。关掉时模型照样分配同样的
+        行缓冲区和暂存块，只是什么都不录，:meth:`_decode_batch` 改走 eager
+        入口——两种模式因此一致，不允许 capture 的后端也仍然能批处理。
 
         Args:
-            max_batch: Upper bound on decode rows. Buckets above it are dropped,
-                because a graph larger than the row count can never run.
-            buckets: Candidate bucket sizes. Always includes 1, so a single
-                running sequence still has a graph to replay.
+            max_batch: 解码行的上限。超过它的桶会被丢掉，因为比行数还大的图
+                永远跑不起来。
+            buckets: 候选桶大小。总包含 1，这样只有一条在跑的序列时也有图可
+                回放。
         """
         buckets = tuple(b for b in buckets if b <= max_batch) or (1,)
         self.buckets = buckets
-        # +1 is the prefill staging row; without it a grouped prefill would have
-        # to share a row with a sequence already decoding.
+        # +1 那一行是预填充暂存行；没有它，分组预填充就得和一条已经在解码的
+        # 序列共用行。
         self.model.enable_batching(max(self.buckets) + 1)
         if self.graph:
             self.model.capture_batch(self.buckets)
         self.batching = True
 
     def enable_spec(self, k: int, sparse_topk: int = 0) -> None:
-        """Turn on batch-friendly MTP with ``k`` drafts per row.
+        """开启批友好的 MTP，每行 ``k`` 个草稿。
 
         Args:
-            k: Draft tokens per step.
-            sparse_topk: Verify against only the top-k historical KV blocks per
-                row (approximate). 0 keeps full attention, which is the exact
-                mode; the approximation exists because the batched verify
-                otherwise pays one weight pass per candidate token.
+            k: 每个投机步的草稿 token 数。
+            sparse_topk: 每行只对历史 KV 块里得分最高的 k 个做验证（近似）。
+                0 表示保留全注意力，也就是精确模式；做近似是因为批验证否则
+                每个候选 token 都要过一遍权重。
 
         Raises:
-            RuntimeError: Batching is off. Single-stream spec has its own path
-                (``spec_generate``) and does not go through this switch.
+            RuntimeError: 批处理没开。单流投机有自己的路径
+                （``spec_generate``），不走这个开关。
         """
         if not self.batching:
             raise RuntimeError("enable_spec() needs the batched engine")
@@ -268,24 +247,23 @@ class ModelRunner:
 
     @torch.inference_mode()
     def prefill(self, seq: "Sequence") -> torch.Tensor:
-        """Feed the whole prompt (minus the cached prefix); return the logits.
+        """吃下整个 prompt（已缓存前缀除外），返回 logits。
 
-        The unchunked entry point. It exists for the engines that cannot chunk
-        (single-stream prefix cache) and as the "one chunk covering everything"
-        case of the batched path, so both keep exactly the numbers they had.
+        不分块的入口。它的存在是为了服务不能分块的引擎（单流前缀缓存），以及
+        作为批处理路径「一个分块覆盖全部」的那种情况，两条路的数字因此都保持
+        原样。
 
         Args:
-            seq: Sequence to prefill. Its ``num_cached_tokens`` and
-                ``num_scheduled_tokens`` are refreshed from the model afterwards.
+            seq: 要预填充的序列。之后会从模型刷新它的 ``num_cached_tokens``
+                和 ``num_scheduled_tokens``。
 
         Returns:
-            Logits for the last prompt position, ``[vocab]``.
+            最后一个 prompt 位置的 logits，形状 ``[vocab]``。
 
         Raises:
-            RuntimeError: The batched path was asked to finish a prompt in one
-                chunk and the cursor did not reach the end. That means the call
-                ran a chunk smaller than the prompt, which is a caller bug: use
-                :meth:`prefill_chunk` for chunked prefill.
+            RuntimeError: 批处理路径被要求用一个分块跑完 prompt，但游标没到
+                末尾。这说明调用跑的分块比 prompt 还短，是调用方的 bug：分块
+                预填充应该用 :meth:`prefill_chunk`。
         """
         t0 = time.time()
         if self.pc is not None:
@@ -310,26 +288,22 @@ class ModelRunner:
 
     @torch.inference_mode()
     def begin_prefill(self, seq: "Sequence") -> None:
-        """Open a resumable prefill: row, prefix match, starting state.
+        """开一次可续的预填充：占行、匹配前缀、摆好起始状态。
 
-        Runs once per admission. The prefix match is taken over the whole token
-        stream (prompt plus anything already generated, minus the last token
-        whose logits have to come out of a real forward), so a resumed request
-        restarts from the deepest block boundary the radix tree can justify
-        instead of from token 0.
+        每次准入跑一次。前缀匹配在整个 token 流上做（prompt 加上已经生成的
+        部分，再去掉必须由真实前向产出 logits 的最后一个 token），所以被恢复的
+        请求会从基数树撑得住的最深块边界重新开始，而不是从 token 0 重来。
 
-        Only the blocks the first chunk needs are reserved here. Reserving the
-        whole prompt would let one long request evict the cache of every other
-        request for blocks it may not reach for many steps.
+        这里只预留第一个分块需要的块。预留给整个 prompt 会让一个长请求为了它
+        好几步之后才用得上的块，把其他所有请求的缓存都淘汰掉。
 
         Args:
-            seq: Sequence to admit. It must not already hold a row; a resumed
-                sequence keeps its row and blocks, so the caller does not repeat
-                this call for it.
+            seq: 要准入的序列。它必须还没占行；被恢复的序列保留自己的行和块，
+                调用方不会为它重复这次调用。
 
         Raises:
-            RuntimeError: No block manager is attached. The batched path cannot
-                run without one, since it must allocate KV before the forward.
+            RuntimeError: 没挂块管理器。批处理路径缺了它跑不了，因为前向之前
+                必须先把 KV 分配出来。
         """
         bm, model = self.bm, self.model
         if bm is None:
@@ -342,10 +316,8 @@ class ModelRunner:
 
         matched, states = 0, None
         if radix is not None:
-            # Blocks from an earlier admission must go back before the table is
-            # replaced by the matched prefix: a resumed sequence normally arrives
-            # with an empty table, and silently dropping one that is not empty
-            # would leak the references the pool counts.
+            # 上一次准入拿到的块必须在块表被匹配到的前缀替换之前还回去：被恢复
+            # 的序列通常空表进来，而悄悄丢掉一张非空表会泄漏池在计的那些引用。
             if seq.block_table:
                 bm.release(seq)
             bm.reserve(1)
@@ -358,11 +330,9 @@ class ModelRunner:
         seq.prefill_states_at = {}
         seq.prefill_logits = None
         seq.prefill_started = True
-        # The state is restored on the staging row and then moved to the
-        # sequence's own row, which is where it lives between chunks. Restoring
-        # straight into the decode row would need that row to be addressable
-        # before any forward has run, and the staging row is the only row the
-        # one-token paths are guaranteed to have.
+        # 状态先在暂存行恢复，再搬到序列自己那一行——分块之间它就住在那里。
+        # 直接恢复到解码行会要求那一行在任何前向跑过之前就可寻址，而暂存行是
+        # 单 token 路径唯一能保证存在的一行。
         stage = model.prefill_row
         if states is not None:
             seq.prefill_states_at[matched] = states
@@ -375,27 +345,24 @@ class ModelRunner:
 
     @torch.inference_mode()
     def prefill_chunk(self, seq: "Sequence", budget: int) -> torch.Tensor | None:
-        """Advance the prompt by at most ``budget`` tokens.
+        """把 prompt 推进最多 ``budget`` 个 token。
 
-        The chunk runs on the staging row, with the sequence's recurrent state
-        moved there for the duration and moved back afterwards, so between
-        chunks the state sits on the sequence's own decode row and no paused
-        request costs a private copy.
+        分块在暂存行上跑，期间把序列的循环状态搬过去、跑完再搬回来，所以分块
+        之间状态待在序列自己的解码行上，被暂停的请求不会多占一份私有拷贝。
 
         Args:
-            seq: Sequence whose ``prefill_cursor`` is where this chunk starts.
-                ``begin_prefill`` must have run for it.
-            budget: Maximum tokens this chunk may cover. A larger remainder is
-                left for the next chunk; a smaller one finishes the prompt.
+            seq: 分块从它的 ``prefill_cursor`` 开始。必须已经为它跑过
+                ``begin_prefill``。
+            budget: 本分块最多覆盖的 token 数。剩余更多就留给下一个分块；剩余
+                更少就把 prompt 跑完。
 
         Returns:
-            The prompt's last-token logits when this chunk completes the prompt,
-            ``None`` when more chunks are needed. Completion also runs
-            :meth:`finish_prefill`, so the caller only has to sample.
+            本分块跑完 prompt 时返回最后一个 token 的 logits，还需要更多分块时
+            返回 ``None``。跑完时也会调用 :meth:`finish_prefill`，调用方只需要
+            采样。
 
         Raises:
-            RuntimeError: ``begin_prefill`` did not run for this sequence, or no
-                block manager is attached.
+            RuntimeError: 没为这条序列跑 ``begin_prefill``，或者没挂块管理器。
         """
         bm, model = self.bm, self.model
         if bm is None:
@@ -409,18 +376,16 @@ class ModelRunner:
         row = seq.row
         cursor = seq.prefill_cursor
         prompt_len = seq.num_prompt_tokens
-        # The stream a resumed request recomputes is prompt plus the tokens it
-        # already emitted: the prompt boundary is where new tokens are sampled
-        # from, not where the forward stops.
+        # 被恢复的请求要重算的流是 prompt 加上它已经生成的 token：prompt 边界是
+        # 新 token 的采样位置，不是前向的停止位置。
         total = seq.num_tokens
         end = min(cursor + max(int(budget), 1), total)
         if end <= cursor:                       # pragma: no cover - caller guards
             self.last_prefill_s = time.time() - t0
             return seq.prefill_logits
 
-        # Evict before allocating: once this request holds the blocks it is
-        # asking for, they are no longer candidates for the eviction that has to
-        # make room for them.
+        # 先淘汰再分配：一旦这个请求握住了它要的块，这些块就不再是那趟替它腾
+        # 空间的淘汰的候选了。
         held = len(seq.block_table) * bs
         if end > held:
             bm.reserve((end - held + bs - 1) // bs + 1)
@@ -430,17 +395,14 @@ class ModelRunner:
         bm.assign(seq.block_table, row=stage)
         model.pos[stage:stage + 1].fill_(cursor)
 
-        # Two granularities, for two different reasons. `step` is the snapshot
-        # interval rounded up to a whole block: a recurrent state is only
-        # reusable on a block boundary, and one snapshot per block of a long
-        # prompt costs more VRAM than the weights, so the boundaries are thinned.
-        # `cfg.chunk` is the GEMM's M inside one call and is purely a tuning
-        # number (measured 865/1035/1094 tok/s at 256/512/2048). Keeping them
-        # apart is what lets the GEMM be re-tuned without changing which
-        # boundaries exist.
+        # 两个粒度，出于两种不同的原因。`step` 是快照间隔向上取整到整块：循环
+        # 状态只在块边界上可复用，而长 prompt 每个块打一次快照比权重还费显存，
+        # 所以边界要放稀。`cfg.chunk` 是一次调用里 GEMM 的 M，纯属调优数字
+        # （实测 256/512/2048 时是 865/1035/1094 tok/s）。把两者分开，重新调
+        # GEMM 时才不会连带改变哪些边界存在。
         step = max(bs, self.cfg.snapshot_interval // bs * bs)
-        # End of the block-aligned head: from there on only logits matter, so the
-        # unaligned tail (and any generated tokens) runs as one pass.
+        # 块对齐头部的终点：从那以后只有 logits 重要，所以没对齐的尾巴（以及
+        # 已生成的 token）一趟跑完。
         head_len = max(0, (prompt_len // bs) * bs - cursor)
         spec_row = row if self.spec else None
         logits = None
@@ -455,10 +417,9 @@ class ModelRunner:
             if radix is not None and done % bs == 0 and done <= prompt_len:
                 seq.prefill_states_at[done] = model.snapshot_linear_states(row=stage)
                 self._trim_states(seq)
-                # Insert per boundary rather than at the end of the prompt: a
-                # request preempted mid-prefill then leaves the blocks it has
-                # already computed reusable, and a second request can join at
-                # them while the first is still prefilling.
+                # 每个边界插一次，而不是等 prompt 跑完再插：预填充中途被抢占的
+                # 请求因此把已经算好的块留成可复用，第二个请求还能在第一个仍在
+                # 预填充时就从这些边界接上。
                 self._insert_prefix(seq, radix)
 
         model.move_linear_states(stage, row)
@@ -472,15 +433,14 @@ class ModelRunner:
         return logits
 
     def finish_prefill(self, seq: "Sequence") -> None:
-        """Close a completed prefill and make the request decodable.
+        """收掉一次跑完的预填充，让请求可以被解码。
 
-        Inserts the prompt into the radix tree (including any boundary the last
-        chunk produced), then flips the sequence to ``RUNNING``. Sampling the
-        first generated token is the caller's job: it holds the logits this
-        prefill just returned.
+        把 prompt 插进基数树（含最后一个分块产出的边界），然后把序列翻成
+        ``RUNNING``。采第一个生成 token 是调用方的事：它手里有这次预填充刚
+        返回的 logits。
 
         Args:
-            seq: Sequence whose ``prefill_cursor`` reached the end of its tokens.
+            seq: ``prefill_cursor`` 已经到达 token 末尾的序列。
         """
         bm = self.bm
         if bm is not None and bm.radix is not None:
@@ -489,16 +449,15 @@ class ModelRunner:
         seq.num_cached_tokens = seq.num_tokens
 
     def _insert_prefix(self, seq: "Sequence", radix) -> None:
-        """Record the block-aligned part of ``seq``'s stream in the radix tree.
+        """把 ``seq`` 的流里按块对齐的那部分记进基数树。
 
-        Called after every chunk rather than once at the end: a request
-        preempted mid-prefill then leaves everything it already computed
-        reusable, and a second request can join at any completed block boundary
-        while the first is still prefilling.
+        每个分块之后都调一次，而不是最后一次性调：预填充中途被抢占的请求因此
+        把已经算出来的东西都留成可复用，第二个请求也能在第一个仍在预填充时从
+        任意已完成的块边界接上。
 
         Args:
-            seq: Sequence holding the blocks to record.
-            radix: The prefix tree. Not ``None``; the caller checks.
+            seq: 持有要记录的块的序列。
+            radix: 前缀树。不会是 ``None``；调用方已检查。
         """
         bs = self.bm.block_size
         full = min(seq.prefill_cursor, (seq.num_tokens // bs) * bs)
@@ -508,15 +467,14 @@ class ModelRunner:
                      dict(seq.prefill_states_at), mm=seq.mm)
 
     def _trim_states(self, seq: "Sequence") -> None:
-        """Cap a sequence's live snapshots at the tree's own budget.
+        """把一条序列的存活快照压到树自己的预算以内。
 
-        A snapshot is ~50 MB (24 linear-attention layers), so keeping every
-        block boundary of a long prompt would cost more than the weights. The
-        deepest boundaries go first, and the prefix the sequence joined at is
-        never dropped: it is where a resumed request would restart.
+        一个快照约 50 MB（24 层线性注意力），长 prompt 的每个块边界都留着会比
+        权重还费显存。最深的边界先丢，而序列接上的那个前缀永远不丢：被恢复的
+        请求会从那里重新开始。
 
         Args:
-            seq: Sequence whose ``prefill_states_at`` is trimmed in place.
+            seq: 就地裁剪其 ``prefill_states_at`` 的序列。
         """
         states_at = seq.prefill_states_at
         while len(states_at) > self.cfg.snapshots:
@@ -527,18 +485,15 @@ class ModelRunner:
 
     @torch.inference_mode()
     def preempt(self, seq: "Sequence") -> None:
-        """Evict a request and leave its prefix recoverable.
+        """淘汰一个请求，同时让它的前缀可恢复。
 
-        Recomputation is the cheapest policy here: the blocks are int8 KV on the
-        device, so swapping them to the host would cost a large synchronous copy
-        per preemption, while the radix tree already holds every block-aligned
-        prefix. The sequence therefore keeps its tokens and loses only the
-        position bookkeeping that recompute rebuilds.
+        重算是这里最便宜的策略：块是设备上的 int8 KV，把它们换出到主机侧意味着
+        每次抢占都要一次大的同步拷贝，而基数树本来就留着每一个按块对齐的前缀。
+        序列因此保留自己的 token，只丢掉重算时会重建的位置记账。
 
         Args:
-            seq: Sequence to evict. It must be in the scheduler's running set;
-                putting it back in the waiting queue is the caller's job so the
-                engine can keep scheduler mutation in one place.
+            seq: 要淘汰的序列。它必须在调度器的运行集合里；把它放回等待队列是
+                调用方的事，这样引擎才能把对调度器的改动都留在一处。
         """
         bm = self.bm
         if bm is not None:
@@ -550,23 +505,22 @@ class ModelRunner:
         seq.park_preempted()
 
     def can_group_prefill(self) -> bool:
-        """Whether several prompts can share one prefill forward.
+        """多个 prompt 能不能共用一个预填充前向。
 
         Returns:
-            ``True`` when batching is on and a block manager is attached; both
-            are prerequisites for a grouped prefill.
+            开了批处理且挂了块管理器时返回 ``True``；两者都是分组预填充的
+            前提。
         """
         return self.batching and self.bm is not None
 
     def _match_for_prefill(self, seq: "Sequence") -> tuple[int, dict | None]:
-        """Adopt ``seq``'s longest cached prefix.
+        """沿用 ``seq`` 最长的已缓存前缀。
 
         Args:
-            seq: Sequence about to be prefilled; its block table and ``matched``
-                are updated in place.
+            seq: 马上要预填充的序列；它的块表和 ``matched`` 会被就地更新。
 
         Returns:
-            ``(matched, states)``, both zero / ``None`` without a radix tree.
+            ``(matched, states)``；没有基数树时分别是 0 和 ``None``。
         """
         bm = self.bm
         if bm is None or bm.radix is None:
@@ -582,21 +536,20 @@ class ModelRunner:
 
     @torch.inference_mode()
     def prefill_group(self, seqs: list["Sequence"]) -> list[torch.Tensor]:
-        """Prefill several prompts in one forward.
+        """一趟前向预填充多个 prompt。
 
-        Prefix reuse composes with this: each sequence adopts its matched blocks
-        and recurrent state first (into its own row), the group forward starts
-        every prompt at its own ``matched`` offset, and the block-boundary
-        snapshots it returns are inserted back into the radix tree.
+        前缀复用的逻辑也接在这里：每条序列先沿用自己匹配到的块和循环状态（放到
+        自己那一行），分组前向让每个 prompt 从各自的 ``matched`` 偏移开始，最后
+        把它返回的块边界快照插回基数树。
 
         Args:
-            seqs: Prompts to prefill. Each gets a row if it has none yet.
+            seqs: 要预填充的 prompt。还没有行的会先分到一行。
 
         Returns:
-            One logits tensor per sequence, in the same order.
+            每条序列一个 logits 张量，顺序一致。
 
         Raises:
-            RuntimeError: No block manager is attached.
+            RuntimeError: 没挂块管理器。
         """
         t0 = time.time()
         bm = self.bm
@@ -613,8 +566,8 @@ class ModelRunner:
                 self.model.restore_linear_states(states, row=seq.row)
             matched_states.append((matched, states))
 
-        # Image prompts pass their payload on ``seq.mm``; ``model.prefill_group``
-        # reads it from the sequences, so this path needs no mm argument.
+        # 带图 prompt 把载荷挂在 ``seq.mm`` 上；``model.prefill_group`` 自己从
+        # 序列里读，所以这条路径不用再传 mm 参数。
         logits, snaps = self.model.prefill_group(
             seqs, snapshot_interval=(self.cfg.snapshot_interval
                                      if radix is not None else None))
@@ -624,10 +577,9 @@ class ModelRunner:
             seq.prefill_logits = None
             seq.num_cached_tokens = len(seq.token_ids)
             seq.num_scheduled_tokens = seq.num_cached_tokens - matched
-            # The whole prompt went through this one forward, so the sequence is
-            # decodable now. This path does not go through ``finish_prefill``, and
-            # leaving ``PREFILLING`` behind would keep it out of every later
-            # decode step.
+            # 整个 prompt 都走完了这一趟前向，序列现在可解码。这条路径不走
+            # ``finish_prefill``，而留着 ``PREFILLING`` 状态会让它进不了之后
+            # 任何一次解码步。
             seq.status = SequenceStatus.RUNNING
             if radix is None:
                 continue
@@ -644,27 +596,26 @@ class ModelRunner:
         return logits
 
     def begin_token(self, seq: "Sequence") -> None:
-        """Open the one-token write window (prefix-cache path only).
+        """打开单 token 写入窗口（仅前缀缓存路径）。
 
-        The window has to be opened before the KV write, and a partial tail block
-        that is still shared with the radix tree is copied at that point, which is
-        what keeps the cached prefix read-only.
+        窗口必须在写 KV 之前打开，仍在与基数树共享的尾块会在那一刻被复制，
+        已缓存的前缀因此保持只读。
 
         Args:
-            seq: Sequence about to decode one token.
+            seq: 马上要解码一个 token 的序列。
         """
         if self.pc is not None and self.pc.seq is not None:
             self.pc.seq.reserve(1)
 
     def decode_step(self, seq: "Sequence", token: int) -> torch.Tensor:
-        """Advance one token through the decode path (graph replay, or eager).
+        """沿解码路径推进一个 token（图回放或 eager）。
 
         Args:
-            seq: Sequence being advanced.
-            token: Token to feed, i.e. the previous output.
+            seq: 正在推进的序列。
+            token: 要喂进去的 token，也就是上一次的输出。
 
         Returns:
-            Logits for the next position.
+            下一个位置的 logits。
         """
         logits = self._forward_token(token)
         if self.pc is not None and self.pc.seq is not None:
@@ -673,19 +624,18 @@ class ModelRunner:
         return logits
 
     def _forward_token(self, token: int) -> torch.Tensor:
-        """One token through whichever decode path this engine captured.
+        """按本引擎 capture 的那条解码路径走一个 token。
 
-        The two model entry points differ only in bookkeeping: ``decode_step``
-        replays a captured graph, ``logits`` runs the same forward eagerly. Both
-        stage the token on the prefill row and both advance the position counter,
-        so everything downstream (the KV write window, ``commit_upto``) is
-        identical and only the launch mechanism changes.
+        两个模型入口只在记账上不同：``decode_step`` 回放 capture 下来的图，
+        ``logits`` 用 eager 跑同一个前向。两者都把 token 铺到预填充行上、都会
+        推进位置计数器，所以下游（KV 写入窗口、``commit_upto``）完全一样，变的
+        只是启动方式。
 
         Args:
-            token: Token id to feed.
+            token: 要喂进去的 token id。
 
         Returns:
-            Logits for the next position, a live buffer either way.
+            下一个位置的 logits；两种路径下都是活缓冲区。
         """
         if self.graph:
             return self.model.decode_step(token)
@@ -693,13 +643,13 @@ class ModelRunner:
 
     @torch.inference_mode()
     def decode(self, seqs: list["Sequence"]) -> list[int]:
-        """Next token for each sequence, batched when more than one is running.
+        """每条序列的下一个 token，多于一条在跑时走批处理。
 
         Args:
-            seqs: Running sequences to advance by one token.
+            seqs: 要各推进一个 token 的运行中序列。
 
         Returns:
-            One sampled token id per sequence, in the same order.
+            每条序列一个采样出的 token id，顺序一致。
         """
         if self.batching:
             return self._decode_batch(seqs)
@@ -712,23 +662,20 @@ class ModelRunner:
 
     @torch.inference_mode()
     def spec_step(self, seqs: list["Sequence"]):
-        """One batch-friendly speculative step.
+        """一个批友好的投机步。
 
         Args:
-            seqs: Running sequences. Each must already have its pending token
-                appended by the engine.
+            seqs: 运行中的序列。每条的待定 token 必须已经由引擎追加过。
 
         Returns:
-            ``(accepted, logits)``. ``accepted[i]`` starts with sequence ``i``'s
-            pending token followed by the drafts the main model accepted, so the
-            caller appends ``accepted[i][1:]``. ``None`` when the drafter's
-            window cannot cover a row — the caller must then fall back to a plain
-            batched decode step rather than skip the sequence.
+            ``(accepted, logits)``。``accepted[i]`` 以序列 ``i`` 的待定 token 开头，
+            后面是主模型接受的草稿，所以调用方追加的是 ``accepted[i][1:]``。
+            草稿模型的窗口覆盖不了某一行时返回 ``None``——此时调用方必须退回
+            普通批解码步，而不是跳过这条序列。
 
         Raises:
-            RuntimeError: Batching or speculation is off. Falling back is the
-                caller's job, so this is a programming error, not a runtime
-                condition.
+            RuntimeError: 批处理或投机没开。退避是调用方的责任，所以这里是
+                编程错误，不是运行期状况。
         """
         model, bm = self.model, self.bm
         if bm is None or not self.spec:
@@ -741,7 +688,7 @@ class ModelRunner:
         tables: list[list[int]] = []
         for seq in seqs:
             pos = seq.num_cached_tokens
-            # +1 for the pending token, +k for the drafts: all of them get KV.
+            # 待定 token 占 1 个、草稿占 k 个：全都要写 KV。
             bm.ensure_blocks(seq, pos + self.spec_k + 1)
             tokens.append(seq.token_ids[-1])
             positions.append(pos)
@@ -752,38 +699,34 @@ class ModelRunner:
                 row_indices=rows,
                 pad_rows=[r for r in range(bucket) if r not in active])
         except RuntimeError:
-            # The drafter was captured for a fixed window; a row whose context
-            # no longer fits makes it refuse. Signalling the caller is cheaper
-            # than rebuilding the drafter mid-generation.
+            # 草稿模型是按固定窗口 capture 的；某行的上下文放不进去就会拒绝。
+            # 通知调用方比在生成中途重建草稿模型便宜得多。
             return None
         for seq, acc in zip(seqs, accepted):
             seq.num_cached_tokens += len(acc)
         return accepted, logits
 
     def _decode_batch(self, seqs: list["Sequence"]) -> list[int]:
-        """Advance several sequences through one batched decode forward.
+        """用一趟批解码前向推进多条序列。
 
         Args:
-            seqs: Running sequences, each with a stable row. The caller has
-                already made room for the one position each of them writes; this
-                method must not allocate, because an allocation here cannot evict
-                or preempt and would leave a half-grown batch.
+            seqs: 运行中的序列，每条都有稳定的行。调用方已经为它们各自要写的
+                那个位置腾好了空间；本方法不许分配，因为这里的分配既不能淘汰
+                也不能抢占，只会留下一个长到一半的批。
 
         Returns:
-            One sampled token id per sequence.
+            每条序列一个采样出的 token id。
 
         Raises:
-            RuntimeError: No block manager is attached, or a sequence's table
-                cannot hold the position it is about to write. Both mean the
-                caller skipped its capacity check.
+            RuntimeError: 没挂块管理器，或者某条序列的块表放不下它即将写的
+                位置。两者都说明调用方漏了容量检查。
         """
         model, bm = self.model, self.bm
         if bm is None:
             raise RuntimeError("batched decode needs a block manager")
-        # Rows are stable for a sequence's lifetime, so a finished sequence leaves
-        # a hole rather than forcing a permutation of recurrent state.  The step
-        # runs the smallest bucket above the highest live row and the model pads
-        # every hole with its sentinel row.
+        # 行在序列存活期间是稳定的，所以结束的序列留下的是空洞，而不是逼着大家
+        # 去置换循环状态。这一步跑「高于最高活跃行的最小桶」，模型用哨兵行填上
+        # 每个空洞。
         rows = [seq.row for seq in seqs]
         active = set(rows)
         bucket = next(b for b in self.buckets if b > max(active))
@@ -801,9 +744,8 @@ class ModelRunner:
             positions.append(pos)
             tables.append(seq.block_table)
         model.set_rows(tokens, positions, tables, row_indices=rows)
-        # Same staging, same body, same buffers: the only difference is whether
-        # the forward was recorded into a graph. A backend that must not capture
-        # (the SCOW driver) therefore still gets a batched step.
+        # 同样的铺设、同样的实现、同样的缓冲区：唯一区别是这一趟前向有没有被
+        # 录进图。所以不允许 capture 的后端（SCOW 驱动）也照样能走批处理步。
         if self.graph:
             logits = model.decode_batch(bucket, bucket, pad_rows=pad_rows)
         else:
@@ -814,16 +756,16 @@ class ModelRunner:
 
     @staticmethod
     def _sample_rows(logits: torch.Tensor, seqs: list["Sequence"]) -> list[int]:
-        """Sample each sequence from its own row of the batched logits.
+        """每条序列从批 logits 里自己那一行采样。
 
         Args:
-            logits: Batched logits, ``[bucket, vocab]``.
-            seqs: Sequences in row order.
+            logits: 批 logits，``[bucket, vocab]``。
+            seqs: 按行序排列的序列。
 
         Returns:
-            One token id per sequence. A single-row logits tensor is read at
-            index 0 regardless of ``seq.row``, because the bucket-1 graph always
-            writes row 0 even for a sequence that kept a higher row.
+            每条序列一个 token id。只有一行的 logits 张量一律读下标 0，不看
+            ``seq.row``，因为 bucket-1 的图无论序列占着多高的行，写的都是第 0
+            行。
         """
         out: list[int] = []
         for seq in seqs:
@@ -833,15 +775,15 @@ class ModelRunner:
 
     @staticmethod
     def sample(logits: torch.Tensor, temperature: float) -> int:
-        """Pick one token from ``logits``.
+        """从 ``logits`` 里挑一个 token。
 
         Args:
-            logits: ``[vocab]`` logits, possibly bf16.
-            temperature: ``0`` selects the argmax; the sampling path upcasts to
-                fp32 first because bf16 softmax loses too much tail mass.
+            logits: ``[vocab]`` 的 logits，可能是 bf16。
+            temperature: 取 ``0`` 时选 argmax；采样路径会先升到 fp32，因为 bf16
+                的 softmax 会丢掉太多尾部概率。
 
         Returns:
-            The sampled token id.
+            采样出的 token id。
         """
         if temperature > 0:
             p = torch.softmax(logits.float() / temperature, dim=-1)

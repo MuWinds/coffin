@@ -1,39 +1,29 @@
-"""The Qwen3.5-4B text engine: weights to layers to captured graphs.
+"""Qwen3.5-4B 文本引擎：从权重到层，再到捕获图。
 
-The assembly point of the family: it owns the layer list, the rope tables, the
-fixed graph buffers and the three execution paths -- decode (one graph replay),
-prefill (batched GEMMs with tiled causal attention) and verify (a captured
-C-token forward for speculative decoding). The primitives it is built from live
-in ``ops/``; the per-layer blocks are next to this module.
+模型族的组装点：它持有层列表、rope 表、固定的图缓冲区和三条执行路径——解码（重放
+一张图）、预填充（批处理 GEMM 加切块的因果注意力），以及校验（为投机解码捕获的 C
+token 前向）。它拼装所用的原语住在 ``ops/``；逐层的块就在本模块旁边。
 
-Module: ``coffin/models/qwen35``. Top of the family and the class
-``engine_api`` registers; it imports ``ops``, ``backends`` and every sibling
-module, and must not import ``engine_api``, ``model_runner`` or anything above the
-family.
+Module: ``coffin/models/qwen35``。族的顶层，也是 ``engine_api`` 注册的那个类；
+它 import ``ops``、``backends`` 和每个同级模块，但不许 import ``engine_api``、
+``model_runner`` 或族以上的任何东西。
 
 Constraints:
-    * Graphs are captured once and then replayed, so every buffer a captured
-      path writes must exist with a stable address before ``capture()`` /
-      ``capture_batch()``. Reallocating ``pos``, ``token_in`` or ``rope_delta``
-      after capture silently makes the graph write into a dead tensor.
-    * Capture goes through ``ops.runtime``, which is what makes this file work on a
-      backend that cannot capture at all: when ``caps.graph`` is false it returns a
-      handle whose ``replay()`` re-runs the body, and every buffer address is still
-      fixed, so the paths below need no branch. That is not a degraded mode -- a
-      backend whose operator table mixes library and hand-written kernels cannot
-      capture by construction (its library GEMM is uncapturable while its own
-      kernels are not), and running eagerly is the correct path there.
-    * ``pos`` addresses KV slots and the context window, while rotation reads
-      ``pos + rope_delta``; keeping the two separate is what lets decode stay one
-      replay after an image prompt.
-    * The linear-attention recurrent state travels with the KV, never without
-      it: prefix reuse, snapshot/restore and row moves all have to carry both or
-      the model continues from a state that never saw the shared keys.
-    * Rows: decode rows are ``0 .. capacity-2`` and ``capacity-1`` is the prefill
-      staging row. A hole in the middle is filled with a sentinel rather than
-      compacted, so state never has to be moved off its row.
-    * No locking. ``llm_engine`` drives all mutation single-threaded, which is
-      why the row bookkeeping is plain dicts and lists.
+    * 图只捕获一次、之后反复重放，所以捕获路径要写的每个缓冲区都必须在
+      ``capture()`` / ``capture_batch()`` 之前以稳定地址存在。捕获之后再重新分配
+      ``pos``、``token_in`` 或 ``rope_delta``，图会悄悄写进一个已经死掉的张量。
+    * 捕获经 ``ops.runtime``，这正是本文件能在完全捕不了图的后端上工作的原因：
+      ``caps.graph`` 为 false 时它返回一个句柄，其 ``replay()`` 重新执行主体，而
+      每个缓冲区地址仍然是固定的，下面这些路径因此不需要分支。那不是降级模式——
+      算子表混合了库内核和手写内核的后端从构造上就捕不了（它的库 GEMM 不可捕获，
+      自己写的内核却可以），在那里即时执行就是正确的路径。
+    * ``pos`` 寻址 KV 槽位和上下文窗口，而旋转读的是 ``pos + rope_delta``；
+      把两者分开，才让图像 prompt 之后的解码仍然只是一次重放。
+    * 线性注意力的循环状态必须和 KV 同行，绝不能单独走：前缀复用、快照/恢复和行
+      搬移都必须同时带两者，否则模型会从一个从没见过那些共享 key 的状态继续。
+    * 行分配：解码行是 ``0 .. capacity-2``，``capacity-1`` 是预填充暂存行。中间的
+      空洞用哨兵行填上而不是压缩，状态因此永远不需要搬离自己那一行。
+    * 不加锁。``llm_engine`` 单线程驱动所有改写，所以行的簿记就是普通的字典和列表。
 """
 
 from __future__ import annotations
@@ -63,88 +53,73 @@ from cache.paged_cache import PagedKVCache
 
 
 def _drop_prefix(sd: dict, prefix: str) -> None:
-    """Delete every entry of ``sd`` under ``prefix``.
+    """删掉 ``sd`` 里 ``prefix`` 之下的每一项。
 
-    Called after a layer has been built, so the peak footprint of a build is the final
-    model rather than the model plus the dict it was read into. This is not a
-    micro-optimisation: a 27B int8 checkpoint is ~26 GiB, the card is 31.7 GiB, and
-    ``GEMVGroup`` copies each ``gate``/``up`` pair into one fused matrix, so a build that
-    keeps the sources resident peaks past the card and dies with ``OutOfMemoryError``
-    mid-construction.
+    在一层建好之后调用，构建的峰值占用因此是最终的模型，而不是模型加上读进来的那个
+    字典。这不是微优化：27B 的 int8 checkpoint 约 26 GiB，卡是 31.7 GiB，而
+    ``GEMVGroup`` 会把每对 ``gate``/``up`` 拷进一个融合矩阵，所以一直留着源张量的
+    构建会冲过显存，在构造中途抛 ``OutOfMemoryError``。
 
-    Only safe when the caller owns the dict -- a caller-supplied one has to survive so the
-    same tensors can rebuild the model, which is the whole reason
-    ``engine_api.load_weights`` is a separate call.
+    只有在调用方拥有该字典时才是安全的——调用方提供的字典必须活着，同一批张量才能
+    重建模型，这也正是 ``engine_api.load_weights`` 被拆成独立调用的全部理由。
 
     Args:
-        sd: State dict to prune in place.
-        prefix: Parameter-name prefix of the layer just built.
+        sd: 要就地裁剪的 state dict。
+        prefix: 刚建好那层的参数名前缀。
 
     Returns:
-        Nothing. Tensors are released when their last reference goes, which after this
-        is the projection that copied them.
+        无。张量在最后一个引用消失时释放，也就是在拷贝它们的那个投影之后。
     """
     for k in [k for k in sd if k.startswith(prefix)]:
         del sd[k]
 
 
 class Qwen35:
-    """The Qwen3.5-4B model: layers, rope tables, graph buffers and execution paths."""
+    """Qwen3.5-4B 模型：层、rope 表、图缓冲区和执行路径。"""
 
     def __init__(self, model_dir: str | Path, max_seq: int = 4096, bench: bool = True,
                  weights: dict | None = None, paged: bool = False,
                  quant: bool = False) -> None:
-        """Load the checkpoint and allocate everything the execution paths need.
+        """加载 checkpoint，并分配执行路径需要的一切。
 
         Args:
-            model_dir: Checkpoint directory; its ``config.json`` decides the
-                layer count, the layer-type interleaving and the rope parameters.
-            max_seq: Longest sequence the engine will run. Sizes the RoPE tables
-                and the mask index, so it bounds ``prefill`` past the end of the
-                table.
-            bench: Autotune the projections on arrival. ``False`` takes the
-                default kernel config, which is what structural tests need to run
-                without paying for the sweeps.
-            weights: Pre-loaded state dict to reuse instead of reading from disk,
-                so a model can be rebuilt after a code change without a reload.
-                The caller keeps ownership; this instance does not clear it.
-            paged: Build the full-attention layers without their private dense KV
-                caches, for the caller that is going to call
-                :meth:`enable_paging` (PrefixCacheEngine does). The MTP layer is
-                not paged -- its cache is not part of a prefix snapshot -- so it
-                keeps its own.
-            quant: Store the text projections as int8 when this call reads the
-                checkpoint itself. Ignored when ``weights`` is given: that dict
-                already decided the storage form.
+            model_dir: checkpoint 目录；它的 ``config.json`` 决定层数、层类型的
+                交错方式和 rope 参数。
+            max_seq: 引擎会跑的最长序列。它定 RoPE 表和掩码下标的尺寸，所以 ``prefill``
+                越过表尾会被它挡住。
+            bench: 到场时对投影做自动调优。``False`` 取默认内核配置，结构测试需要的
+                正是不付扫描代价就能跑。
+            weights: 预加载好的 state dict，用它而不是从磁盘读，改完代码重建模型
+                因此不必重新加载。所有权仍在调用方；本实例不会清空它。
+            paged: 不给全注意力层建私有稠密 KV 缓存，留给之后要调 :meth:`enable_paging`
+                的调用方（PrefixCacheEngine 就是）。MTP 层不分页——它的缓存不参与
+                前缀快照——所以它保留自己的。
+            quant: 本次调用自己读 checkpoint 时，把文本投影存成 int8。给了
+                ``weights`` 时忽略：那个字典已经定下了存储形式。
 
         Raises:
-            ValueError: ``model_dir`` has no ``config.json`` or no
-                ``text_config``, surfaced by the JSON/config access.
-            FileNotFoundError: No safetensors shard for the expected prefix.
-                Report the mismatched checkpoint; the engine cannot start.
+            ValueError: ``model_dir`` 里没有 ``config.json`` 或没有
+                ``text_config``，由 JSON/配置访问处暴露出来。
+            FileNotFoundError: 找不到期望前缀的 safetensors 分片。报出不匹配的
+                checkpoint；引擎起不来。
         """
         model_dir = Path(model_dir)
         self.raw_cfg = json.loads((model_dir / "config.json").read_text())
         self.cfg = self.raw_cfg["text_config"]
         self.max_seq = max_seq
-        #: Whether this instance owns the state dict and may release tensors as it
-        #: consumes them. It does when it loaded them itself; a caller-supplied dict is
-        #: kept intact so the same tensors can rebuild the model on a reload.
+        #: 本实例是否拥有该 state dict、可以在消费张量的同时释放它们。自己加载时是；
+        #: 调用方提供的字典保持完整，同一批张量才能在重载时重建模型。
         #:
-        #: Ownership decides the build's peak footprint, which is what makes a 27B
-        #: checkpoint loadable at all: ``GEMVGroup`` replaces two source matrices with one
-        #: fused copy, so without draining, both forms are resident and the peak is the
-        #: dict plus the fused copies. Draining frees each source as its layer is built,
-        #: which holds the peak at roughly the final size instead of twice it (measured:
-        #: a 26 GiB int8 27B peaked past 31.7 GiB and raised OutOfMemoryError mid-build).
+        #: 所有权决定构建的峰值占用，这正是 27B checkpoint 能不能加载的前提：
+        #: ``GEMVGroup`` 用一份融合拷贝替换两个源矩阵，不排空的话两种形式同时常驻，
+        #: 峰值就是字典加上融合拷贝。排空让每个源在它那层建好时释放，峰值因此维持在
+        #: 接近最终大小、而不是两倍（实测：26 GiB 的 int8 27B 峰值冲过 31.7 GiB，
+        #: 在构建中途抛 OutOfMemoryError）。
         #:
-        #: The fused copies are also freed per layer. ``GEMVGroup`` concentrates every
-        #: pair of projections into one wider matrix, and each of those transients is
-        #: charged to the caching allocator's segments even after the two sources are
-        #: gone: a 27B build reached 27.00 GiB allocated + 4.57 GiB *reserved but
-        #: unallocated* and then failed a 170 MiB ``cat``. Returning the segments after
-        #: each layer keeps the reserved pool tracking the live set instead of the peak
-        #: of the largest layer.
+        #: 融合拷贝也按层释放。``GEMVGroup`` 把每对投影汇成一个更宽的矩阵，这些临时量
+        #: 即使两个源已经没了，也会记在缓存分配器的段上：一次 27B 构建达到 27.00 GiB
+        #: 已分配加 4.57 GiB *已保留但未分配*，然后在一次 170 MiB 的 ``cat`` 上失败。
+        #: 每层之后把段还回去，保留池就跟着活集合走，而不是跟着最大那一层的峰值走。
         own_sd = weights is None
         sd = weights if weights is not None else load_weights(model_dir, quant=quant)
 
@@ -153,53 +128,47 @@ class Qwen35:
         self.layers = []
         for i in range(self.cfg["num_hidden_layers"]):
             self.layers.append(Layer(sd, i, self.cfg, bench, max_seq, paged))
-            # A layer that has been built holds whatever it needs; its remaining entries
-            # in the dict are the ones `GEMVGroup` already copied, so they are pure peak.
+            # 建好的层已经持有它需要的一切；它在字典里剩下的条目都是 `GEMVGroup`
+            # 已经拷过的，纯粹是峰值。
             if own_sd:
                 _drop_prefix(sd, f"model.language_model.layers.{i}.")
                 runtime.empty_cache()
-        # Tied or untied is a property of the checkpoint, not of the architecture: both
-        # the 4B and the 27B are ``Qwen3_5ForConditionalGeneration``, and only the 27B
-        # ships a separate ``lm_head.weight``. Keying on the tensor rather than on the
-        # family name is what lets one code path serve both -- and the alternative is
-        # not a crash, it is the head silently reading the embedding, which produces
-        # plausible logits from the wrong matrix.
+        # 绑定还是不绑定是 checkpoint 的属性，不是架构的：4B 和 27B 都是
+        # ``Qwen3_5ForConditionalGeneration``，只有 27B 单独带了 ``lm_head.weight``。
+        # 按张量而不是按族名来判断，才让一条代码路径同时服务两者——反过来的做法不是
+        # 崩溃，而是头悄悄改读嵌入，用错误的矩阵产生看似合理的 logits。
         head_w = sd.get("lm_head.weight")
         self.lm_head = self.embed if head_w is None else TiedEmbedding(head_w, bench)
         self.head_is_tied = head_w is None
         self.mtp = MTP(sd, self.cfg, bench, max_seq) if "mtp.fc.weight" in sd else None
-        #: Vision tensors stay in the resident dict but are only turned into a
-        #: tower on the first image request (see ``enable_vision``); a text-only
-        #: server therefore carries the 0.62 GiB but never builds the module.
+        #: 视觉张量留在常驻字典里，但只在第一次图像请求时才变成视觉塔（见
+        #: ``enable_vision``）；纯文本服务端因此背着那 0.62 GiB，却从不构建该模块。
         self.vision_sd = {k: v for k, v in sd.items()
                           if k.startswith("model.visual.")}
         self.vision = None
-        if weights is None:                 # caller-owned dict stays resident
+        if weights is None:                 # 调用方持有的字典保持常驻
             sd.clear()
         runtime.empty_cache()
 
         rp = self.cfg["rope_parameters"]
         self.rot = int(self.cfg["head_dim"] * rp["partial_rotary_factor"])
-        #: The one frequency axis: the 1-D decode tables and the 3-D mRoPE tables
-        #: both derive from it, so a text-only prompt gets identical cos/sin on
-        #: either path.
+        #: 唯一的频率轴：一维解码表和三维 mRoPE 表都从它推导，纯文本 prompt 在两条
+        #: 路径上因此得到相同的 cos/sin。
         self.inv_freq = make_inv_freq(self.cfg["head_dim"], self.rot,
                                       rp["rope_theta"], _device)
         self.cos_tbl, self.sin_tbl = make_rope_tables(
             self.cfg["head_dim"], self.rot, rp["rope_theta"], max_seq, _device,
             inv_freq=self.inv_freq)
 
-        # Fixed buffers the captured graphs address.  ``pos``/``token_in``/
-        # ``logits_out`` grow a leading row dim when ``enable_batching`` is used;
-        # with the default capacity of 1 they keep their single-stream shapes
-        # exactly.  When batching is on, row ``prefill_row`` (the last one) is
-        # reserved for the single-stream prefill / verify paths, so prefilling a
-        # new request never touches a decode row (see ``enable_batching``).
+        # 捕获图寻址的固定缓冲区。用 ``enable_batching`` 时 ``pos``/``token_in``/
+        # ``logits_out`` 会长出一个前导行维；默认容量 1 时它们精确保持单流形状。
+        # 批处理打开时，``prefill_row``（最后一行）留给单流预填充 / 校验路径，
+        # 新请求的预填充因此永远碰不到某个解码行（见 ``enable_batching``）。
         self.batch_capacity = 1
         self.decode_capacity = 1
         self.prefill_row = 0
-        #: ``False`` in the batched engine: speculative decoding is single-stream,
-        #: so the MTP head's prefill is dead work there and is skipped.
+        #: 批处理引擎里是 ``False``：投机解码是单流的，MTP 头的预填充在那里是白做的
+        #: 工作，会被跳过。
         self.mtp_prefill = True
         self.pool = None
         self._batch_graphs: dict[int, runtime.Capture] = {}
@@ -209,15 +178,12 @@ class Qwen35:
         self.pos = torch.zeros(1, dtype=torch.long, device=_device)
         self.pos1 = self.pos[:1]
         self.mask_idx = torch.arange(max_seq, dtype=torch.long, device=_device)
-        #: mRoPE offset of the request being decoded, per row: the mRoPE position
-        #: of token ``i`` is ``i + rope_delta``.  0 for a text-only request (where
-        #: the three axes collapse to 1-D and this is the identity), and the
-        #: constant ``MMInput.rope_delta`` after a prompt that contains an image --
-        #: the image block ends at ``max(h, w) / merge`` while consuming
-        #: ``h*w/merge**2`` tokens, so from then on the position runs ahead of the
-        #: token index.  Keeping it a *buffer add* inside the captured graphs is
-        #: what lets decode stay one replay: only the cos/sin row moves, every KV
-        #: slot is still addressed by the token index.
+        #: 正在解码的请求的逐行 mRoPE 偏移：token ``i`` 的 mRoPE 位置是
+        #: ``i + rope_delta``。纯文本请求为 0（三根轴退化成 1 维，这就是恒等），
+        #: 含图像的 prompt 之后是恒定的 ``MMInput.rope_delta``——图像块结束于
+        #: ``max(h, w) / merge``，而只消耗了 ``h*w/merge**2`` 个 token，所以此后位置
+        #: 会跑在 token 下标前面。把它保持成捕获图里的*缓冲区加法*，解码才能仍然只是
+        #: 一次重放：只有 cos/sin 那一行动，每个 KV 槽位仍按 token 下标寻址。
         self.rope_delta = torch.zeros(1, dtype=torch.long, device=_device)
         self.rope_delta1 = self.rope_delta[:1]
         self.token_in = torch.zeros(1, dtype=torch.long, device=_device)
@@ -225,14 +191,13 @@ class Qwen35:
         self.logits_single = self.logits_out
         self._graph = None
 
-        # Batched speculative decoding (per-row drafter + per-row verify); all of
-        # it is allocated by ``enable_spec_batch`` and stays off by default so the
-        # single-stream spec path and the plain batched path are untouched.
+        # 批量投机解码（逐行草稿器加逐行校验）；全部由 ``enable_spec_batch`` 分配，
+        # 默认关闭，单流投机路径和普通批处理路径因此不受影响。
         self.batch_spec = False
         self.spec_width = 0
         self.spec_buckets: tuple[int, ...] = ()
-        self.verify_mode = "token"      # "once" = one forward for all B*c tokens
-        self.sparse_topk = 0            # >0: selective KV (needs masked multi-q)
+        self.verify_mode = "token"      # "once" = 对全部 B*c 个 token 一次前向
+        self.sparse_topk = 0            # >0：选择性 KV（需要带掩码的多查询）
         self.verify_toks_b = None
         self.verify_pos_b = None
         self.verify_hidden_b = None
@@ -242,8 +207,8 @@ class Qwen35:
         self.h_prev_b = None
         self._verify_batch_graphs: dict[int, runtime.Capture] = {}
 
-        # Speculative-verify state; the graph over it is captured by
-        # ``capture_verify`` at whatever width ``verify_c`` ends up with.
+        # 投机校验的状态；覆盖它的图由 ``capture_verify`` 按 ``verify_c`` 最终定下的
+        # 宽度捕获。
         hidden = self.cfg["hidden_size"]
         self.h_prev = torch.zeros(hidden, dtype=D, device=_device)
         self.verify_c = 4
@@ -254,35 +219,29 @@ class Qwen35:
         self.verify_logits = torch.zeros(self.verify_c, self.embed.shape[0], dtype=D, device=_device)
         self._verify_graph = None
 
-        # Acceptance statistics of the last ``spec_generate``, read by ``spec_stats``.
+        # 上一次 ``spec_generate`` 的接受统计，由 ``spec_stats`` 读取。
         self.n_drafted = 0
         self.n_accepted = 0
         self.n_spec_steps = 0
 
     def enable_batching(self, capacity: int) -> None:
-        """Allocate a leading row dim of ``capacity`` on every per-token buffer.
+        """给每个逐 token 缓冲区分配一个 ``capacity`` 长的前导行维。
 
-        Stage 1 runs ``B`` sequences through one forward: the projections are
-        batched (one weight read for all rows, see ``models/qwen35/batch.py``)
-        while the stateful mixers keep calling the single-stream kernels once per
-        row on row slices. Every buffer the captured graph writes therefore has
-        to exist -- with a stable address -- before capture.
+        阶段 1 让 ``B`` 个序列走一次前向：投影是批处理的（所有行共用一次权重读取，见
+        ``models/qwen35/batch.py``），有状态的 mixer 仍在行切片上逐行调用单流内核。
+        所以捕获图要写的每个缓冲区都必须在捕获之前、以稳定地址存在。
 
         Args:
-            capacity: Rows to allocate, *including* the single-stream staging row.
-                Decode rows are ``0 .. capacity-2``; row ``capacity-1`` is the row
-                ``prefill`` writes (``prefill_row``, also what ``pos1`` points
-                at). That split is what lets continuous batching prefill a new
-                request between decode steps without clobbering a live decode
-                row's recurrent state. ``capacity=1`` keeps the single-stream
-                buffers untouched, so the default path is unchanged.
+            capacity: 要分配的行数，*包含*单流暂存行。解码行是
+                ``0 .. capacity-2``；第 ``capacity-1`` 行是 ``prefill`` 写的那一行
+                （``prefill_row``，也是 ``pos1`` 指向的行）。正是这个切分让连续批处理
+                能在解码步之间预填充新请求，而不踩坏某个活着的解码行的循环状态。
+                ``capacity=1`` 时单流缓冲区原样不动，默认路径因此不变。
 
         Raises:
-            ValueError: ``capacity < 1``. The engine must not build a zero-row
-                batch; reject it at the caller.
-            RuntimeError: A graph was already captured. Call this before
-                ``capture()``/``capture_batch()``, because the graphs bake in the
-                buffer addresses this allocates.
+            ValueError: ``capacity < 1``。引擎不能构建零行的批；在调用方那里拒绝。
+            RuntimeError: 已经有图被捕获。要在 ``capture()``/``capture_batch()``
+                之前调用，因为图会把这里分配的缓冲区地址烘进去。
         """
         capacity = int(capacity)
         if capacity < 1:
@@ -294,10 +253,10 @@ class Qwen35:
             self.decode_capacity = 1
             self.prefill_row = 0
             return
-        # One row is the prefill/verify staging row; the rest are decode rows.
+        # 一行是预填充/校验的暂存行，其余都是解码行。
         self.decode_capacity = capacity - 1
         self.prefill_row = capacity - 1
-        self.mtp_prefill = False        # speculative decoding is single-stream only
+        self.mtp_prefill = False        # 投机解码只有单流
         self.pos = torch.zeros(capacity, dtype=torch.long, device=_device)
         self.pos1 = self.pos[self.prefill_row:self.prefill_row + 1]
         self.rope_delta = torch.zeros(capacity, dtype=torch.long, device=_device)
@@ -305,8 +264,8 @@ class Qwen35:
         self.token_in = torch.zeros(capacity, dtype=torch.long, device=_device)
         self.logits_out = torch.zeros(capacity, self.embed.shape[0], dtype=D, device=_device)
         self.logits_single = self.logits_out[self.prefill_row]
-        # Per-row attention window length (``pos+1``) for the stage-3 batched
-        # attention kernel; int32 because the kernel reads it on the device.
+        # 阶段 3 批处理注意力内核用的逐行注意力窗口长度（``pos+1``）；用 int32 是因为
+        # 内核要在设备上读它。
         self.ctx_lens = torch.ones(capacity, dtype=torch.int32, device=_device)
         for layer in self.layers:
             layer.mix.enable_batching(capacity, self.prefill_row)
@@ -315,14 +274,12 @@ class Qwen35:
             self._prepare_pool_rows()
 
     def _prepare_pool_rows(self) -> None:
-        """Grow the slot map and reserve one scratch block per row.
+        """扩出槽位表，并为每一行预留一个暂存块。
 
-        The captured graphs run every row of their bucket, including rows the
-        caller does not fill (a bucket is padded with sentinel rows). Reserving a
-        block per row *before* capture and pointing that row's map at it is what
-        stops the capture-time warmup from scribbling over a block a real sequence
-        owns -- the same trick the runtime service uses for its single scratch block. The
-        prefill row gets one too, because ``capture()`` warms its prefill path.
+        捕获图会跑完它那个 bucket 的每一行，包括调用方没填的行（bucket 用哨兵行补
+        齐）。在捕获*之前*给每行预留一个块、并把该行的表指向它是关键：捕获时的预热
+        因此不会涂掉某个真实序列拥有的块——运行时服务给它的单个暂存块用的是同一招。
+        预填充行也分一个，因为 ``capture()`` 会预热它的预填充路径。
         """
         pool = self.pool
         if pool is None or self.batch_capacity <= 1:
@@ -336,43 +293,35 @@ class Qwen35:
             pool.assign(blk, 0, row)
 
     def enable_paging(self, num_blocks: int = 512, block_size: int = 64):
-        """Serve the full-attention layers from a shared paged int8 block pool.
+        """让全注意力层从共享的分页 int8 块池取 KV。
 
-        Must run before :meth:`capture`: the captured decode step bakes in the pool
-        tensors (and the device-resident slot map), so switching afterwards would
-        leave a graph writing somewhere else.
+        必须在 :meth:`capture` 之前跑：捕获的解码步会把池张量（以及设备侧常驻的槽位
+        表）烘进去，之后再切换只会留下一张写错地方的图。
 
-        Caller contract: **assign a block table before any prefill or capture**.
-        ``pos2slot`` starts as all zeros, so running ``prefill()``/``capture()``
-        on a freshly paged model makes every position address pool slot 0 and
-        successive prefills read each other's KV. The symptom looks like a
-        non-deterministic model but is a caller error; ``PrefixCacheEngine``
-        satisfies the contract by allocating blocks and calling ``assign_table``.
+        调用方契约：**在任何预填充或捕获之前先分配块表**。``pos2slot`` 初值全是零，
+        所以在刚分页化的模型上跑 ``prefill()``/``capture()`` 会让每个位置都指向池的
+        0 号槽位，连续几次预填充互相读到对方的 KV。症状看着像模型不确定，实际是调用
+        方的错误；``PrefixCacheEngine`` 通过分配块并调用 ``assign_table`` 满足契约。
 
         Args:
-            num_blocks: Blocks in the pool. The pool is the KV budget for every
-                live request combined, so a short pool shows up as a scheduling
-                stall rather than an error.
-            block_size: Tokens per block; also the granularity at which the radix
-                tree can share a prefix.
+            num_blocks: 池里的块数。池是所有活请求合起来的 KV 预算，所以池太小会表现
+                成调度卡顿，而不是报错。
+            block_size: 每块的 token 数；也是基数树共享前缀的粒度。
 
         Returns:
-            The pool, which the caller drives through a
-            :class:`~radix_cache.RadixCache`.
+            池本身，调用方通过 :class:`~radix_cache.RadixCache` 驱动它。
 
         Raises:
-            RuntimeError: A graph was already captured; the pool tensors must be
-                in place before capture.
-            ValueError: From :class:`~paged_cache.PagedKVCache` when the requested
-                block count cannot cover ``max_seq``; give the pool more blocks.
+            RuntimeError: 已经有图被捕获；池张量必须在捕获之前就位。
+            ValueError: 请求的块数覆盖不了 ``max_seq`` 时由
+                :class:`~paged_cache.PagedKVCache` 抛出；给池更多块。
         """
         if self._graph is not None:
             raise RuntimeError("enable_paging() must be called before capture()")
         full = [layer.mix for layer in self.layers if isinstance(layer.mix, FullAttn)]
-        # Release the private dense caches *before* the pool is allocated. At a 256k
-        # window each is ~4.5 GB, and holding both at once does not fit beside 4 GB
-        # of int8 weights -- they are dead the moment the pool exists, so dropping
-        # them first turns "OOM at startup" into "no extra peak at all".
+        # 在分配池*之前*释放私有稠密缓存。256k 窗口下每份约 4.5 GB，两者同时持有
+        # 再叠上 4 GB 的 int8 权重根本放不下——池一存在它们就死了，先丢掉它们把
+        # 「启动 OOM」变成「完全没有额外峰值」。
         for mix in full:
             mix.kcache = mix.vcache = mix.kscale = mix.vscale = None
         runtime.empty_cache()
@@ -388,26 +337,24 @@ class Qwen35:
         return pool
 
     def enable_vision(self, quant: bool = False, dtype=D) -> "VisionTower":
-        """Attach the vision tower, built lazily so text-only serving pays nothing.
+        """接上视觉塔，按需构建，纯文本服务因此不付任何代价。
 
-        The tower is not part of the decode graph: an image is encoded once per
-        request, before its tokens are prefilled, so it can be a plain eager
-        module. Its weights live in the same resident dict as the text ones and
-        are released by :meth:`close`.
+        视觉塔不在解码图里：一张图在它的 token 被预填充之前、每个请求只编码一次，所以
+        它可以是个普通的即时执行模块。它的权重和文本的一起放在常驻字典里，由
+        :meth:`close` 释放。
 
         Args:
-            quant: Store the tower's GEMM weights as int8 + per-row scale. Worth
-                it only when the fp16 tower is what does not fit in VRAM.
-            dtype: Compute dtype for the tower's activations and weights.
+            quant: 把视觉塔的 GEMM 权重存成 int8 加逐行 scale。只有当放不下的是 fp16
+                的视觉塔时才值得。
+            dtype: 视觉塔激活和权重的计算 dtype。
 
         Returns:
-            The tower, which :meth:`image_embeds` then calls once per image batch.
+            视觉塔，:meth:`image_embeds` 之后每个图像批调用它一次。
 
         Raises:
-            RuntimeError: The model was not built paged, or its checkpoint has no
-                ``vision_config``. Only the serve path supports vision, so reject
-                the request rather than prefilling image tokens with no
-                embeddings.
+            RuntimeError: 模型不是按分页方式构建的，或者它的 checkpoint 没有
+                ``vision_config``。只有服务路径支持视觉，所以宁可拒绝请求，也不要
+                在没有任何嵌入的情况下预填充图像 token。
         """
         from models.qwen35.vision import VisionTower
 
@@ -422,26 +369,26 @@ class Qwen35:
         return self.vision
 
     def image_embeds(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
-        """Encode a batch of images into LLM token embeddings ``[Σtokens, hidden]``.
+        """把一批图像编码成 LLM token 嵌入 ``[Σtokens, hidden]``。
 
-        The result is in prompt order, which is exactly the order of the prompt's
-        ``<|image_pad|>`` tokens, so the caller can splice it in without permuting
-        anything: that alignment is what lets ``scatter_image_embeds`` work off
-        absolute spans alone.
+        结果就是 prompt 顺序，恰好是 prompt 里
+        ``<|image_pad|>`` token 的顺序，调用方因此不用做任何重排就能把它拼进去：正是
+        这个对齐让 ``scatter_image_embeds`` 只靠绝对区间就能工作。
+
 
         Args:
-            pixel_values: The processor's flattened patch tensor,
+            pixel_values: processor 展平后的 patch 张量，
                 ``[Σ t*h*w, C*tps*p*p]``.
-            grid_thw: The ``(t, h, w)`` patch grids, one row per image, in prompt
-                order.
+            grid_thw: ``(t, h, w)`` patch 网格，每图一行，按 prompt
+                顺序。
 
         Returns:
-            ``[Σtokens, hidden]`` bf16 embeddings, ready to overwrite the image
-            rows of the prefill gather buffer.
+            ``[Σtokens, hidden]`` 的 bf16 嵌入，可以直接覆写预填充 gather 缓冲区的
+            图像行。
 
         Raises:
-            RuntimeError: The tower was never attached. Call :meth:`enable_vision`
-                first; a text-only server reaches this only on a caller bug.
+            RuntimeError: 视觉塔从未接上。先调 :meth:`enable_vision`；纯文本服务端
+                只有调用方出 bug 才会走到这里。
         """
         if self.vision is None:
             raise RuntimeError("vision tower not enabled (enable_vision())")
@@ -451,20 +398,20 @@ class Qwen35:
             return self.vision(pv, gt).to(D)
 
     def snapshot_linear_states(self, row: int = 0) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
-        """Clone every linear-attention layer's recurrent and conv state for ``row``.
+        """克隆 ``row`` 那一行上每个线性注意力层的循环状态和卷积状态。
 
-        Prefix sharing needs this: a cached KV prefix is only reusable together
-        with the recurrent state that produced it, because those 24 layers carry
-        the prefix forward as a fixed-size state rather than as KV.
+        前缀共享需要它：缓存的 KV 前缀只有连同产生它的循环状态一起才能复用，因为
+        那 24 层是用一个定长的状态、而不是 KV 来携带前缀向前走的。
+
 
         Args:
-            row: Which row's sequence to snapshot; the prefill row or a decode
-                row. A batched caller passes the row it wants, not the default.
+            row: 要打快照的是哪一行的序列；预填充行或某个解码行。批处理调用方传它
+                想要的那一行，而不是默认值。
 
         Returns:
-            ``{layer index: (recurrent state, conv state)}``, holding only the
-            linear-attention layers. The clones are independent, so the caller can
-            keep them past the next prefill.
+            ``{层下标: (循环状态, 卷积状态)}``，只含线性注意力层。克隆是独立的，
+            调用方可以让它们活过下一次预填充。
+
         """
         out: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         for i, layer in enumerate(self.layers):
@@ -474,18 +421,16 @@ class Qwen35:
         return out
 
     def restore_linear_states(self, states, row: int = 0) -> None:
-        """Adopt a snapshot taken by :meth:`snapshot_linear_states` into ``row``.
+        """把 :meth:`snapshot_linear_states` 打下的快照装进 ``row``。
 
         Args:
-            states: A dict as returned by :meth:`snapshot_linear_states`; its keys
-                must be this model's linear-attention layer indices.
-            row: Row to install the state into, normally the sequence's own decode
-                row.
+            states: :meth:`snapshot_linear_states` 返回的那种字典；它的键必须是本模型
+                的线性注意力层下标。
+            row: 要装入状态的行，通常是该序列自己的解码行。
 
         Raises:
-            KeyError: ``states`` names a layer index this model does not have --
-                i.e. a snapshot from a different architecture. Reject it rather
-                than restoring a partial state.
+            KeyError: ``states`` 点出了本模型没有的层下标——也就是来自另一套架构的
+                快照。宁可拒绝，也不要恢复一个残缺的状态。
         """
         for i, (st, conv) in states.items():
             mix = self.layers[i].mix
@@ -493,19 +438,15 @@ class Qwen35:
             mix.conv_state[row].copy_(conv)
 
     def move_linear_states(self, src_row: int, dst_row: int) -> None:
-        """Copy row ``src_row``'s recurrent state into ``dst_row``.
+        """把 ``src_row`` 那一行的循环状态拷进 ``dst_row``。
 
-        The bridge between the two halves of a batched step: a new request is
-        prefilled on the staging row (``prefill_row``), then its recurrent state
-        is moved into the free decode row that will carry on generating. The
-        row's :attr:`rope_delta` travels with it -- it belongs to the sequence,
-        not to the row, and losing it would rotate the next tokens of an image
-        prompt at the wrong angle.
+        批处理步骤两半之间的桥：新请求先在暂存行（``prefill_row``）上预填充，然后它的
+        循环状态被搬进那个即将接着生成解码行。该行的 :attr:`rope_delta` 也跟着走——
+        它属于序列而不属于行，丢了它会让图像 prompt 后续 token 按错误的角度旋转。
 
         Args:
-            src_row: Row holding the state to move, normally ``prefill_row``.
-            dst_row: Destination decode row. A no-op when the two are equal, which
-                is the single-stream case.
+            src_row: 持有待搬移状态的行，通常是 ``prefill_row``。
+            dst_row: 目标解码行。两者相等时是空操作，也就是单流的情形。
         """
         if src_row == dst_row:
             return
@@ -517,12 +458,11 @@ class Qwen35:
         self.rope_delta[dst_row].copy_(self.rope_delta[src_row])
 
     def zero_linear_states(self, row: int) -> None:
-        """Clear one row's recurrent state before a fresh sequence occupies it.
+        """在新序列占用它之前，清空某一行的循环状态。
 
         Args:
-            row: Decode row being handed to a new request. The row's
-                ``rope_delta`` is cleared with the state: a stale offset from the
-                previous occupant would rotate the new request wrongly.
+            row: 要交给新请求的解码行。该行的 ``rope_delta`` 随状态一起清空：上一个
+                占用者残留的偏移会把新请求转错。
         """
         for layer in self.layers:
             mix = layer.mix
@@ -532,15 +472,13 @@ class Qwen35:
         self.rope_delta[row].zero_()
 
     def _forward(self) -> None:
-        """One token on the single-stream path (the prefill/staging row).
+        """单流路径（预填充/暂存行）上的一个 token。
 
-        This is the graph ``capture()`` records for the single-stream engine and
-        the eager reference the batched path is compared against; it writes the
-        staging row, never a decode row.
+        这就是 ``capture()`` 为单流引擎录下的图，也是批处理路径拿来对照的即时执行
+        参考；它写暂存行，永远不写解码行。
 
-        The rotation reads ``pos + rope_delta`` while the KV slot stays at ``pos``
-        (see ``rope_delta``); with a text-only request the buffer is 0 and this is
-        exactly the old one-term lookup.
+        旋转读 ``pos + rope_delta``，而 KV 槽位仍停在 ``pos``（见 ``rope_delta``）；
+        纯文本请求里这个缓冲区是 0，于是恰好就是原来的单一项查表。
         """
         pr = self.prefill_row
         x = self.embed.lookup(self.token_in[pr:pr + 1]).view(-1)
@@ -553,20 +491,17 @@ class Qwen35:
         self.pos1.add_(1)
 
     def _forward_batch(self, rows: int) -> None:
-        """Run one token for each of ``rows`` sequences in a single forward.
+        """在一次前向里为 ``rows`` 个序列各跑一个 token。
 
-        Projections take the M=rows batched GEMV path (the row count is static in
-        a captured graph); attention and the delta-net recurrence call the
-        existing single-token kernels once per row, on row slices of their
-        per-row buffers, so each row's numbers match a solo decode exactly.
-        ``positions`` stays the raw token index (it addresses the KV slot and the
-        context window); the 5th ``ctx`` entry carries the per-row ``rope_delta``
-        so only the rotation is shifted (mRoPE after an image).
+        投影走 M=rows 的批处理 GEMV 路径（捕获图里行数是静态的）；注意力和 delta-net
+        递推仍逐行调用现有的单 token 内核，作用在各行缓冲区的行切片上，所以每一行的
+        数字与单条解码精确一致。``positions`` 仍是裸的 token 下标（它寻址 KV 槽位和
+        上下文窗口）；``ctx`` 的第 5 项携带逐行 ``rope_delta``，只让旋转发生偏移
+        （图像之后的 mRoPE）。
 
         Args:
-            rows: Rows this graph runs, i.e. the bucket size. It must equal the
-                width the graph was captured for; the buffers it touches are
-                fixtures of capture, not parameters.
+            rows: 这张图跑多少行，也就是 bucket 大小。它必须等于捕获时的宽度；它碰
+                的缓冲区是捕获的固定件，不是参数。
         """
         x = self.embed.lookup(self.token_in[:rows])           # [rows, hidden]
         positions = self.pos[:rows]
@@ -579,11 +514,10 @@ class Qwen35:
         self.pos[:rows].add_(1)
 
     def reset(self) -> None:
-        """Zero every per-row position and recurrent state.
+        """把逐行位置和循环状态全部清零。
 
-        Called between requests and before each capture warmup, so a graph is
-        recorded against a known state rather than whatever the previous request
-        left behind.
+        在请求之间、以及每次捕获预热之前调用，图因此是在已知状态下录的，而不是对着
+        上一个请求留下的残余。
         """
         self.pos.zero_()
         self.rope_delta.zero_()
@@ -596,18 +530,18 @@ class Qwen35:
             self.mtp.b_pos.zero_()
 
     def logits(self, token: int) -> torch.Tensor:
-        """Feed one token through the un-captured forward and return its logits.
+        """让一个 token 走一遍未捕获的前向，返回它的 logits。
 
-        The eager reference for the captured decode path, and what ``prefill``
-        uses for prompts too short to batch.
+        捕获解码路径的即时执行参考，``prefill`` 也用它处理短到不值得批处理的 prompt。
+
 
         Args:
-            token: Next token id to feed; it is staged on the prefill row, whose
-                position advances by one.
+            token: 要喂的下一个 token id；它被放到预填充行上，该行的位置加一。
+
 
         Returns:
-            ``[vocab]`` bf16 logits of the staged position. This is the live
-            buffer, not a copy -- the next call overwrites it.
+            该位置的 ``[vocab]`` bf16 logits。这是活缓冲区而不是拷贝——下一次调用会
+            覆盖它。
         """
         pr = self.prefill_row
         self.token_in[pr:pr + 1].fill_(token)
@@ -618,49 +552,42 @@ class Qwen35:
     def prefill(self, tokens: list[int], chunk: int = 2048,
                 spec_row: int | None = None,
                 mm: "MMInput | None" = None) -> torch.Tensor:
-        """Process a whole prompt in batched GEMMs; returns the last token's logits.
+        """用批处理 GEMM 处理整个 prompt；返回最后一个 token 的 logits。
 
-        ``chunk`` is the GEMM's M, and it is worth a lot: the library GEMM on fp16
-        reaches ~13 TFLOP/s at M=256 and ~20 at M>=1024, and a bigger chunk also
-        means fewer 4-3-token-sized elementwise ops per token. Measured at n=2048:
-        865 tok/s at 256, 1035 at 512, 1094 at 2048. It only costs activation
-        memory (attention scores are [nkv, rep, C, p1] fp32), which is why this is
-        not ``max_seq``.
+        ``chunk`` 就是 GEMM 的 M，它很值钱：fp16 上的库 GEMM 在 M=256 时约
+        13 TFLOP/s、M>=1024 时约 20；更大的分块还意味着每 token 更少的、只有 4-3 个
+        token 大小的逐元素算子。n=2048 实测：256 时 865 tok/s，512 时 1035，2048 时
+        1094。它只多花激活内存（注意力 score 是 [nkv, rep, C, p1] 的 fp32），这也是
+        它不用 ``max_seq`` 的原因。
 
         Args:
-            tokens: The whole prompt, in order. Position starts from the current
-                ``pos1``, so a chunked prefill continues where the last call
-                stopped.
-            chunk: Tokens per GEMM pass; see the measurements above.
-            spec_row: Decode row whose paged drafter KV receives this prompt's
-                hidden states. Only used when batched speculative decoding is
-                enabled; ``None`` leaves the MTP head untouched.
-            mm: The request's image payload as an
-                :class:`mm_input.MMInput`, or ``None`` for text-only. It changes
-                exactly two things, both per chunk and both in *absolute* prompt
-                coordinates (``tokens`` is the whole prompt, so chunk ``[c0, c1)``
-                is prompt ``[pos0+c0, pos0+c1)``): the gather buffer's image rows
-                are overwritten with the tower's embeddings (``mm.spans`` overlap,
-                so a chunk that starts inside an image copies only its own rows --
-                no chunk-boundary assumption), and the full-attention layers
-                rotate with the explicit 3-D cos/sin of those tokens
-                (``ops.mrope.mrope_cos_sin`` over ``mm.slice_positions``) instead
-                of the 1-D table.
+            tokens: 整个 prompt，按顺序。位置从当前的
+                ``pos1`` 开始，分块预填充因此接着上一次调用停下的地方继续。
+            chunk: 每次 GEMM 处理的 token 数；见上面的实测数据。
+            spec_row: 哪个解码行的分页草稿器 KV 接收这个 prompt 的隐含状态。只有打开
+                批量投机解码时才用；``None`` 表示不碰 MTP 头。
+            mm: 该请求的图像载荷，类型 :class:`mm_input.MMInput`，纯文本时为 ``None``。
+                它恰好改变两件事，都是逐分块的，且都用*绝对* prompt 坐标
+                （``tokens`` 是整个 prompt，所以分块 ``[c0, c1)`` 就是 prompt 的
+                ``[pos0+c0, pos0+c1)``）：gather 缓冲区的图像行被视觉塔的嵌入覆写
+                （``mm.spans`` 允许重叠，所以从图像中间开始的分块只拷自己那几行——
+                不假设分块边界），以及全注意力层改用这些 token 的显式三维 cos/sin
+                （对 ``mm.slice_positions`` 调 ``ops.mrope.mrope_cos_sin``），
+                而不是一维表。
 
-                What it deliberately does *not* change: the causal mask, the KV
-                slot and the context window keep using the token index, which is
-                why decode afterwards only needs the scalar ``rope_delta``.
-                ``mm=None`` is the old path, bit for bit.
+                它刻意*不*改的东西：因果掩码、KV 槽位和上下文窗口仍用 token 下标，
+                解码之后因此只需要那个标量 ``rope_delta``。``mm=None`` 就是旧路径，
+                逐位相同。
 
         Returns:
-            ``[vocab]`` logits of the prompt's last token, from which the first
-            generated token is sampled. For a prompt shorter than 4 tokens this is
-            the decode path's last output rather than a batched one.
+            prompt 最后一个 token 的 ``[vocab]`` logits，第一个生成的 token 从这里
+            采样。短于 4 个 token 的 prompt 这里是解码路径的最后一次输出，而不是批处理
+            的结果。
 
         Raises:
-            ValueError: ``tokens`` is empty, or it does not fit between the
-                current position and ``max_seq``. Reject the request at the
-                scheduler, which is the only layer that can shorten or refuse it.
+            ValueError: ``tokens`` 为空，或者放不进当前位置与 ``max_seq`` 之间的
+                区间。在调度器那里拒绝该请求，那是唯一能缩短或拒绝它的层。
+
         """
         n = len(tokens)
         pos0 = int(self.pos1)
@@ -669,10 +596,10 @@ class Qwen35:
         if n > self.max_seq - pos0:
             raise ValueError(f"prompt of {n} exceeds max_seq={self.max_seq}")
         if n < 4:
-            # Tiny prompts are memory-bound: a library GEMM at M<4 is slower than
-            # the dedicated decode entry, so walk them through the decode path.
-            # ``rope_delta`` is a decode-graph input, so it has to be in place
-            # before the first ``logits`` call.
+            # 极短的 prompt 受内存限制：M<4 时库 GEMM 比专用的解码入口还慢，所以让
+            # 它们走解码路径。
+            # ``rope_delta`` 是解码图的输入，必须在第一次 ``logits`` 调用之前就位。
+
             if mm is not None:
                 self.rope_delta[self.prefill_row] = int(mm.rope_delta)
             lg = None
@@ -688,11 +615,9 @@ class Qwen35:
             c1 = min(c0 + chunk, n)
             x = self.embed.lookup(toks[c0:c1])
             positions = torch.arange(pos0 + c0, pos0 + c1, device=_device)
-            # Query tiles for the causal attention: each tile reads keys only up to
-            # its own last position, so the masked-out half of the score block is
-            # never built. Host-side ints, so no device sync per layer. The key
-            # range and the query range are both *absolute* positions, which is
-            # what the cache slice and mask_idx are indexed with.
+            # 因果注意力的查询切块：每块只读到自己的最后一个位置，score 块里被掩掉的那
+            # 一半因此根本不会被构造。切块坐标在主机侧算成整数，每层不会多一次设备同步。
+            # key 范围和查询范围都是*绝对*位置，缓存切片和 mask_idx 就是按它索引的。
             n_loc, base = c1 - c0, pos0 + c0
             tiles = ([(q0, min(q0 + Q, n_loc), base, base + min(q0 + Q, n_loc))
                       for q0 in range(0, n_loc, Q)]
@@ -707,13 +632,13 @@ class Qwen35:
             for layer in self.layers:
                 x = layer.prefill(x, positions, layer_ctx, tiles)
             if self.mtp is not None and self.mtp_prefill:
-                # Feed the MTP head chunk by chunk instead of holding every chunk's
-                # hidden state to concatenate at the end: `H` for a 256k prompt is
-                # 1.34 GB bf16 and the cat copy doubles it. The last prompt token
-                # has no next token, so each chunk stops one short of its end. Its
-                # own attention is a full-attention layer over the same positions,
-                # so an image chunk hands it its own rope slice (it covers
-                # ``m1 - c0`` tokens, a strict prefix of the chunk's).
+                # 把 MTP 头按分块喂，而不是把所有分块的隐含状态都攒着最后拼接：256k 的
+                # prompt 其 `H` 是 1.34 GB bf16，拼接拷贝还要再翻一倍。最后一个 prompt
+                # token 没有下一个 token，所以每个分块都在末尾少喂一个。MTP 自己的
+                # 注意力是覆盖相同位置的全注意力层，所以图像分块也把自己的 rope 切片交给
+                # 它（覆盖 ``m1 - c0`` 个 token，是该分块的严格前缀）。
+
+
                 m1 = min(c1, n - 1)
                 if m1 > c0:
                     self.mtp.prefill(x[:m1 - c0], toks[c0 + 1:m1 + 1],
@@ -722,7 +647,7 @@ class Qwen35:
                                      rope=None if rope is None
                                      else (rope[0][:m1 - c0], rope[1][:m1 - c0]))
             elif self.batch_spec and self.mtp is not None and spec_row is not None:
-                # Batched spec: same chunk, into that row's paged drafter KV.
+                # 批量投机：同样的分块，写进该行的分页草稿器 KV。
                 m1 = min(c1, n - 1)
                 if m1 > c0:
                     self.mtp.prefill_row(
@@ -732,9 +657,9 @@ class Qwen35:
                         else (rope[0][:m1 - c0], rope[1][:m1 - c0]))
             last = x[-1]
         self.pos1.fill_(pos0 + n)
-        # From here on every decode step of this request rotates at
-        # ``token_index + rope_delta``; a text-only prompt (or ``mm=None``) writes
-        # 0, which is the identity the captured graph was built with.
+        # 此后这个请求的每个解码步都按 ``token_index + rope_delta`` 旋转；纯文本
+        # prompt（或 ``mm=None``）写入 0，那正是捕获图构建时的恒等值。
+
         self.rope_delta[self.prefill_row] = int(mm.rope_delta) if mm is not None else 0
 
         if self.mtp is not None and self.mtp_prefill and n >= 2:
@@ -746,63 +671,59 @@ class Qwen35:
 
     @torch.no_grad()
     def prefill_group(self, seqs: list, snapshot_interval: int | None = None):
-        """Prefill several prompts in one forward.
+        """用一次前向预填充多个 prompt。
 
-        Only the projection/MLP stages are shared: at every layer all sequences'
-        hidden states are concatenated, the projection runs once over ``C_total``
-        tokens (a bigger GEMM, and one weight dequant per layer instead of one per
-        sequence), the result is sliced per sequence for the stateful attention /
-        delta scan on that sequence's own positions and rows, and the output
-        projections plus the MLP run batched again. Prefill is eager (no captured
-        graph), so the dynamic ``C_total`` costs nothing.
+        只共享投影/MLP 阶段：每一层里所有序列的隐含状态先拼接，投影对 ``C_total`` 个
+        token 只跑一次（更大的 GEMM，而且每层一次权重反量化而不是每序列一次），结果按
+        序列切开，在该序列自己的位置和行上做有状态的注意力 / delta 扫描，然后输出投影
+        和 MLP 再批处理跑一次。预填充是即时执行的（没有捕获图），所以动态的
+        ``C_total`` 不花代价。
 
-        With ``snapshot_interval`` set, the suffix of each sequence is walked in
-        block-aligned ``snapshot_interval`` chunks (token-major: every chunk goes
-        through *all* layers before the next chunk starts) so the recurrent state
-        can be snapshotted at block boundaries, exactly like the single-sequence
-        prefix path. Without it the whole suffix is one chunk, which also keeps
-        ``k == 1`` bit-identical to ``prefill``.
+        设了 ``snapshot_interval`` 时，每个序列的后缀按块对齐的 ``snapshot_interval``
+        分块遍历（token 优先：每一块都要跑完*所有*层，下一块才开始），循环状态于是
+        能在块边界打快照，和单序列前缀路径完全一样。不设时整个后缀是一块，这也让
+        ``k == 1`` 与 ``prefill`` 逐位相同。
 
-        This buys the latency of a *batch* of prompts rather than their sum: the
-        weights are read once per layer. It is not bit-identical to running the
-        prompts one by one -- a different GEMM M changes the fp32 accumulation
-        order -- so the contract is "same argmax, logits within a few bf16 ULPs"
-        (the single-sequence ``prefill`` path is unchanged and stays exact).
+
+
+        换来的是*一批* prompt 的延迟而不是它们之和：权重每层只读一次。它和逐个跑
+        prompt 并非逐位一致——不同的 GEMM M 会改变 fp32 累加次序——所以契约是「argmax
+        相同，logits 在几个 bf16 ULP 之内」（单序列的 ``prefill`` 路径不变，仍然是精确的）。
 
         Args:
-            seqs: Duck-typed sequences, each needing ``token_ids`` (the whole
-                prompt), ``matched`` (how many leading prompt tokens the radix
-                tree already holds; default 0), ``row`` (the decode row it keeps
-                for its lifetime) and ``block_table`` (its KV blocks, already
-                allocated -- matched blocks shared with the tree, suffix blocks
-                fresh). A ``mm`` attribute is read when present.
+            seqs: 鸭子类型的序列对象，每个需要 ``token_ids``（整个
+                prompt）、``matched``（基数树已经持有的前导 prompt token 数，默认 0）、
+                ``row``（它终身占用的解码行）和 ``block_table``（它的 KV 块，已分配——
+                命中的块与树共享，后缀块是新的）。有 ``mm`` 属性时会读它。
 
-                The caller is responsible for having restored the matched
-                boundary's recurrent state into ``row`` already; this method only
-                clears the row when ``matched == 0``. Nothing is staged on the
-                prefill row: KV and recurrent state land directly in each
-                sequence's decode row, so no state has to be moved afterwards.
-            snapshot_interval: Record a recurrent-state snapshot every this many
-                tokens, rounded up to a whole block. ``None`` records none, which
-                is the right choice when the caller does not intend to insert the
-                prefix into a radix tree.
+
+
+                把命中边界的循环状态恢复进 ``row`` 是调用方的责任；本方法只在
+                ``matched == 0`` 时清空该行。预填充行上不做暂存：KV 和循环状态直接
+                落在各序列自己的解码行里，之后不需要搬移任何状态。
+
+
+            snapshot_interval: 每这么多个 token 记一次循环状态快照，向上取整到整块。
+                ``None`` 表示不记，调用方不打算把前缀插进基数树时这是对的选择。
+
+
 
         Returns:
-            ``(logits_list, states_at_list)``: one next-token logits tensor per
-            sequence, and per sequence the block-boundary snapshots taken while
-            prefilling (``{absolute_position: snapshot_linear_states(row)}``) for
-            the radix tree to insert. ``states_at_list[i]`` is empty when
-            ``snapshot_interval`` is ``None``.
+            ``(logits_list, states_at_list)``：每个序列一个下一 token 的 logits 张量；
+            以及每个序列在预填充过程中于块边界打下的快照
+            （``{absolute_position: snapshot_linear_states(row)}``），供基数树插入。
+            ``snapshot_interval`` 为 ``None`` 时 ``states_at_list[i]`` 为空。
+
 
         Raises:
-            RuntimeError: The model has no paged pool. Group prefill writes
-                straight into per-row block tables, so call
-                :meth:`enable_paging` first.
-            ValueError: A prompt is empty or longer than ``max_seq``,
-                ``matched`` is outside the prompt, two sequences claim the same
-                decode row, or a row is outside ``0 .. decode_capacity-1``.
-                Reject the batch at the scheduler; these are request-shape bugs
-                that would otherwise corrupt another sequence's row.
+            RuntimeError: 模型没有分页池。组预填充直接写进逐行的块表，所以先调
+                :meth:`enable_paging`。
+
+            ValueError: 某个 prompt 为空或超过 ``max_seq``、``matched`` 落在 prompt 之外、
+                两个序列抢占同一个解码行，或某行超出 ``0 .. decode_capacity-1``。在调度
+                器那里拒绝这一批；这些是请求形状的 bug，否则会弄坏另一个序列的行。
+
+
         """
         if self.pool is None:
             raise RuntimeError("prefill_group needs a paged pool (enable_paging())")
@@ -827,29 +748,29 @@ class Qwen35:
         ctx = (self.cos_tbl, self.sin_tbl, self.mask_idx)
         bs = self.pool.bs
         suffix = [length - m for length, m in zip(lens, matched)]
-        # Per-sequence image payload, read off the sequence so a multimodal
-        # request needs no extra argument here (the runner already carries it on
-        # ``Sequence.mm``). All-``None`` -- the text-only engine -- takes exactly
-        # the old code path: no rope pair, no embed overwrite, delta 0.
+        # 逐序列的图像载荷，从序列对象上读，这样多模态请求在这里不需要额外参数
+        # （runner 已经把它挂在 ``Sequence.mm`` 上）。全为 ``None`` 时——也就是纯文本
+        # 引擎——走的正是原来的代码路径：没有 rope 对、不覆写嵌入、delta 为 0。
+
         mm_list = [getattr(s, "mm", None) for s in seqs]
         for s, row, m, mm_i in zip(seqs, rows, matched, mm_list):
             self.pool.assign_table(list(s.block_table), 0, row)
             if m == 0:
-                self.zero_linear_states(row)      # fresh sequence
-                # matched > 0: the caller restored the boundary's state into this
-                # row, and the rope offset with it -- rewriting it here would be
-                # the same value, but a re-used row of a *text* request must go
-                # back to 0, so it is written unconditionally.
+                self.zero_linear_states(row)      # 新序列
+                # matched > 0：调用方已把边界状态恢复进这一行，rope 偏移也一起恢复了——
+                # 在这里重写会是同一个值，但复用一行给*文本*请求时必须回到 0，所以
+                # 无条件写一次。
+
             self.rope_delta[row] = int(mm_i.rope_delta) if mm_i is not None else 0
 
-        # Token-major schedule. With prefix reuse the suffix is split at
-        # block-aligned snapshot boundaries: the block-aligned head (the part the
-        # tree can reuse) is walked in ``snapshot_interval`` chunks with one
-        # snapshot each; the sub-block tail goes last and only its logits matter.
+        # token 优先的调度。有前缀复用时，后缀按块对齐的快照边界切开：块对齐的头部
+        # （树能复用的那段）按 ``snapshot_interval`` 分块遍历、每块打一份快照；
+        # 不足一块的尾巴放到最后，只有它的 logits 有用。
+
         states_at: list[dict[int, dict]] = [{} for _ in range(n)]
         plans: list[list[tuple[int, int, int]]] = []
-        # Last token index of the snapshottable head of each sequence (a whole
-        # number of blocks above ``matched``); the rest is the tail.
+        # 每个序列可打快照头部的最后一个 token 下标（``matched`` 之上的整数块）；
+        # 其余是尾巴。
         head = [max(0, (length // bs) * bs - m) for length, m in zip(lens, matched)]
         if snapshot_interval is None:
             plans.append([(i, 0, suffix[i]) for i in range(n)])
@@ -894,7 +815,7 @@ class Qwen35:
                 parts.append(emb)
                 positions.append(torch.arange(base, base + length,
                                               dtype=torch.long, device=_device))
-                # Absolute key range: a tile only reads keys up to its own end.
+                # 绝对 key 范围：一个切块只读到自己的末尾。
                 tiles.append(
                     [(q0, min(q0 + Q, length), base, base + min(q0 + Q, length))
                      for q0 in range(0, length, Q)]
@@ -908,10 +829,10 @@ class Qwen35:
                 for k, (i, _c0, _c1) in enumerate(chunk):
                     sl = slice(starts[k], starts[k + 1])
                     proj_k = tuple(t[sl] for t in proj)
-                    # The rope pair rides on ``ctx`` (the same pass-through style
-                    # ``FullAttn.batch`` uses for ``ctx_lens``): the layer helpers
-                    # forward ``ctx`` untouched, so a sequence with an image gets
-                    # its own 3-D rotation and a text sequence gets the 1-D table.
+                    # rope 对搭在 ``ctx`` 上（``FullAttn.batch`` 对 ``ctx_lens`` 用的也是
+                    # 这种透传方式）：层辅助函数原样转发 ``ctx``，所以带图像的序列拿到自己
+                    # 的三维旋转，纯文本序列拿到一维表。
+
                     ctx_k = ctx if ropes[k] is None else ctx + (ropes[k],)
                     pieces.append(layer.prefill_group_state(
                         mix, proj_k, positions[k], ctx_k, tiles[k], rows[i]))
@@ -922,9 +843,9 @@ class Qwen35:
             for k, (i, c0, c1) in enumerate(chunk):
                 if c1 == suffix[i]:
                     last_hidden[i] = x[starts[k + 1] - 1].clone()
-                # Batched spec: feed this chunk's main hidden states to that row's
-                # drafter KV (H at position p, next token p+1) -- the same pair the
-                # single-sequence prefill hands to ``MTP.prefill``.
+                # 批量投机：把这个分块的主模型隐含状态喂给该行的草稿器 KV（位置 p 处的
+                # H，下一个 token p+1）——与单序列预填充交给 ``MTP.prefill`` 的同一对。
+
                 if self.batch_spec and self.mtp is not None:
                     base = matched[i] + c0
                     length = c1 - c0
@@ -938,15 +859,15 @@ class Qwen35:
                         self.mtp.prefill_row(rows[i], h, nxt, pos, ctx)
                     if c1 == suffix[i]:
                         self.h_prev_b[rows[i]].copy_(x[starts[k + 1] - 1])
-                # A reusable snapshot only exists on a block boundary inside the
-                # block-aligned head (same rule as the single-sequence path).
+                # 可复用的快照只存在于块对齐头部内部的块边界上（和单序列路径同一规则）。
+
                 if snapshot_interval is not None and c1 % bs == 0 and c1 <= head[i]:
                     states_at[i][matched[i] + c1] = \
                         self.snapshot_linear_states(row=rows[i])
 
-        # One lm_head read for every sequence: [n, hidden] -> [n, vocab]. The
-        # batched GEMV path handles n in 2/4/8; other counts use the single GEMV
-        # per row (the usual bucket sizes are what matter here).
+        # 所有序列共用一次 lm_head 读取：[n, hidden] -> [n, vocab]。批处理 GEMV
+        # 路径处理 n 为 2/4/8 的情形；其他计数退回逐行单个 GEMV（这里重要的是日常
+        # 的 bucket 大小）。
         last = torch.stack([self.norm(h) for h in last_hidden])
         if n in (2, 4, 8):
             logits = self.embed.prefill(last)
@@ -956,36 +877,32 @@ class Qwen35:
         return out, states_at
 
     def capture(self, warmup: int = 3) -> None:
-        """Capture ``_forward`` into a device graph for one-launch decode steps.
+        """把 ``_forward`` 捕获进设备图，让解码步只需一次 launch。
 
         Args:
-            warmup: Eager iterations before the capture, to settle the allocator
-                and every lazy kernel handle. Capturing without them records the
-                setup work into the graph instead of the steady state.
+            warmup: 捕获前的即时执行轮数，用来安置好分配器和每个惰性内核句柄。
+                不预热就捕获，录进图里的是初始化工作而不是稳态。
 
         Raises:
-            RuntimeError: Raised by the runtime's graph machinery when the stream
-                is busy or a graph is already active; capture must run before the
-                engine starts serving. Only reachable on a backend whose
-                ``caps.graph`` is true.
+            RuntimeError: 流正忙或已有图在活动时由运行时的图机制抛出；捕获必须在
+                引擎开始服务之前跑完。只有 ``caps.graph`` 为真的后端才会走到。
         """
         self.reset()
         self.token_in.zero_()
 
         def _reset() -> None:
-            """Rewind the model between the warmup and the capture.
+            """在预热和捕获之间把模型倒回去。
 
-            The warmup advances ``pos`` and the recurrent state; the graph has to be
-            recorded against the same state its first replay will see, so both
-            counters go back to zero in between -- and ``token_in`` with them, so
-            the recorded body starts from token 0 rather than from the warmup's.
+            预热会推进 ``pos`` 和循环状态；图必须按它第一次重放会看到的状态来录，
+            所以两个计数器在中间都要归零——``token_in`` 也一样，录下的主体因此从
+            token 0 开始，而不是从预热留下的那个开始。
             """
             self.reset()
             self.token_in.zero_()
 
         self._graph = runtime.capture(self._forward, warmup, reset=_reset)
-        # Warm the batched-prefill path as well: its first call otherwise pays for
-        # library handle creation, the triangular solver and pool growth.
+        # 批处理预填充路径也预热一下：否则它的第一次调用要付库句柄创建、三角求解器和
+        # 池增长的代价。
         self.prefill([1, 2, 3, 4, 5, 6, 7, 8] * 4)
         self.reset()
         if self.mtp is not None:
@@ -995,31 +912,26 @@ class Qwen35:
 
     @torch.inference_mode()
     def set_rows(self, tokens, positions, slot_rows=None, row_indices=None) -> None:
-        """Stage one decode step of the active sequences.
+        """为活跃序列铺好一个解码步。
 
-        Everything here is an eager host/device write outside the captured graph,
-        because the captured decode reads these buffers rather than taking them as
-        arguments.
+        这里的一切都是捕获图之外的即时执行主机/设备写入，因为捕获的解码是去读这些
+        缓冲区，而不是把它们当参数收。
 
         Args:
-            tokens: Per-row input token id, in the order of ``row_indices``.
-            positions: Per-row absolute position; it addresses both the KV slot
-                and the context window.
-            slot_rows: Optional per-row block table. Each is copied into that
-                row's ``pos2slot`` map, and unchanged tables are skipped so a
-                steady-state step writes nothing here.
-            row_indices: Decode row for each entry, when the live sequences are not
-                the contiguous rows ``0..n-1``. Only the listed rows are touched,
-                so a finished sequence's row can be left as a hole for
-                ``decode_batch(pad_rows=...)`` to fill with the sentinel.
+            tokens: 逐行输入 token id，顺序与 ``row_indices`` 一致。
+            positions: 逐行绝对位置；它同时寻址 KV 槽位和上下文窗口。
+            slot_rows: 可选的逐行块表。每个都会被拷进该行的 ``pos2slot`` 表，没变的
+                表会被跳过，稳态的一步因此在这里什么都不写。
+            row_indices: 每个条目对应的解码行，用于活跃序列不是连续行 ``0..n-1``
+                的情况。只有列出的行会被碰，已结束序列的行因此可以留成洞，交给
+                ``decode_batch(pad_rows=...)`` 用哨兵补齐。
 
         Raises:
-            RuntimeError: ``enable_batching`` was never called on this model; the
-                single-stream buffers have no row dim to write.
-            ValueError: ``tokens`` and ``positions`` differ in length,
-                ``row_indices`` differs from them too, or a row falls outside
-                ``0 .. decode_capacity-1`` and would overwrite the staging row or
-                another sequence's state. Reject the step at the runner.
+            RuntimeError: 这个模型从未调过 ``enable_batching``；单流缓冲区没有可写的
+                行维。
+            ValueError: ``tokens`` 与 ``positions`` 长度不同、``row_indices`` 也和它们
+                对不上，或某个行落在 ``0 .. decode_capacity-1`` 之外，会覆盖暂存行或
+                另一个序列的状态。在 runner 那里拒绝这一步。
         """
         if self.batch_capacity <= 1:
             raise RuntimeError("set_rows() needs enable_batching(capacity>1)")
@@ -1040,8 +952,8 @@ class Qwen35:
             self.token_in[:n].copy_(torch.as_tensor(tokens, dtype=torch.long, device=_device))
             pos_t = torch.as_tensor(positions, dtype=torch.long, device=_device)
             self.pos[:n].copy_(pos_t)
-            # Absolute position P means positions 0..P exist, i.e. P+1 keys: the
-            # batched attention kernel loops only over this row's own window.
+            # 绝对位置 P 意味着位置 0..P 都存在，也就是 P+1 个 key：批处理注意力内核
+            # 只在自己这一行的窗口上循环。
             self.ctx_lens[:n].copy_(pos_t.to(torch.int32).add_(1))
         else:
             for r, tok, pos in zip(rows, tokens, positions):
@@ -1059,30 +971,24 @@ class Qwen35:
 
     def capture_batch(self, buckets: tuple[int, ...] = (1, 2, 4, 8),
                       warmup: int = 3) -> None:
-        """Capture one decode graph per bucket, all sharing one memory pool.
+        """每个 bucket 捕获一张解码图，它们共用一个内存池。
 
-        Each graph is a fixed-``rows`` forward, so the projection shapes and every
-        kernel launch inside it are static -- which is what makes the batched
-        weight reads possible in the first place. The graphs share a single CUDA
-        graph memory pool: they are mutually exclusive (one replay at a time), so
-        the pool only has to be as large as the largest bucket rather than the sum
-        over buckets. Bucket 1 is captured through the *batched* path as well (a
-        decode row), not through ``_forward``; ``_forward`` belongs to the
-        single-stream engine (``capture()``/``decode_step``) and writes the
-        staging row.
+        每张图都是固定 ``rows`` 的前向，所以投影形状和里面的每次内核 launch 都是静态
+        的——这正是批量权重读取得以可能的原因。这些图共用一个 CUDA graph 内存池：它们
+        互斥（同一时间只重放一张），所以池只需大到能容下最大的 bucket，而不是各 bucket
+        之和。bucket 1 也走*批处理*路径（作为解码行）捕获，而不是走 ``_forward``；
+        ``_forward`` 属于单流引擎（``capture()``/``decode_step``），写的是暂存行。
 
         Args:
-            buckets: Bucket sizes to capture. Each must be one of (1, 2, 4, 8),
-                the widths the batched kernels instantiate; bucket 1 is always
-                captured so a single live sequence never falls back.
-            warmup: Eager iterations per bucket before its capture.
+            buckets: 要捕获的 bucket 大小。每个必须是 (1, 2, 4, 8) 之一，也就是批处理
+                内核实例化的宽度；bucket 1 总会捕获，单个活序列因此永远不会回退。
+            warmup: 每个 bucket 捕获之前的即时执行轮数。
 
         Raises:
-            RuntimeError: Batching was not enabled or the model is not paged.
-                Copy-on-write blocks are what keep the capture warmup from
-                overwriting a real sequence, so both preconditions are required.
-            ValueError: A bucket is outside (1, 2, 4, 8). Pick a supported width;
-                the kernels have no other instantiation.
+            RuntimeError: 没开批处理，或者模型没分页。写时复制块才是让捕获预热不去
+                覆写真实序列的东西，所以两个前提都必需。
+            ValueError: 某个 bucket 不在 (1, 2, 4, 8) 内。选一个支持的宽度；内核没有
+                别的实例化。
         """
         if self.batch_capacity <= 1:
             raise RuntimeError("capture_batch() needs enable_batching(capacity>1)")
@@ -1095,7 +1001,7 @@ class Qwen35:
         pool_handle = runtime.graph_pool_handle()
         self._batch_graphs = {}
         if self.ctx_lens is not None:
-            self.ctx_lens.fill_(1)       # capture-time windows are all pos 0
+            self.ctx_lens.fill_(1)       # 捕获时的窗口都是 pos 0
         self.reset()
         for b in order:
             if b > self.decode_capacity:
@@ -1106,30 +1012,24 @@ class Qwen35:
         self.reset()
 
     def _stage_sentinels(self, rows: int, bucket: int, pad_rows=()) -> None:
-        """Turn every row the caller does not fill into a harmless sentinel.
+        """把调用方没填的每一行变成无害的哨兵行。
 
-        A bucket graph runs all ``bucket`` rows -- the batched kernels carry no
-        live mask, they execute the width they were built for -- so a hole has to
-        be a row that is valid to run, not a skipped one: the row's slot map is
-        pointed at its scratch block, and its token, position and context length
-        are the ones of a lone token 0 seen for the first time (position 0, window
-        1). Its result is computed and then discarded by the caller. The rotation
-        offset is part of that reset: left stale from the previous occupant, a
-        negative ``rope_delta`` would index before the first row of the cos/sin
-        table.
+        bucket 图会跑满 ``bucket`` 行——批处理内核不带活掩码，它们就执行构造时的宽度
+        ——所以一个洞必须是一行可运行的行，而不是被跳过的行：该行的槽位表指向它自己的
+        暂存块，它的 token、位置和上下文长度是首次出现的孤立 token 0 对应的那组（位置
+        0、窗口 1）。它的结果会算出来，然后由调用方丢弃。旋转偏移是这次重置的一部分：
+        上一个占用者留下的负 ``rope_delta`` 会索引到 cos/sin 表第一行之前。
 
         Args:
-            rows: High-water mark of the live rows: everything below it is live
-                except the rows in ``pad_rows``.
-            bucket: Row count of the graph, or of the eager forward, that consumes
-                these buffers. Rows ``rows..bucket-1`` are staged too.
-            pad_rows: Holes inside ``0 .. rows-1``, i.e. rows whose sequence
-                finished while later rows stayed live.
+            rows: 活行的高水位：它以下的一切都是活的，``pad_rows`` 里的行除外。
+            bucket: 消费这些缓冲区的图（或即时前向）的行数。``rows..bucket-1`` 的行
+                也会被铺上。
+            pad_rows: ``0 .. rows-1`` 内部的洞，也就是序列已经结束、而后面行仍然活着
+                的那些行。
 
         Raises:
-            ValueError: A pad row is outside ``0 .. bucket-1``. Such a row has no
-                buffers and no scratch block, so it would corrupt a live row's
-                state or index past the buffer; reject it at the runner.
+            ValueError: 某个 pad 行落在 ``0 .. bucket-1`` 之外。这样的行没有缓冲区也
+                没有暂存块，会弄坏某个活行的状态或索引越界；在 runner 那里拒绝。
         """
         pad = {int(r) for r in pad_rows}
         if any(r < 0 or r >= bucket for r in pad):
@@ -1146,25 +1046,23 @@ class Qwen35:
 
     @torch.inference_mode()
     def decode_batch(self, rows: int, bucket: int, pad_rows=()) -> torch.Tensor:
-        """Replay ``bucket``'s graph; returns the logits of all ``bucket`` rows.
+        """重放 ``bucket`` 对应的图；返回全部 ``bucket`` 行的 logits。
 
-        The runner keeps each sequence on a fixed decode row, so the live rows of
-        a bucket need not be contiguous; :meth:`_stage_sentinels` fills the holes.
-        :meth:`decode_batch_eager` is the same step without a graph, for a backend
-        where capture is not allowed.
+        runner 让每个序列待在固定的解码行上，所以一个 bucket 的活行不必连续；
+        :meth:`_stage_sentinels` 负责填洞。:meth:`decode_batch_eager` 是同一步但
+        不带图，用于不允许捕获的后端。
+
 
         Args:
-            rows: High-water mark of the live rows: everything below it is
-                occupied except the rows in ``pad_rows``.
-            bucket: Which captured graph to replay. It also fixes the row count,
-                so rows ``rows..bucket-1`` always run as sentinels.
-            pad_rows: Holes inside ``0 .. rows-1``, i.e. rows whose sequence
-                finished while later rows stayed live.
+            rows: 活行的高水位：它以下的一切都被占用，``pad_rows`` 里的行除外。
+            bucket: 要重放哪张捕获图。它同时固定行数，所以 ``rows..bucket-1`` 的行
+                总是作为哨兵跑。
+            pad_rows: ``0 .. rows-1`` 内部的洞，也就是序列已经结束、而后面行仍然活着
+                的那些行。
 
         Returns:
-            ``[bucket, vocab]`` view of the logits. The caller samples by
-            ``seq.row``; the returned buffer is live, not a copy, so it is only
-            valid until the next replay.
+            logits 的 ``[bucket, vocab]`` 视图。调用方按 ``seq.row`` 采样；返回的
+            缓冲区是活的而不是拷贝，所以只在下一次重放之前有效。
 
         Raises:
             ValueError: No graph was captured for ``bucket``, ``rows`` is outside
@@ -1182,34 +1080,28 @@ class Qwen35:
 
     @torch.inference_mode()
     def decode_batch_eager(self, rows: int, bucket: int, pad_rows=()) -> torch.Tensor:
-        """Run ``bucket`` rows of batched decode eagerly, with no captured graph.
+        """即时执行 ``bucket`` 行的批处理解码，不用捕获图。
 
-        The entry point for a backend that must not capture: the SCOW driver
-        mis-handles graph replay badly enough to damage the card, so capture is
-        forbidden there and :meth:`capture_batch` is never called. Staging,
-        sentinel rows and the ``bucket``-wide output are the ones
-        :meth:`decode_batch` has, and the body is the same :meth:`_forward_batch`.
-        Nothing in that body reads a graph -- it reads only the fixed buffers and
-        advances ``pos[:bucket]`` -- so a bucket's logits here equal the logits of
-        a captured graph of the same width.
+        给那些绝不能捕获的后端用的入口：SCOW 的驱动把图重放搞坏到能损坏显卡，所以
+        那里禁止捕获，也从不调用 :meth:`capture_batch`。铺行、哨兵行和 ``bucket`` 宽
+        的输出都与 :meth:`decode_batch` 相同，主体也是同一个
+        :meth:`_forward_batch`。那段主体不读任何图——它只读固定缓冲区并推进
+        ``pos[:bucket]``——所以这里一个 bucket 的 logits 与同宽捕获图的 logits 相等。
 
-        The bucket set is deliberately not validated. The runner's scheduler picks
-        ``bucket`` from the live row count, and the "was this width captured?"
-        check belongs to the graph path, which is the only place a captured set
-        exists; with capture off there is nothing to look up in.
+        bucket 集合刻意不校验。runner 的调度器按活行数挑 ``bucket``，而「这个宽度
+        捕获过没有」的检查属于图路径，那是唯一存在捕获集合的地方；捕获关掉时根本没
+        东西可查。
 
         Args:
-            rows: High-water mark of the live rows: everything below it is
-                occupied except the rows in ``pad_rows``.
-            bucket: Row count to run this step, i.e. the width of the batched
-                forward. Any width up to ``decode_capacity`` is legal.
-            pad_rows: Holes inside ``0 .. rows-1``, i.e. rows whose sequence
-                finished while later rows stayed live.
+            rows: 活行的高水位：它以下的一切都被占用，``pad_rows`` 里的行除外。
+            bucket: 这一步要跑的行数，也就是批处理前向的宽度。任何不超过
+                ``decode_capacity`` 的宽度都合法。
+            pad_rows: ``0 .. rows-1`` 内部的洞，也就是序列已经结束、而后面行仍然活着
+                的那些行。
 
         Returns:
-            ``[bucket, vocab]`` view of the logits. The caller samples by
-            ``seq.row``; the buffer is live, not a copy, so it is only valid until
-            the next call.
+            logits 的 ``[bucket, vocab]`` 视图。调用方按 ``seq.row`` 采样；缓冲区是
+            活的而不是拷贝，所以只在下一次调用之前有效。
 
         Raises:
             RuntimeError: :meth:`enable_batching` was never called with a capacity
@@ -1239,51 +1131,41 @@ class Qwen35:
                           max_drafter_len: int = 16384,
                           sparse_topk: int = 0,
                           verify_mode: str | None = None) -> None:
-        """Allocate the per-row drafter/verify state and capture their graphs.
+        """分配逐行的草稿器/校验状态，并捕获它们的图。
 
-        ``K`` drafts per step means verifying ``c = K + 1`` tokens per row. The
-        drafter gets its own small paged KV pool (one identity block table per
-        decode row) and a bucket graph that advances every row once per replay.
+        每步 ``K`` 份草稿意味着每行校验 ``c = K + 1`` 个 token。草稿器有自己的一个小
+        分页 KV 池（每个解码行一张恒等块表）和一张 bucket 图，每次重放推进每一行一次。
 
-        Two verify implementations share the same buffers and the same per-step
-        interface (:meth:`spec_step_batch`):
+        两套校验实现共用同一批缓冲区、同一个逐步接口（:meth:`spec_step_batch`）：
 
-        * ``"once"`` -- one forward for all ``B*c`` tokens: wide-M projections and
-          the multi-query paged attention kernel (task-12); the fast path;
-        * ``"token"`` -- ``c`` sequential batched-decode forwards; slower, but it
-          only needs the stage-3 kernels and stays as the fallback.
+        * ``"once"``——对全部 ``B*c`` 个 token 一次前向：宽 M 投影加多查询分页注意力
+          内核（task-12）；快路径；
+        * ``"token"``——``c`` 次串行批处理解码前向；更慢，但只需 stage-3 的内核，
+          留作回退。
 
-        The ``c`` rollback snapshots per row are the expensive part (24 layers x
-        2 MB fp32 per snapshot); ``enable_verify_batch`` sizes them for exactly
-        this width.
+        每行 ``c`` 份回滚快照是贵的那部分（每份 24 层 × 2 MB fp32）；
+        ``enable_verify_batch`` 按这个宽度定它们的尺寸。
 
         Args:
-            K: Drafts per speculative step. The verify width is ``K + 1`` because
-                the main model's own next token is always verified too.
-            buckets: Batch widths to capture verify graphs for; those above the
-                decode capacity are dropped.
-            block_size: Drafter pool block size; ``None`` reuses the main pool's.
-            max_drafter_len: Contexts the drafter pool can cover. Beyond it
-                :meth:`MTP.check_len` raises so the caller can fall back to plain
-                decode.
-            sparse_topk: Opt-in selective-KV verify. Must be 0 until the masked
-                multi-query kernel lands.
-            verify_mode: ``"once"`` or ``"token"``; ``None`` reads
-                ``Q35_SPEC_VERIFY`` and falls back to ``"token"`` when the
-                required kernels are absent. The default stays the c-token verify
-                because at B=8 even 4k context measured below greedy (task-13
-                conclusion); the one-forward form is kept as the reference path
-                until a wide-M kernel beats the M=8 one per element.
+            K: 每个投机步的草稿数。校验宽度是 ``K + 1``，因为主模型自己的下一个 token
+                也要被校验。
+            buckets: 要为哪些批宽度捕获校验图；超过解码容量的会被丢掉。
+            block_size: 草稿器池的块大小；``None`` 复用主池的。
+            max_drafter_len: 草稿器池能覆盖的上下文。超过之后 :meth:`MTP.check_len`
+                会抛错，调用方可以回退到普通解码。
+            sparse_topk: 可选的选择性 KV 校验。在带掩码的多查询内核落地之前必须是 0。
+            verify_mode: ``"once"`` 或 ``"token"``；``None`` 时读 ``Q35_SPEC_VERIFY``，
+                所需内核缺失时回退到 ``"token"``。默认仍是 c token 校验，因为 B=8 下
+                即便 4k 上下文实测都低于贪心（task-13 的结论）；一次性前向的形式作为
+                参考路径保留，直到有宽 M 内核按元素胜出 M=8 的那个。
 
         Raises:
-            RuntimeError: Batching was not enabled, the model is not paged, or the
-                checkpoint has no MTP head. Speculative decoding needs all three;
-                the engine should start without it instead.
-            ValueError: ``K`` outside ``1..CKPT-1`` (the verify graph and the
-                rollback snapshots are sized by ``CKPT``), no bucket fits the
-                decode capacity, or ``verify_mode`` is not one of the two names.
-            NotImplementedError: ``sparse_topk > 0``; the masked kernel does not
-                exist yet.
+            RuntimeError: 没开批处理、模型没分页，或 checkpoint 里没有 MTP 头。投机
+                解码三样都要；否则引擎应当不带它启动。
+            ValueError: ``K`` 在 ``1..CKPT-1`` 之外（校验图和回滚快照按 ``CKPT`` 定
+                尺寸）、没有 bucket 放得进解码容量，或 ``verify_mode`` 不是那两个名字
+                之一。
+            NotImplementedError: ``sparse_topk > 0``；带掩码的内核还不存在。
         """
         if self.batch_capacity <= 1:
             raise RuntimeError("enable_spec_batch() needs enable_batching(capacity>1)")
@@ -1296,10 +1178,10 @@ class Qwen35:
                 "sparse Top-K verify needs the masked attn_paged_multi_q kernel "
                 "(task-12); pass sparse_topk=0 for now")
         if verify_mode is None:
-            # Default stays the c-token verify. The one-forward verify is opt-in
-            # (``Q35_SPEC_VERIFY=once``): at B=8 even 4k context measured below
-            # greedy (task-13 conclusion), so it is kept as the reference path
-            # until a wide-M kernel that beats the M=8 one per element exists.
+            # 默认仍是 c token 校验。一次性前向校验是选项（``Q35_SPEC_VERIFY=once``）：
+            # B=8 下即便 4k 上下文实测都低于贪心（task-13 的结论），所以它作为参考路径
+            # 保留，直到出现按元素胜出 M=8 的宽 M 内核。
+
             verify_mode = os.environ.get("Q35_SPEC_VERIFY", "token")
             if verify_mode not in ("once", "token"):
                 verify_mode = "token"
@@ -1310,8 +1192,8 @@ class Qwen35:
             raise ValueError(f"verify_mode must be 'once' or 'token' (got {verify_mode!r})")
         self.verify_mode = verify_mode
         self.sparse_topk = int(sparse_topk)
-        # Drop any graphs captured for a previous configuration before allocating
-        # the (possibly differently sized) buffers for this one.
+        # 在为新配置分配（可能尺寸不同的）缓冲区之前，先丢掉上一个配置捕获的图。
+
         self._verify_batch_graphs = {}
         width = int(K) + 1
         if width < 2 or width > CKPT:
@@ -1346,36 +1228,32 @@ class Qwen35:
         self.capture_verify_batch()
 
     def _verify_batch_once(self, rows: int, prof: dict | None = None) -> None:
-        """One forward for every row's ``c`` tokens (task-13 fast path).
+        """对每一行的 ``c`` 个 token 做一次前向（task-13 的快路径）。
 
-        Layout: ``x`` is row-major ``[rows*c, hidden]`` (a row's c verified tokens
-        are contiguous). Per layer, the projection and the MLP run once with the
-        wide-M kernels over all rows*c tokens; the two stateful halves keep the
-        greedy-decode kernels:
+        布局：``x`` 是行主序的 ``[rows*c, hidden]``（一行那 c 个被校验的 token 连续
+        存放）。每层里投影和 MLP 用宽 M 内核对全部 rows*c 个 token 各跑一次；两个有
+        状态的一半仍用贪心解码的内核：
 
-        * full attention -- all c K/V rows are written first, then one
-          multi-query paged-attention call serves all c queries from that row's
-          history (kernels task-12). Writing all of them before the call is safe:
-          the kernel masks each query at its own position;
-        * linear attention -- the conv/delta recurrence is sequential over the c
-          tokens (state dependency), one batch launch per token, and the state is
-          snapshotted right after token j for the rollback.
+        * 全注意力——先把全部 c 行 K/V 写进去，然后一次多查询分页注意力调用，用该行的
+          历史服务全部 c 个查询（内核 task-12）。在调用前把它们全部写完是安全的：内核
+          会把每个查询掩在它自己的位置上；
+        * 线性注意力——卷积/delta 递推对 c 个 token 是串行的（状态依赖），每 token 一次
+          批处理 launch，第 j 个 token 之后立刻打状态快照供回滚。
 
-        When the multi-query kernel is missing this falls back to the per-token
-        attention entry (correct, just not the point of this path).
+        多查询内核缺失时回退到逐 token 的注意力入口（结果正确，只是这条路径的意义就
+        没了）。
 
         Args:
-            rows: Rows this graph runs, i.e. the verify bucket size.
-            prof: Optional ``{tag: [(start_event, end_event), ...]}`` accumulator.
-                When given, each segment is timed with CUDA events for attribution;
-                ``None`` skips the events so the captured graph stays lean.
+            rows: 这张图跑多少行，即校验的 bucket 大小。
+            prof: 可选的 ``{tag: [(start_event, end_event), ...]}`` 累加器。给了就用
+                CUDA 事件给每一段计时以便归因；``None`` 跳过事件，捕获图因此更精简。
         """
         c = self.spec_width
         total = rows * c
         hidden = self.cfg["hidden_size"]
-        # The 5th entry is the per-row mRoPE offset: every verified token rotates
-        # at ``pos + rope_delta`` while its KV slot stays at ``pos``. Constant
-        # within a request, so it is a buffer the captured graph reads.
+        # 第 5 项是逐行 mRoPE 偏移：每个被校验的 token 按 ``pos + rope_delta`` 旋转，
+        # 而它的 KV 槽位仍停在 ``pos``。请求内它是常量，所以就是捕获图读的一个缓冲区。
+
         ctx = (self.cos_tbl, self.sin_tbl, self.mask_idx, self.ctx_lens,
                self.rope_delta)
         poss = self.verify_pos_b[:rows]
@@ -1384,18 +1262,18 @@ class Qwen35:
         prof = prof if prof is not None else None
 
         def lap(tag, start):
-            """Close the open timing segment ``tag`` and return the next start.
+            """结束打开着的计时段 ``tag``，返回下一个起点。
 
             Args:
-                tag: Segment name, e.g. "proj" / "recur" / "attn" / "mlp" /
-                    "lmhead"; it becomes a key in ``prof``.
-                start: Event recorded before the segment, or ``None`` when
-                    profiling is off, in which case nothing is recorded.
+                tag: 段名，例如 "proj" / "recur" / "attn" / "mlp" / "lmhead"；
+                    它会成为 ``prof`` 里的一个键。
+                start: 在这一段之前记录的事件；关闭 profiling 时为 ``None``，那就什么
+                    都不记。
 
             Returns:
-                ``start`` unchanged. The caller's pattern is
-                ``s = ...; s.record(); lap(tag, s); s = ...``, so this value is
-                only meaningful as a placeholder before the next event is created.
+                原样返回 ``start``。调用方的模式是
+                ``s = ...; s.record(); lap(tag, s); s = ...``，所以这个值只在下一个
+                事件创建之前作为占位有意义。
             """
             if prof is not None:
                 end = runtime.Event()
@@ -1434,11 +1312,11 @@ class Qwen35:
                     s = runtime.Event()
                     s.record()
                 if multi_q:
-                    # multi-query entry returns the pre-out_proj attention output
+                    # 多查询入口返回的是 out_proj 之前的注意力输出
                     pre = mix.verify_batch_multi(qg, k, v, poss, ctx, rows)
                     out = wide_proj(mix.o_proj, pre)
                 else:
-                    # fallback: the per-token entry already includes o_proj
+                    # 回退：逐 token 入口已经含了 o_proj
                     qg = qg.view(rows, c, -1)
                     k = k.view(rows, c, -1)
                     v = v.view(rows, c, -1)
@@ -1466,22 +1344,19 @@ class Qwen35:
             lap("lmhead", s)
 
     def _verify_batch_impl(self, rows: int) -> None:
-        """``c`` sequential batched-decode steps, snapshotting state after each.
+        """``c`` 次串行的批处理解码步，每步之后打状态快照。
 
-        Each step is the batched greedy decode forward, so a row's verify logits
-        are exactly the logits the plain greedy step would produce at that token;
-        the per-token recurrent snapshots are the rollback points.
+        每一步都是批处理贪心解码前向，所以一行的校验 logits 恰好就是普通贪心步在那个
+        token 上会产出的 logits；逐 token 的循环状态快照就是回滚点。
 
-        (A single multi-token forward -- all ``B*c`` tokens in one projection pass
-        -- was implemented and measured, but at ``M = B*c = 16`` the projection
-        falls back to the prefill path with its full int8->fp16 dequant (~250-290
-        ms fixed cost on this part), 6.9x *slower* than these ``c`` batched-decode
-        steps. A wide-M batched GEMV (one weight pass for M=16/32) is what would
-        make the single-pass verify worthwhile; until that kernel exists this is
-        the faster form.)
+        （单次多 token 前向——全部 ``B*c`` 个 token 一趟投影——实现并测过，但在
+        ``M = B*c = 16`` 时投影退回预填充路径，连带完整的 int8->fp16 反量化（这颗芯片上
+        约 250-290 ms 固定成本），比这 ``c`` 次批处理解码步慢 6.9 倍。能一次权重读取
+        搞定 M=16/32 的宽 M 批处理 GEMV 才能让单趟校验值得做；在那个内核出现之前，
+        这个形态更快。）
 
         Args:
-            rows: Rows this graph runs, i.e. the verify bucket size.
+            rows: 这张图跑多少行，即校验的 bucket 大小。
         """
         ctx_base = (self.cos_tbl, self.sin_tbl, self.mask_idx)
         c = self.spec_width
@@ -1502,21 +1377,18 @@ class Qwen35:
                     mix.snapshot_batch(rows, j)
 
     def set_verify_mode(self, mode: str) -> None:
-        """Switch the captured verify implementation (``"once"`` / ``"token"``).
+        """切换所捕获的校验实现（``"once"`` / ``"token"``）。
 
-        Both use the same buffers and the same ``spec_step_batch`` interface, so
-        the graphs can be re-captured on the spot; used for A/B measurement and by
-        the engine when it wants the cheap fallback.
+        两者用同一批缓冲区、同一个 ``spec_step_batch`` 接口，所以图可以当场重捕；用于
+        A/B 测量，也用于引擎想要便宜回退的时候。
 
         Args:
-            mode: The implementation to capture from now on. Setting the mode
-                already in use is a no-op, so a repeated request does not pay for
-                another capture.
+            mode: 从今往后要捕获的实现。设成已经在用的模式是空操作，重复请求因此不必
+                再付一次捕获代价。
 
         Raises:
-            ValueError: ``mode`` is not one of the two names.
-            RuntimeError: Batched speculative decoding was never enabled; there is
-                nothing to capture.
+            ValueError: ``mode`` 不是那两个名字之一。
+            RuntimeError: 批量投机解码从未启用；没有东西可捕获。
         """
         if mode not in ("once", "token"):
             raise ValueError(f"verify_mode must be 'once' or 'token' (got {mode!r})")
@@ -1526,18 +1398,16 @@ class Qwen35:
         self.capture_verify_batch()
 
     def capture_verify_batch(self, warmup: int = 2) -> None:
-        """Capture one verify graph per bucket, all sharing a graph memory pool.
+        """每个 bucket 捕获一张校验图，它们共用一个 graph 内存池。
 
-        The graph records whichever implementation ``verify_mode`` selected; the
-        per-step interface and the rollback buffers are identical for both.
+        图录下的是 ``verify_mode`` 选中的那个实现；两者的逐步接口和回滚缓冲区完全
+        相同。
 
         Args:
-            warmup: Eager iterations per bucket before its capture, to settle the
-                allocator and the kernel handles.
+            warmup: 每个 bucket 捕获之前的即时执行轮数，用来安置分配器和内核句柄。
 
         Raises:
-            RuntimeError: ``enable_spec_batch`` was never called, so there are no
-                buffers to capture over.
+            RuntimeError: ``enable_spec_batch`` 从未被调用，没有缓冲区可供捕获。
         """
         if not self.batch_spec:
             raise RuntimeError("enable_spec_batch() first")
@@ -1554,35 +1424,28 @@ class Qwen35:
                         slot_rows: list[list[int]], bucket: int, K: int,
                         row_indices=None,
                         pad_rows=()) -> tuple[list[list[int]], list[torch.Tensor], list[int]]:
-        """One batched speculative step over ``tokens``/``positions``.
+        """在 ``tokens``/``positions`` 上做一个批量投机步。
 
         Args:
-            tokens: The token already sampled for each sequence -- the one the
-                drafter starts from.
-            positions: Each sequence's absolute position of that token.
-            slot_rows: The main model's block tables for those rows, the same
-                arguments :meth:`set_rows` takes.
-            bucket: Which captured graphs to replay. Every row of the bucket runs,
-                the unused ones as sentinels, so the bucket must be one that was
-                captured.
-            K: Drafts to make per sequence this step; must fit ``spec_width``.
-            row_indices: Fixed decode row for each entry; defaults to ``i``, which
-                is only correct when the live rows are contiguous.
-            pad_rows: Holes inside the bucket, i.e. rows whose sequence is not part
-                of this step.
+            tokens: 每个序列已经采样出的 token——草稿器就是从它开始。
+            positions: 每个序列那个 token 的绝对位置。
+            slot_rows: 主模型给这些行用的块表，参数和 :meth:`set_rows` 相同。
+            bucket: 要重放哪几张捕获图。bucket 的每一行都会跑，没用上的作为哨兵，
+                所以 bucket 必须是捕获过的之一。
+            K: 这一步每个序列做多少份草稿；必须放得进 ``spec_width``。
+            row_indices: 每个条目固定的解码行；默认是 ``i``，只有活行连续时才正确。
+            pad_rows: bucket 内部的洞，也就是本步不参与的序列所在的行。
 
         Returns:
-            ``(accepted_tokens, logits_next, accepted_counts)``: per input
-            sequence the accepted tokens *including* ``tokens[i]``, the logits
-            that follow the accepted prefix (sample the next token from those),
-            and how many draft tokens were accepted. The caller advances the
-            sequence by ``len(accepted_tokens[i])`` and stages the next step.
+            ``(accepted_tokens, logits_next, accepted_counts)``：每个输入序列被接受的
+            token（*包含* ``tokens[i]``）、被接受前缀之后的 logits（下一个 token 从这里
+            采样），以及接受了多少份草稿。调用方按 ``len(accepted_tokens[i])`` 推进该
+            序列并铺下一步。
 
         Raises:
-            RuntimeError: Batched speculative decoding was never enabled.
-            ValueError: Row indices mismatch the token count or repeat, the bucket
-                was not captured, ``K`` exceeds the captured verify width, or the
-                context would run past the drafter pool.
+            RuntimeError: 批量投机解码从未启用。
+            ValueError: 行下标与 token 数不符或有重复、bucket 没捕获过、``K`` 超过
+                捕获的校验宽度，或上下文会冲出草稿器池。
         """
         if not self.batch_spec:
             raise RuntimeError("enable_spec_batch() first")
@@ -1602,7 +1465,7 @@ class Qwen35:
                       [positions[i] for i in range(n)],
                       [slot_rows[i] for i in range(n)],
                       row_indices=active_rows)
-        # Sentinels for every row the bucket graph executes but we do not use.
+        # 给 bucket 图会执行、但我们不用的每一行铺哨兵。
         pad = set(int(r) for r in pad_rows)
         pad |= {r for r in range(bucket) if r not in active_rows}
         for row in sorted(pad):
@@ -1610,14 +1473,14 @@ class Qwen35:
             self.token_in[row] = self._sentinel_token
             self.pos[row] = 0
             self.ctx_lens[row] = 1
-            # 0 keeps the rotation inside the table: a stale negative delta from
-            # the previous occupant would index before its first row.
+            # 取 0 让旋转留在表内：上一个占用者残留的负 delta 会索引到表的第一行之前。
+
             self.rope_delta[row] = 0
 
-        # Stage the drafter: h at the previous accepted token, its token, and the
-        # drafter position (main position - 1: the MTP predicts the token after h).
-        # Each row's mRoPE offset is copied across so the drafter rotates exactly
-        # like the main model; a padded row gets 0 (it runs on the sentinel).
+        # 铺草稿器：上一个被接受 token 处的 h、它的 token，以及草稿器位置（主模型位置
+        # 减一：MTP 预测的是 h 之后的 token）。每行的 mRoPE 偏移被拷过去，草稿器因此
+        # 和主模型转得一模一样；被填充的行拿 0（它跑在哨兵上）。
+
         mtp = self.mtp
         mtp.b_rope_delta.zero_()
         for i, row in enumerate(active_rows):
@@ -1641,7 +1504,7 @@ class Qwen35:
                 torch.arange(width, device=_device))
         self._verify_batch_graphs[bucket].replay()
 
-        # Acceptance per live row: logits[j].argmax() must equal the next draft.
+        # 逐活行判断接受：logits[j].argmax() 必须等于下一份草稿。
         pred = self.verify_logits_b[:bucket, :K].argmax(-1)      # [bucket, K]
         match = (pred == self.verify_toks_b[:bucket, 1:width]).tolist()
         accepted_tokens: list[list[int]] = []
@@ -1662,14 +1525,14 @@ class Qwen35:
         return accepted_tokens, logits_next, accepted_counts
 
     def _verify_impl(self) -> None:
-        """Verify the staged ``c`` tokens in one eager forward over the layers.
+        """用一次穿过各层的即时前向校验铺好的 ``c`` 个 token。
 
-        The body ``capture_verify`` records; it reads the fixed verify buffers and
-        writes ``verify_hidden``/``verify_logits`` in place, so the graph needs no
-        arguments and no allocations at replay time.
+        这是 ``capture_verify`` 录下的主体；它读固定的校验缓冲区，并就地写
+        ``verify_hidden``/``verify_logits``，所以图在重放时既不需要参数也不需要分配。
         """
         x = self.embed.lookup(self.verify_toks)
-        # 4th entry: this request's mRoPE offset (a buffer, so the graph replays
+        # 第 4 项：本请求的 mRoPE 偏移（是个缓冲区，图因此原样重放；``verify_pos``
+        # unchanged; ``verify_pos`` keeps addressing the KV slots).
         # unchanged; ``verify_pos`` keeps addressing the KV slots).
         ctx = (self.cos_tbl, self.sin_tbl, self.mask_idx, self.rope_delta1)
         for layer in self.layers:
@@ -1678,23 +1541,20 @@ class Qwen35:
         self.verify_logits.copy_(self.lm_head.prefill(self.norm(x)))
 
     def capture_verify(self, c: int = 4, warmup: int = 3) -> None:
-        """Capture the c-token verification forward into its own graph.
+        """把 c token 的校验前向捕获进它自己的图。
 
-        Verifying k drafts has to cost about one weight pass. Eagerly it costs
-        ~k decode steps, mostly CPU launch overhead from the per-token recurrent
-        update, so the whole forward is captured once and replayed per step.
+        校验 k 份草稿的成本必须大约等于一次权重读取。即时执行时它要花约 k 个解码步，
+        主要来自逐 token 递推更新的 CPU launch 开销，所以整个前向捕获一次、每步重放。
 
         Args:
-            c: Verify width, which is also the draft width: ``K = c - 1`` drafts
-                are verified per replay. The batched GEMV accepts only M in
-                {2, 4, 8}, and the linear-attn layers keep ``CKPT`` state
-                snapshots for the rollback, so ``c`` must be one of those widths.
-            warmup: Eager iterations before the capture.
+            c: 校验宽度，也是草稿宽度：每次重放校验 ``K = c - 1`` 份草稿。批处理
+                GEMV 只接受 M 属于 {2, 4, 8}，而线性注意力层为回滚保存 ``CKPT`` 份
+                状态快照，所以 ``c`` 必须是这些宽度之一。
+            warmup: 捕获之前的即时执行轮数。
 
         Raises:
-            ValueError: ``c`` is not 2, 4 or 8, or exceeds ``CKPT``. The rollback
-                snapshot ring is sized by ``CKPT``, so a wider verify could not be
-                rewound.
+            ValueError: ``c`` 不是 2、4 或 8，或者超过 ``CKPT``。回滚快照环按 ``CKPT``
+                定尺寸，更宽的校验没法倒回。
         """
         if c not in (2, 4, 8) or c > CKPT:
             raise ValueError(f"verify width must be 2, 4 or 8 (got {c})")
@@ -1710,41 +1570,39 @@ class Qwen35:
 
     @torch.inference_mode()
     def spec_step(self, logits_prev: torch.Tensor, K: int) -> tuple[list[int], torch.Tensor]:
-        """Draft K tokens with the MTP, verify all K+1 at once, accept the
-        matching prefix and rewind the recurrent state to it.
+        """用 MTP 草拟 K 个 token，一次校验全部 K+1 个，接受匹配的前缀并把循环状态
+        倒回到那里。
 
-        Both halves are graph replays and every position/payload stays on the
-        device, so the only host round trip per step is the acceptance test --
-        which the caller needs anyway to emit the tokens.
+        两半都是图重放，每个位置/载荷都留在设备上，所以每步唯一的主机往返就是接受
+        判断——而调用方本来就要它才能吐出 token。
 
         Args:
-            logits_prev: The main model's logits for the last committed token;
-                its argmax seeds the drafter.
-            K: Drafts to make. ``K + 1`` tokens are then verified in one replay,
-                so ``K + 1`` must fit the captured verify width.
+            logits_prev: 主模型对最后一个已提交 token 的 logits；它的 argmax 给草稿器
+                做种子。
+            K: 要草拟多少份。随后在一次重放里校验 ``K + 1`` 个 token，所以 ``K + 1``
+                必须放得进捕获的校验宽度。
 
         Returns:
-            ``(accepted_token_ids, logits_after_prefix)``. The main model's own
-            next token is always accepted, so at least one token advances, and the
-            returned logits are the ones to sample the following token from.
+            ``(accepted_token_ids, logits_after_prefix)``。主模型自己的下一个 token
+            总会被接受，所以至少推进一个 token；返回的 logits 就是用来采样后续 token
+            的那份。
 
         Raises:
-            AssertionError: No MTP head or no verify graph, or ``K + 1`` exceeds
-                ``verify_c``. Both are configuration errors: enable the MTP head
-                and capture at the widest ``K`` the engine will use.
+            AssertionError: 没有 MTP 头或没有校验图，或者 ``K + 1`` 超过 ``verify_c``。
+                两者都是配置错误：打开 MTP 头，并按引擎会用的最宽 ``K`` 捕获。
         """
         assert self.mtp is not None and self._verify_graph is not None, "MTP not available"
         assert K + 1 <= self.verify_c, f"K+1={K + 1} exceeds verify width {self.verify_c}"
 
-        # draft: t0 is the main model's own next token, then K chained MTP steps.
-        # The drafter rotates at the same mRoPE position as the main model, so the
-        # request's offset is copied across before the first replay.
+        # 草拟：t0 是主模型自己的下一个 token，然后是 K 个串起来的 MTP 步。草稿器在
+        # 和主模型相同的 mRoPE 位置上旋转，所以第一次重放之前先把请求的偏移拷过去。
+
         self.mtp.pos.copy_(self.pos1).sub_(1)
         self.mtp.rope_delta.copy_(self.rope_delta1)
         t0 = logits_prev.argmax()
         self.mtp.draft(self.h_prev, t0, K, self.verify_toks[:K + 1])
 
-        # verify: one replay of the c-token graph
+        # 校验：重放一次 c token 的图
         self.verify_pos.copy_(self.verify_off).add_(self.pos1)
         self._verify_graph.replay()
 
@@ -1754,7 +1612,7 @@ class Qwen35:
             j += 1
         toks = self.verify_toks[:j + 1].tolist()
 
-        # commit the accepted prefix, rewind everything else
+        # 提交被接受的前缀，其余全部倒回
         self.n_drafted += K
         self.n_accepted += j
         self.n_spec_steps += 1
@@ -1771,25 +1629,25 @@ class Qwen35:
     @torch.inference_mode()
     def spec_generate(self, prompt: list[int], max_new: int, K: int = 3,
                       eos: set[int] | None = None) -> list[int]:
-        """Greedy speculative decode; returns up to ``max_new`` new token ids.
+        """贪心投机解码；返回最多 ``max_new`` 个新 token id。
 
-        A convenience entry point for benchmarks and single-request use; the
-        serving engine drives :meth:`spec_step` itself so it can interleave
-        requests.
+        给基准测试和单请求使用提供便利的入口；服务引擎自己驱动 :meth:`spec_step`，
+        以便交错处理请求。
+
 
         Args:
-            prompt: Prompt token ids, prefilled before the first step.
-            max_new: Stop after this many generated tokens.
-            K: Drafts per step; forwarded to :meth:`spec_step`.
-            eos: Token ids that end the request; ``None`` means none.
+            prompt: prompt token id，在第一步之前预填充。
+            max_new: 生成这么多 token 之后停下。
+            K: 每步的草稿数；透传给 :meth:`spec_step`。
+            eos: 结束请求的 token id；``None`` 表示没有。
 
         Returns:
-            The generated tokens in order, possibly fewer than ``max_new`` when an
-            EOS token or the ``max_seq`` bound stops the loop first.
+            按顺序生成的 token；若 EOS token 或 ``max_seq`` 上界先停住了循环，可能
+            少于 ``max_new``。
 
         Raises:
-            ValueError: The prompt is empty or longer than ``max_seq``; see
-                :meth:`prefill`.
+            ValueError: prompt 为空或超过 ``max_seq``；见 :meth:`prefill`。
+
         """
         eos = eos or set()
         self.n_drafted = self.n_accepted = self.n_spec_steps = 0
@@ -1809,17 +1667,17 @@ class Qwen35:
 
     @property
     def spec_stats(self) -> dict:
-        """Acceptance report for the last :meth:`spec_generate` run.
+        """上一次 :meth:`spec_generate` 运行的接受情况报告。
 
         Returns:
-            Per-run counters: ``steps``, ``drafted``, ``accepted``, ``tokens``,
-            plus ``accept_rate`` (the fraction of *drafted* tokens the main model
-            agreed with) and ``tokens_per_step``. The latter two are the
-            speedup-relevant figures, since every step costs about one verify
-            pass.
+            单次运行的计数：``steps``、``drafted``、``accepted``、``tokens``，外加
+            ``accept_rate``（主模型认可的*草稿* token 占比）和 ``tokens_per_step``。
+            后两个才是与加速相关的数字，因为每一步的成本约等于一次校验。
+
+
         """
         steps = max(self.n_spec_steps, 1)
-        tokens = self.n_accepted + self.n_spec_steps      # drafts + one bonus each
+        tokens = self.n_accepted + self.n_spec_steps      # 草稿数 + 每步一个额外 token
         return {
             "steps": self.n_spec_steps,
             "drafted": self.n_drafted,
@@ -1830,19 +1688,18 @@ class Qwen35:
         }
 
     def decode_step(self, token: int) -> torch.Tensor:
-        """Feed one token to the captured single-stream graph and return its logits.
+        """把一个 token 喂给捕获的单流图，返回它的 logits。
 
         Args:
-            token: The token to append; it is staged on the prefill row, whose
-                position then advances.
+            token: 要追加的 token；它被放到预填充行上，该行的位置随后推进。
 
         Returns:
-            ``[vocab]`` logits buffer of that row. Live, not a copy: the next
-            replay overwrites it, so sample before calling again.
+            该行的 ``[vocab]`` logits 缓冲区。是活的而不是拷贝：下一次重放会覆盖它，
+            所以要在再次调用之前采样。
 
         Raises:
-            AttributeError: ``capture()`` was never called; there is no graph to
-                replay. Start the engine through its normal bring-up path.
+            AttributeError: ``capture()`` 从未被调用，没有图可重放。让引擎走它正常的
+                启动路径。
         """
         pr = self.prefill_row
         self.token_in[pr:pr + 1].fill_(token)
@@ -1851,20 +1708,20 @@ class Qwen35:
 
     @property
     def graph_ready(self) -> bool:
-        """Report whether the single-stream decode graph has been captured.
+        """报告单流解码图是否已捕获。
 
         Returns:
-            ``True`` once :meth:`capture` succeeded, which is the point from which
-            :meth:`decode_step` may be called.
+            :meth:`capture` 成功之后为 ``True``，从那时起才可以调
+            :meth:`decode_step`。
         """
         return self._graph is not None
 
     def close(self) -> None:
-        """Drop the captured graphs and the layer objects.
+        """丢掉捕获图和层对象。
 
-        runtime service rebuilds the model after reloading the code; a live
-        ``CUDAGraph`` pins its private memory pool (about half the model's
-        footprint), so dropping the model reference alone is not enough.
+        运行时服务在重新加载代码之后会重建模型；活着的 ``CUDAGraph`` 会钉住它私有的
+        内存池（约占模型占用的一半），所以只丢掉模型引用是不够的。
+
         """
         self._graph = None
         self._verify_graph = None

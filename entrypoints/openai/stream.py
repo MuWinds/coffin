@@ -1,7 +1,13 @@
-"""Incremental reasoning and tool-call stream parsers.
+"""推理段与工具调用的增量流解析器。
 
-Module: ``coffin.serving``. The parsers convert the engine's raw token stream
-into OpenAI-compatible deltas without touching the model or HTTP transport.
+Module: ``coffin.serving``。这两个解析器把引擎的原始 token 流转成 OpenAI 兼容
+的 delta，全程不碰模型，也不碰 HTTP 传输层。
+
+Constraints:
+    * 增量解析：每个 ``push`` 只扫新追加的文本，整体代价是 O(tokens)，绝不
+      重扫整段回答。
+    * 流式与非流式两条路径产出的 ``arguments`` 必须是同一个字符串，否则
+      客户端在同一次调用的两种模式之间切换会看到不同的参数。
 """
 
 from __future__ import annotations
@@ -21,47 +27,43 @@ _JSON_LITERAL_HEAD = "-0123456789tfn{["
 _SHORT_ESCAPE = {"\n": "\\n", "\r": "\\r", "\t": "\\t", "\b": "\\b", "\f": "\\f"}
 
 class AnswerFilter:
-    """Splits the raw stream into (reasoning, content) increments.
+    """把原始流切成（推理, 内容）两种增量。
 
-    Two things are handled here and both are load-bearing for a thinking model:
+    这里处理两件事，对思考型模型都是承重的：
 
-    * the reasoning block -- with thinking on the *prompt* opens ``<think>``, so
-      the generated text starts inside it. The reasoning is handed out as
-      ``reasoning_content`` deltas while it is being produced, and ``content``
-      starts only after ``</think>``. Dropping it, or replaying it at the end, is
-      what left an agent UI's thinking pane empty.
-    * ``<tool_call>`` markup -- once it appears, content stops and the call is
-      delivered structured instead; a partial marker is held back so it cannot
-      leak, and ``finish`` releases that tail at end of stream.
+    * 推理段——思考开在 *prompt* 里时会先出现 ``<think>``，生成的文本因此从
+      推理段内部开始。推理边产生边以 ``reasoning_content`` 增量发出，
+      ``content`` 要等 ``</think>`` 之后才开始。把它丢掉或者压到最后再补，
+      正是 agent 界面思考面板空白的原因。
+    * ``<tool_call>`` 标记——一旦出现，内容输出停止，调用改以结构化字段交付；
+      不完整的标记会被扣住以免泄漏，``finish`` 在流末尾放行这段尾巴。
 
-    Deliberately incremental: each ``push`` only scans the newly appended text,
-    so the filter costs O(tokens) rather than rescanning the whole answer.
+    刻意做成增量：每个 ``push`` 只扫新追加的文本，所以过滤器是 O(tokens)
+    而不是每次重扫整段回答。
     """
 
     def __init__(self, prompt_opens_think: bool, marker: str = TOOL_OPEN) -> None:
-        """Start a filter for one reply.
+        """为一次回复建一个过滤器。
 
         Args:
-            prompt_opens_think: Whether the rendered prompt already ended inside
-                an open ``<think>``, which the engine reports on its ``start``
-                line. When it did not, the whole answer is content from the first
-                token.
-            marker: The tool-call opener to cut content at.
+            prompt_opens_think: 渲染后的 prompt 是否已经在未闭合的 ``<think>``
+                内部结束，这个信息由引擎在 ``start`` 行里给出。为否时，整段
+                回答从第一个 token 起就是 content。
+            marker: 用来截断内容的工具调用开头标记。
         """
         self.raw = ""
         self.marker = marker
         self.past_think = not prompt_opens_think
-        self.think_pos = 0            # how much of the reasoning has been sent
-        self.emitted = 0              # how much of the content has been sent
+        self.think_pos = 0            # 已发出的推理文本长度
+        self.emitted = 0              # 已发出的内容文本长度
         self.done_tools = False
 
     def _content(self) -> str:
-        """Next content increment, holding back a possible partial tool marker.
+        """下一个内容增量，同时扣住可能是半个工具标记的尾巴。
 
         Returns:
-            The content text that is safe to emit now. Empty while the tail could
-            still become the marker: emitting it and finding out later would leak
-            markup into the answer.
+            现在可以安全发出的内容文本。尾巴仍可能长成完整标记时返回空——先
+            发出去、后来才发现，就会把标记文本漏进回答里。
         """
         if self.done_tools:
             return ""
@@ -71,7 +73,7 @@ class AnswerFilter:
             self.done_tools = True
             out, self.emitted = body[:k], self.emitted + k
             return out
-        keep = len(self.marker) - 1          # never emit a partial marker
+        keep = len(self.marker) - 1          # 半个标记绝不发出
         if len(body) <= keep:
             return ""
         out = body[:len(body) - keep]
@@ -79,20 +81,20 @@ class AnswerFilter:
         return out
 
     def push(self, piece: str) -> tuple[str, str]:
-        """Split one streamed piece into its reasoning and content increments.
+        """把一段流式片段拆成推理增量和内容增量。
 
         Args:
-            piece: The engine's incremental text for one token.
+            piece: 引擎为一个 token 给出的增量文本。
 
         Returns:
-            ``(reasoning_delta, content_delta)``. Either may be empty; the caller
-            emits only the non-empty one as its own SSE delta.
+            ``(reasoning_delta, content_delta)``。任一侧都可能为空；调用方只把
+            非空的那个作为一条 SSE delta 发出。
         """
         self.raw += piece
         if self.past_think:
             return "", self._content()
         i = self.raw.find("</think>", self.think_pos)
-        if i < 0:                            # still inside the reasoning block
+        if i < 0:                            # 还在推理段内部
             out = self.raw[self.think_pos:]
             self.think_pos = len(self.raw)
             return out, ""
@@ -103,20 +105,19 @@ class AnswerFilter:
         return reasoning, self._content()
 
     def finish(self, has_tools: bool) -> tuple[str, str]:
-        """Flush the tails at end of stream.
+        """在流末尾把扣住的尾巴放出来。
 
-        The content hold-back exists so a partial ``<tool_call>`` never reaches the
-        client; at end of stream it has to be released, or the last few characters
-        of every answer would be lost. With tool calls the tail *is* markup
-        (already delivered structured), so it is dropped.
+        扣住内容的目的是让半个 ``<tool_call>`` 永远到不了客户端；流结束时必须
+        放行，否则每个回答的最后几个字符都会丢。有工具调用时这段尾巴*就是*
+        标记文本（已经以结构化字段交付过），直接丢弃。
 
         Args:
-            has_tools: Whether the final engine reply carried parsed tool calls.
+            has_tools: 引擎的最终回包是否带了已解析的工具调用。
 
         Returns:
-            ``(reasoning_tail, content_tail)``; either may be empty.
+            ``(reasoning_tail, content_tail)``；任一侧都可能为空。
         """
-        if not self.past_think:              # the reasoning never closed
+        if not self.past_think:              # 推理段始终没有闭合
             out = self.raw[self.think_pos:]
             self.think_pos = len(self.raw)
             return out, ""
@@ -131,18 +132,16 @@ class AnswerFilter:
 
 
 def _json_escape(text: str) -> str:
-    """Escape a fragment exactly the way ``json.dumps(ensure_ascii=False)`` does.
+    """按 ``json.dumps(ensure_ascii=False)`` 的方式转义一个片段。
 
-    Byte-for-byte agreement matters: the fragments a client concatenates have to
-    be the same string the non-streaming path returns, or a client that falls back
-    to the non-stream JSON of the same call would see two different argument
-    strings.
+    必须逐字节一致：客户端拼起来的片段得和非流式路径返回的是同一个字符串，
+    否则客户端在同一个调用上退回非流式 JSON 时会看到两份不同的 arguments。
 
     Args:
-        text: Raw value text from the tool-call markup.
+        text: 工具调用标记里的原始取值文本。
 
     Returns:
-        The escaped fragment, without the enclosing quotes.
+        转义后的片段，不含外层引号。
     """
     out = []
     for ch in text:
@@ -158,18 +157,18 @@ def _json_escape(text: str) -> str:
 
 
 def _coerce_value(value: str):
-    """Keep the value typed like ``tool_call._coerce`` (the non-streaming path).
+    """按 ``tool_call._coerce``（非流式路径）的规则保住取值的类型。
 
-    The two paths must agree on the type, or the same call would arrive as
-    ``{"n": 3}`` when streamed and ``{"n": "3"}`` when not.
+    两条路径的类型必须一致，否则同一个调用流式过来是 ``{"n": 3}``，不走流式
+    却变成 ``{"n": "3"}``。
 
     Args:
-        value: The raw text between ``<parameter=...>`` and ``</parameter>``.
+        value: ``<parameter=...>`` 与 ``</parameter>`` 之间的原始文本。
 
     Returns:
-        The parsed JSON value when the text is a JSON literal (including nested
-        objects and arrays), else the stripped string. Text that looks numeric but
-        does not parse -- ``1.2.3`` -- stays a string rather than failing the call.
+        文本是 JSON 字面量（含嵌套对象和数组）时返回解析后的值，否则返回
+        去空白后的字符串。看着像数字却解析不了的东西——比如 ``1.2.3``——
+        保持字符串，而不是让整个调用失败。
     """
     s = value.strip()
     if s in ("true", "false", "null"):
@@ -183,44 +182,39 @@ def _coerce_value(value: str):
 
 
 class ToolStream:
-    """Turn the Qwen ``<tool_call>`` markup into OpenAI ``tool_calls`` deltas as it
-    is generated, in the shape vLLM's streaming tool parsers emit.
+    """把 Qwen 的 ``<tool_call>`` 标记边生成边转成 OpenAI 的 ``tool_calls`` 增量，
+    形状与 vLLM 的流式工具解析器一致。
 
-    The engine streams the call token by token, but parsing only at the end (what
-    this server used to do) means a client gets one fat delta after the whole call
-    is complete: no progress for a long argument, and a UI that looks hung. So the
-    same state machine vLLM runs per choice lives here instead:
+    引擎是逐 token 流出调用的，但如果只在末尾解析（本服务以前的做法），客户端
+    要在整个调用结束之后才拿到一个很胖的 delta：长参数期间毫无进度，界面看起来
+    像卡死。所以这里放的是 vLLM 每个 choice 各跑一份的同一台状态机：
 
-    * the first fragment of a call carries ``index``/``id``/``type``/``function.name``
-      (with ``arguments: ""``), so the client knows *which* tool is being called
-      before its arguments exist;
-    * ``function.arguments`` arrives in fragments -- a parameter's value streams as
-      it is generated when it is a string, and is emitted whole (typed: numbers,
-      true/false/null, nested JSON) when it looks like a JSON literal, because that
-      decision cannot be unmade half way through;
-    * ``</tool_call>`` closes the call with a final empty ``arguments`` fragment, and
-      the next call gets ``index + 1``.
+    * 调用的第一个片段带 ``index``/``id``/``type``/``function.name``（``arguments``
+      为空串），客户端因此能在参数存在之前就知道*要调哪个*工具；
+    * ``function.arguments`` 分片到达——参数值是字符串时边生成边流，看起来像
+      JSON 字面量时则整个发出（带类型：数字、true/false/null、嵌套 JSON），
+      因为这个判断一旦做下就没法在半途反悔；
+    * ``</tool_call>`` 用最后一个空的 ``arguments`` 片段收尾，下一个调用的
+      ``index`` 加一。
 
-    ``arguments`` accumulates to exactly ``json.dumps(parsed_arguments)`` -- the same
-    string the non-streaming reply carries -- so a client can use either path.
+    ``arguments`` 累加起来恰好等于 ``json.dumps(parsed_arguments)``——与非流式
+    回复里携带的字符串完全相同——所以客户端两条路径都能用。
 
-    The buffer is append-only and ``pos`` only ever moves forward past text that is
-    already decided, which is what lets a token that splits a marker across two
-    pieces still parse: an incomplete marker is not matched until its last
-    character arrives.
+    缓冲区只追加，``pos`` 只向前越过已经定下来的文本，这才使得一个把标记切成
+    两半的 token 仍然能正确解析：不完整的标记要等最后一个字符到齐才匹配。
     """
 
     def __init__(self, seed: str = "", max_calls: int | None = None,
                  marker: str = _CALL_OPEN) -> None:
-        """Start a parser for one reply.
+        """为一次回复建一个解析器。
 
         Args:
-            seed: Text to parse before any generated piece. Used to inject the
-                forced ``tool_choice: required`` opener, which lives in the prompt
-                rather than in the generated text.
-            max_calls: Stop emitting after this many calls, for
-                ``parallel_tool_calls: false``. ``None`` emits every call.
-            marker: The tool-call opener to look for.
+            seed: 在任何生成的片段之前先解析的文本。用来注入
+                ``tool_choice: required`` 产生的强制开头——它在 prompt 里，
+                不在生成文本里。
+            max_calls: 发满这么多个调用后就停，用于
+                ``parallel_tool_calls: false``。``None`` 表示全都发。
+            marker: 要找的工具调用开头标记。
         """
         self.buf = seed or ""
         self.pos = 0
@@ -232,60 +226,56 @@ class ToolStream:
         self.name_sent = False
         self.first_param = True
         self.param = None
-        self.mode = ""            # "", "stream" (string value) or "hold" (JSON literal)
-        self.hold = ""            # held value text for "hold"
-        self.ws = ""              # trailing whitespace of a streamed value
+        self.mode = ""            # ""、"stream"（字符串取值）或 "hold"（JSON 字面量）
+        self.hold = ""            # "hold" 模式下扣住的取值文本
+        self.ws = ""              # 流式取值尾部暂扣的空白
         self.value_started = False
-        self.open_quote = False   # the JSON string's opening quote is still owed
+        self.open_quote = False   # JSON 字符串的开引号还没发出去
         self.emitted_any = False
 
     def _delta(self, arguments: str, name: str | None = None) -> dict | None:
-        """Build one ``tool_calls`` delta, or ``None`` when it must be suppressed.
+        """构造一条 ``tool_calls`` 增量；该被压掉时返回 ``None``。
 
         Args:
-            arguments: The ``function.arguments`` fragment for this delta.
-            name: The function name on the fragment that introduces the call;
-                ``None`` for every following fragment, which is what tells the
-                client whether to expect a new ``id``/``type`` pair.
+            arguments: 这条增量的 ``function.arguments`` 片段。
+            name: 只在引入调用的那个片段上给函数名；后续片段一律 ``None``，
+                客户端据此判断是否需要期待新的 ``id``/``type`` 对。
 
         Returns:
-            A ``{"tool_calls": [...]}`` payload, or ``None`` once
-            ``parallel_tool_calls: false`` has been satisfied -- the caller then
-            emits nothing for the extra call.
+            ``{"tool_calls": [...]}`` 载荷；``parallel_tool_calls: false`` 已经
+            满足后返回 ``None``——调用方据此对多余的调用什么都不发。
         """
         if self.max_calls is not None and self.index >= self.max_calls:
-            return None                     # parallel_tool_calls: false -> drop it
+            return None                     # parallel_tool_calls: false，多余的直接丢
         fn: dict = {"arguments": arguments}
         if name is not None:
             fn["name"] = name
         tc: dict = {"index": self.index, "function": fn}
-        if name is not None:                # the fragment that introduces the call
+        if name is not None:                # 引入这个调用的片段
             tc["id"] = self.call_id
             tc["type"] = "function"
         self.emitted_any = True
         return {"tool_calls": [tc]}
 
     def _value_fragment(self, text: str) -> list[dict]:
-        """Feed raw value text and emit whatever argument fragment is now final.
+        """吃进原始取值文本，把此刻已经定型的参数片段发出去。
 
-        A string value can stream as it arrives; a JSON literal cannot, because a
-        number read as a string cannot be turned back into a number once the client
-        has already received the quotes. So the first character decides the mode
-        once and the value follows it to the end: ``hold`` buffers the text and
-        dumps it coerced at the closing tag, ``stream`` escapes and forwards it.
+        字符串值可以边到边流；JSON 字面量不行，因为客户端已经收到引号之后，一个
+        被当成字符串读走的数字就没法再变回数字。所以第一个字符一次性定下模式，
+        取值一路跟随：``hold`` 把文本攒着，到闭合标记时强制类型后整体 dump；
+        ``stream`` 转义后直接转发。
 
         Args:
-            text: Newly available value text, without its closing tag.
+            text: 新到手的取值文本，不含闭合标记。
 
         Returns:
-            Zero or more ``tool_calls`` deltas. Trailing whitespace is held back
-            instead of emitted, so the value of ``"1 "`` loses its pad and matches
-            what ``_coerce`` produces on the non-streaming path.
+            零条或多条 ``tool_calls`` 增量。尾部空白暂扣不发，``"1 "`` 的值因此
+            去掉补白，与非流式路径上 ``_coerce`` 的结果一致。
         """
         if not text:
             return []
         if not self.value_started:
-            text = text.lstrip()            # ``_coerce`` strips the value's ends
+            text = text.lstrip()            # ``_coerce`` 会去掉取值两端的空白
             if not text:
                 return []
             self.value_started = True
@@ -293,12 +283,12 @@ class ToolStream:
                 self.mode = "hold"
             else:
                 self.mode = "stream"
-                self.open_quote = True      # a string value opens with a quote
+                self.open_quote = True      # 字符串值以一个引号开头
         if self.mode == "hold":
             self.hold += text
             return []
         combined = self.ws + text
-        body = combined.rstrip()            # trailing whitespace is not emitted yet
+        body = combined.rstrip()            # 尾部空白暂时不发
         if not body:
             self.ws = combined
             return []
@@ -311,20 +301,19 @@ class ToolStream:
         return [d] if d else []
 
     def _close_param(self) -> list[dict]:
-        """Emit the fragment that terminates the current parameter's value.
+        """发出结束当前参数取值的那个片段。
 
         Returns:
-            Zero or one delta. A ``hold`` value is coerced and dumped whole so the
-            argument stream ends exactly like ``json.dumps`` would; a ``stream``
-            value just closes its quote.
+            零条或一条增量。``hold`` 模式先把值强制类型再整体 dump，参数流因此
+            与 ``json.dumps`` 的结果完全一致；``stream`` 模式只补上收尾引号。
         """
         out: list[dict] = []
         if self.mode == "hold":
             d = self._delta(json.dumps(_coerce_value(self.hold), ensure_ascii=False))
         elif self.mode == "stream":
-            d = self._delta('"')            # close the value string
+            d = self._delta('"')            # 收掉字符串的引号
         else:
-            d = self._delta('""')           # empty (or whitespace-only) value
+            d = self._delta('""')           # 空值（或只有空白）
         if d:
             out.append(d)
         self.param = None
@@ -335,46 +324,46 @@ class ToolStream:
         return out
 
     def push(self, piece: str) -> list[dict]:
-        """Parse one streamed text piece.
+        """解析一段流式文本。
 
         Args:
-            piece: The engine's incremental text for one token.
+            piece: 引擎为一个 token 给出的增量文本。
 
         Returns:
-            The ``tool_calls`` deltas that became final with this piece; empty
-            while a marker or a held JSON literal is still incomplete.
+            这一段之后才定型的 ``tool_calls`` 增量；标记或扣住的 JSON 字面量
+            还没收齐时为空。
         """
         self.buf += piece
         return self._drain(final=False)
 
     def finish(self) -> list[dict]:
-        """Flush a truncated call at end of stream.
+        """在流末尾把被截断的调用收尾。
 
         Returns:
-            The remaining deltas, including the closing fragment for a call whose
-            markup ended early. Without this a call cut off by ``max_tokens`` would
-            reach the client with an unterminated ``arguments`` string.
+            剩下的增量，包括标记提前结束的调用的收尾片段。没有这一步，被
+            ``max_tokens`` 截断的调用会让客户端收到一个没有结束的
+            ``arguments`` 字符串。
         """
         return self._drain(final=True)
 
     def _drain(self, final: bool) -> list[dict]:
-        """Advance the state machine over whatever the buffer now holds.
+        """按缓冲区当前的进展推进状态机。
 
         Args:
-            final: ``True`` at end of stream, which closes a truncated parameter
-                instead of waiting for its closing tag.
+            final: 流末尾时为 ``True``，此时直接收掉被截断的参数，不再等它的
+                闭合标记。
 
         Returns:
-            The deltas produced by this pass, in emission order.
+            本趟产出的增量，按发出顺序排列。
         """
         out: list[dict] = []
         while True:
             if not self.in_call:
                 i = self.buf.find(self.marker, self.pos)
                 if i < 0:
-                    # nothing to do until the opener is complete: the buffer is
-                    # append-only and these markers only match in full, so ``pos``
-                    # must stay put or later pieces would be scanned past.
+                    # 开头标记没收完整之前什么都不做：缓冲区只追加，而这些
+                    # 标记只按完整形式匹配，所以 ``pos`` 必须原地不动，否则
+                    # 后面的片段会被跳过。
                     break
                 self.pos = i + len(self.marker)
                 self.in_call = True
@@ -391,7 +380,7 @@ class ToolStream:
             if self.param is not None:
                 end = self.buf.find(_PARAM_CLOSE, self.pos)
                 if end < 0:
-                    if final:                       # truncated call: close it here
+                    if final:                       # 调用被截断：就地收尾
                         out += self._value_fragment(self.buf[self.pos:])
                         self.pos = len(self.buf)
                         out += self._close_param()
@@ -415,7 +404,7 @@ class ToolStream:
                    *[(p, "close") for p, _ in closes if p >= 0]]
             nxt = [c for c in nxt if c is not None]
             if not nxt:
-                # wait for the marker to be complete (see above): do not advance pos
+                # 等标记收完整（见上）：不要推进 pos
                 break
             pos, kind = min(nxt, key=lambda c: c[0])
             if kind == "fn":
@@ -437,7 +426,7 @@ class ToolStream:
                 self.pos = m_param.end()
                 continue
             if self.buf.startswith(_CALL_CLOSE, pos):
-                d = self._delta("")               # vLLM's end-of-call empty fragment
+                d = self._delta("")               # vLLM 收尾用的空片段
                 if d:
                     out.append(d)
                 self.pos = pos + len(_CALL_CLOSE)

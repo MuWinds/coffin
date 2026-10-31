@@ -29,12 +29,12 @@
    `max|y| == 0` / NaN。参考引擎的 `MAX_GEMV_N=131072` 就是这条。
    **`lm_head` 必须走自写内核或分块**，不能交给库。
 3. **cuBLAS 无法被 capture**：`torch.cuda.graph` 里做 `x @ w` 报
-   `CUBLAS_STATUS_ALLOC_FAILED`。**但自写 kernel 可以正常 capture + replay**
+   `CUBLAS_STATUS_ALLOC_FAILED`。**但自写内核可以正常 capture + replay**
    （已实测：replay 后重新读了激活，rel err 2e-6）。所以 decode 的 graph
-   路径只有在我们自己的 kernel 上才成立。
+   路径只有在我们自己的内核上才成立。
 4. **`F.rms_norm` / `torch.compile` / `scaled_dot_product_attention` 等 2.4+ API 全不存在**。
 
-**实测性能（决定 kernel 怎么写）：**
+**实测性能（决定内核怎么写）：**
 
 | 项 | 值 |
 | --- | --- |
@@ -43,7 +43,7 @@
 | 库 `[K,N]`（`x @ Wt`）M=1 bf16 | 360–406 GB/s（但宽 N 会 NaN） |
 | 我写的 `[K,N]` GEMV M=1 | **U=4：168 GB/s（N=9728,K=2560）/ 361 GB/s（lm_head）**；正确性 rel ≈ 1.5e-6 |
 | prefill GEMM（库，M=2048） | bf16 与 fp16 **同为 32.6 TFLOP/s**（所以 `weight_dtype` 不必为算力选 fp16） |
-| graph capture | 自写 kernel ✅，cuBLAS ❌ |
+| graph capture | 自写内核 ✅，cuBLAS ❌ |
 
 带宽与形状强相关（同一内核）：`N=9728,K=2560` 168 GB/s、`N=248320` 361 GB/s、
 `N=2560,K=9728` 47 GB/s、`N=2560,K=4096` 63 GB/s。**按首维 N 分档**：
@@ -66,8 +66,8 @@ N 越大越接近上限，小 N 受 launch/占用率限制 → 需要按形状�
    `moorethreads.py` 保留。
 4. **权重布局走 `caps.weight_layout`**：CoreX 是 `"kn"`（`[K,N]`，加载时转置一次），
    HIP 是 `"nk"`。契约保持 checkpoint 的 `[N,K]`，转置成本由后端承担。
-5. **`caps.graph`**：CoreX 可以为 `True`（自写 kernel 可 capture），
-   但**只有当一层的算子全部是自写 kernel 时**才成立。保守起步：
+5. **`caps.graph`**：CoreX 可以为 `True`（自写内核可 capture），
+   但**只有当一层的算子全部是自写内核时**才成立。保守起步：
    先 `False`，把 graph 作为最后一个开关。
 6. **`caps.graph=False` 的正确形态是"eager 替身"，不是"运行期静默降级"**。
    `ops.runtime.capture()` 在 `graph=False` 时返回一个 `replay()` **重跑 body** 的
@@ -151,7 +151,7 @@ N 越大越接近上限，小 N 受 launch/占用率限制 → 需要按形状�
 
   - `caps.graph=False` 时 `capture()` 返回的 `Capture.replay()` **重跑 body**，不是
     空操作。所以 eager 替身**语义正确**、不是"只是不崩"：CoreX 上 cuBLAS 不可捕获而
-    自写 kernel 可捕获，混合算子表的正确执行方式就是 eager，这条路径给出的数与图路径
+    自写内核可捕获，混合算子表的正确执行方式就是 eager，这条路径给出的数与图路径
     同源。
   - `caps.graph=True` 但 body 里混了不可捕获的算子时，`capture()` **抛异常，不吞**。
     理由：吞掉会把"这一层算子不全自写"变成静默的性能退化，而那正是 `caps.graph`
@@ -190,7 +190,7 @@ N 越大越接近上限，小 N 受 launch/占用率限制 → 需要按形状�
      也会暴露 `torch.cuda`。所以先判 `caps.device == "cpu"`，再验 `is_available()`。
   3. `cache/paged_cache.py` 默认 device → `backends.device`（`None` 表示取后端），
      **int8 KV 布局一字未动**（`[nslots,nkv,hd]` int8 + `[nslots,nkv]` fp32 scale 是
-     kernel 契约，已写进文件头 Constraints）。
+     内核契约，已写进文件头 Constraints）。
   4. `entrypoints/cli/runtime.py` 加 `--backend NAME`（**parse 后、import 绑定算子表
      的模块前**写 `COFFIN_BACKEND`）与 `--no-graph`（→ `EngineConfig.graph`，有效值
      = 用户意图 AND `caps.graph`）。
@@ -287,7 +287,7 @@ N 越大越接近上限，小 N 受 launch/占用率限制 → 需要按形状�
 
 **第一次**：`check_graph.py` 报 `capture rel=2.551e-03 / replay rel=2.744e-03 /
 output moved by 2.910e+02`，看起来完美。但那个脚本只捕获了 `linear` 和 `rms_norm`
-**两个算子，孤立地**——它从没跑过 32 层的调用图、paged attention 的窗口、或递推状态的
+**两个算子，孤立地**——它从没跑过 32 层的调用图、paged 注意力的窗口、或递推状态的
 原地更新。把"两个算子可捕获"当成"整步可捕获"是推断，不是测量。
 
 **第二次**：按整步重测，`capture()` 成功（2396 ms），打印 `decode path: graph replay`，
@@ -323,9 +323,9 @@ capture+replay，逐 token 完全相同，且进程存活。单个算子的捕�
 
 §4.y 的两次失败都查清了根因，`_GRAPH_VERIFIED = True` 现在有测量支撑。
 
-**第一次失败（calling order）**：探针先 `prefill` 再 `capture()`。而 `capture()`
+**第一次失败（调用顺序）**：探针先 `prefill` 再 `capture()`。而 `capture()`
 第一件事就是 `reset()` 并跑自己的 dummy prefill —— 它把 prompt 的 KV cache 与递推
-状态整个洗掉了，replay 于是在一个从未被写过的窗口上驱动 attention。正确顺序是
+状态整个洗掉了，replay 于是在一个从未被写过的窗口上驱动注意力。正确顺序是
 `reset()` → `capture()` → `reset()` → `prefill()`（`run_chat.generate` 一直是这样）。
 
 **第二次失败（不是 graph，是卡）**：`gr2-1` 在 `decode path: graph replay` 之后无输出。
@@ -358,7 +358,7 @@ completed attempts: [0, 1, 2, 3, 4, 5] of 6
 而判据只有端到端文本。三条都验证到了根因。
 
 1. **`delta` 的 `rel=4.5e-02` 是共享内存竞态，真 bug。** `group_sum` / `block_reduce`
-   在读完 `red[base]` 后直接 `return`，没有关闭屏障；同一个 kernel 一次会调它两次
+   在读完 `red[base]` 后直接 `return`，没有关闭屏障；同一个内核一次会调它两次
    （max 与 sum，或 kv 与 result），第二次开头的 `red[threadIdx.x] = v` 可能早于第一次
    的读。slot 0 的 `base == 0`，于是 thread 0 写的正是别人还要读的那个槽。症状是
    "错得不多也不飞"——一位部分和坏掉，落在 1e-2 量级，很容易被误读成精度问题。
@@ -366,7 +366,7 @@ completed attempts: [0, 1, 2, 3, 4, 5] of 6
    `linear_attn.cu` 四个 reducer 全部补上关闭屏障，形状统一。
 
 2. **`attn_decode` 的 `rel=1.000e+00`（输出全零）是探针传了 CPU 张量。**
-   `pos = torch.tensor([63])` 落在 host 上，而 kernel 是**从设备解引用** `pos` 的
+   `pos = torch.tensor([63])` 落在 host 上，而内核是**从设备解引用** `pos` 的
    （这样 graph 才能在 replay 时换位置而不重捕）。主机指针被当成长度读 → `nvalid`
    越界 → 窗口空 → 每个 split 停在 `m=-1e30/l=0` → combine `0/0` → 全零。
    因为 `rel = err/max|ref|`，全零恰好给出**精确的 1.0**，这个数字本身就是指纹。
@@ -377,12 +377,12 @@ completed attempts: [0, 1, 2, 3, 4, 5] of 6
    50 331 648（正好 24 段 / 48 MiB）。原来的 `grew != w.numel() * 2` 严格相等把一次
    正确的转置判成了失败。已改成同时接受逻辑值与段取整值。
 
-**方法结论**：探针的期望值必须和 kernel 的**调用契约**对齐，而不是和"看起来合理"对齐。
+**方法结论**：探针的期望值必须和内核的**调用契约**对齐，而不是和"看起来合理"对齐。
 一条 `assert pos.is_cuda` 抵得上一轮作业往返。端到端文本正确是强证据，但它只覆盖
 "走过的路径"——`paged=0` 时 dense 分支确实走到了，所以那次文本正确**不能**用来给
 dense 分支背书，它只是恰好算术自洽（`per=ceil(5/256)=1`，空 split 被 max 淘汰）。
 
-### 核心带宽实测（决定 kernel 形态的那几个数）
+### 核心带宽实测（决定内核形态的那几个数）
 
 | 形状 | N | K | 带宽 |
 | --- | ---: | ---: | ---: |

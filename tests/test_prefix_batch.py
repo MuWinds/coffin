@@ -1,22 +1,20 @@
-"""Per-sequence prefix reuse in the batched engine.
+"""批处理引擎里逐序列的前缀复用。
 
-Module: ``coffin/tests``. Wraps a paged model in ``llm_engine.LLMEngine`` and
-drives it through ``config`` / ``sequence`` / ``scheduler``; it is the only test
-that asserts on the scheduler-visible ``matched`` count.
+Module: ``coffin/tests``。把分页模型包进 ``llm_engine.LLMEngine``，再经
+``config`` / ``sequence`` / ``scheduler`` 驱动它；它是唯一对调度器可见的
+``matched`` 计数做断言的测试。
 
 Constraints:
-    * The reference for a warm run is the same engine's *cold* run, with the tree
-      cleared in between; comparing against a second model would need two 4B
-      copies on a 16 GB card.
-    * ``add_request`` plus manual ``step`` is used where the admission order is
-      the thing under test, because ``generate`` owns the whole loop and hides it.
-    * ``tearDownClass`` must close the fixture: this class owns an engine, and a
-      leaked block pool keeps the card busy for every later module.
+    * 热跑的参照是同一个引擎的 *冷* 跑，中间清空基数树；若换第二个模型做对照，
+      16 GB 卡上就要多放一份 4B 权重。
+    * 准入顺序本身是被测对象的地方用 ``add_request`` 加手工 ``step``，因为
+      ``generate`` 拥有整个循环，会把准入时机藏起来。
+    * ``tearDownClass`` 必须关掉 fixture：这个类独占一个引擎，泄漏的块池会让
+      后面每个模块都占着卡。
 
-The radix tree is per-sequence state (block hashes + the delta-net recurrent
-snapshot that produced them), so batching must not switch it off: a request is
-admitted, matches the longest cached block prefix, restores that boundary's
-recurrent state, prefills only the suffix and inserts what it computed.
+基数树是逐序列的状态（块哈希，加上产出这些哈希的 delta-net 循环状态快照），
+所以批处理不能把它关掉：一个请求被准入后，命中已缓存的最长块前缀，恢复该
+边界处的循环状态，只预填充后缀，再把它算出的内容插进树里。
 
     python3 -m unittest discover -s tests -p "test_prefix_batch.py" -v
 """
@@ -32,17 +30,16 @@ from engine.llm_engine import LLMEngine
 from engine.sequence import SamplingParams
 
 BLOCK = 64
-PREFIX = [1000 + i for i in range(192)]          # three full blocks
+PREFIX = [1000 + i for i in range(192)]          # 192 = 3 * BLOCK：共享前缀正好落在块边界上
 TAIL_A = [4000 + i for i in range(16)]
 TAIL_B = [5000 + i for i in range(24)]
 
 
 def make_engine(model, *, max_seq: int, max_num_seqs: int = 4) -> LLMEngine:
-    """Build an engine whose block size matches the model's snapshot interval.
+    """建一个块大小与模型快照间隔对齐的引擎。
 
-    ``snapshot_interval=BLOCK`` is not a tuning choice: a recurrent snapshot is
-    only meaningful at a block boundary, so the two constants must agree or a
-    restored state would not correspond to the reused KV.
+    ``snapshot_interval=BLOCK`` 不是调参选择：循环状态快照只在块边界上才有
+    意义，两个常量必须相等，否则恢复出来的状态配不上被复用的那段 KV。
     """
     cfg = EngineConfig(model_dir=str(support.MODEL_DIR), max_seq=max_seq,
                        bench=False, quant=True, prefix_cache=True,
@@ -55,31 +52,31 @@ def make_engine(model, *, max_seq: int, max_num_seqs: int = 4) -> LLMEngine:
 
 @support.needs_model
 class BatchedPrefixTest(unittest.TestCase):
-    """Batching must not disable prefix reuse; a reused prefix must not change the answer."""
+    """批处理不能关掉前缀复用；复用到的前缀也不能改变答案。"""
 
     MAX_SEQ = 1024
 
     @classmethod
     def setUpClass(cls) -> None:
-        """Load the paged model and build the engine all tests in this class share."""
+        """加载分页模型，并建好本类所有测试共用的引擎。"""
         cls.MODEL = support.ModelFixture.get(quant=True, max_seq=cls.MAX_SEQ,
                                              paged=True, bench=False)
         cls.ENGINE = make_engine(cls.MODEL, max_seq=cls.MAX_SEQ)
 
     @classmethod
     def tearDownClass(cls) -> None:
-        """Release the engine and the model, so the next module starts from an empty card."""
+        """释放引擎和模型，让下一个模块从一张空卡开始。"""
         cls.ENGINE = None
         cls.MODEL = None
         support.ModelFixture.close()
 
     def _generate(self, prompt: list[int], n: int = 4) -> dict:
-        """Greedy-generate through the shared engine; temperature 0 keeps runs comparable."""
+        """走共享引擎做贪心生成；温度 0 让不同次运行之间可以逐 token 比较。"""
         return self.ENGINE.generate(prompt, SamplingParams(max_tokens=n,
                                                            temperature=0.0))
 
     def test_cold_then_warm_identical_prompt(self) -> None:
-        """The second identical request must match a prefix and still emit the cold tokens."""
+        """第二次相同请求必须命中前缀，而输出仍要与冷跑逐 token 相同。"""
         engine = self.ENGINE
         engine.clear_prefix_cache()
         cold = self._generate(PREFIX + TAIL_A)
@@ -89,7 +86,7 @@ class BatchedPrefixTest(unittest.TestCase):
         self.assertEqual(warm["tokens"], cold["tokens"])
 
     def test_shared_system_prompt_with_different_tails(self) -> None:
-        """A shared prefix with a different tail must match exactly the prefix, and its own cold answer must agree."""
+        """共享前缀配不同后缀时，命中长度必须恰好等于前缀，且与它自己的冷跑答案一致。"""
         engine = self.ENGINE
         engine.clear_prefix_cache()
         cold_a = self._generate(PREFIX + TAIL_A)
@@ -101,13 +98,14 @@ class BatchedPrefixTest(unittest.TestCase):
         self.assertEqual(warm_b["tokens"], cold_b["tokens"])
 
     def test_concurrent_identical_prompts_reuse_the_prefix(self) -> None:
-        """Reuse must work while the first request is still decoding, not only after it retires."""
+        """复用要在第一个请求仍在解码时就生效，而不是等它退场之后。"""
         engine = self.ENGINE
         engine.clear_prefix_cache()
         prompt = PREFIX + TAIL_A
-        # First request is admitted alone so its prefill populates the tree; the
-        # second one is admitted while it decodes and must reuse the prefix.
-        # Its first token comes out of that first step, so collect the event too.
+        # 先单独准入第一个请求，让它的预填充把树填上；第二个请求在它解码时
+        # 才准入，必须复用这段前缀。
+        # 第一个请求的首个 token 就出自这一步，所以这一步的事件也要收下来；
+        # 此时第二个请求还没建出来，out[1] 先留空占位。
         first = engine.add_request(prompt, SamplingParams(max_tokens=4,
                                                           temperature=0.0))
         out: list[list[int]] = [
@@ -128,11 +126,11 @@ class BatchedPrefixTest(unittest.TestCase):
                                 "the second concurrent request should reuse the prefix")
 
     def test_grouped_prefill_populates_the_prefix_cache(self) -> None:
-        """Grouped prefill is a different code path; it must still leave the block-aligned snapshots a warm hit needs."""
+        """分块预填充走的是另一条代码路径，但它同样要留下冷跑命中所需的、按块对齐的状态快照。"""
         engine = self.ENGINE
         engine.clear_prefix_cache()
-        # Two prompts admitted together go through one grouped prefill; it still
-        # has to leave block-aligned snapshots behind for the next request.
+        # 两个请求一起准入会走一次分块预填充（grouped prefill）；这条路径同样
+        # 得为下一个请求留下按块对齐的状态快照。
         a = engine.add_request(PREFIX + TAIL_A,
                                SamplingParams(max_tokens=3, temperature=0.0))
         b = engine.add_request(PREFIX + TAIL_B,
@@ -148,7 +146,7 @@ class BatchedPrefixTest(unittest.TestCase):
         self.assertEqual(warm["tokens"], out_a)
 
     def test_prefix_stats_report_cached_blocks(self) -> None:
-        """The stats feed the server's cache metrics, so an empty or missing ``prefix`` block hides a broken tree from operators."""
+        """``prefix`` 这一块 stats 直接喂给服务端的缓存指标；它缺失或为空，运维就看不见树已经坏了。"""
         engine = self.ENGINE
         engine.clear_prefix_cache()
         self._generate(PREFIX + TAIL_A, 2)

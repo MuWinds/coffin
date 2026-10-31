@@ -1,29 +1,23 @@
 // @file gemv_int8.cu
-// @brief Weight-only int8 GEMV (W8A16) for decode.
+// @brief 解码用的纯权重 int8 GEMV（W8A16）。
 //
-// Module: coffin/kernels. The quantised half of the projection path; the fp16/bf16
-// family is ``gemv.cu`` and the M in {16, 24, 32} verify variant is
-// ``gemv_wide.cu``, which must stay bit-identical to the M=8 kernel here.
+// Module: coffin/kernels。投影路径的量化那一半；fp16/bf16 家族在 ``gemv.cu``，M 取
+// {16, 24, 32} 的校验变体在 ``gemv_wide.cu``，后者必须与这里的 M=8 内核逐位一致。
 //
-// Why: decode on this part is bandwidth-bound. The projections run at 540-680 GB/s
-// against a ~700 GB/s copy ceiling and are ~48% of the step, hipBLAS GEMV at M=1
-// is unusable and Triton has no gfx906 backend. The only remaining lever on that
-// 48% is reading fewer bytes per weight, so the weights are stored as int8 with a
-// per-row scale and read once per decode step. Activations stay bf16: the kernel
-// is memory-bound, so the int8 -> float conversion is hidden, and keeping A in
-// bf16 avoids a second quantiser and its error.
+// 为什么：这颗芯片上解码是带宽受限的。投影跑到 540-680 GB/s，而拷贝上限约 700 GB/s，
+// 占该步 ~48%；hipBLAS 的 M=1 GEMV 没法用，Triton 又没有 gfx906 后端。那 48% 上仅剩的
+// 杠杆就是每个权重少读几个字节，于是权重以 int8 存储、每行一个 scale，每个解码步只读
+// 一次。激活保持 bf16：内核是访存受限的，int8 -> float 的转换被掩盖掉了，而 A 留在 bf16
+// 也省掉了第二个量化器及其误差。
 //
 // Constraints:
-//   * Weights are INT8 row-major [N, K] with a per-row fp32 scale; a column-major
-//     or per-group layout would break both this kernel and every prepacked
-//     checkpoint.
-//   * The structure is deliberately identical to ``gemv_kernel`` (one warp per
-//     output row, R rows per warp, U-way K unroll, 8 accumulators per lane): only
-//     the weight load changes, from one uint4 (8 bf16, 16 B) to one uint2 (8 int8,
-//     8 B), and the row scale is applied once at the end instead of per element.
-//   * Only the listed (R, U) / (M, U) pairs are instantiated; anything else is a
-//     TORCH_CHECK failure.
-//   * ``dk``-style tails: K % 8 is handled by a scalar tail, so any K is correct.
+//   * 权重是 INT8 行主序 [N, K] 配每行一个 fp32 scale；列主序或按组布局会同时弄坏本内核
+//     和每一个预打包 checkpoint。
+//   * 结构与 ``gemv_kernel`` 刻意保持一致（每个输出行一个 warp，每 warp R 行，K 方向 U
+//     路展开，每 lane 8 个累加器）：只有权重读取变了，从一次 uint4（8 个 bf16，16 B）变成
+//     一次 uint2（8 个 int8，8 B），行 scale 也改成最后统一乘一次而不是逐元素乘。
+//   * 只实例化列出的 (R, U) / (M, U) 组合；别的组合一律 TORCH_CHECK 失败。
+//   * 尾部处理：K % 8 用标量尾循环收掉，所以任意 K 都是对的。
 
 #include "hip_ops.h"
 
@@ -39,14 +33,14 @@ __device__ __forceinline__ float bf16_to_float(unsigned short h) {
 
 __device__ __forceinline__ unsigned short float_to_bf16(float f) {
     unsigned u = __float_as_uint(f);
-    u += 0x7fffu + ((u >> 16) & 1u);   // round to nearest even
+    u += 0x7fffu + ((u >> 16) & 1u);   // 就近舍入到偶数（round to nearest even）
     return (unsigned short)(u >> 16);
 }
 
-// @brief Eight int8 (one uint2) against eight bf16 (one uint4).
+// @brief 八个 int8（一个 uint2）对八个 bf16（一个 uint4）。
 //
-// Extracting the bytes by shift keeps the packed weight in registers; a
-// reinterpret_cast to char* would force it to local memory.
+// 用移位来取字节，打包的权重才能留在寄存器里；换成 reinterpret_cast 到 char* 会把它逼
+// 进 local memory。
 __device__ __forceinline__ void accumulate_i8(float* acc, const uint2& w, const uint4& x) {
     const unsigned short* xh = reinterpret_cast<const unsigned short*>(&x);
     const unsigned lo = w.x, hi = w.y;
@@ -58,11 +52,11 @@ __device__ __forceinline__ void accumulate_i8(float* acc, const uint2& w, const 
     }
 }
 
-// @brief One warp per output row, R rows per warp, 8 FMA chains per lane.
+// @brief 每个输出行一个 warp，每 warp R 行，每 lane 8 条 FMA 链。
 //
-// @param S [N] fp32 per-row dequant scale, applied once after the reduction.
-// @param x [K] bf16 activation.
-// @param y [N] bf16 output; lane 0 writes the row's scaled sum.
+// @param S [N] fp32 每行反量化 scale，在归约之后统一乘一次。
+// @param x [K] bf16 激活。
+// @param y [N] bf16 输出；由 lane 0 写出该行乘过 scale 的和。
 template <int R, int U>
 __global__ void gemv_w8a16_kernel(const int8_t* __restrict__ W,
                                   const float* __restrict__ S,
@@ -107,7 +101,7 @@ __global__ void gemv_w8a16_kernel(const int8_t* __restrict__ W,
         for (int r = 0; r < R; ++r)
             if (row0 + r < N) accumulate_i8(acc[r], w0[(size_t)r * nvec + i], xb);
     }
-    // K not a multiple of 8: the leftover elements have no vector to live in.
+    // K 不是 8 的整数倍时，剩下的元素没有向量可装。
     for (int k = (nvec << 3) + lane; k < K; k += 32) {
         const float xf = bf16_to_float(x[k]);
 #pragma unroll
@@ -129,13 +123,12 @@ __global__ void gemv_w8a16_kernel(const int8_t* __restrict__ W,
     }
 }
 
-// @brief Batched small-M variant: the row (and its scale) is read once for M
-//        input vectors.
+// @brief 批处理的小 M 变体：一次读取权重行（及其 scale）服务 M 个输入向量。
 //
-// That is what keeps speculative verification at ~one weight pass.
+// 投机校验因此只花大约一次权重读取。
 //
-// @param X [M, K] bf16; M is the instantiated template parameter.
-// @param Y [M, N] bf16; the scale is applied per row after the reduction.
+// @param X [M, K] bf16；M 就是实例化的模板参数。
+// @param Y [M, N] bf16；scale 在归约之后按行乘上。
 template <int M, int U>
 __global__ void gemv_w8a16_m_kernel(const int8_t* __restrict__ W,
                                     const float* __restrict__ S,
@@ -197,16 +190,15 @@ __global__ void gemv_w8a16_m_kernel(const int8_t* __restrict__ W,
 
 }  // namespace
 
-// @brief Weight-only int8 GEMV for a single decode token.
+// @brief 单个解码 token 的纯权重 int8 GEMV。
 //
-// @param W [N, K] int8 row-major, contiguous.
-// @param S [N] fp32 per-row scale, contiguous.
-// @param x [K] bf16 activation, contiguous.
-// @param R Output rows per warp (1, 2 or 4); picked by the load-time benchmark.
-// @param U K-loop unroll; only affects latency hiding, not the arithmetic.
-// @return [N] bf16.
-// @throws c10::Error (TORCH_CHECK) on a non-contiguous input or a weight dtype
-//         that is not int8.
+// @param W [N, K] int8 行主序，连续存放。
+// @param S [N] fp32 每行 scale，连续存放。
+// @param x [K] bf16 激活，连续存放。
+// @param R 每个 warp 的输出行数（1、2 或 4）；由加载时的基准测试挑选。
+// @param U K 循环展开；只影响延迟掩盖，不影响算术。
+// @return [N] bf16。
+// @throws c10::Error（TORCH_CHECK）：输入不连续，或权重 dtype 不是 int8。
 torch::Tensor gemv_w8a16(torch::Tensor W, torch::Tensor S, torch::Tensor x,
                          int64_t R, int64_t U) {
     TORCH_CHECK(W.is_contiguous() && x.is_contiguous() && S.is_contiguous(),
@@ -235,13 +227,13 @@ torch::Tensor gemv_w8a16(torch::Tensor W, torch::Tensor S, torch::Tensor x,
     return y;
 }
 
-// @brief Batched small-M int8 GEMV: one weight pass for M activation vectors.
+// @brief 批处理的小 M int8 GEMV：一次权重读取服务 M 个激活向量。
 //
-// @param X [M, K] bf16; M must be 2, 4 or 8, the instantiated values. The verify
-//          path with M in {16, 24, 32} is ``gemv_wide.cu`` instead.
-// @param U K-loop unroll.
-// @return [M, N] bf16, bit-identical to calling ``gemv_w8a16`` on each row.
-// @throws c10::Error (TORCH_CHECK) when M/U has no instantiated kernel.
+// @param X [M, K] bf16；M 必须是 2、4 或 8，即已实例化的取值。M 取 {16, 24, 32} 的校验
+//          路径走 ``gemv_wide.cu``。
+// @param U K 循环展开。
+// @return [M, N] bf16，与逐行调用 ``gemv_w8a16`` 逐位一致。
+// @throws c10::Error（TORCH_CHECK）：M/U 没有对应的已实例化内核。
 torch::Tensor gemv_w8a16_m(torch::Tensor W, torch::Tensor S, torch::Tensor X, int64_t U) {
     TORCH_CHECK(W.is_contiguous() && X.is_contiguous() && S.is_contiguous(),
                 "contiguous inputs required");

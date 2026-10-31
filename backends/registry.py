@@ -1,44 +1,35 @@
-"""Choose the one backend this process runs on: env override, then auto-detect, then reference.
+"""为本进程挑出唯一要跑的后端：环境变量覆盖，然后自动探测，最后参考实现。
 
-Selection happens once, at import time, and is never revisited: there is no runtime hot
-swap, so a backend change means a new process. The order is fixed and deliberately
-boring -- ``COFFIN_BACKEND`` (exact name) wins for debugging and A/B, otherwise every
-registered backend is probed and the best claim wins, with the pure-torch reference as
-the guaranteed last candidate.
+选择只发生一次，在 import 时，此后不再重来：没有运行时热切换，换后端就是换进程。
+顺序是固定且刻意平淡的——``COFFIN_BACKEND``（精确名字）优先，方便调试和 A/B；
+否则逐个探测已注册的后端，最强的认领胜出，纯 torch 参考实现作为兜底的最后候选。
 
-Two sources of backends, one list
----------------------------------
-*Hand-written* backends (:data:`BUILTIN`) are modules that need real code: ``hip`` has
-kernels, tuning and a build path, and ``reference`` is the fallback everything else
-resolves to. *Discovered* backends live in ``backends/vendors/`` as declarative specs
-(see :mod:`coffin.backends.discovery`), so adding a platform means adding one file and
-editing nothing here. :func:`candidates` merges the two into the single ordered sequence
-that selection, logging and the error text all read.
+后端的两个来源，一份清单
 
-Detection is by **claim strength**, not by a boolean, because more than one vendor can
-answer for the same device. Iluvatar's CoreX answers through ``torch.cuda`` exactly like
-the Hygon DCU, so both may see "a CUDA device is present"; the vendor that matched the
-device *name* outranks the one that only matched the namespace, and the Iluvatar spec
-wins. On Enflame and Moore Threads the namespace itself is unique (``gcu``, ``musa``), so the
-namespace claim is enough. That single rule covers both cases without the registry
-knowing which vendors exist.
+*手写*后端（:data:`BUILTIN`）是需要真代码的模块：``hip`` 有内核、调优和一条编译
+路径，``reference`` 是其余一切解析到的兜底。*被发现*的后端住在
+``backends/vendors/`` 里，是声明式的 spec（见 :mod:`coffin.backends.discovery`），
+所以加一个平台就是加一个文件，这里一个字都不用改。:func:`candidates` 把两者合并
+成唯一的有序序列，选择、日志和错误文案都读它。
 
-Module: ``coffin/backends``. Sits next to ``protocol`` at the bottom of the dependency
-graph: it may import ``torch``, ``protocol``, ``vendor``, ``discovery`` and the built-in
-backend modules, and nothing from ``coffin/ops``, ``models``, ``engine``, ``serving`` or
-``cache``.
+检测用的是**认领强度**而不是布尔值，因为同一个设备可能被多个厂商应答。Iluvatar 的
+CoreX 与 Hygon DCU 一样经由 ``torch.cuda`` 应答，两者都可能看到「存在一个 CUDA
+设备」；匹配到设备*名字*的厂商排在只匹配到命名空间的前面，于是 Iluvatar 的 spec
+胜出。Enflame 和 Moore Threads 上命名空间本身就是唯一的（``gcu``、``musa``），所以
+命名空间认领就够了。这一条规则覆盖两种情形，registry 不必知道有哪些厂商。
+
+Module: ``coffin/backends``。与 ``protocol`` 一起位于依赖图底部：它可以 import
+``torch``、``protocol``、``vendor``、``discovery`` 以及内置后端模块，不得 import
+``coffin/ops``、``models``、``engine``、``serving`` 或 ``cache`` 里的任何东西。
 
 Constraints:
-    * ``select()`` is the only place that raises about backend selection. It must name
-      the requested backend, every candidate tried, and each candidate's
-      :meth:`reason`, because a silently-chosen reference backend looks exactly like a
-      mysteriously slow deployment.
-    * An explicit ``COFFIN_BACKEND`` never falls through to another backend. A typo or a
-      broken build must fail loudly; quietly running reference instead would hide the
-      failure behind a 10x slowdown.
-    * Importing this module must not build, compile or probe anything: it reads a
-      directory listing and module names. ``import backends`` on a CPU-only host has to
-      work, and it is what the test suite relies on.
+    * ``select()`` 是唯一会就后端选择抛出异常的地方。它必须点名被请求的后端、试过的
+      每个候选，以及每个候选的 :meth:`reason`——一个被悄悄选中的参考后端，看起来
+      就和一个莫名其妙很慢的部署一模一样。
+    * 显式的 ``COFFIN_BACKEND`` 绝不会落到别的后端。拼写错误或坏掉的构建必须响亮
+      地失败；悄悄改跑参考实现只会把故障藏在 10 倍减速后面。
+    * import 本模块不得编译、构建或探测任何东西：它只读目录列表和模块名。纯 CPU
+      主机上的 ``import backends`` 必须能跑，测试套件就指望这一点。
 """
 
 from __future__ import annotations
@@ -50,62 +41,58 @@ from typing import Sequence
 from backends import discovery
 from backends.protocol import Backend, Caps, Ops
 
-#: Environment variable that pins the backend by name; empty/unset means auto-detect.
-#: Read once, at import of :mod:`coffin.backends`.
+#: 按名字钉住后端的环境变量；为空或未设置表示自动探测。只在 import
+#: :mod:`coffin.backends` 时读一次。
 ENV_VAR = "COFFIN_BACKEND"
 
-#: Hand-written backends, in probe order. Everything under ``backends/vendors/`` is
-#: discovered and merged in; only backends that need real code live here.
+#: 手写后端，按探测顺序排列。``backends/vendors/`` 下的一切都是被发现后合并进来的；
+#: 只有需要真代码的后端放在这里。
 #:
-#: ``hip`` and ``corex`` are hand-written rather than declarative vendor specs because
-#: they carry kernels, kernel tiling, autotune and a build path -- none of which a
-#: declaration expresses. They also share the ``cuda`` namespace, so which one wins is
-#: decided by each backend's own probe (``torch.version.hip`` for ROCm, the device name
-#: for CoreX), not by ordering here. ``reference`` is last because it always reports
-#: usable, so anything after it would be unreachable.
+#: ``hip`` 和 ``corex`` 之所以手写而不是声明式 spec，是因为它们带着内核、内核切块、
+#: autotune 和一条编译路径——这些一个声明都表达不了。它们还共用 ``cuda`` 命名空间，
+#: 所以谁胜出由各自后端的 probe 决定（ROCm 看 ``torch.version.hip``，CoreX 看设备
+#: 名），而不是由这里的顺序决定。``reference`` 放最后，因为它永远报可用，排在它后面
+#: 的后端都到不了。
 BUILTIN: tuple[str, ...] = ("hip", "corex", "reference")
 
-#: Module name of each built-in backend inside this package.
+#: 每个内置后端在本包内的模块名。
 _BUILTIN_MODULE = {
     "hip": "backends.hip",
     "corex": "backends.corex",
     "reference": "backends.reference",
 }
 
-#: Probe priority of each built-in, used only to break a tie between two backends that
-#: claimed the same device equally strongly. The reference is last because it always
-#: answers usable; ``hip`` and ``corex`` sit at the same priority on purpose, since
-#: neither may win a shared ``cuda`` namespace by ordering alone.
+#: 每个内置后端的探测优先级，只用于打破两个后端同等强度认领同一设备时的平局。参考
+#: 实现排最后因为它永远报可用；``hip`` 和 ``corex`` 是故意同优先级的，共享的
+#: ``cuda`` 命名空间里谁都不能靠排序胜出。
 _BUILTIN_PRIORITY = {"hip": 0, "corex": 0, "reference": 1000}
 
 
 class Candidate:
-    """One selectable backend, with the claim it made on this host.
+    """一个可被选中的后端，以及它在这台主机上的认领。
 
     Attributes:
-        name: Backend identifier, i.e. what ``COFFIN_BACKEND`` accepts.
-        backend: The object the protocol drives; a module for hand-written backends, a
-            :class:`~coffin.backends.vendor.SpecBackend` for a declared vendor.
-        claim: How strongly this host matched, from
-            :func:`coffin.backends.vendor.detect` (``0`` for a hand-written backend that
-            does not take part in claim ordering). Higher wins.
-        priority: Tie-break among equal claims, lower first.
+        name: 后端标识符，即 ``COFFIN_BACKEND`` 接受的名字。
+        backend: 协议驱动的对象；手写后端是模块，声明式厂商是
+            :class:`~coffin.backends.vendor.SpecBackend`。
+        claim: 主机匹配的强度，来自 :func:`coffin.backends.vendor.detect`（不参与
+            认领排序的手写后端为 ``0``）。越高越优。
+        priority: 认领相等时的平局裁决，越小越优。
     """
 
     __slots__ = ("name", "backend", "claim", "priority")
 
     def __init__(self, name: str, backend: Backend, claim: int = 0,
                  priority: int = 0) -> None:
-        """Record one backend and the claim it made on this host.
+        """记录一个后端以及它在这台主机上的认领。
 
         Args:
-            name: Backend identifier, i.e. what ``COFFIN_BACKEND`` accepts.
-            backend: The module or :class:`~coffin.backends.vendor.SpecBackend` the
-                protocol drives.
-            claim: Claim strength from :func:`coffin.backends.vendor.detect`; ``0`` for
-                a hand-written backend, which does not compete on claim.
-            priority: Tie-break among equal claims, lower first. The reference carries
-                the highest value so it always sorts last.
+            name: 后端标识符，即 ``COFFIN_BACKEND`` 接受的名字。
+            backend: 协议驱动的模块或 :class:`~coffin.backends.vendor.SpecBackend`。
+            claim: 来自 :func:`coffin.backends.vendor.detect` 的认领强度；手写后端为
+                ``0``，因为它不靠认领竞争。
+            priority: 认领相等时的平局裁决，越小越优。参考实现取最大值，所以永远
+                排最后。
         """
         self.name = name
         self.backend = backend
@@ -113,23 +100,23 @@ class Candidate:
         self.priority = priority
 
     def rank(self) -> tuple[int, int, str]:
-        """Sort key: strongest claim first, then priority, then name.
+        """排序键：认领最强者优先，其次优先级，最后名字。
 
         Returns:
-            ``(-claim, priority, name)``. Claim is negated because sorting ascending
-            puts the strongest first; the trailing name keeps the order total, so two
-            vendors that tie cannot make selection depend on import order.
+            ``(-claim, priority, name)``。取反是因为升序排序要把最强的排在前面；
+            末尾的名字让顺序成为全序，两个并列的厂商就不会让选择结果取决于 import
+            顺序。
         """
         return (-self.claim, self.priority, self.name)
 
 
 def _builtins() -> tuple[Candidate, ...]:
-    """Load every hand-written backend.
+    """加载每一个手写后端。
 
     Returns:
-        One :class:`Candidate` per :data:`BUILTIN`, in declaration order. A built-in
-        that fails to import propagates: these are first-party modules, so a failure is
-        a bug in this repository rather than a platform that happens to be absent.
+        按 :data:`BUILTIN` 声明顺序，每个一项 :class:`Candidate`。import 失败的
+        内置后端会直接抛出：它们是一方模块，失败是本仓库的 bug，而不是某个恰好
+        不在的平台。
     """
     out = []
     for name in BUILTIN:
@@ -139,21 +126,21 @@ def _builtins() -> tuple[Candidate, ...]:
 
 
 def _vendors() -> tuple[Candidate, ...]:
-    """Load every discovered vendor backend and evaluate its claim on this host.
+    """加载每一个被发现的厂商后端，并评估它在这台主机上的认领。
 
-    The claim is read here, once, because it is the whole basis of the ordering; asking
-    each vendor again later would allow the host and the ordering to disagree.
+    认领在这里只读一次，因为它是整个排序的依据；事后再问每个厂商一遍，会让主机
+    状态和排序结论对不上。
 
     Returns:
-        One :class:`Candidate` per vendor file that imports cleanly. A vendor that
-        fails to import is skipped: one broken platform file must not make the layer
-        unselectable, and :func:`describe_all` is where it gets reported.
+        每个能干净 import 的厂商文件一项 :class:`Candidate`。import 失败的厂商被
+        跳过：一个坏掉的平台文件不能让整层都选不出后端，它会由
+        :func:`describe_all` 报出来。
     """
     out = []
     for spec, backend in discovery.iter_vendors():
         try:
             claim = backend.claim()
-        except Exception:                         # pragma: no cover - probe error
+        except Exception:                         # pragma: no cover - 探测出错
             claim = 0
         out.append(Candidate(spec.name, backend, claim=claim,
                              priority=spec.priority))
@@ -161,31 +148,28 @@ def _vendors() -> tuple[Candidate, ...]:
 
 
 def candidates() -> tuple[Candidate, ...]:
-    """Return every selectable backend, strongest claim first.
+    """返回所有可选后端，认领最强的在前。
 
     Returns:
-        Hand-written backends and discovered vendors merged and sorted by
-        :meth:`Candidate.rank`. The reference sorts last among equals because its
-        priority is the highest, which is what makes it the guaranteed fallback.
+        手写后端与发现的厂商合并后按 :meth:`Candidate.rank` 排序。并列时参考实现
+        排最后，因为它的优先级最高，这正是它成为保证兜底的原因。
     """
     return tuple(sorted(_builtins() + _vendors(), key=Candidate.rank))
 
 
 def _backend_named(name: str) -> Backend | None:
-    """Resolve one backend by name, without probing it.
+    """按名字解析一个后端，不探测它。
 
     Args:
-        name: Backend identifier from ``COFFIN_BACKEND`` or a caller.
+        name: 来自 ``COFFIN_BACKEND`` 或调用方的后端标识符。
 
     Returns:
-        The backend object, or ``None`` when no candidate has that name. Tries the
-        built-in module map first so an explicit pin does not pay for a vendor
-        directory scan.
+        后端对象；没有候选叫这个名字时返回 ``None``。先查内置模块映射，这样显式
+        钉住某个后端时不必付一次厂商目录扫描的代价。
 
     Raises:
-        ImportError: The named built-in exists but its module cannot import. Reported
-            rather than swallowed, because an explicitly pinned backend that silently
-            became something else is the failure this layer exists to prevent.
+        ImportError: 具名内置后端存在但模块 import 不了。这里报出来而不是吞掉，
+            因为一个被显式钉住却悄悄变成别的后端的情形，正是这一层要防的故障。
     """
     if name in _BUILTIN_MODULE:
         return importlib.import_module(_BUILTIN_MODULE[name])
@@ -196,29 +180,27 @@ def _backend_named(name: str) -> Backend | None:
 
 
 def available_names() -> tuple[str, ...]:
-    """Return the backend names this build can select, in probe order.
+    """返回本次构建可选的后端名，按探测顺序。
 
     Returns:
-        The names, strongest claim first. Discovered vendors are included, so a name
-        added as a file is immediately a valid ``COFFIN_BACKEND`` value without editing
-        this module.
+        名字列表，认领最强者在先。被发现的厂商也包含在内，所以新加一个文件就成了
+        合法的 ``COFFIN_BACKEND`` 取值，不必修改本模块。
     """
     return tuple(candidate.name for candidate in candidates())
 
 
 def _load(name: str) -> Backend:
-    """Resolve a backend by name or raise with the known names.
+    """按名字解析后端，失败时连同已知名字一起抛出。
 
     Args:
-        name: Backend identifier.
+        name: 后端标识符。
 
     Returns:
-        The backend object.
+        后端对象。
 
     Raises:
-        KeyError: No candidate has that name, or a discovered vendor file failed to
-            import. The message lists what is available, since a missing vendor file is
-            the usual cause.
+        KeyError: 没有候选叫这个名字，或者某个被发现的厂商文件 import 失败。消息
+            会列出可用项，因为厂商文件缺失是最常见的原因。
     """
     backend = _backend_named(name)
     if backend is None:
@@ -227,43 +209,41 @@ def _load(name: str) -> Backend:
 
 
 def _describe(candidate: Candidate) -> str:
-    """One-line status for a candidate, for the selection error text.
+    """给某个候选生成一行状态，供选择错误的文案使用。
 
     Args:
-        candidate: The backend and the claim it made.
+        candidate: 后端以及它做出的认领。
 
     Returns:
-        ``"name: state (reason)"``. Only called on the failure path, because building
-        the reason may import a vendor whose optional dependency is absent.
+        ``"name: state (reason)"``。只在失败路径上调用，因为生成 reason 可能
+        import 一个可选依赖不存在的厂商。
     """
     try:
         present = candidate.backend.probe()
         ok = candidate.backend.usable() if present else False
         why = "" if ok else (candidate.backend.reason() or "not usable")
-    except Exception as exc:                      # pragma: no cover - probe error
+    except Exception as exc:                      # pragma: no cover - 探测出错
         return f"{candidate.name}: probe raised {type(exc).__name__}: {exc}"
     state = "usable" if ok else ("present, unusable" if present else "absent")
     return f"{candidate.name}: {state}{(' (' + why + ')') if why else ''}"
 
 
 def select(requested: str | None = None) -> Backend:
-    """Pick the backend for this process.
+    """为本进程挑一个后端。
 
     Args:
-        requested: Backend name from ``COFFIN_BACKEND``, or ``None`` to read the
-            environment and then auto-detect. Passing a value explicitly is what tests
-            use to exercise the failure paths without touching the environment.
+        requested: 来自 ``COFFIN_BACKEND`` 的后端名；``None`` 表示读环境变量再自动
+            探测。显式传值供测试使用，这样不必改环境变量就能走到失败路径。
 
     Returns:
-        The selected backend.
+        选中的后端。
 
     Raises:
-        RuntimeError: An explicit name is not a known backend, or the explicitly named
-            backend is not usable. The message lists every candidate with its probe
-            result and reason, since the usual cause is a driver or toolchain problem on
-            the host rather than a wrong name.
-        RuntimeError: Auto-detection found no usable backend. Only reachable if the
-            reference backend itself is broken, so the message is a bug report.
+        RuntimeError: 显式给的名字不是已知后端，或显式指定的后端不可用。消息会逐个
+            列出候选及其探测结果和 reason，因为常见原因是主机上的驱动或工具链问题，
+            而不是名字写错。
+        RuntimeError: 自动探测找不到任何可用后端。这只有当参考后端本身坏掉时才可能
+            发生，所以那段消息就是一份 bug 报告。
     """
     explicit = requested if requested is not None else os.environ.get(ENV_VAR, "")
     explicit = (explicit or "").strip()
@@ -289,7 +269,7 @@ def select(requested: str | None = None) -> Backend:
         try:
             if candidate.backend.probe() and candidate.backend.usable():
                 return candidate.backend
-        except Exception:                          # pragma: no cover - probe error
+        except Exception:                          # pragma: no cover - 探测出错
             continue
 
     raise RuntimeError(
@@ -298,21 +278,19 @@ def select(requested: str | None = None) -> Backend:
         + "; ".join(_describe(candidate) for candidate in candidates()))
 
 
-#: The selected backend. Anything that needs the selection result imports one of the
-#: accessors below instead of reaching for this name.
+#: 选中的后端。任何需要选择结果的地方都 import 下面某个访问器，而不是直接拿这个名字。
 _backend: Backend | None = None
 
 
 def backend() -> Backend:
-    """Return the process-wide backend, selecting it on first use.
+    """返回进程级后端，首次使用时才做选择。
 
     Returns:
-        The selected backend; the same object on every call, because selecting twice
-        would either rebuild kernels or make two parts of the process disagree about the
-        device.
+        选中的后端；每次调用都是同一个对象，因为选两次要么会重建内核，要么会让进程
+        的两部分对设备产生分歧。
 
     Raises:
-        RuntimeError: Selection failed, with the diagnostic from :func:`select`.
+        RuntimeError: 选择失败，带上 :func:`select` 的诊断信息。
     """
     global _backend
     if _backend is None:
@@ -321,57 +299,54 @@ def backend() -> Backend:
 
 
 def _reset_for_tests(module: Backend | None = None) -> None:
-    """Force the memoised selection, so a test can exercise another backend.
+    """强行改写记忆化的选择结果，好让测试去跑另一个后端。
 
     Args:
-        module: Backend to pin, bypassing :func:`select`; ``None`` clears the memo so the
-            next :func:`backend` call selects again.
+        module: 要钉住的后端，绕过 :func:`select`；``None`` 清掉记忆，下次
+            :func:`backend` 调用重新选择。
 
     Returns:
-        Nothing. Not public API: it exists because a test that reloaded the backend
-        package has to be able to re-pin the module-level table.
+        无。不是公开 API：它存在是因为重载过后端包的测试必须能重新钉住模块级的表。
     """
     global _backend
     _backend = module
 
 
 def ops() -> Ops:
-    """Return the selected backend's total op table.
+    """返回所选后端的完整算子表。
 
     Returns:
-        The table, with every name callable: the backend's native entries plus reference
-        implementations for everything it does not implement. This is the object model
-        code binds at import time.
+        表，每个名字都可调用：后端的原生条目，加上它没实现的一切的参考实现。模型
+        代码在 import 时绑定的就是这个对象。
 
     Raises:
-        RuntimeError: Selection failed.
+        RuntimeError: 选择失败。
     """
     return backend().ops()
 
 
 def caps() -> Caps:
-    """Return the selected backend's capability record.
+    """返回所选后端的能力记录。
 
     Returns:
-        The record model code reads for dtypes, device and behavioural flags.
+        模型代码用来读 dtype、设备和行为标志的那条记录。
 
     Raises:
-        RuntimeError: Selection failed.
+        RuntimeError: 选择失败。
     """
     return backend().caps()
 
 
 def status() -> str:
-    """Render the one-line startup banner for the selected backend.
+    """渲染所选后端的一行启动横幅。
 
     Returns:
-        ``backend=hip device=cuda:0 native=17/17 graph=1 autotune=1``. It replaces the
-        ``hip=...`` field the transport used to print: without this line a run that
-        silently fell back to the reference backend looks like a slow model instead of a
-        missing kernel build.
+        ``backend=hip device=cuda:0 native=17/17 graph=1 autotune=1``。它替代传输层
+        原先打印的 ``hip=...`` 字段：没有这一行，一次悄悄回退到参考实现的运行看起来
+        就像模型慢，而不是内核没编出来。
 
     Raises:
-        RuntimeError: Selection failed.
+        RuntimeError: 选择失败。
     """
     b = backend()
     c = b.caps()
@@ -381,13 +356,12 @@ def status() -> str:
 
 
 def describe_all() -> Sequence[str]:
-    """Render one status line per candidate, for a diagnostic dump.
+    """为每个候选渲染一行状态，供诊断转储使用。
 
     Returns:
-        One ``name: state`` string per candidate, in probe order. Unlike :func:`status`
-        this touches every backend's ``probe``, so it is a diagnostic call, not a startup
-        one. A vendor file that fails to import is included as an error line rather than
-        omitted: a backend that vanishes without a word is the bug this guards against.
+        按探测顺序，每个候选一条 ``name: state``。与 :func:`status` 不同，它会碰每个
+        后端的 ``probe``，所以这是诊断调用而不是启动调用。import 失败的厂商文件会作为
+        错误行出现而不是被略去：一个悄无声息消失的后端，正是这里要防的 bug。
     """
     lines = [_describe(candidate) for candidate in candidates()]
     for module_name in discovery.modules():

@@ -123,6 +123,10 @@
 | occupancy | 占用率 | |
 | tiling | 分块 | 与 chunk 的「分块」区分时用「切块」 |
 | split-K | split-K | 保留 |
+| K-unroll | K 方向展开因子 | |
+| scratch | 中间缓冲区 | 共享内存语境写「共享暂存」 |
+| row pitch | 行距 | `stride` 作为参数名保留英文 |
+| eager path | 即时执行路径 | 与「图捕获」对举 |
 | GEMV / GEMM | GEMV / GEMM | 保留 |
 | offload | 卸载 | |
 | VRAM | 显存 | |
@@ -152,6 +156,32 @@
 | module | 模块 |
 
 ---
+
+| claim / claim strength | 认领 / 认领强度 | 后端声明支持某算子的动作 |
+| eager path | 即时执行路径 | 与「图捕获」对举 |
+| tiling | 切块 | 与 chunk 的「分块」冲突时用「切块」 |
+| allowlist | 允许列表 | 不用「白名单」；该表现在只能朝空收敛 |
+| partials | 部分和 | split-K 的 part_acc / part_ml 累加缓冲 |
+| split | 分片 | split-K 的分片数 |
+| staging row | 暂存行 | 预填充语境写「预填充暂存行」 |
+| high-water mark | 高水位 | |
+| decode row | 解码行 | |
+| draft / drafting | 草稿 / 草拟 | drafter 用「草稿模型」 |
+| verify | 校验 | 投机语境写「投机校验」 |
+| tap / taps / tap sum | 抽头 / 抽头 / 抽头求和 | |
+| packed fp16 | packed fp16 | 硬件打包乘加，无贴切中文 |
+| bucket | bucket | 分桶参数名，保留英文 |
+| staging row | 暂存行 | |
+| sentinel row | 哨兵行 | |
+| salt / salted | 盐 / 加盐 | |
+| span | 跨度 | |
+| oracle | 对照实现 | |
+| stub | 桩 | 桩引擎 |
+| tapping | 抽头 | |
+| dense model | 稠密模型 | |
+| fixture | fixture | 保留英文 |
+| online softmax | online softmax | 保留英文 |
+| teacher forcing | teacher forcing | 保留英文 |
 
 ## 构词习惯
 

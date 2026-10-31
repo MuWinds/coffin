@@ -1,23 +1,22 @@
-"""Qwen3.5-4B family entry point: model class, weight loader, tuning knobs.
+"""Qwen3.5-4B 族入口：模型类、权重加载器、调优开关。
 
-The checkpoint is a hybrid-attention model -- 24 Gated-DeltaNet layers and 8
-GQA layers, plus a single MTP layer used as a speculative drafter -- so the
-pieces here are the ones specific to that shape. The math and the kernels they
-run on live in ``ops/``.
+checkpoint 是混合注意力模型——24 层 Gated-DeltaNet 加 8 层 GQA，另有一个
+MTP 层当投机草稿模型——所以这里的部件都是这个形状专属的。数学和它们跑的
+内核放在 ``ops/``。
 
-Module: ``coffin/models/qwen35``. Top of the family: it may import ``ops`` and
-its own siblings (``blocks``, ``batch``, ``linear_attn``, ``full_attn``, ``mtp``,
-``vision``, ``weights``, ``tuning``), and is itself reached only through
-``engine_api``, which dispatches on the checkpoint's ``config.json``.
+Module: ``coffin/models/qwen35``。族的顶层：它可以 import ``ops`` 和自己
+的同级模块（``blocks``、``batch``、``linear_attn``、``full_attn``、``mtp``、
+``vision``、``weights``、``tuning``），而它自己只能经 ``engine_api`` 到达，
+后者按 checkpoint 的 ``config.json`` 分派。
 
 Constraints:
-    * Absolute imports only (``from models.qwen35.model import Qwen35``): the
-      entry points put ``coffin/`` on ``sys.path``, so ``models`` is a top-level
-      package next to ``ops`` and ``backends``.
-    * Nothing in the family may import ``engine_api`` or anything above it --
-      that module is the one place allowed to know which families exist.
-    * No hardware detail: the device, the dtypes and the split-K width all come
-      from ``backends``, so a new accelerator changes nothing in this package.
+    * 只用绝对导入（``from models.qwen35.model import Qwen35``）：入口脚本把
+      ``coffin/`` 放进 ``sys.path``，所以 ``models`` 是和 ``ops``、``backends``
+      平级的顶层包。
+    * 族里任何东西都不许 import ``engine_api`` 或更上层——那个模块是唯一
+      允许知道存在哪些族的地方。
+    * 不写硬件细节：设备、dtype 和 split-K 宽度都来自 ``backends``，换一颗
+      加速器不需要改这个包里的任何东西。
 """
 
 from models.qwen35.model import Qwen35

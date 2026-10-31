@@ -1,37 +1,29 @@
-"""Multi-token-prediction head: the speculative decoder's drafter.
+"""多 token 预测头：投机解码的草稿器。
 
-Module: ``coffin/models/qwen35``. Sits on top of the family's own blocks: it
-reuses ``FullAttn`` (as ``mtp.layers.0``), ``MLP``, the tied embedding and the
-batched projections, and is driven by ``model.py`` (``spec_generate`` /
-``spec_step`` / ``spec_step_batch``). It owns a second paged pool for the
-drafter KV and must not outlive the model that built it.
+Module: ``coffin/models/qwen35``。架在本族自己的块之上：复用 ``FullAttn``（作为
+``mtp.layers.0``）、``MLP``、绑定嵌入和批处理投影，由 ``model.py`` 驱动
+（``spec_generate`` / ``spec_step`` / ``spec_step_batch``）。它持有第二套分页池
+给草稿器 KV，不能比构建它的模型活得更久。
 
-One full-attention layer that, given the main model's hidden state at position
-``i`` and the embedding of token ``i+1``, predicts ``i+2``.  Drafting runs as a
-captured graph over fixed buffers with the chained argmax resolved on the
-device, so K drafts are K replays and the host never sees a token between them.
+一个全注意力层：给它主模型在位置 ``i`` 的隐含状态和 token ``i+1`` 的嵌入，它预测
+``i+2``。草稿过程是固定缓冲区上的一张捕获图，链式 argmax 在设备上解析，所以 K 份
+草稿就是 K 次重放，主机在中间看不到任何 token。
 
 Constraints:
-    * The draft chain lives entirely in device buffers (``h_in``, ``tok_in``,
-      ``logits_out``, ``b_*``). A host read between replays costs a full sync
-      per drafted token (~0.5 ms at batch 1) and destroys the point of
-      speculation, so the chained argmax must stay on the device.
-    * Graphs bake in buffer addresses and the pool tensors. ``capture_draft`` /
-      ``capture_draft_batch`` must run after every allocation, and the buffers
-      they write may never be reallocated while the graph is live.
-    * Capture goes through ``ops.runtime``, so a backend that cannot capture (its
-      operator table mixes library and hand-written kernels) runs the same body
-      eagerly instead. The chained argmax still stays on the device either way,
-      which is what keeps the no-host-round-trip constraint true on both paths.
-    * The drafter KV is rewritten at the main model's draft positions and rolled
-      back by the main verify, so it only needs the same window; a prompt past
-      ``batch_len`` is truncated and reported through ``check_len`` rather than
-      written past the pool.
-    * ``self.pos`` is the KV address and ``rope_delta`` the mRoPE offset. mRoPE
-      moves the rotation only -- the same split the main attention uses, and
-      mixing them up silently rotates by the wrong position after an image.
-    * All mutation is single-threaded, driven by ``llm_engine``; there is no
-      locking and none may be added.
+    * 草稿链完全活在设备缓冲区里（``h_in``、``tok_in``、``logits_out``、
+      ``b_*``）。重放之间读一次主机，每个草稿 token 就要一次完整同步（batch 1 时
+      约 0.5 ms），投机也就没有意义了，所以链式 argmax 必须留在设备上。
+    * 图会把缓冲区地址和池张量烘进去。``capture_draft`` / ``capture_draft_batch``
+      必须在每次分配之后跑，而它们写的缓冲区在图存活期间绝不能被重新分配。
+    * 捕获经 ``ops.runtime``，所以捕不了的后端（算子表混了库内核和手写内核）改为
+      即时执行同一段主体。两条路径下链式 argmax 都留在设备上，无主机往返的约束
+      因此在两边都成立。
+    * 草稿器 KV 在主模型的草稿位置被改写、由主校验回滚，所以它只需要同样的窗口；
+      超过 ``batch_len`` 的 prompt 会被截断并通过 ``check_len`` 上报，而不是写
+      越池。
+    * ``self.pos`` 是 KV 地址，``rope_delta`` 是 mRoPE 偏移。mRoPE 只动旋转——
+      和主注意力是同一种拆分，两者搞混会在图像之后用错误的位置旋转而不报错。
+    * 所有改写都是单线程的，由 ``llm_engine`` 驱动；没有加锁，也不许加。
 """
 
 from __future__ import annotations
@@ -52,25 +44,25 @@ from cache.paged_cache import PagedKVCache
 
 
 class MTP:
-    """Multi-token-prediction head: one full-attention layer that, given the main
-    model's hidden ``h_i`` and the embedding of token ``i+1``, predicts ``i+2``.
+    """多 token 预测头：一个全注意力层，给它主模型的隐含状态 ``h_i`` 和 token
+    ``i+1`` 的嵌入，它预测 ``i+2``。
 
-    Drafting chains its own outputs (``h`` from the previous step feeds the
-    next), and the next token is ``logits.argmax()`` on the device, so a whole
-    draft never syncs to the host. The main model then verifies the draft.
+    草稿过程把自己的输出串起来（上一步的 ``h`` 喂给下一步），下一个 token 是设备上
+    的 ``logits.argmax()``，所以一整份草稿从不同步回主机。之后由主模型校验这份
+    草稿。
     """
 
     def __init__(self, sd: dict, cfg: dict, bench: bool, max_seq: int) -> None:
-        """Load the MTP head and allocate the single-stream draft buffers.
+        """加载 MTP 头并分配单流草稿缓冲区。
 
         Args:
-            sd: Full state dict; this head reads the ``mtp.*`` keys plus the tied
-                ``model.language_model.embed_tokens.weight``.
-            cfg: Model config; ``hidden_size`` and the attention geometry pass
-                straight through to the embedded ``FullAttn`` layer.
-            bench: Threaded into ``_proj`` to select the benchmark weight layout.
-            max_seq: Context window handed to the embedded full-attention layer,
-                which sizes its dense (non-paged) KV cache from it.
+            sd: 完整 state dict；这个头读 ``mtp.*`` 这些键，外加绑定的
+                ``model.language_model.embed_tokens.weight``。
+            cfg: 模型配置；``hidden_size`` 和注意力几何直接传给内嵌的
+                ``FullAttn`` 层。
+            bench: 透传给 ``_proj``，用于选择基准权重布局。
+            max_seq: 交给内嵌全注意力层的上下文窗口，它据此确定稠密（非分页）
+                KV 缓存的尺寸。
         """
         p = "mtp"
         self.embed = TiedEmbedding(sd["model.language_model.embed_tokens.weight"], bench)
@@ -83,17 +75,15 @@ class MTP:
         self.mlp = MLP(sd, f"{p}.layers.0.mlp", bench)
         self.norm = RMSNorm(sd[f"{p}.norm.weight"])
         self.pos = torch.zeros(1, dtype=torch.long, device=_device)
-        #: mRoPE offset of the request being drafted, matching ``Qwen35.rope_delta``:
-        #: the drafter's rotation reads ``pos + rope_delta`` while ``pos`` keeps
-        #: addressing the KV slot.  The caller (``Qwen35.spec_step`` /
-        #: ``spec_step_batch``) copies the row's value in before a draft, because
-        #: the captured draft graph can only add a buffer, not branch on one.
+        #: 正在草拟的请求的 mRoPE 偏移，与 ``Qwen35.rope_delta`` 对应：草稿器的旋转
+        #: 读 ``pos + rope_delta``，而 ``pos`` 继续寻址 KV 槽位。调用方
+        #: （``Qwen35.spec_step`` / ``spec_step_batch``）在草稿前把该行的值拷进来，
+        #: 因为捕获的草稿图只能加一个缓冲区，不能按它分支。
         self.rope_delta = torch.zeros(1, dtype=torch.long, device=_device)
 
-        # Drafting runs as a captured graph. The chain (h, token) -> (h', token')
-        # lives entirely in these device buffers, so K drafts are K replays with
-        # no host round trip and no per-op launch overhead; the chained argmax is
-        # resolved on the device between replays.
+        # 草稿过程是一张捕获图。链 (h, token) -> (h', token') 完全活在这些设备
+        # 缓冲区里，所以 K 份草稿就是 K 次重放，没有主机往返、也没有逐算子 launch
+        # 开销；链式 argmax 在重放之间于设备上解析。
         hidden = cfg["hidden_size"]
         self.tok_in = torch.zeros(1, dtype=torch.long, device=_device)
         self.h_in = torch.zeros(hidden, dtype=D, device=_device)
@@ -101,17 +91,17 @@ class MTP:
         self._ctx = None
         self._graph: runtime.Capture | None = None
 
-        # Batched drafter (one row per sequence).  Kept entirely separate from the
-        # single-stream buffers above so the speculative path stays untouched.
+        # 批处理草稿器（每个序列一行）。与上面的单流缓冲区完全分开，投机路径因此
+        # 不受影响。
         self._sd, self._cfg, self._bench = sd, cfg, bench
-        # Keep the attention tensors alive even when the caller clears ``sd`` after
-        # the model is built (the batch drafter builds its paged twin lazily).
+        # 即使调用方在模型构建后清空 ``sd``，也要让注意力张量活着（批处理草稿器
+        # 会延迟构建它的分页孪生体）。
         self._attn_sd = {k: v for k, v in sd.items()
                          if k.startswith("mtp.layers.0.self_attn.")}
         self._max_seq = max_seq
         self.batch_capacity = 0
         self.batch_buckets: tuple[int, ...] = ()
-        self.batch_len = 0               # drafter positions a row can address
+        self.batch_len = 0               # 一行能寻址的草稿器位置数
         self.pool: PagedKVCache | None = None
         self.attn_b: FullAttn | None = None
         self.b_pos = self.b_tok = self.b_h = self.b_logits = None
@@ -120,24 +110,22 @@ class MTP:
         self._draft_graphs: dict[int, runtime.Capture] = {}
 
     def reset(self) -> None:
-        """Rewind the single-stream drafter to position 0.
+        """把单流草稿器倒回位置 0。
 
         Returns:
-            Nothing. The MTP KV is position-indexed and never read past ``pos``,
-            so moving the counter back is a complete rollback; the embedded
-            attention layer's own cache is cleared too.
+            无。MTP 的 KV 按位置索引且从不读越过 ``pos``，所以把计数器移回去就是
+            完整回滚；内嵌注意力层自己的缓存也一并清空。
         """
         self.attn.reset()
         self.pos.zero_()
         self.rope_delta.zero_()
 
     def _draft_impl(self) -> None:
-        """One draft step over fixed buffers; the tail token feeds the next.
+        """在固定缓冲区上跑一步草稿；尾部的 token 喂给下一步。
 
         Returns:
-            Nothing. Reads ``tok_in`` / ``h_in`` / ``pos`` and writes back the new
-            hidden, the logits and the advanced position -- all in place, because
-            this body is what the captured graph replays.
+            无。读 ``tok_in`` / ``h_in`` / ``pos``，写回新的隐含状态、logits 和
+            推进后的位置——全部就地，因为捕获图重放的就是这段主体。
         """
         cos_tbl, sin_tbl, mask_idx = self._ctx[0], self._ctx[1], self._ctx[2]
         e = self.embed.lookup(self.tok_in).view(-1)
@@ -151,19 +139,17 @@ class MTP:
         self.pos.add_(1)
 
     def capture_draft(self, ctx, warmup: int = 3) -> None:
-        """Capture one draft step; :meth:`draft` chains K replays of it.
+        """捕获一步草稿；:meth:`draft` 把它的 K 次重放串起来。
 
         Args:
-            ctx: The main model's ``(cos_tbl, sin_tbl, mask_idx)``. Held, not
-                copied, because the graph reads those exact tensors.
-            warmup: Replays on a side stream before capturing. The kernels need
-                their shapes warmed or capture records an allocation it cannot
-                replay.
+            ctx: 主模型的 ``(cos_tbl, sin_tbl, mask_idx)``。只持有不拷贝，因为图
+                读的就是这几个张量本身。
+            warmup: 捕获之前在旁路流上的重放次数。内核要先按形状预热，否则捕获会
+                录下一次它无法重放的分配。
 
         Returns:
-            Nothing. ``_graph`` holds the captured step; a second call replaces
-            it, and the position counters are reset on both sides of the capture
-            so the first replay starts at 0.
+            无。``_graph`` 持有捕获好的那一步；再次调用会替换它，捕获前后各重置
+            一次位置计数器，好让第一次重放从 0 开始。
         """
         self._ctx = ctx
         self.reset()
@@ -172,27 +158,26 @@ class MTP:
 
     def draft(self, h_prev: torch.Tensor, tok0: torch.Tensor, K: int,
               out_toks: torch.Tensor) -> None:
-        """Chain ``K`` drafts from ``(h_prev, tok0)``; writes K+1 ids into ``out_toks``.
+        """从 ``(h_prev, tok0)`` 串出 ``K`` 份草稿；把 K+1 个 id 写进 ``out_toks``。
 
-        ``self.pos`` must already sit at the position of ``h_prev``.
+        ``self.pos`` 必须已经停在 ``h_prev`` 对应的位置上。
 
         Args:
-            h_prev: The main model's hidden state for the last accepted token.
-            tok0: That token's id, the first input of the chain.
-            K: Drafts to produce; ``K`` replays of the captured step.
-            out_toks: Long buffer of at least ``K+1`` entries. ``out_toks[0]`` is
-                ``tok0`` and ``out_toks[i]`` the ``i``-th draft, which is the
-                layout the verify step indexes.
+            h_prev: 主模型对最后一个已接受 token 的隐含状态。
+            tok0: 那个 token 的 id，也就是链的第一个输入。
+            K: 要产出的草稿数；即捕获步的 ``K`` 次重放。
+            out_toks: 至少 ``K+1`` 项的 long 缓冲区。``out_toks[0]`` 是 ``tok0``，
+                ``out_toks[i]`` 是第 ``i`` 份草稿——校验步骤按这个布局索引。
 
         Raises:
-            AssertionError: The graph was not captured. ``capture_draft`` must run
-                after the model is built and before the first draft.
+            AssertionError: 图还没捕获。``capture_draft`` 必须在模型构建之后、
+                第一次草稿之前跑。
         """
         assert self._graph is not None, "draft graph not captured"
         self.h_in.copy_(h_prev)
         self.tok_in.copy_(tok0.reshape(1))
-        # Slice, not index: ``out_toks[0]`` on a 1-D tensor is a 0-dim view and
-        # ``copy_`` from a [1] tensor into it fails the shape check.
+        # 用切片而不是索引：一维张量上的 ``out_toks[0]`` 是零维视图，把 [1] 张量
+        # ``copy_`` 进去过不了形状检查。
         out_toks[0:1].copy_(self.tok_in)
         for i in range(1, K + 1):
             self._graph.replay()
@@ -200,22 +185,20 @@ class MTP:
             out_toks[i:i + 1].copy_(self.tok_in)
 
     def step(self, h_prev: torch.Tensor, tok: torch.Tensor, ctx) -> tuple[torch.Tensor, torch.Tensor]:
-        """One eager draft step at ``self.pos``; returns (h', logits) and advances pos.
+        """在 ``self.pos`` 处做一步即时执行的草稿；返回 (h', logits) 并推进 pos。
 
-        ``ctx`` is the main model's ``(cos_tbl, sin_tbl, mask_idx)`` (an optional
-        4th entry is ignored); the rotation adds :attr:`rope_delta`, which the
-        caller keeps in step with the main model's row.
+        ``ctx`` 是主模型的 ``(cos_tbl, sin_tbl, mask_idx)``（可选的第四项被忽略）；
+        旋转会加上 :attr:`rope_delta`，调用方让它和主模型对应行保持一致。
 
         Args:
-            h_prev: The main model's hidden state at the current position.
-            tok: The token id to draft from.
-            ctx: The main model's ``(cos_tbl, sin_tbl, mask_idx[, rope])``; the
-                rope entry is ignored here because this path handles no image
-                chunk.
+            h_prev: 主模型在当前位置的隐含状态。
+            tok: 从这个 token id 开始草拟。
+            ctx: 主模型的 ``(cos_tbl, sin_tbl, mask_idx[, rope])``；这里忽略 rope
+                那一项，因为这条路径不处理任何图像分块。
 
         Returns:
-            ``(h, logits)`` for the predicted next token. The caller samples from
-            ``logits``; the drafter does not commit a token on this path.
+            预测下一个 token 用的 ``(h, logits)``。调用方从 ``logits`` 里采样；
+            这条路径上草稿器不提交 token。
         """
         cos_tbl, sin_tbl, mask_idx = ctx[0], ctx[1], ctx[2]
         e = self.embed.lookup(tok.reshape(1)).view(-1)
@@ -229,47 +212,42 @@ class MTP:
 
     def prefill(self, H: torch.Tensor, next_toks: torch.Tensor, positions: torch.Tensor,
                 ctx, rope=None) -> None:
-        """Fill the MTP KV cache over a run of prompt positions.
+        """在一段 prompt 位置上填充 MTP 的 KV 缓存。
 
-        ``H[i]`` is the main model's hidden state at ``positions[i]`` and
-        ``next_toks[i]`` is the token that follows it -- the MTP head is trained on
-        exactly that pair, so the caller passes the already-shifted tokens (there is
-        no shift inside, or a chunked caller would shift twice).
+        ``H[i]`` 是主模型在 ``positions[i]`` 的隐含状态，``next_toks[i]`` 是紧跟它
+        的那个 token——MTP 头正是按这一对训练的，所以调用方传进来的是已经移过位的
+        token（这里不再移位，否则分块调用方会移两次）。
 
-        ``rope`` is an optional explicit ``(cos, sin)`` pair of ``[n, rot]`` rows
-        for a prompt region that contains image tokens (``ops.mrope``): the
-        drafter is a full-attention layer over the same positions as the main
-        model, so it has to rotate identically.  ``None`` keeps the 1-D table
-        path; either way ``positions`` addresses the KV slots and ``ctx`` stays
-        the main model's tuple.
+        ``rope`` 是可选的显式 ``(cos, sin)`` 对，形状 ``[n, rot]``，用于含图像
+        token 的 prompt 区域（``ops.mrope``）：草稿器是覆盖与主模型相同位置的全
+        注意力层，必须同样地旋转。``None`` 走一维表路径；两种情况下 ``positions``
+        都寻址 KV 槽位，``ctx`` 仍是主模型的元组。
 
-        The queries are tiled and the keys streamed like the main attention
-        (``PREFILL_ATTN_TILE`` / ``PREFILL_ATTN_KB``): without the query tiles the
-        score block is ``[nkv, rep, n, kend]``, which is 1 GiB at 16k tokens and
-        17 GB at 64k.
+        查询照主注意力那样切块、key 流式读取（``PREFILL_ATTN_TILE`` /
+        ``PREFILL_ATTN_KB``）：不做查询切块的话 score 块是
+        ``[nkv, rep, n, kend]``，16k token 时 1 GiB、64k 时 17 GB。
 
         Args:
-            H: Main-model hidden states, ``[n, hidden]``.
-            next_toks: Token ids following each row of ``H``, ``[n]`` long.
-            positions: Absolute positions of those tokens, ``[n]`` long.
-            ctx: The main model's ``(cos_tbl, sin_tbl, mask_idx[, rope])``.
-            rope: Explicit 3-D ``(cos, sin)`` for an image-bearing region.
+            H: 主模型的隐含状态，``[n, hidden]``。
+            next_toks: 跟在 ``H`` 每一行之后的 token id，长度 ``[n]``。
+            positions: 那些 token 的绝对位置，长度 ``[n]``。
+            ctx: 主模型的 ``(cos_tbl, sin_tbl, mask_idx[, rope])``。
+            rope: 含图像区域用的显式三维 ``(cos, sin)``。
 
         Returns:
-            Nothing. The cache is filled and ``self.pos`` is moved past the last
-            position, so the next draft continues from there.
+            无。缓存被填好，``self.pos`` 移到最后一个位置之后，下一份草稿从那继续。
         """
         n = min(int(positions.shape[0]), int(H.shape[0]), int(next_toks.shape[0]))
         if n <= 0:
             return
-        # The caller may put the rope pair on ctx instead of the argument.
+        # 调用方可能把 rope 对放在 ctx 里而不是参数里。
         if len(ctx) > 3:
             if rope is None:
                 rope = ctx[3]
             ctx = ctx[:3]
         e = self.embed.lookup(next_toks[:n])
-        # ``fc`` must go through the batched path: the fused entry takes a single
-        # [K] vector, so calling it with [n, 2*hidden] silently reads row 0 only.
+        # ``fc`` 必须走批处理路径：融合入口只吃单个 [K] 向量，用 [n, 2*hidden]
+        # 调它只会静默读到第 0 行。
         x = self.fc.prefill(torch.cat([self.pre_norm_emb(e), self.pre_norm_hid(H[:n])],
                                       dim=-1))
         Q = PREFILL_ATTN_TILE
@@ -277,8 +255,8 @@ class MTP:
             c1 = min(c0 + PREFILL_MTP_CHUNK, n)
             n_loc = c1 - c0
             base = int(positions[c0])
-            # Tiles are absolute: ``(q0, q1, p0, kend)`` in chunk coordinates, so
-            # the last tile's causal bound is the chunk end.
+            # 切块坐标是绝对的：``(q0, q1, p0, kend)`` 都在分块坐标里，所以最后一个
+            # 切块的因果上界就是分块末尾。
             tiles = ([(q0, min(q0 + Q, n_loc), base, base + min(q0 + Q, n_loc))
                       for q0 in range(0, n_loc, Q)]
                      if n_loc > Q else None)
@@ -287,46 +265,41 @@ class MTP:
                                                     positions[c0:c1], ctx, tiles,
                                                     rope=rope_c)
             x[c0:c1] = x[c0:c1] + self.mlp.prefill(self.post_ln(x[c0:c1]))
-            # The final norm is not applied per chunk: the caller consumes the
-            # hidden state through ``_draft_impl``, which normalises once at the
-            # end. Computing it here would cost a full [n, hidden] pass and change
-            # nothing the next replay reads.
+            # 最后那一步归一化不按分块施加：调用方经 ``_draft_impl`` 消费隐含状态，
+            # 那里会在末尾统一归一化一次。在这里算要完整跑一遍 [n, hidden]，而且改变
+            # 不了下一次重放读到的任何东西。
             _ = self.norm(x[c0:c1])
         self.pos.fill_(int(positions[n - 1]) + 1)
 
     def enable_spec_batch(self, capacity: int, buckets: tuple[int, ...],
                           ctx, block_size: int = 64,
                           max_len: int = 16384) -> None:
-        """Give the drafter per-row buffers, a paged KV pool and captured graphs.
+        """给草稿器配好逐行缓冲区、分页 KV 池和捕获图。
 
-        The drafter's KV is rewritten at the same positions as the main model's
-        drafts and rolled back by the main verify, so it only needs the same
-        context window: ``min(max_seq, max_len)`` positions per row (the cap keeps
-        the pool small enough to coexist with the decode graphs; longer contexts
-        are reported to the caller by :meth:`check_len`).
+        草稿器的 KV 在主模型草稿所在的相同位置被改写、并由主校验回滚，所以它只
+        需要同样的上下文窗口：每行 ``min(max_seq, max_len)`` 个位置（这个上限让池
+        小到能与解码图共存；更长的上下文由 :meth:`check_len` 上报给调用方）。
 
         Args:
-            capacity: Decode rows.
-            buckets: Batch sizes to capture a draft graph for; one graph each,
-                and every bucket must be ``<= capacity``.
-            ctx: The main model's ``(cos_tbl, sin_tbl, mask_idx)``.
-            block_size: Paged-KV block size; the per-row block count
-                ``batch_len / block_size`` is rounded down, so a row always
-                addresses whole blocks.
-            max_len: Upper bound on drafter positions per row.
+            capacity: 解码行数。
+            buckets: 要为哪些批大小各捕获一张草稿图；每个一张，且每个都必须
+                ``<= capacity``。
+            ctx: 主模型的 ``(cos_tbl, sin_tbl, mask_idx)``。
+            block_size: 分页 KV 的块大小；每行的块数 ``batch_len / block_size``
+                向下取整，所以一行总是寻址整块。
+            max_len: 每行草稿器位置数的上限。
 
         Returns:
-            Nothing. Idempotent for an unchanged ``(capacity, buckets)``; a
-            change drops the old pool and graphs first, because a captured graph
-            cannot be pointed at a new pool.
+            无。``(capacity, buckets)`` 不变时幂等；一旦变化就先丢掉旧池和旧图，
+            因为捕获的图没法指向新池。
         """
         capacity = max(int(capacity), 1)
         if (self.pool is not None and self.batch_capacity == capacity
                 and self.batch_buckets == tuple(buckets)):
             return
         if self.pool is not None:
-            # Rebuilding for different buckets (e.g. a second test class on the
-            # same model): drop the old drafter state before allocating the new.
+            # 为不同的 bucket 重建（例如在同一个模型上跑第二个测试类）：先丢掉旧的
+            # 草稿器状态，再分配新的。
             self.pool = None
             self.attn_b = None
             self._draft_graphs = {}
@@ -341,8 +314,8 @@ class MTP:
         self.pool = PagedKVCache(1, nkv, hd, num_blocks=capacity * bpr,
                                  block_size=bs, max_seq=self.batch_len,
                                  rows=capacity)
-        # Static block tables: row ``r`` owns blocks ``[r*bpr, (r+1)*bpr)``, so
-        # the draft path runs no allocator and no table mutation.
+        # 静态块表：第 ``r`` 行拥有块 ``[r*bpr, (r+1)*bpr)``，所以草稿路径既不跑
+        # 分配器，也不改块表。
         for row in range(capacity):
             self.pool.assign_table([row * bpr + i for i in range(bpr)], 0, row)
         self.attn_b = FullAttn(self._attn_sd, "mtp.layers.0.self_attn", self._cfg,
@@ -355,23 +328,22 @@ class MTP:
         self.b_h_prev = torch.zeros(capacity, hidden, dtype=D, device=_device)
         self.b_logits = torch.zeros(capacity, self.embed.shape[0], dtype=D, device=_device)
         self._ctx_lens = torch.ones(capacity, dtype=torch.int32, device=_device)
-        #: Per-row mRoPE offset of the batched drafter, mirrored from the main
-        #: model's ``rope_delta`` by the caller (``Qwen35.spec_step_batch``); 0 for
-        #: a text-only bucket, so the default bucket is unchanged.
+        #: 批处理草稿器的逐行 mRoPE 偏移，由调用方（``Qwen35.spec_step_batch``）从
+        #: 主模型的 ``rope_delta`` 镜像过来；纯文本 bucket 为 0，默认 bucket 因此
+        #: 不变。
         self.b_rope_delta = torch.zeros(capacity, dtype=torch.long, device=_device)
         self.capture_draft_batch()
 
     def check_len(self, max_position: int) -> None:
-        """Raise if a row's context would run past the drafter pool.
+        """某一行的上下文会超出草稿器池时抛出。
 
         Args:
-            max_position: The row's last position, i.e. context length minus one.
+            max_position: 该行最后一个位置，即上下文长度减一。
 
         Raises:
-            RuntimeError: The position is at or past ``batch_len``. The pool has
-                no slot to write, so the caller must disable speculation for this
-                request or raise ``max_len``; truncating silently would draft
-                against a KV that disagrees with the main model.
+            RuntimeError: 位置等于或超过 ``batch_len``。池里没有槽位可写，调用方
+                必须为这个请求关掉投机或者调高 ``max_len``；悄悄截断会对着一个与
+                主模型不一致的 KV 草拟。
         """
         if self.pool is not None and max_position >= self.batch_len:
             raise RuntimeError(
@@ -379,18 +351,16 @@ class MTP:
                 "disable spec for this request or raise max_len")
 
     def _draft_batch_impl(self, rows: int) -> None:
-        """One draft step for ``rows`` rows: the chain tail feeds the next replay.
+        """为 ``rows`` 行做一步草稿：链的尾部喂给下一次重放。
 
         Args:
-            rows: Active rows, i.e. the leading slice of every ``b_*`` buffer.
+            rows: 活跃行数，即每个 ``b_*`` 缓冲区的前导切片。
 
         Returns:
-            Nothing. All state moves in place, because this body is the captured
-            bucket graph.
+            无。全部状态就地迁移，因为这段主体就是捕获的 bucket 图。
         """
         cos_tbl, sin_tbl, mask_idx = self._ctx[0], self._ctx[1], self._ctx[2]
-        # +1 in place: the entry takes a length, not a last index, and this runs
-        # inside the captured graph, so it cannot allocate.
+        # 就地 +1：这个入口要的是长度而不是末下标；而且它跑在捕获图里，不能分配。
         self._ctx_lens[:rows].copy_(
             self.b_pos[:rows].to(torch.int32).add_(1))
         e = self.embed.lookup(self.b_tok[:rows])
@@ -406,15 +376,14 @@ class MTP:
         self.b_pos[:rows].add_(1)
 
     def capture_draft_batch(self) -> None:
-        """One graph per drafter bucket; :meth:`draft_batch` chains K replays.
+        """每个草稿器 bucket 一张图；:meth:`draft_batch` 把它的 K 次重放串起来。
 
         Returns:
-            Nothing. The position counters are zeroed before and after capture so
-            every bucket graph starts at position 0.
+            无。捕获前后都把位置计数器清零，每张 bucket 图因此都从位置 0 开始。
 
         Raises:
-            AssertionError: No pool exists yet, i.e. ``enable_spec_batch`` was not
-                called after the model was built.
+            AssertionError: 还没有池，也就是模型构建之后没调过
+                ``enable_spec_batch``。
         """
         assert self.pool is not None, "enable_spec_batch() first"
         self._draft_graphs = {}
@@ -425,18 +394,17 @@ class MTP:
         self.b_pos.zero_()
 
     def draft_batch(self, bucket: int, K: int, out_toks: torch.Tensor) -> None:
-        """Chain ``K`` drafts for every row of ``bucket``; writes ``[bucket, K+1]``.
+        """为 ``bucket`` 的每一行串出 ``K`` 份草稿；写出 ``[bucket, K+1]``。
 
-        ``b_h``/``b_tok``/``b_pos`` must be staged by the caller; the chained
-        argmax stays on the device between replays, like the single-stream draft.
+        调用方必须先把 ``b_h``/``b_tok``/``b_pos`` 备好；链式 argmax 和单流草稿
+        一样，在重放之间留在设备上。
 
         Args:
-            bucket: Batch size whose graph to replay. It must be one of the
-                captured buckets: a larger one would overrun the buffers, a
-                smaller one would leave rows undrafted.
-            K: Drafts to produce per row.
-            out_toks: Long buffer ``[bucket, K+1]``; column 0 is the input token,
-                column ``i`` the ``i``-th draft.
+            bucket: 要重放哪张图的批大小。它必须是已捕获的 bucket 之一：更大的会
+                冲出缓冲区，更小的会留下没草拟的行。
+            K: 每行要产出的草稿数。
+            out_toks: long 缓冲区 ``[bucket, K+1]``；第 0 列是输入 token，第 ``i``
+                列是第 ``i`` 份草稿。
         """
         g = self._draft_graphs[bucket]
         out_toks[:, 0].copy_(self.b_tok[:bucket])
@@ -448,42 +416,39 @@ class MTP:
     @torch.no_grad()
     def prefill_row(self, row: int, H: torch.Tensor, next_toks: torch.Tensor,
                     positions: torch.Tensor, ctx, rope=None) -> None:
-        """Fill one row's paged drafter KV over a run of prompt positions.
+        """在一段 prompt 位置上填充某一行的分页草稿器 KV。
 
-        Same maths as :meth:`prefill`, but the attention writes/reads ``row``'s
-        slot map instead of the single-stream dense cache.  ``rope`` is the same
-        optional explicit 3-D ``(cos, sin)`` pair (image tokens in this region).
+        数学和 :meth:`prefill` 相同，但注意力读写的是 ``row`` 的槽位表，而不是单流
+        的稠密缓存。``rope`` 仍是那个可选的显式三维 ``(cos, sin)`` 对（本区域含
+        图像 token）。
 
         Args:
-            row: Decode row whose block table addresses the drafter pool.
-            H: Main-model hidden states, ``[n, hidden]``.
-            next_toks: Token ids following each row of ``H``, ``[n]`` long.
-            positions: Absolute positions of those tokens, ``[n]`` long.
-            ctx: The main model's ``(cos_tbl, sin_tbl, mask_idx[, rope])``.
-            rope: Explicit 3-D ``(cos, sin)`` for an image-bearing region.
+            row: 其块表指向草稿器池的解码行。
+            H: 主模型的隐含状态，``[n, hidden]``。
+            next_toks: 跟在 ``H`` 每一行之后的 token id，长度 ``[n]``。
+            positions: 那些 token 的绝对位置，长度 ``[n]``。
+            ctx: 主模型的 ``(cos_tbl, sin_tbl, mask_idx[, rope])``。
+            rope: 含图像区域用的显式三维 ``(cos, sin)``。
 
         Returns:
-            Nothing. A run that would cross ``batch_len`` is truncated to the part
-            that fits, so the row's later positions are dropped and the caller
-            falls back through :meth:`check_len` instead of writing past the pool.
+            无。会越过 ``batch_len`` 的那段被截到放得下的部分，该行后面的位置于是
+            被丢掉，调用方经 :meth:`check_len` 回退，而不是写越池。
 
         Raises:
-            AssertionError: ``enable_spec_batch`` has not built the paged drafter.
+            AssertionError: ``enable_spec_batch`` 还没建出分页草稿器。
         """
         assert self.attn_b is not None, "enable_spec_batch() first"
         n = min(int(positions.shape[0]), int(H.shape[0]), int(next_toks.shape[0]))
         if n <= 0:
             return
-        # The caller may put the rope pair on ctx instead of the argument.
+        # 调用方可能把 rope 对放在 ctx 里而不是参数里。
         if len(ctx) > 3:
             if rope is None:
                 rope = ctx[3]
             ctx = ctx[:3]
-        # The drafter pool only addresses positions in [0, batch_len): a prompt
-        # longer than the drafter window must not write past it.  Prefill the
-        # prefix that fits and let spec_step_batch report the overflow via
-        # check_len(), so the caller falls back to a plain decode step instead of
-        # crashing inside the attention kernel.
+        # 草稿器池只寻址 [0, batch_len) 内的位置：比草稿窗口更长的 prompt 不许写
+        # 越它。只预填充放得下的前缀，让 spec_step_batch 经 check_len() 上报溢出，
+        # 调用方于是回退到普通解码步，而不是在注意力内核里崩掉。
         n = min(n, self.batch_len - int(positions[0]))
         if n <= 0:
             return
@@ -505,12 +470,11 @@ class MTP:
             x[c0:c1] = x[c0:c1] + self.mlp.prefill(self.post_ln(x[c0:c1]))
 
     def close(self) -> None:
-        """Drop the captured draft graphs; they pin their own private memory pools.
+        """丢弃已捕获的草稿图；它们各自钉住私有的内存池。
 
         Returns:
-            Nothing. The graphs hold device memory no allocator can reclaim while
-            they exist, so a model reload must call this first or the next model
-            sees less free VRAM than this one used.
+            无。这些图存在期间占着的设备内存任何分配器都收不回，所以重载模型前
+            必须先调它，否则下一个模型看到的空闲显存会比这个用掉的还少。
         """
         self._graph = None
         self._draft_graphs = {}

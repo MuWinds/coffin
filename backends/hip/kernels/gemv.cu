@@ -1,35 +1,28 @@
 // @file gemv.cu
-// @brief Vector-matrix product for single-token decode, plus a batched small-M
-//        variant.
+// @brief 单 token 解码用的向量-矩阵乘，外加一个小 M 的批处理变体。
 //
-// Module: coffin/kernels. The projection kernel every layer routes through, bound
-// as ``gemv_bf16`` / ``gemv_f16`` / ``gemv_bf16_m`` / ``gemv_f16_m``; the int8
-// family lives in ``gemv_int8.cu``.
+// Module: coffin/kernels。每层都要经过的投影内核，绑定为 ``gemv_bf16`` /
+// ``gemv_f16`` / ``gemv_bf16_m`` / ``gemv_f16_m``；int8 家族在 ``gemv_int8.cu``。
 //
-// Why not hipBLAS: GEMV at M=1 is useless on this part (55-296 GB/s against a
-// ~700 GB/s copy ceiling), the winning hipBLAS kernel changes unpredictably from
-// shape to shape, and Triton has no gfx906 backend. A plain warp-per-row reduce
-// with 128-bit loads reaches 540-680 GB/s, so the engine routes every projection
-// (and lm_head) through this kernel instead.
+// 为什么不用 hipBLAS：M=1 的 GEMV 在这颗芯片上没法用（55-296 GB/s，拷贝上限约
+// 700 GB/s），hipBLAS 挑中的那个内核还会随形状不可预测地变，而 Triton 没有 gfx906
+// 后端。一个朴素的「每行一个 warp、128 位加载」的归约能到 540-680 GB/s，所以引擎把
+// 每个投影（以及 lm_head）都走这个内核。
 //
-// The batched variant exists for speculative decoding: verifying k drafted tokens
-// must cost about one weight pass, not k. hipBLAS has no hipBLASLt / tensor-core
-// path for gfx906, so its small-M GEMM is ~4x a decode step. Here each warp still
-// owns one weight row, but keeps M accumulators and applies the row to M input
-// vectors, so the weights are read exactly once.
+// 批处理变体是为投机解码准备的：校验 k 个草稿 token 的代价必须接近一次权重读取，而不是
+// k 次。gfx906 上没有 hipBLASLt / tensor core 路径，所以 hipBLAS 的小 M GEMM 大约是一
+// 个解码步的 4 倍。这里每个 warp 仍然独占一个权重行，但保留 M 个累加器、把该行同时施加
+// 到 M 个输入向量上，权重因此只读一次。
 //
 // Constraints:
-//   * Weights are row-major [N, K]; the K loop walks 16-byte (8 value) units and
-//     the leftover K % 8 is a scalar tail, so any K is correct but only K % 8 == 0
-//     gets the vector path.
-//   * bf16 activations only: the kernel unpacks bf16 by a shift, so an fp16
-//     activation tensor would silently read the wrong values. Only the weights can
-//     be fp16 (``F16W``).
-//   * The launch must be on the current torch stream; the legacy default stream is
-//     not part of a ``torch.cuda.graph`` capture and a kernel launched there is
-//     dropped from the graph.
-//   * Every (R, U) and (M, U) pair is instantiated at compile time; an unlisted
-//     pair is a TORCH_CHECK failure, not a slow path.
+//   * 权重是行主序 [N, K]；K 循环以 16 字节（8 个值）为单位走，剩下的 K % 8 用标量尾
+//     循环收掉，所以任意 K 都正确，但只有 K % 8 == 0 才走向量路径。
+//   * 激活只支持 bf16：内核用移位解包 bf16，传一个 fp16 激活张量会静默读到错的值。只有
+//     权重可以是 fp16（``F16W``）。
+//   * 必须在当前 torch 流上启动；旧的默认流不属于 ``torch.cuda.graph`` 捕获范围，在那里
+//     启动的内核会从图里被丢掉。
+//   * 每个 (R, U) 和 (M, U) 组合都是编译期实例化的；不在列表里的组合是 TORCH_CHECK
+//     失败，而不是慢路径。
 
 #include "hip_ops.h"
 
@@ -40,22 +33,21 @@
 
 namespace {
 
-// bf16 is stored as uint16 and the fp32 value is that bit pattern shifted into
-// the high half, so unpacking is a shift rather than a mantissa conversion.
+// bf16 以 uint16 存储，它的 fp32 值就是把这个位模式左移到高半部分，所以解包是一次
+// 移位而不是尾数转换。
 __device__ __forceinline__ float bf16_to_float(unsigned short h) {
     return __uint_as_float(((unsigned)h) << 16);
 }
 
 __device__ __forceinline__ unsigned short float_to_bf16(float f) {
     unsigned u = __float_as_uint(f);
-    u += 0x7fffu + ((u >> 16) & 1u);   // round to nearest even
+    u += 0x7fffu + ((u >> 16) & 1u);   // 就近舍入到偶数（round to nearest even）
     return (unsigned short)(u >> 16);
 }
 
-// fp16 shares the 16-bit container but not the layout: it needs a real mantissa
-// conversion. Weights are fp16 here because this part has no packed bf16 math
-// (bf16 GEMM runs at 2.3 TFLOP/s, fp16 at 20), while activations stay bf16 --
-// the copy loop is memory-bound, so the extra convert is free.
+// fp16 共用 16 位容器但布局不同：它需要真正的尾数转换。这里权重用 fp16，是因为这颗
+// 芯片没有 packed bf16 数学（bf16 GEMM 跑 2.3 TFLOP/s，fp16 能到 20），而激活保持
+// bf16——拷贝循环是访存受限的，多出来的一次转换不花时间。
 __device__ __forceinline__ float half_to_float(unsigned short h) {
     return __half2float(*reinterpret_cast<const __half*>(&h));
 }
@@ -65,8 +57,8 @@ __device__ __forceinline__ float w_to_float(unsigned short h) {
     return F16W ? half_to_float(h) : bf16_to_float(h);
 }
 
-// Adds one 8-element vector product into eight independent partial sums, so each
-// lane keeps eight FMA chains in flight instead of one serial dependency.
+// 把一个 8 元素的向量乘积加到八个相互独立的部分和上，每个 lane 因此有八条 FMA 链在飞，
+// 而不是一条串行依赖链。
 template <bool F16W>
 __device__ __forceinline__ void accumulate(float* acc, const uint4& w, const uint4& x) {
     const unsigned short* wh = reinterpret_cast<const unsigned short*>(&w);
@@ -75,15 +67,13 @@ __device__ __forceinline__ void accumulate(float* acc, const uint4& w, const uin
     for (int j = 0; j < 8; ++j) acc[j] += w_to_float<F16W>(wh[j]) * bf16_to_float(xh[j]);
 }
 
-// One warp per output row; a lane strides over K in 16-byte (8 bf16) units.
-// R rows per warp amortise the x vector over R rows, and U-way unrolling issues
-// U loads before the first FMA, which is what short-K shapes need to hide
-// memory latency (K=4096 was 158 GB/s at U=1 and 264 GB/s at U=2).
+// 每个输出行一个 warp；一个 lane 以 16 字节（8 个 bf16）为单位跨 K 方向推进。
+// 每 warp 的 R 行让 x 向量摊薄到 R 行上，U 路展开则在第一次 FMA 之前就发出 U 次加载，
+// 短 K 的形状正需要这个来掩盖访存延迟（K=4096 时 U=1 只有 158 GB/s，U=2 达到 264 GB/s）。
 //
-// @param W [N, K] row-major weights, bf16 or fp16 as ``F16W`` selects.
-// @param x [K] bf16 activation. Must be bf16 even when ``F16W``: only the weight
-//          dtype changes.
-// @param y [N] bf16 output, written by lane 0 of each warp's row.
+// @param W [N, K] 行主序权重，bf16 或 fp16 由 ``F16W`` 选择。
+// @param x [K] bf16 激活。``F16W`` 为真时它仍必须是 bf16：只有权重 dtype 会变。
+// @param y [N] bf16 输出，由每个 warp 所负责行的 lane 0 写出。
 template <int R, int U, bool F16W>
 __global__ void gemv_kernel(const uint16_t* __restrict__ W,
                             const uint16_t* __restrict__ x,
@@ -127,7 +117,7 @@ __global__ void gemv_kernel(const uint16_t* __restrict__ W,
         for (int r = 0; r < R; ++r)
             if (row0 + r < N) accumulate<F16W>(acc[r], w0[(size_t)r * nvec + i], xb);
     }
-    // K not a multiple of 8: the leftover elements have no vector to live in.
+    // K 不是 8 的整数倍时，剩下的元素没有向量可装。
     for (int k = (nvec << 3) + lane; k < K; k += 32) {
         const float xf = bf16_to_float(x[k]);
 #pragma unroll
@@ -146,11 +136,11 @@ __global__ void gemv_kernel(const uint16_t* __restrict__ W,
     }
 }
 
-// One warp per weight row, M accumulators per lane: the row is read once and
-// applied to M input vectors, so a small-M batch costs ~one weight pass.
+// 每个权重行一个 warp，每 lane 保留 M 个累加器：该行只读一次，同时施加到 M 个输入向量
+// 上，小 M 的批因此只花约一次权重读取。
 //
-// @param X [M, K] bf16, one activation vector per row of the batch.
-// @param Y [M, N] bf16; lane 0 of the warp writes column ``warp`` of all M rows.
+// @param X [M, K] bf16，批里每个元素一行激活向量。
+// @param Y [M, N] bf16；由该 warp 的 lane 0 写出全部 M 行的第 ``warp`` 列。
 template <int M, int U, bool F16W>
 __global__ void gemv_m_kernel(const uint16_t* __restrict__ W,
                               const uint16_t* __restrict__ X,
@@ -212,10 +202,9 @@ __global__ void gemv_m_kernel(const uint16_t* __restrict__ W,
 
 namespace {
 
-// Both weight dtypes share one launch path; only the unpack inside the kernel
-// differs (see ``w_to_float``). Every shipped (R, U) pair is an explicit
-// instantiation, so a new pair has to be added here and to the Python benchmark
-// list at the same time.
+// 两种权重 dtype 共用一条启动路径，只有内核里的解包不同（见 ``w_to_float``）。随版本
+// 发布的每个 (R, U) 组合都是一次显式实例化，所以新增组合必须同时加在这里和 Python 侧的
+// 基准测试列表里。
 template <bool F16W>
 void launch_gemv(const uint16_t* wp, const uint16_t* xp, uint16_t* yp, int N, int K,
                  int R, int U, int blocks, int threads, hipStream_t stream) {
@@ -238,8 +227,7 @@ torch::Tensor gemv_entry(torch::Tensor W, torch::Tensor x, int64_t R, int64_t U)
                 "weight dtype does not match the kernel");
     TORCH_CHECK(x.scalar_type() == at::kBFloat16, "activations stay bf16");
     const int N = W.size(0), K = W.size(1);
-    // The output carries the *activation* dtype: the weights are fp16 for the
-    // prefill GEMM, but the decode activation stream stays bf16.
+    // 输出跟随的是*激活*的 dtype：预填充 GEMM 的权重是 fp16，但解码的激活流仍是 bf16。
     auto y = torch::empty({N}, x.options());
     const int threads = 256, warps_per_block = threads / 32;
     const int rows_per_block = (int)R * warps_per_block;
@@ -247,9 +235,8 @@ torch::Tensor gemv_entry(torch::Tensor W, torch::Tensor x, int64_t R, int64_t U)
     const auto* wp = reinterpret_cast<const uint16_t*>(W.data_ptr());
     const auto* xp = reinterpret_cast<const uint16_t*>(x.data_ptr());
     auto* yp = reinterpret_cast<uint16_t*>(y.data_ptr());
-    // Must be the current stream: the legacy default stream is not part of a
-    // torch.cuda.graph capture, so a kernel launched there is silently dropped
-    // from the graph and replay produces garbage.
+    // 必须是当前流：旧的默认流不属于 torch.cuda.graph 捕获范围，在那里启动的内核会被
+    // 静默从图里丢掉，重放出来就是垃圾。
     hipStream_t stream = at::cuda::getCurrentCUDAStream();
     launch_gemv<F16W>(wp, xp, yp, N, K, (int)R, (int)U, blocks, threads, stream);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -294,47 +281,45 @@ torch::Tensor gemv_m_entry(torch::Tensor W, torch::Tensor X, int64_t U) {
 
 }  // namespace
 
-// @brief Single-token bf16 GEMV: y[n] = dot(W[n, :], x).
+// @brief 单 token bf16 GEMV：y[n] = dot(W[n, :], x)。
 //
-// @param W [N, K] bf16 row-major.
-// @param x [K] bf16; contiguous, like W.
-// @param R Output rows per warp (1, 2 or 4); chosen by the load-time benchmark.
-// @param U K-loop unroll (1, 2 or 4); same choice, and it only affects latency
-//          hiding, not the arithmetic.
-// @return [N] bf16.
-// @throws c10::Error (TORCH_CHECK) on a non-contiguous input, a weight dtype that
-//         is not bf16, or an (R, U) pair with no instantiated kernel.
+// @param W [N, K] bf16 行主序。
+// @param x [K] bf16；与 W 一样连续存放。
+// @param R 每个 warp 的输出行数（1、2 或 4）；由加载时的基准测试挑选。
+// @param U K 循环展开（1、2 或 4）；同样是基准测试挑的，且它只影响延迟掩盖，不影响算术。
+// @return [N] bf16。
+// @throws c10::Error（TORCH_CHECK）：输入不连续、权重 dtype 不是 bf16，或 (R, U) 组合
+//         没有已实例化的内核。
 torch::Tensor gemv_bf16(torch::Tensor W, torch::Tensor x, int64_t R, int64_t U) {
     return gemv_entry<false>(W, x, R, U);
 }
 
-// @brief Same as ``gemv_bf16`` with fp16 weights; the prefill GEMM reads the same
-//        tensors, so the weights are stored fp16 to keep that path fast.
+// @brief 与 ``gemv_bf16`` 相同，但权重是 fp16；预填充 GEMM 读的是同一批张量，所以权重
+//        存成 fp16 来保持那条路径够快。
 //
-// @param W [N, K] fp16 row-major.
-// @return [N] bf16: the activation stream stays bf16 even though the weights do
-//         not.
-// @throws c10::Error (TORCH_CHECK) on a dtype or (R, U) mismatch.
+// @param W [N, K] fp16 行主序。
+// @return [N] bf16：权重不是 bf16，但激活流仍然是。
+// @throws c10::Error（TORCH_CHECK）：dtype 或 (R, U) 不匹配。
 torch::Tensor gemv_f16(torch::Tensor W, torch::Tensor x, int64_t R, int64_t U) {
     return gemv_entry<true>(W, x, R, U);
 }
 
-// @brief Batched small-M bf16 GEMV: one weight pass serves all M activations.
+// @brief 批处理的小 M bf16 GEMV：一次权重读取服务全部 M 个激活。
 //
-// @param X [M, K] bf16; M must be 2, 4 or 8, the instantiated values.
-// @param U K-loop unroll.
-// @return [M, N] bf16.
-// @throws c10::Error (TORCH_CHECK) when M/U has no instantiated kernel or the
-//         shapes do not line up; the caller picks M from the verify batch size.
+// @param X [M, K] bf16；M 必须是 2、4 或 8，即已实例化的取值。
+// @param U K 循环展开。
+// @return [M, N] bf16。
+// @throws c10::Error（TORCH_CHECK）：M/U 没有已实例化的内核，或形状对不上；M 由调用方
+//         按校验批大小挑选。
 torch::Tensor gemv_bf16_m(torch::Tensor W, torch::Tensor X, int64_t U) {
     return gemv_m_entry<false>(W, X, U);
 }
 
-// @brief Batched small-M GEMV with fp16 weights.
+// @brief 权重为 fp16 的批处理小 M GEMV。
 //
-// @param X [M, K] bf16; M must be 2, 4 or 8.
-// @return [M, N] bf16.
-// @throws c10::Error (TORCH_CHECK) when M/U has no instantiated kernel.
+// @param X [M, K] bf16；M 必须是 2、4 或 8。
+// @return [M, N] bf16。
+// @throws c10::Error（TORCH_CHECK）：M/U 没有已实例化的内核。
 torch::Tensor gemv_f16_m(torch::Tensor W, torch::Tensor X, int64_t U) {
     return gemv_m_entry<true>(W, X, U);
 }

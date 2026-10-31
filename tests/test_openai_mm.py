@@ -1,39 +1,33 @@
-"""Self-test for the image (``image_url``) path of the OpenAI adapter (no GPU).
+"""OpenAI adapter 的图片（``image_url``）路径自测，不需要 GPU。
 
-Module: ``coffin/tests``. The multimodal counterpart of ``test_openai.py``: it
-imports the OpenAI adapter and reproduces the engine over a stub socket.
+Module: ``coffin/tests``。``test_openai.py`` 的多模态对照版：导入 OpenAI
+adapter，用 socket 桩代替引擎把整条链路跑一遍。
 
 Constraints:
-    * This file must not import ``support``: that module calls
-      ``torch.cuda.is_available()`` at import time, which blocks while another
-      process holds the card, and a protocol test has no reason to queue behind
-      the GPU. It therefore sets ``MKL_THREADING_LAYER`` and ``sys.path`` itself.
-      For the same reason the adapter is imported after ``sys.path`` is
-      prepared -- that ordering is why the import carries a ``# noqa: E402``.
-    * The real PNG bytes are decoded, not mocked: the base64 and size-limit path
-      is what is under test, and a fake payload would skip it.
-    * Every refusal is asserted to happen before the engine is called: a refused
-      image that still reached the socket would be a resource leak and a 400 that
-      arrives after a generation is a wasted request.
-    * ``srv.STATE`` and the ``MAX_*`` limits are patched in place and restored in
-      ``finally``; the HTTP server runs in a thread of this process, so a leaked
-      patch changes what later tests measure.
+    * 不能 import ``support``：那个模块在 import 时就调用
+      ``torch.cuda.is_available()``，别的进程占着卡时会阻塞，而协议测试没有
+      理由排在 GPU 后面。所以 ``MKL_THREADING_LAYER`` 和 ``sys.path`` 都由
+      本文件自己设。同样因为如此，adapter 必须在 ``sys.path`` 准备好之后才
+      import，这个顺序正是那条 import 带 ``# noqa: E402`` 的原因。
+    * 真正解码 PNG 字节，不打桩：被测的正是 base64 与大小限制这条路径，
+      假 payload 会把它整段跳过。
+    * 每个拒绝都断言发生在调用引擎之前：被拒绝的图片若仍到达 socket，既是
+      资源泄漏，生成完才回来的 400 也只是一次浪费掉的请求。
+    * ``srv.STATE`` 和 ``MAX_*`` 限制原地改、在 ``finally`` 里复原；HTTP
+      服务器跑在本进程的线程里，漏掉的补丁会改变后续测试量到的东西。
 
-Two things are under test and they are deliberately separated:
+被测的是刻意分开的两件事：
 
-* **this process's job** -- parsing ``data:`` URLs out of a parts array, replacing
-  them with the template's ``{"type": "image"}`` marker, enforcing the count/size
-  limits, and turning every refusal into a readable ``400`` *before* the engine is
-  asked to generate anything.  A stub engine socket plays the engine, so the tests
-  run anywhere (the same trick as ``test_openai.py``).
-* **the contract with the engine** -- an image request must arrive as
-  ``images=[{"b64": ..., "mime": ...}]`` on the socket JSON, the messages must keep
-  their interleaved order, and ``usage.prompt_tokens`` must be the engine's
-  ``n_prompt`` (which already counts the image tokens).
+* **本进程的职责** —— 从 parts 数组里解析 ``data:`` URL，替换成模板的
+  ``{"type": "image"}`` 标记，执行数量/大小上限，并在要求引擎生成之前把
+  每一种拒绝变成可读的 ``400``。socket 桩扮演引擎，所以测试在哪都能跑
+  （与 ``test_openai.py`` 同一手法）。
+* **与引擎的契约** —— 图片请求必须以 ``images=[{"b64": ..., "mime": ...}]``
+  出现在 socket JSON 上，messages 保持交错顺序，``usage.prompt_tokens``
+  必须是引擎的 ``n_prompt``（它已经算上了图片 token）。
 
-The no-image regression matters as much as the new behaviour: a text-only request
-must produce byte-for-byte the same socket payload it produced before images
-existed, which is asserted directly on the captured request.
+无图回归和新行为同等重要：纯文本请求的 socket 报文必须与图片功能出现之前
+逐字节一致，这一点直接在捕获到的请求上断言。
 """
 
 from __future__ import annotations
@@ -50,28 +44,28 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-# This is a pure-protocol test: a stub socket plays the engine, so nothing here
-# needs a DCU -- and nothing here imports ``support``, because that module calls
-# ``torch.cuda.is_available()`` at import time, which *blocks* while another
-# process holds the card (a test suite that hangs on a busy GPU is a test suite
-# nobody runs).  Only the two things ``support`` would have set up are done here.
+# 纯协议测试：socket 桩扮演引擎，不需要 DCU。也不 import ``support``——那个
+# 模块在 import 时调用 ``torch.cuda.is_available()``，别的进程占着卡时它会
+# 阻塞（挂在繁忙 GPU 上的测试套件没人会跑）。``support`` 本来会做的设置只有
+# 下面这两件，就地做完。
 os.environ.setdefault("MKL_THREADING_LAYER", "GNU")
 _ENGINE_DIR = Path(__file__).resolve().parent.parent
 if str(_ENGINE_DIR) not in sys.path:
     sys.path.insert(0, str(_ENGINE_DIR))
 
-from entrypoints.openai import server as srv  # noqa: E402  (after sys.path is prepared)
+# sys.path 在上一行才补齐，这条 import 必须排在它之后，否则导入就失败。
+from entrypoints.openai import server as srv  # noqa: E402
 
-#: A tiny valid PNG (1x1, opaque white).  Real bytes, so the base64/decoding path
-#: is exercised rather than mocked; the *image* content never matters here.
+#: 一张 1x1 的不透明白色 PNG。用真实字节，base64/解码路径才会被走到而不是
+#: 被打桩；图片内容本身在这里从不重要。
 PNG_1PX = base64.b64decode(
     b"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/"
     b"q842iQAAAABJRU5ErkJggg==")
 PNG_B64 = base64.b64encode(PNG_1PX).decode()
 DATA_URL = f"data:image/png;base64,{PNG_B64}"
 
-#: What the engine reports for one image: its placeholders expand to this many
-#: tokens, and the prompt grows by exactly that much.
+#: 引擎为一幅图报告的 token 数：占位符展开成这么多 token，prompt 也正好按这个
+#: 数增长。
 IMAGE_TOKENS = 64
 PLAIN = ["The", " image", " says", " SCNET", "."]
 
@@ -80,14 +74,14 @@ _MODULE: dict = {}
 
 
 def _pieces(req: dict) -> tuple[list[str], bool]:
-    """The canned answer, truncated to ``max_new`` like the engine would."""
+    """预先定好的回答，像引擎那样按 ``max_new`` 截断。"""
     pieces = PLAIN
     n = int(req.get("max_new", -1))
     return (pieces[:n] if n >= 0 else pieces), False
 
 
 def _text_of(req: dict) -> str:
-    """Flatten every text part of the request's messages, both content shapes included."""
+    """把请求 messages 里所有 text 片段拼成一串，两种 content 形状都覆盖。"""
     out = []
     for m in req.get("messages") or []:
         content = m.get("content")
@@ -101,7 +95,7 @@ def _text_of(req: dict) -> str:
 
 
 def _n_prompt(req: dict) -> int:
-    """11 text tokens + one image's worth per image part, like the real engine."""
+    """11 个文本 token，再加每个图片片段一幅图的量，与真实引擎一致。"""
     base = 11
     return base + IMAGE_TOKENS * len(req.get("images") or [])
 
@@ -119,11 +113,11 @@ def _reply(req: dict) -> dict:
 
 
 def _fake_engine(port: int, stop: threading.Event) -> None:
-    """Serve the engine's line protocol on ``port`` until ``stop`` is set.
+    """在 ``port`` 上按引擎的行协议服务，直到 ``stop`` 被置位。
 
-    The 0.5 s accept timeout is what lets the loop observe ``stop``; a blocking
-    accept would hang ``tearDownModule``. A 1 MB recv buffer is enough for the
-    base64 payloads the size-limit tests send.
+    0.5 秒的 accept 超时让循环有机会看到 ``stop``；阻塞式 accept 会把
+    ``tearDownModule`` 永久挂住。1 MB 的 recv 缓冲足够装下大小限制测试发出的
+    base64 payload。
     """
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -173,7 +167,7 @@ def _fake_engine(port: int, stop: threading.Event) -> None:
 
 
 def post(port: int, body: dict) -> dict:
-    """POST one non-stream request and decode the JSON reply; a 4xx propagates as an exception."""
+    """发一个非流式请求并解析 JSON 回复；4xx 以异常形式向外传播。"""
     req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions",
                                  data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
@@ -182,7 +176,7 @@ def post(port: int, body: dict) -> dict:
 
 
 def post_status(port: int, body: dict) -> tuple[int, dict]:
-    """POST and return ``(status, body)`` even for a 4xx/5xx (no exception)."""
+    """发请求并返回 ``(status, body)``，4xx/5xx 也不抛异常。"""
     req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions",
                                  data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
@@ -194,7 +188,7 @@ def post_status(port: int, body: dict) -> tuple[int, dict]:
 
 
 def sse(port: int, body: dict) -> list[dict]:
-    """POST a streaming request and return the parsed ``data:`` chunks, minus the terminator."""
+    """发一个流式请求，返回解析后的 ``data:`` 分块，去掉终止标记。"""
     req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions",
                                  data=json.dumps({**body, "stream": True}).encode(),
                                  headers={"Content-Type": "application/json"})
@@ -220,10 +214,10 @@ def image_message(text: str = "What does it say?", n: int = 1) -> dict:
 
 
 def setUpModule() -> None:
-    """Start one stub engine and one HTTP server for the module, waiting for the bind.
+    """为整个模块起一个引擎桩和一个 HTTP 服务器，并等到端口绑定完成。
 
-    ``STATE`` is patched rather than constructed because that dict is the
-    server's process-wide configuration; the tests revert any piece they change.
+    ``STATE`` 是原地改而不是重新构造，因为那个 dict 就是服务器的进程级配置；
+    每个测试把自己动过的部分复原。
     """
     probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     probe.bind(("127.0.0.1", 0))
@@ -232,7 +226,7 @@ def setUpModule() -> None:
     stop = threading.Event()
     thread = threading.Thread(target=_fake_engine, args=(engine_port, stop), daemon=True)
     thread.start()
-    for _ in range(50):                       # wait for the stub to bind
+    for _ in range(50):                       # 等桩把端口绑上
         if getattr(stop, "server_sock", None) is not None:
             break
         time.sleep(0.05)
@@ -250,7 +244,7 @@ def setUpModule() -> None:
 
 
 def tearDownModule() -> None:
-    """Stop the stub engine and close the HTTP server so a rerun can bind cleanly."""
+    """停掉引擎桩并关掉 HTTP 服务器，让下一轮能干净地重新绑定。"""
     _MODULE["stop"].set()
     _MODULE["httpd"].shutdown()
     _MODULE["httpd"].server_close()
@@ -258,7 +252,7 @@ def tearDownModule() -> None:
 
 
 class _TcpEngine(srv.EngineClient):
-    """``EngineClient`` over TCP (a dev box may have no ``AF_UNIX``)."""
+    """走 TCP 的 ``EngineClient``（开发机可能没有 ``AF_UNIX``）。"""
 
     def _open(self):
         conn = socket.create_connection(("127.0.0.1", int(self.sock_path)),
@@ -267,22 +261,22 @@ class _TcpEngine(srv.EngineClient):
 
 
 class UnitTest(unittest.TestCase):
-    """The pure functions, without the socket: what exactly leaves this process."""
+    """纯函数，不碰 socket：离开本进程的到底是什么。"""
 
     def test_data_url_is_split_into_b64_and_the_template_marker(self):
-        """The engine stores bytes, not URLs: a data URL must become ``{"b64", "mime"}`` plus the template's own marker, in place."""
+        """引擎存的是字节而不是 URL：data URL 必须原地变成 ``{"b64", "mime"}``，再加模板自己的标记。"""
         msgs, images, err = srv._split_messages([image_message("hi")])
         self.assertIsNone(err)
         self.assertEqual(len(images), 1)
         self.assertEqual(base64.b64decode(images[0]["b64"]), PNG_1PX)
         self.assertEqual(images[0]["mime"], "image/png")
-        # order preserved: the image marker comes before the text part
+        # 顺序保持：图片标记排在 text 片段之前
         content = msgs[0]["content"]
         self.assertEqual([p["type"] for p in content], ["image", "text"])
         self.assertEqual(content[1]["text"], "hi")
 
     def test_http_url_is_refused_with_a_readable_message(self):
-        """Fetching remote URLs is an SSRF and a latency hole, so the server refuses rather than downloads; the message says so."""
+        """拉取远程 URL 既是 SSRF 也是延迟黑洞，所以服务器直接拒绝而不下载；报错信息里会说清这一点。"""
         msgs, images, err = srv._split_messages([{"role": "user", "content": [
             {"type": "image_url",
              "image_url": {"url": "https://example.com/a.png"}}]}])
@@ -292,7 +286,7 @@ class UnitTest(unittest.TestCase):
         self.assertIn("does not fetch", err)
 
     def test_video_parts_are_refused(self):
-        """``video`` and ``video_url`` are valid OpenAI part types but this engine has no video tower, so accepting them would silently drop frames."""
+        """``video`` 和 ``video_url`` 是合法的 OpenAI 片段类型，但本引擎没有视觉塔的视频部分，接受它们等于悄悄丢帧。"""
         for kind in ("video", "video_url"):
             with self.subTest(kind=kind):
                 _m, _i, err = srv._split_messages([{"role": "user", "content": [
@@ -301,7 +295,7 @@ class UnitTest(unittest.TestCase):
                 self.assertIn("video", err)
 
     def test_system_message_with_an_image_is_refused(self):
-        """The chat template has no image slot in the system turn; an image there would shift every later placeholder."""
+        """system 轮在对话模板里没有图片槽位；放在那里的图片会把后面每个占位符都错位。"""
         _m, _i, err = srv._split_messages([
             {"role": "system", "content": [{"type": "image_url",
                                             "image_url": {"url": DATA_URL}}]},
@@ -311,14 +305,14 @@ class UnitTest(unittest.TestCase):
         self.assertIn("template", err)
 
     def test_too_many_images_is_refused(self):
-        """The cap bounds per-request VRAM for the vision tower, so it must be enforced before any image is decoded."""
+        """这个上限约束的是视觉塔的单请求显存，所以必须在解码任何一张图之前生效。"""
         n = srv.MAX_IMAGES + 1
         _m, _i, err = srv._split_messages([image_message(n=n)])
         self.assertIsNotNone(err)
         self.assertIn("too many images", err)
 
     def test_oversized_image_is_refused(self):
-        """The per-image byte cap is what stops one request from monopolising the upload path; the limit is patched, not the image."""
+        """单图字节上限用来防止一个请求独占上传路径；这里改的是限制值，不是图片。"""
         old = srv.MAX_IMAGE_BYTES
         srv.MAX_IMAGE_BYTES = len(PNG_1PX) - 1
         try:
@@ -329,7 +323,7 @@ class UnitTest(unittest.TestCase):
         self.assertIn("per-image limit", err)
 
     def test_total_base64_budget_is_refused(self):
-        """Per-image caps alone would let N legal images add up past the budget, so the request total is checked too."""
+        """只有单图上限的话，N 张合法图片加起来仍可能超过预算，所以请求总量另查一遍。"""
         old = srv.MAX_IMAGE_TOTAL_BYTES
         srv.MAX_IMAGE_TOTAL_BYTES = len(DATA_URL) * 2 - 1
         try:
@@ -340,7 +334,7 @@ class UnitTest(unittest.TestCase):
         self.assertIn("per-request limit", err)
 
     def test_invalid_base64_and_unknown_mime_are_refused(self):
-        """Malformed payloads must fail here with a 400; a decode error reaching the engine would surface as a 500 mid-generation."""
+        """畸形 payload 必须在这里就以 400 失败；解码错误漏到引擎会在生成中途变成 500。"""
         cases = {
             "bad base64": "data:image/png;base64,!!!notbase64!!!",
             "no payload": "data:image/png;base64,",
@@ -354,7 +348,7 @@ class UnitTest(unittest.TestCase):
                 self.assertIsNotNone(err, f"{label} should be refused")
 
     def test_text_only_content_is_untouched(self):
-        """Text requests predate images, so both content shapes must normalise to the same string with no image list."""
+        """文本请求比图片先存在，两种 content 形状都必须归一到同一个字符串，且不带图片列表。"""
         plain = [{"role": "user", "content": "hello"},
                  {"role": "user", "content": [{"type": "text", "text": "hi"}]}]
         msgs, images, err = srv._split_messages(plain)
@@ -364,7 +358,7 @@ class UnitTest(unittest.TestCase):
         self.assertEqual([m["content"] for m in norm], ["hello", "hi"])
 
     def test_template_content_keeps_a_parts_array_only_when_it_has_an_image(self):
-        """The template accepts a plain string for text, and the parts array must survive only when an image marker is in it."""
+        """模板对文本接受纯字符串；只有 parts 数组里含图片标记时，数组才必须原样保留。"""
         self.assertEqual(srv._template_content("hi"), "hi")
         self.assertEqual(srv._template_content([{"type": "text", "text": "a"},
                                                 {"type": "text", "text": "b"}]), "ab")
@@ -374,14 +368,14 @@ class UnitTest(unittest.TestCase):
 
 
 class HttpTest(unittest.TestCase):
-    """End to end over HTTP: the socket payload the engine receives, and the reply."""
+    """走 HTTP 的端到端测试：引擎收到的 socket 报文，以及回复。"""
 
     @property
     def port(self) -> int:
         return _MODULE["port"]
 
     def test_image_request_reaches_the_engine_with_images(self):
-        """The socket contract: bytes plus mime in ``images``, a marker (never the URL) in the messages, and prompt tokens that include the image."""
+        """socket 契约：``images`` 里是字节加 mime，messages 里是标记（绝不是 URL），prompt token 数包含图片。"""
         SEEN.clear()
         r = post(self.port, {"model": "qwen3.5-4b",
                              "messages": [image_message("what is in scnetimage?")]})
@@ -389,21 +383,21 @@ class HttpTest(unittest.TestCase):
         self.assertEqual(len(req["images"]), 1)
         self.assertEqual(base64.b64decode(req["images"][0]["b64"]), PNG_1PX)
         self.assertEqual(req["images"][0]["mime"], "image/png")
-        # the placeholder the template needs, not the URL
+        # 模板要的占位符，不是 URL
         self.assertEqual(req["messages"][0]["content"][0], {"type": "image"})
         self.assertNotIn("data:", json.dumps(req["messages"]))
-        # usage counts the image tokens because it is the engine's n_prompt
+        # usage 之所以算上图片 token，是因为它直接取引擎的 n_prompt
         self.assertEqual(r["usage"]["prompt_tokens"], 11 + IMAGE_TOKENS)
         self.assertEqual(r["choices"][0]["message"]["content"],
                          "The image says SCNET.")
 
     def test_no_image_request_payload_is_unchanged(self):
-        """A text-only request's socket JSON must be what it was before images.
+        """纯文本请求的 socket JSON 必须与图片功能出现之前完全一致。
 
-        Asserted as *exact equality against the literal payload*, not just "no
-        images key": the point of the image feature is that it costs the text path
-        nothing, and a stray ``images: []`` or a re-shaped content array would be
-        invisible to a looser check (and would change radix-block keys downstream).
+        断言方式是与字面 payload 精确相等，而不是只查有没有 images 键：图片
+        功能的全部意义就在于文本路径不付任何代价，多一个空的 ``images: []``
+        或 content 数组被改了形状，松一点的检查根本看不出来（而这两样都会改变
+        下游的基数块键）。
         """
         SEEN.clear()
         post(self.port, {"messages": [{"role": "user", "content": "hi"}],
@@ -415,7 +409,7 @@ class HttpTest(unittest.TestCase):
             "max_new": 5, "temperature": 0.0, "max_seconds": None})
 
     def test_text_parts_array_still_flattens_to_a_string(self):
-        """A parts array with no image is still the old text request; keeping it a list would change the radix block key for no gain."""
+        """不带图片的 parts 数组仍算原来的文本请求；留成 list 只会白白改变基数块键。"""
         SEEN.clear()
         post(self.port, {"messages": [{"role": "user", "content": [
             {"type": "text", "text": "a"}, {"type": "text", "text": "b"}]}]})
@@ -423,7 +417,7 @@ class HttpTest(unittest.TestCase):
         self.assertNotIn("images", SEEN[-1])
 
     def test_multi_image_order_is_preserved(self):
-        """Images are positional: reordering them against the text silently pairs each question with the wrong picture."""
+        """图片是位置相关的：相对文本重排会悄悄把每道题配到错的那张图上。"""
         SEEN.clear()
         other = base64.b64encode(PNG_1PX + b"\x00").decode()
         body = {"messages": [{"role": "user", "content": [
@@ -435,7 +429,7 @@ class HttpTest(unittest.TestCase):
         r = post(self.port, body)
         req = SEEN[-1]
         self.assertEqual(len(req["images"]), 2)
-        # the engine sees one marker per image, in the client's order
+        # 引擎按客户端给的顺序，每张图看到一个标记
         kinds = [p["type"] for p in req["messages"][0]["content"]]
         self.assertEqual(kinds, ["text", "image", "text", "image"])
         self.assertEqual([p.get("text") for p in req["messages"][0]["content"]
@@ -444,7 +438,7 @@ class HttpTest(unittest.TestCase):
         self.assertEqual(r["usage"]["prompt_tokens"], 11 + 2 * IMAGE_TOKENS)
 
     def test_image_request_streams(self):
-        """The streaming path must carry the same usage as the non-stream one, or clients that read only the stream under-count the prompt."""
+        """流式路径必须携带与非流式相同的 usage，否则只读流的客户端会把 prompt 算少。"""
         SEEN.clear()
         chunks = sse(self.port, {"messages": [image_message("scnetimage")]})
         self.assertEqual(content_of(chunks), "The image says SCNET.")
@@ -452,7 +446,7 @@ class HttpTest(unittest.TestCase):
         self.assertEqual(len(SEEN[-1]["images"]), 1)
 
     def test_error_codes_are_400_and_readable(self):
-        """Each refusal must be a 400 the client can show, and nothing may be forwarded: a rejected image must not reach the engine."""
+        """每种拒绝都必须是客户端能展示的 400，且不能有任何东西被转发：被拒的图片不得到达引擎。"""
         cases = {
             "http url": {"role": "user", "content": [
                 {"type": "image_url",
@@ -472,19 +466,19 @@ class HttpTest(unittest.TestCase):
                 self.assertEqual(status, 400, f"{label}: {body}")
                 self.assertEqual(body["error"]["code"], 400)
                 self.assertTrue(body["error"]["message"])
-                # nothing was forwarded: a refused image never reaches the engine
+                # 什么都没转发：被拒绝的图片从不到达引擎
                 self.assertFalse([r for r in SEEN if r.get("images")],
                                  f"{label} leaked an image to the engine")
 
     def test_too_many_images_is_400(self):
-        """The unit-level cap must also be reachable over HTTP; a 200 with an error body would break client error handling."""
+        """单元级的上限在 HTTP 上也得能触发；回 200 却在 body 里塞错误会打坏客户端的错误处理。"""
         status, body = post_status(self.port,
                                    {"messages": [image_message(n=srv.MAX_IMAGES + 1)]})
         self.assertEqual(status, 400, body)
         self.assertIn("too many images", body["error"]["message"])
 
     def test_no_vision_server_answers_503(self):
-        """A server started with ``--no-vision`` must refuse with 503 and name the flag, not fail somewhere inside prefill."""
+        """以 ``--no-vision`` 启动的服务器必须回 503 并点明这个开关，而不是在预填充内部某处失败。"""
         srv.STATE["vision"] = False
         try:
             status, body = post_status(self.port,
@@ -495,7 +489,7 @@ class HttpTest(unittest.TestCase):
         self.assertIn("--no-vision", body["error"]["message"])
 
     def test_text_only_request_unchanged_with_vision_enabled(self):
-        """Vision being on must cost the text path nothing: same token counts, same finish reason."""
+        """开启视觉不能让文本路径付代价：token 数相同，finish reason 也相同。"""
         r = post(self.port, {"messages": [{"role": "user", "content": "hi"}],
                              "max_tokens": 3})
         self.assertEqual(r["usage"]["prompt_tokens"], 11)
@@ -504,14 +498,14 @@ class HttpTest(unittest.TestCase):
 
 
 class EngineErrorTest(unittest.TestCase):
-    """An engine-side rejection has to come back out with *its* status code."""
+    """引擎侧拒绝必须带着它自己的状态码原样透出。"""
 
     @property
     def port(self) -> int:
         return _MODULE["port"]
 
     def test_engine_400_is_forwarded_on_the_non_stream_path(self):
-        """The engine's own status and message must reach the client intact; flattening them to 500 hides which component rejected."""
+        """引擎自己的状态码和消息必须原封不动送到客户端；压成 500 就藏掉了是哪个组件拒绝的。"""
         class _Rejecting(srv.EngineClient):
             def call(self, req):
                 return {"ok": False, "error": "image placeholder mismatch",
@@ -528,7 +522,7 @@ class EngineErrorTest(unittest.TestCase):
         self.assertEqual(body["error"]["type"], "invalid_request_error")
 
     def test_engine_503_is_forwarded_on_the_stream_path(self):
-        """A rejection before ``start`` must be an HTTP status, not a 200 SSE error event: streaming clients ignore the latter."""
+        """``start`` 之前的拒绝必须是 HTTP 状态码，而不是 200 里的 SSE 错误事件：流式客户端会直接忽略后者。"""
         class _Rejecting(srv.EngineClient):
             def stream(self, req):
                 yield {"type": "error", "ok": False, "status": 503,
@@ -547,7 +541,7 @@ class EngineErrorTest(unittest.TestCase):
             status, body = ctx.exception.code, json.loads(ctx.exception.read())
         finally:
             srv.STATE["engine"] = real
-        # a rejection before ``start`` is a real HTTP status, not a 200 SSE event
+        # ``start`` 之前的拒绝是真 HTTP 状态码，不是 200 的 SSE 事件
         self.assertEqual(status, 503, body)
         self.assertIn("vision tower", body["error"]["message"])
 
@@ -556,14 +550,12 @@ if __name__ == "__main__":
     unittest.main()
 
 class ToolRoleImageTest(unittest.TestCase):
-    """An agent that returns a screenshot as the *tool* result must work.
+    """agent 把截图作为 *tool* 结果返回时，链路必须通。
 
-    This is how images actually arrive from an IDE/agent client: the model asks
-    for a screenshot and the tool sends the capture back in a ``tool`` message.
-    The server used to reject that with 400 ("only user turns accept image
-    parts"), which a streaming client surfaced as "Stream completed without a
-    choice" because the error never reached it.  Both halves of that bug are
-    pinned here.
+    图在 IDE/agent 客户端上实际就是这样进来的：模型要一张截图，工具把截屏
+    放进 ``tool`` 消息送回。服务器以前会用 400 拒绝（"only user turns accept
+    image parts"），流式客户端因为收不到这个错误，最后只看到 "Stream
+    completed without a choice"。这个 bug 的两半都在这里钉住。
     """
 
     def _tool_messages(self):
@@ -578,7 +570,7 @@ class ToolRoleImageTest(unittest.TestCase):
         ]
 
     def test_tool_role_images_are_accepted(self):
-        """This is how an agent client delivers a screenshot, so refusing it breaks the whole tool-loop use case."""
+        """agent 客户端就是这样交付截图的，拒绝它等于废掉整个工具循环场景。"""
         msgs, images, err = srv._split_messages(self._tool_messages())
 
         self.assertIsNone(err)
@@ -586,7 +578,7 @@ class ToolRoleImageTest(unittest.TestCase):
         self.assertEqual(len(msgs), 3)
 
     def test_system_role_images_are_rejected_with_advice(self):
-        """The refusal must name the system role so the client knows to move the image into the user turn."""
+        """拒绝信息必须点出 system 角色，客户端才知道要把图片挪进 user 轮。"""
         msgs, images, err = srv._split_messages(
             [{"role": "system",
               "content": [{"type": "image_url", "image_url": {"url": DATA_URL}}]}])
@@ -595,7 +587,7 @@ class ToolRoleImageTest(unittest.TestCase):
         self.assertIn("system", err)
 
     def test_assistant_role_images_are_rejected(self):
-        """An image the model "sent" has no template slot and no vision-tower input, so it must be refused rather than dropped."""
+        """模型「发出」的图片既没有模板槽位也没有视觉塔输入，必须拒绝而不是悄悄丢掉。"""
         msgs, images, err = srv._split_messages(
             [{"role": "assistant",
               "content": [{"type": "image_url", "image_url": {"url": DATA_URL}}]}])

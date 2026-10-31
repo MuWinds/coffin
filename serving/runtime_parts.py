@@ -1,19 +1,17 @@
-"""Runtime mixins for the resident inference service.
+"""常驻推理服务的运行时 mixin。
 
-Module: ``coffin.serving``. Each mixin owns one lifecycle concern and operates
-on the state created by ``runtime_service.Server``.
+Module: ``coffin.serving``。每个 mixin 管一个生命周期关注点，操作的是
+``runtime_service.Server`` 建好的状态。
 
 Constraints:
-    * Mixins do not own process state; ``Server.__init__`` remains the single
-      place that provisions model, tokenizer and request queues.
-    * No platform fact is spelled here. The device, the VRAM readout, the timing
-      barrier and "are there kernels" all come from ``backends``; the readout
-      helpers live in ``runtime_support`` because they have to degrade to a no-op
-      on a host with no accelerator, where ``COFFIN_BACKEND=reference`` still has
-      to bring the banner and the diagnostics up.
-    * Image preprocessing is the only path here that needs the checkpoint's
-      processor, and it is reached only from a request carrying ``images``: a
-      text-only deployment must never import the vision stack.
+    * mixin 不持有进程状态；模型、分词器和请求队列的准备工作仍然只在
+      ``Server.__init__`` 一处完成。
+    * 这里不写任何平台事实。设备、显存读数、计时屏障以及「有没有内核」全部来自
+      ``backends``；读数辅助函数放在 ``runtime_support``，因为它们必须在没有
+      加速卡的主机上退化成空操作，而那里 ``COFFIN_BACKEND=reference`` 仍要把
+      启动横幅和诊断跑起来。
+    * 图像预处理是这里唯一需要 checkpoint 处理器的路径，而且只从带 ``images``
+      的请求进入：纯文本部署绝不能 import 视觉栈。
 """
 
 from __future__ import annotations
@@ -40,33 +38,30 @@ from .runtime_support import (MMError, _decode_image, allocated_gib, empty_cache
 
 
 class RuntimeLifecycleMixin:
-    """Bring-up, teardown and reload: the model, the engine and the tower.
+    """启动、拆解和 reload：模型、引擎和视觉塔。
 
-    Owns the three transitions of a server's life -- first build, full rebuild
-    after ``reload``, and the engine loop that drives one step at a time -- and
-    nothing about a request's contents. Kept out of ``Server.__init__`` because a
-    reload re-runs exactly the build step, and the two must not diverge.
+    它管服务生命里的三种转换——首次构建、``reload`` 之后的整体重建、一次一步的
+    引擎循环——关于请求内容一概不管。之所以不放进 ``Server.__init__``，是因为
+    reload 重跑的恰好就是构建那一步，两者不能各写一份。
 
     Constraints:
-        * ``_build`` is the only place that constructs a model or an engine, so a
-          reload cannot skip a step the first start performed.
-        * Teardown precedes rebuild: the pool and the captured graphs together
-          exceed the card, so holding the old model while building the new one
-          runs out of memory rather than merely being untidy.
+        * ``_build`` 是唯一构造模型或引擎的地方，reload 因此不可能跳过首次启动
+          做过的任何一步。
+        * 先拆再建：池加上 captured 的图已经超过这张卡的容量，一边建新的还一边
+          留着旧的，结果不是「不整洁」而是直接 OOM。
     """
 
     def _load_weight_kwargs(self) -> dict:
-        """How to load this server's weights: text quant plus the vision policy.
+        """本服务的权重怎么加载：文本量化加视觉策略。
 
-        The tower rides the same resident dict as the text weights (that is what
-        lets ``reload`` rebuild from VRAM), but it has its own memory policy: fp16
-        by default, int8 with ``--vision-int8``, and not loaded at all with
-        ``--no-vision``. Only forwarded when the checkpoint declares a vision
-        config, so a text-only checkpoint keeps the plain call.
+        视觉塔和文本权重共用一个常驻字典（reload 才能从显存重建），但它有自己的
+        内存策略：默认 fp16，``--vision-int8`` 时 int8，``--no-vision`` 时压根
+        不加载。只有 checkpoint 声明了视觉配置才转发这些参数，纯文本 checkpoint
+        因此仍走最朴素的调用。
 
         Returns:
-            Extra keyword arguments for ``engine_api.load_weights``; empty for a
-            checkpoint with no ``vision_config``.
+            给 ``engine_api.load_weights`` 的额外关键字参数；没有
+            ``vision_config`` 的 checkpoint 返回空字典。
         """
         raw = json.loads((Path(self.model_dir) / "config.json").read_text())
         if not raw.get("vision_config"):
@@ -74,30 +69,26 @@ class RuntimeLifecycleMixin:
         return {"vision": self.vision, "vision_quant": self.vision_int8}
 
     def _build(self) -> None:
-        """Create the model and the engine, then bring up the vision tower.
+        """建模型、建引擎，然后拉起视觉塔。
 
-        Split out of ``__init__`` because ``_reload`` runs exactly this step
-        again against the tensors that are already resident. ``build_s`` is
-        reported by ``ping`` and the startup log, so a slow build is visible
-        without a profiler.
+        从 ``__init__`` 里拆出来，是因为 ``_reload`` 会拿已经在显存里的张量把
+        这一步原样再跑一遍。``build_s`` 由 ``ping`` 和启动日志上报，构建慢了
+        不用 profiler 也看得见。
         """
         t0 = time.time()
-        # The checkpoint config decides which family implementation is built;
-        # ``serve`` itself only knows the engine_api.Model contract.
+        # 建哪个模型族由 checkpoint 配置决定；``serve`` 自己只认识
+        # engine_api.Model 这个契约。
         self.model = engine_api.create_model(self.model_dir, max_seq=self.max_seq,
                                             bench=self.bench, weights=self.weights,
                                             paged=self.prefix_cache)
-        # The engine owns the prefix cache, the block pool, the scheduler and the
-        # captured graphs; ``serve`` keeps only the transport and rendering.
+        # 前缀缓存、块池、调度器和 captured 的图都归引擎；``serve`` 只留传输和渲染。
         self.engine = llm_engine.LLMEngine(self.cfg, self.model)
         self.engine.eos = set(self.eos)
         self.engine.build()
         self.pc = self.engine.pc
-        # The tower is built here, after the engine's pools and graphs exist: it
-        # is an eager module that never enters the decode graph, so it can come
-        # up last and still be resident for the first image request.
-        # ``--no-vision`` skips it, which is the only way to get the 0.62 GiB
-        # back.
+        # 视觉塔放在这里建，在引擎的池和图都就绪之后：它是 eager 模块，从不进
+        # 解码图，所以最后起来也仍能在第一个带图请求时用上。``--no-vision`` 跳过
+        # 它，这是把那 0.62 GiB 拿回来的唯一办法。
         if self.vision and self.model.vision_sd and self.model.vision is None:
             try:
                 t_v = time.time()
@@ -114,14 +105,12 @@ class RuntimeLifecycleMixin:
         self.build_s = time.time() - t0
 
     def _reload(self) -> None:
-        """Rebuild the model, the engine and the backend op table from VRAM.
+        """用显存里的内容重建模型、引擎和后端算子表。
 
-        The old model (buffers plus its captured graph pool) is torn down first,
-        otherwise the two models do not both fit in 16 GB. The graph is nulled
-        explicitly inside ``close()``: a live ``CUDAGraph`` pins its private
-        memory pool, and that pool is ~half the model's footprint (all the
-        grouped-projection copies), so merely dropping ``self.model`` is not
-        enough.
+        老模型（缓冲区加上它 capture 的图池）先拆掉，否则两个模型在 16 GB 里放
+        不下。图是在 ``close()`` 里显式置空的：活着的 ``CUDAGraph`` 会把它私有的
+        内存池钉住，而那个池约占模型体积的一半（所有分组投影的副本），所以光把
+        ``self.model`` 丢掉是不够的。
         """
         import gc
 
@@ -134,32 +123,30 @@ class RuntimeLifecycleMixin:
         self.engine = None
         self.model = None
         if old is not None:
-            old.close()          # nulls the graphs (they pin their pools) + layers
+            old.close()          # 置空图和层（图会钉住自己的池）
         del old
         gc.collect()
         sync()
         empty_cache()
         _mem("after teardown")
 
-        # Only the backend layer is re-resolved, not reloaded per module: a kernel
-        # build is memoised on the backend module, so re-importing the op table
-        # would leave the engine calling closures over the torn-down context.
+        # 只重新解析后端这一层，不逐模块 reload：内核构建在后端模块上是记忆化的，
+        # 重新 import 算子表会让引擎继续调用闭包里的已拆解上下文。
         backends.reload()
 
-        # Every engine module, dependencies first: reloading in the other order
-        # would leave old classes bound to the new tensors.
+        # 每个引擎模块按依赖先后 reload：顺序反了会让旧类绑到新张量上。
         engine_api.reload()
-        self.processor = None    # re-imported transformers classes: rebuild lazily
+        self.processor = None    # transformers 的类重新导入过：惰性重建
         self._processor_failed = None
         self.n_reload += 1
         self._build()
         _mem("after build")
 
     def start(self) -> None:
-        """Run the serving loop on its own thread.
+        """在自己的线程上跑服务循环。
 
-        Idempotent: a second call is a no-op, so ``serve`` can start the loop
-        before it accepts connections without tracking the state itself.
+        幂等：第二次调用是空操作，``serve`` 因此可以在开始接受连接之前就把循环
+        起好，不必自己记状态。
         """
         if self._loop_thread is not None:
             return
@@ -168,11 +155,10 @@ class RuntimeLifecycleMixin:
         self._loop_thread.start()
 
     def stop(self) -> None:
-        """Ask the engine thread to return and wait up to 5 s for it.
+        """请求引擎线程退出，并最多等它 5 s。
 
-        The thread also polls the condition with a 0.2 s timeout, so a missed
-        notification costs one step rather than a hang. A join that times out is
-        not an error: the thread is a daemon and the process is exiting anyway.
+        线程本身也按 0.2 s 超时轮询条件变量，所以漏掉一次通知的代价是一步，而不是
+        卡死。join 超时不算错误：它是守护线程，进程本来也要退了。
         """
         self._stop = True
         with self._cv:
@@ -182,11 +168,10 @@ class RuntimeLifecycleMixin:
             self._loop_thread = None
 
     def _engine_loop(self) -> None:
-        """One ``engine.step()`` per iteration, dispatching tokens to requests.
+        """每次迭代跑一次 ``engine.step()``，把 token 分发给各请求。
 
-        The 0.2 s wait bounds the cost of a lost notification: the loop must also
-        notice ``_paused`` (a diagnostic is touching the model) and ``_stop``,
-        neither of which may be waited on indefinitely.
+        0.2 s 的等待给漏掉的通知兜底：循环还必须能注意到 ``_paused``（有诊断代码
+        正在动模型）和 ``_stop``，这两个都不能无限等下去。
         """
         while not self._stop:
             with self._cv:
@@ -201,7 +186,8 @@ class RuntimeLifecycleMixin:
             try:
                 with self._lock:
                     events = self.engine.step()
-            except Exception as exc:  # keep serving; report to every active request
+            # 服务要继续活着，所以把错误报给每个在途请求，而不是把线程弄挂。
+            except Exception as exc:  # noqa: BLE001
                 print(f"[serve] engine step failed: {exc}", flush=True)
                 self._fail(str(exc))
                 self.engine.reset()
@@ -217,15 +203,14 @@ class RuntimeLifecycleMixin:
                         self._outputs.pop(seq.seq_id, None)
 
     def _fail(self, message: str) -> None:
-        """Report one engine failure to every in-flight request and drop the queues.
+        """把一次引擎故障报告给每个在途请求，并丢掉所有队列。
 
-        A failed ``step()`` has already lost the batch's state, so each waiting
-        connection is answered with the error rather than left blocked on a queue
-        nothing will feed again. The dict is swapped under the lock so a request
-        submitted concurrently cannot land in the discarded copy.
+        失败的 ``step()` 已经把这一批的状态弄丢了，所以每个等待中的连接都直接收
+        到错误，而不是继续阻塞在一个再也没有人来喂的队列上。字典在锁内整体换掉，
+        并发提交的请求因此不可能落进被丢弃的那一份。
 
         Args:
-            message: The failure text, sent verbatim to every waiting connection.
+            message: 故障文本，原样发给每个在等待的连接。
         """
         with self._lock:
             pending, self._outputs = self._outputs, {}
@@ -235,42 +220,36 @@ class RuntimeLifecycleMixin:
 
 
 class RuntimeGenerationMixin:
-    """Text generation: submit a request, collect its tokens, clamp the budget.
+    """文本生成：提交请求、收回 token、夹紧预算。
 
-    Everything here talks to the engine's request queue, so a request is served by
-    the same batched step loop as every other; the one exception is
-    ``_spec_generate``, which drives the model directly because the speculative
-    loop needs the logits of a whole verify window.
+    这里的一切都与引擎的请求队列打交道，所以一个请求和其他所有请求一样由同一套批
+    处理步进循环服务；唯一例外是 ``_spec_generate``，它直接驱动模型，因为投机循环
+    需要整个验证窗口的 logits。
 
     Constraints:
-        * The output budget is clamped against the context window before a request
-          is submitted: the decode step writes KV at ``pos`` with no bounds check,
-          and the rope tables are sized to ``max_seq``, so an unclamped budget runs
-          off the end of both.
-        * ``_spec_generate`` requires the verify graph to be captured for
-          ``k + 1`` tokens, and only supports greedy: the accept test compares the
-          main model's argmax against the draft.
+        * 输出预算在请求提交之前就要按上下文窗口夹紧：解码步写 KV 时不做越界检查，
+          RoPE 表也是按 ``max_seq`` 定尺寸的，预算不夹就会撞穿两者。
+        * ``_spec_generate`` 要求验证图是按 ``k + 1`` 个 token capture 的，而且只支持
+          贪心：接受判断是拿主模型的 argmax 与草稿比对。
     """
 
     def _submit(self, ids: list[int], params: SamplingParams, mm=None):
-        """Queue one request and return its sequence plus the token queue.
+        """把一个请求排进队列，返回它的序列和 token 队列。
 
-        ``mm`` rides on the :class:`~sequence.Sequence` (``seq.mm``), which is what
-        the runner, the block manager and the radix tree all read: the tree salts
-        its block keys with ``mm.digest`` so two different images can never share a
-        cached KV prefix. The queue is registered *inside* the same lock that the
-        engine loop's ``step()`` takes, so a prefilled sequence always has a queue
-        waiting for its tokens.
+        ``mm`` 挂在 :class:`~sequence.Sequence` 上（``seq.mm``），runner、块管理器和
+        基数树读的都是它：树拿 ``mm.digest`` 给块键加盐，两张不同的图因此永远无法
+        共用同一段缓存 KV。队列是在引擎循环 ``step()`` 所用的同一把锁*内部*注册的，
+        所以一条预填充中的序列总有一个等着收 token 的队列。
 
         Args:
-            ids: Prompt token ids, already rendered and (for an image request)
-                already expanded to the processor's layout.
-            params: Sampling and stopping policy for this request.
-            mm: The request's ``MMInput``, or ``None`` for a text prompt.
+            ids: prompt 的 token id，已经渲染好，带图请求的话也已经展开成处理器
+                的布局。
+            params: 这个请求的采样与停止策略。
+            mm: 请求的 ``MMInput``，文本 prompt 传 ``None``。
 
         Returns:
-            ``(seq, out_q)``: the engine-side sequence and the queue that will
-            receive ``{"token", "done", "error", "prefill_s"}`` events.
+            ``(seq, out_q)``：引擎侧的序列，以及将收到
+            ``{"token", "done", "error", "prefill_s"}`` 事件的队列。
         """
         out_q: queue.Queue = queue.Queue()
         with self._lock:
@@ -281,24 +260,22 @@ class RuntimeGenerationMixin:
 
     def _blocking_generate(self, prompt_ids: list[int], max_new: int,
                            temperature: float, deadline: float = 0.0, mm=None):
-        """Submit a request and collect its tokens until the engine says done.
+        """提交一个请求，一直收 token 到引擎说完成。
 
         Args:
-            prompt_ids: Prompt token ids.
-            max_new: Output budget in tokens, already clamped by ``_room``.
-            temperature: 0 for greedy.
-            deadline: Epoch-seconds cutoff, 0 for none.
-            mm: The request's ``MMInput``, or ``None``.
+            prompt_ids: prompt 的 token id。
+            max_new: 以 token 计的输出预算，已经由 ``_room`` 夹紧。
+            temperature: 0 表示贪心。
+            deadline: 以 epoch 秒计的截止时间，0 表示不限。
+            mm: 请求的 ``MMInput``，或 ``None``。
 
         Returns:
-            ``(tokens, prefill_s, decode_s)``. ``decode_s`` excludes the prefill
-            and is floored at 0 because the two timings are read from different
-            clocks and can invert by a few microseconds on a short answer.
+            ``(tokens, prefill_s, decode_s)``。``decode_s`` 不含预填充，且下界
+            取 0，因为两段计时读的是不同的时钟，短回答上可能倒挂几微秒。
 
         Raises:
-            RuntimeError: The engine reported an error for this request. The
-                failed step has already been reset, so the caller may retry a new
-                request, but not this sequence.
+            RuntimeError: 引擎为这个请求报了错。失败的那一步已经被重置，调用方
+                可以重新发起一个新请求，但这条序列不能再用。
         """
         seq, out_q = self._submit(prompt_ids,
                                   self._sampling(max_new, temperature, deadline), mm=mm)
@@ -317,26 +294,23 @@ class RuntimeGenerationMixin:
         return out, pre, max(total - pre, 0.0)
 
     def _room(self, n_prompt: int, max_new) -> tuple[int, bool]:
-        """Clamp the output budget to what the context window has left.
+        """把输出预算夹到上下文窗口还剩的空间以内。
 
-        The window is shared by prompt *and* output (262144 tokens total), and the
-        decode step has no bounds check of its own: it writes the KV cache at
-        ``pos`` and the rope tables are ``[max_seq]``, so a budget larger than the
-        room would run off the end of both. Long-context clients routinely ask for
-        a full window without looking at their prompt length, so the engine clamps
-        instead of faulting.
+        窗口由 prompt *和* 输出共享（总共 262144 个 token），而解码步自身没有越界
+        检查：它按 ``pos`` 写 KV 缓存，RoPE 表也只有 ``[max_seq]`` 那么长，预算
+        超过剩余空间就会同时撞穿两者。长上下文客户端经常看都不看 prompt 长度就要一
+        整个窗口，所以引擎把它夹紧，而不是让它越界。
 
         Args:
-            n_prompt: Prompt length in tokens, after image expansion.
-            max_new: Requested output budget; ``None`` or negative means "as much
-                as fits", the caller stating no preference.
+            n_prompt: 图像展开之后的 prompt token 长度。
+            max_new: 请求的输出预算；``None`` 或负数表示「能放多少写多少」，也就是
+                调用方没有表态。
 
         Returns:
-            ``(budget, window_full)``. ``budget`` is what the request may actually
-            generate, never negative -- a prompt that exactly fills the window
-            generates nothing. ``window_full`` says the *request* was cut by the
-            window rather than finishing on its own. Both travel back in the
-            reply so the client can tell "done" from "ran out of room".
+            ``(budget, window_full)``。``budget`` 是这个请求实际能生成多少，永远
+            不为负——刚好占满窗口的 prompt 一个 token 也生成不了。``window_full``
+            表示这个*请求*是被窗口截断的，而不是自己跑完的。两者都随回复返回，
+            客户端才能分清「完成」和「没地方了」。
         """
         room = max(0, self.max_seq - n_prompt)
         if max_new is None or int(max_new) < 0:
@@ -345,43 +319,41 @@ class RuntimeGenerationMixin:
 
     def _sampling(self, max_new: int, temperature: float,
                   deadline: float = 0.0) -> SamplingParams:
-        """Build the per-request decoding policy the engine's scheduler sees.
+        """构造引擎调度器看到的、按请求生效的解码策略。
 
         Args:
-            max_new: Output budget, after ``_room`` clamping.
-            temperature: 0 for greedy, which is what enables the spec path.
-            deadline: Epoch-seconds cutoff, 0 for none.
+            max_new: 输出预算，已经过 ``_room`` 夹紧。
+            temperature: 0 表示贪心，也正是投机路径的开启条件。
+            deadline: 以 epoch 秒计的截止时间，0 表示不限。
 
         Returns:
-            The sampling parameters, with this server's full stop-id set attached
-            so every path stops on the template's own end-of-turn token.
+            采样参数，附上本服务完整的停止 id 集合，这样每条路径都会停在模板自己的
+            轮次结束 token 上。
         """
         return SamplingParams(temperature=temperature, max_tokens=max_new,
                               eos=set(self.eos), deadline=deadline)
 
     def _deadline(self, req: dict) -> float:
-        """Wall-clock cap for this generation (epoch seconds, 0 = none).
+        """这次生成的墙钟上限（epoch 秒，0 = 不限）。
 
-        The request may only shorten the server-wide ``--max-seconds``, never
-        extend it: the cap exists to cover a client that goes quiet without
-        closing its socket, so a client cannot opt out of it.
+        请求只能把服务级的 ``--max-seconds`` 改短，永远不能改长：这一刀是为了兜住
+        静默下来却不关 socket 的客户端，所以客户端没法把自己排除在外。
 
         Args:
-            req: The request dict; ``max_seconds`` overrides the server default.
+            req: 请求字典；``max_seconds`` 覆盖服务默认值。
 
         Returns:
-            The absolute cutoff, or 0 when no cap applies.
+            绝对的截止时刻；没有上限时返回 0。
         """
         secs = float(req.get("max_seconds") or self.max_seconds or 0.0)
         return time.time() + secs if secs > 0 else 0.0
 
     def _cached_tokens(self) -> int:
-        """How much of the last prompt came out of the prefix cache.
+        """上一个 prompt 有多少是从前缀缓存里直接来的。
 
         Returns:
-            The matched prefix length, 0 when nothing was reused. Read after the
-            request finished, because a batched step updates it per sequence and
-            only the reply needs it.
+            匹配到的前缀长度，什么都没复用时是 0。在请求结束之后读，因为批处理步
+            是按序列更新它的，而只有回复需要这个数。
         """
         if self.pc is not None:
             return self.pc.last_matched
@@ -390,21 +362,21 @@ class RuntimeGenerationMixin:
     @torch.inference_mode()
     def _generate(self, prompt_ids: list[int], max_new: int, temperature: float,
                   deadline: float = 0.0, mm=None) -> tuple[list[int], float, float]:
-        """Non-streaming generation through the engine's batched path.
+        """走引擎的批处理路径做非流式生成。
 
         Args:
-            prompt_ids: Prompt token ids.
-            max_new: Output budget, after ``_room`` clamping.
-            temperature: 0 for greedy.
-            deadline: Epoch-seconds cutoff, 0 for none.
-            mm: The request's ``MMInput``, or ``None``.
+            prompt_ids: prompt 的 token id。
+            max_new: 输出预算，已经过 ``_room`` 夹紧。
+            temperature: 0 表示贪心。
+            deadline: 以 epoch 秒计的截止时间，0 表示不限。
+            mm: 请求的 ``MMInput``，或 ``None``。
 
         Returns:
-            ``(tokens, prefill_s, decode_s)``, as ``_blocking_generate`` returns
-            them.
+            ``(tokens, prefill_s, decode_s)``，与 ``_blocking_generate`` 返回的
+            一致。
 
         Raises:
-            RuntimeError: The engine reported an error for this request.
+            RuntimeError: 引擎为这个请求报了错。
         """
         return self._blocking_generate(prompt_ids, max_new, temperature, deadline, mm=mm)
 
@@ -412,33 +384,28 @@ class RuntimeGenerationMixin:
     def _spec_generate(self, prompt_ids: list[int], max_new: int, k: int,
                        deadline: float = 0.0,
                        mm=None) -> tuple[list[int], float, float]:
-        """Greedy speculative decode, driving the model instead of the scheduler.
+        """贪心投机解码，直接驱动模型而不是走调度器。
 
-        This bypasses the engine's request queue: it resets the model, prefills,
-        then loops on ``spec_step`` directly. That is what lets the ``spec`` op
-        A/B it against the plain path, and it means the verify graph must already
-        be captured for ``k + 1`` tokens (``capture_verify``) or the first step
-        raises.
+        它绕过引擎的请求队列：先重置模型、预填充，然后直接在 ``spec_step`` 上循环。
+        ``spec`` 操作因此能拿它和普通路径做 A/B；代价是验证图必须已经按 ``k + 1``
+        个 token capture 过（``capture_verify``），否则第一步就会抛异常。
 
-        Only greedy is supported: the accept/reject test compares the main
-        model's argmax against the draft, which is exact for greedy and not for
-        sampling.
+        只支持贪心：接受/拒绝判断是拿主模型的 argmax 与草稿比对，这对贪心成立，对
+        采样不成立。
 
         Args:
-            prompt_ids: Prompt token ids.
-            max_new: Output budget, after ``_room`` clamping.
-            k: Drafts per step; the verify graph must already be captured for
-                ``k + 1`` tokens.
-            deadline: Epoch-seconds cutoff, 0 for none.
-            mm: The request's ``MMInput``, or ``None``. Supported, not refused:
-                ``prefill(mm=...)`` writes the request's ``rope_delta`` and both
-                the drafter and the verify graph read it per step (``spec_step``
-                copies it into ``mtp.rope_delta``), so an image prompt speculates
-                exactly like a text one.
+            prompt_ids: prompt 的 token id。
+            max_new: 输出预算，已经过 ``_room`` 夹紧。
+            k: 每步的草稿数；验证图必须已按 ``k + 1`` 个 token capture。
+            deadline: 以 epoch 秒计的截止时间，0 表示不限。
+            mm: 请求的 ``MMInput``，或 ``None``。支持而不是拒绝：
+                ``prefill(mm=...)`` 会把请求的 ``rope_delta`` 写进去，草稿模型和
+                验证图每步都读它（``spec_step`` 会把它拷进 ``mtp.rope_delta``），
+                所以带图 prompt 和文本 prompt 投机的行为完全一样。
 
         Returns:
-            ``(tokens, prefill_s, decode_s)``. ``decode_s`` covers the spec loop
-            only, so it is directly comparable with the plain path's decode time.
+            ``(tokens, prefill_s, decode_s)``。``decode_s`` 只覆盖投机循环，所以
+            可以直接和普通路径的解码时间对比。
         """
         m = self.model
         m.reset()
@@ -468,32 +435,29 @@ class RuntimeGenerationMixin:
 
 
 class RuntimeChatMixin:
-    """Chat rendering, image preprocessing and the op dispatcher.
+    """对话渲染、图像预处理和操作分派。
 
-    Turns an OpenAI-shaped request into token ids the engine can run, and turns the
-    engine's token stream back into a reply or an SSE sequence. Also owns the
-    diagnostic ops, which is why they are refused here rather than in the transport:
-    they touch the model directly and so must take the same lock as a decode step.
+    它把 OpenAI 形状的请求变成引擎能跑的 token id，再把引擎的 token 流变回回复或
+    SSE 序列。诊断类操作也归它管，这也是它们在这里而不是在传输层被拒绝的原因：
+    它们直接动模型，所以必须和解码步拿同一把锁。
 
     Constraints:
-        * One rendering rule for text and images: the template renders the prompt
-          either way and the image path only hands that same text to the processor
-          afterwards, so adding vision cannot change how a text prompt renders.
-        * The image path runs entirely before the prompt is prefilled, so every
-          rejection is a clean status instead of a half-generated answer.
+        * 文本和图像共用一条渲染规则：模板照常渲染 prompt，图像路径只是之后把同一
+          段文本交给处理器，所以加入视觉能力不可能改变纯文本 prompt 的渲染结果。
+        * 图像路径完全跑在预填充之前，所以每一次拒绝都是一个干净的状态码，而不是
+          一个生成到一半的回答。
     """
 
     def _vision_ready(self) -> bool:
-        """Whether this server can serve an image request at all.
+        """这个服务到底能不能处理带图请求。
 
-        Read from the checkpoint config rather than from ``self.vision``, because
-        the tower is only built lazily on the first image request: the flag alone
-        would answer "yes" for a text-only checkpoint and turn a clear 503 into a
-        failure halfway through the prefill.
+        从 checkpoint 配置读，而不是看 ``self.vision``，因为视觉塔只在第一个带图
+        请求时才惰性构建：光看那个开关会对纯文本 checkpoint 回答「能」，把一个本该
+        清楚的 503 变成预填充跑到一半才失败。
 
         Returns:
-            ``True`` when ``--no-vision`` was not passed and the checkpoint
-            declares a ``vision_config``.
+            没传 ``--no-vision`` 且 checkpoint 声明了 ``vision_config`` 时返回
+            ``True``。
         """
         if not self.vision:
             return False
@@ -501,21 +465,18 @@ class RuntimeChatMixin:
         return bool(raw.get("vision_config"))
 
     def _ensure_processor(self):
-        """Load the checkpoint's image processor on first use.
+        """首次使用时才加载 checkpoint 的图像处理器。
 
-        Lazy rather than eager because it is the only transformers piece with a
-        heavy import cost besides the tokenizer, and a text-only deployment never
-        touches it. The ~2 s lands on the first image request, where it is one
-        more second against a prefill that is already hundreds of ms, instead of
-        on every cold start.
+        惰性而不是启动时加载，因为除了分词器，它是 transformers 里唯一导入开销很大
+        的部件，而纯文本部署根本碰不到它。那约 2 s 落在第一个带图请求上，那里相对
+        一次本来就要几百毫秒的预填充只多一秒，而不是摊到每一次冷启动。
 
         Returns:
-            The loaded ``AutoProcessor``.
+            加载好的 ``AutoProcessor``。
 
         Raises:
-            MMError: The processor cannot be loaded (503). A broken checkpoint
-                must not retry on every request, so the failure is remembered and
-                reported instead of being re-attempted.
+            MMError: 处理器加载不了（503）。坏掉的 checkpoint 不能每个请求都重试，
+                所以失败会被记住并上报，而不是反复尝试。
         """
         if self.processor is not None:
             return self.processor
@@ -535,41 +496,35 @@ class RuntimeChatMixin:
         return self.processor
 
     def _prepare_mm(self, images: list[dict], text: str):
-        """An image request's parts -> ``MMInput`` for the engine.
+        """把带图请求的片段变成引擎用的 ``MMInput``。
 
-        Runs the whole image path *before* the prompt is prefilled, so every
-        rejection is a clean 400 instead of a half-generated answer:
+        整条图像路径都跑在 prompt 预填充*之前*，所以每次拒绝都是干净的 400，而不是
+        一个生成到一半的回答：
 
-        1. PIL decode + orientation + RGB conversion per image (``_decode_image``);
-        2. the checkpoint's processor over ``text`` (the rendered prompt, whose
-           ``{"type": "image"}`` markers already became
-           ``<|vision_start|><|image_pad|><|vision_end|>``) -- it downsamples each
-           image into ``[image_min_pixels, image_max_pixels]``, patchifies it and
-           expands the ``<|image_pad|>`` runs to one token per merged patch;
-        3. a self-check that the expanded count is exactly ``Σ grid.prod() / 4``,
-           which is what turns a processor-version drift into a 400 rather than an
-           index mismatch deep inside the model;
-        4. the vision tower -> embeddings, and ``mm_input`` -> 3-D positions.
+        1. 每张图做 PIL 解码 + 摆正 + 转 RGB（``_decode_image``）；
+        2. checkpoint 的处理器处理 ``text``（渲染好的 prompt，其中的
+           ``{"type": "image"}`` 标记已经变成
+           ``<|vision_start|><|image_pad|><|vision_end|>``）——它把每张图缩到
+           ``[image_min_pixels, image_max_pixels]`` 区间、切 patch，并把
+           ``<|image_pad|>`` 段展开成每个合并 patch 一个 token；
+        3. 自检展开后的数量恰好是 ``Σ grid.prod() / 4``，正是这一步把处理器版本
+           漂移变成 400，而不是模型深处的一次下标错位；
+        4. 视觉塔 -> 嵌入，``mm_input`` -> 三维位置。
 
         Args:
-            images: The request's ``images`` array, one ``{"b64", "mime"}`` dict
-                per image, in prompt order.
-            text: The rendered prompt, i.e. the chat template's output before the
-                processor expands the image placeholders.
+            images: 请求的 ``images`` 数组，每张图一个 ``{"b64", "mime"}`` 字典，
+                按 prompt 顺序排列。
+            text: 渲染好的 prompt，也就是处理器展开图像占位符之前的对话模板输出。
 
         Returns:
-            ``(token_ids, mm)``. ``token_ids`` are the processor's own ids: for an
-            image prompt the tokenizer and the processor agree, but taking them
-            from the processor is what guarantees the placeholders and
-            ``pixel_values`` line up (the count is asserted, so a disagreement
-            cannot pass silently).
+            ``(token_ids, mm)``。``token_ids`` 用的是处理器自己给的 id：带图
+            prompt 上分词器和处理器本来一致，但从处理器取才能保证占位符和
+            ``pixel_values`` 对得上（数量是断言过的，分歧不可能悄悄过去）。
 
         Raises:
-            MMError: The server has no vision tower (503), ``images`` is empty or
-                not a list, the request carries more than ``--max-images``, an
-                image fails to decode, the processor fails, or the placeholder
-                runs disagree with the grids. Every one of those is a client
-                error with a status the transport can forward.
+            MMError: 服务没有视觉塔（503）；``images`` 为空或不是列表；请求带的
+                图像超过 ``--max-images``；某张图解不开；处理器失败；或者占位符段
+                与网格对不上。每一条都是客户端错误，带着传输层可以直接转发的状态码。
         """
         from utils.mm_input import (IMAGE_TOKEN_ID, MMInput, find_image_spans,
                                     image_digest, mrope_positions)
@@ -608,23 +563,20 @@ class RuntimeChatMixin:
         ids = out["input_ids"][0].tolist()
         grid = out["image_grid_thw"].long()
         pixel_values = out["pixel_values"]
-        # One merged visual patch == one prompt token, per image.
+        # 每张图里一个合并后的视觉 patch 对应一个 prompt token。
         want = int((grid.prod(-1) // 4).sum())
 
-        # Three cheap checks that together pin the whole alignment, so a processor
-        # or template drift fails here instead of surfacing as an embedding/KV
-        # index mismatch inside the model:
+        # 三个廉价检查合起来把整套对齐钉死，处理器或模板漂移因此在这里就失败，而
+        # 不是变成模型内部的一次嵌入/KV 下标错位：
         #
-        # 1. the processor's tokenizer must agree with the one this server renders
-        #    prompts with -- if they were different tokenizers every id would be
-        #    off and the model would answer something unrelated;
-        # 2. the prompt's expansion must be *exactly* "each image marker becomes
-        #    grid.prod()/4 tokens"; the unexpanded rendering has one
-        #    ``<|image_pad|>`` per image, so
-        #    ``len(ids) == len(unexpanded) - n_images + Σ grid.prod()/4`` is the
-        #    processor's own contract;
-        # 3. the resulting placeholder runs are what the model overwrites, and
-        #    their count and order must match the grids the tower encodes.
+        # 1. 处理器自带的分词器必须和服务端渲染 prompt 用的是同一个——若两者不同，
+        #    每个 id 都会错，模型答出来的东西会完全不相干；
+        # 2. 展开量必须*恰好*是「每个图像标记变成 grid.prod()/4 个 token」；未展开
+        #    的渲染每张图只有一个 ``<|image_pad|>``，所以
+        #    ``len(ids) == len(unexpanded) - n_images + Σ grid.prod()/4`` 正是
+        #    处理器自己的契约；
+        # 3. 由此得到的占位符段是模型要覆写的地方，它们的数量和顺序必须与视觉塔编码
+        #    的网格一致。
         plain_ids = self.tok.encode(text)
         n_plain_pads = sum(1 for t in plain_ids if t == IMAGE_TOKEN_ID)
         if n_plain_pads != len(images):
@@ -660,67 +612,63 @@ class RuntimeChatMixin:
 
     def _render_with_text(self, messages: list[dict], tools, enable_thinking: bool,
                           forced_prefix: str = "") -> tuple[list[int], str]:
-        """Render a conversation with the checkpoint's own jinja template.
+        """用 checkpoint 自带的 jinja 模板渲染一段对话。
 
-        Using the checkpoint's template rather than a hand-built string is what
-        keeps the tool schemas, the thinking mode and the special tokens exactly
-        as the model was trained to see them.
+        用 checkpoint 的模板而不是手拼字符串，才能让工具 schema、思考模式和特殊
+        token 与模型训练时见过的完全一致。
 
         Args:
-            messages: Conversation turns in OpenAI chat format.
-            tools: Tool schemas, or ``None``; the template renders them into the
-                system turn, so a text prompt with tools is not a plain prompt.
-            enable_thinking: Whether the template opens the reasoning block.
-            forced_prefix: Template opener appended to the assistant turn, used to
-                implement ``tool_choice: required``.
+            messages: OpenAI 对话格式的轮次。
+            tools: 工具 schema 或 ``None``；模板会把它们渲染进 system 轮次，所以
+                带工具的文本 prompt 并不是一个朴素 prompt。
+            enable_thinking: 模板是否打开推理段。
+            forced_prefix: 追加到 assistant 轮次的模板开头，用于实现
+                ``tool_choice: required``。
 
         Returns:
-            ``(token_ids, text)``. The text is kept because the image path has to
-            hand the *rendered* prompt to the processor, and because the caller
-            inspects its tail to see whether thinking was opened.
+            ``(token_ids, text)``。保留文本，是因为图像路径要把*渲染好的* prompt
+            交给处理器，也因为调用方会看它的结尾判断思考段有没有被打开。
         """
         text = self.tok.apply_chat_template(
             messages, tools=tools, enable_thinking=enable_thinking,
             tokenize=False, add_generation_prompt=True)
         if forced_prefix:
-            # ``tool_choice: required`` (OpenAI's ``ChatCompletionToolChoiceOption``)
-            # is implemented by continuing the assistant turn: the rendered prompt
-            # already ends at the assistant header, so appending the template's
-            # opener leaves the model no way out but to finish the call.
+            # ``tool_choice: required``（OpenAI 的 ``ChatCompletionToolChoiceOption``）
+            # 是靠续写 assistant 轮次实现的：渲染好的 prompt 已经停在 assistant 头
+            # 上，追加模板的开头之后，模型除了把这个调用写完没有别的出路。
             text += forced_prefix
         return self.tok.encode(text), text
 
     def _render(self, messages: list[dict], tools, enable_thinking: bool,
                 forced_prefix: str = "") -> list[int]:
-        """Token ids of a rendered conversation; the text form is not needed.
+        """渲染好的对话的 token id；不需要文本形式。
 
         Args:
-            messages: Conversation turns in OpenAI chat format.
-            tools: Tool schemas, or ``None``.
-            enable_thinking: Whether the template opens the reasoning block.
-            forced_prefix: Template opener appended to the assistant turn.
+            messages: OpenAI 对话格式的轮次。
+            tools: 工具 schema 或 ``None``。
+            enable_thinking: 模板是否打开推理段。
+            forced_prefix: 追加到 assistant 轮次的模板开头。
 
         Returns:
-            The prompt token ids, ready to submit.
+            可以直接提交的 prompt token id。
         """
         return self._render_with_text(messages, tools, enable_thinking, forced_prefix)[0]
 
     @staticmethod
     def _split(raw: str, enable_thinking: bool) -> tuple[str, str]:
-        """Split reasoning from answer, knowing whether thinking was asked for.
+        """在知道有没有要求思考的前提下，把推理段和答案分开。
 
-        ``split_thinking`` cannot tell "no reasoning" from "reasoning that was cut
-        off before the closing marker": with thinking on and no ``</think>`` in the
-        text, everything generated so far *is* reasoning. Returning it as the
-        answer is how a thinking model's monologue ends up looking like a reply.
+        ``split_thinking`` 分不清「没有推理」和「推理在闭合标记之前就被截断了」：
+        开着思考而文本里没有 ``</think>`` 时，到目前为止生成的全部*都是*推理。
+        把它当答案返回，思考模型的内心独白就会变成一条看起来像回复的东西。
 
         Args:
-            raw: The full generated text, forced prefix included.
-            enable_thinking: Whether the caller asked the template for reasoning.
+            raw: 完整的生成文本，含强制开头。
+            enable_thinking: 调用方是否向模板要求过推理。
 
         Returns:
-            ``(thinking, answer)``. Both are empty strings when the model produced
-            neither; the answer is empty for a truncated reasoning block.
+            ``(thinking, answer)``。模型什么都没产出时两者都是空串；推理段被截断
+            时答案是空串。
         """
         thinking, answer = split_thinking(raw)
         if enable_thinking and not thinking and "</think>" not in raw:
@@ -728,32 +676,27 @@ class RuntimeChatMixin:
         return thinking, answer
 
     def _render_request(self, req: dict, thinking_on: bool, prefix: str):
-        """Render one request's prompt -> ``(token_ids, text, MMInput|None)``.
+        """渲染一个请求的 prompt -> ``(token_ids, text, MMInput|None)``。
 
-        The text-only path is render, encode, no ``mm``. A request carrying
-        ``images`` renders the *same* way (the template turns its
-        ``{"type": "image"}`` markers into the vision delimiters) and then hands
-        the rendered text to the processor, which is the only difference -- that
-        keeps one rendering rule for both paths, so adding vision could never
-        change how a text-only prompt renders.
+        纯文本路径就是渲染、编码、不带 ``mm``。带 ``images`` 的请求用*同样的*
+        方式渲染（模板把它的 ``{"type": "image"}`` 标记变成视觉分隔符），然后把
+        渲染好的文本交给处理器，区别仅此而已——两条路径共用一条渲染规则，加入视觉
+        因此不可能改变纯文本 prompt 的渲染结果。
 
         Args:
-            req: The request dict: ``messages``, optional ``tools`` and ``images``.
-            thinking_on: Whether the template should open the reasoning block.
-            prefix: The forced tool-call opener, empty when the caller did not ask
-                for ``tool_choice: required``.
+            req: 请求字典：``messages``、可选的 ``tools`` 和 ``images``。
+            thinking_on: 模板是否应打开推理段。
+            prefix: 强制工具调用的开头，调用方没要求 ``tool_choice: required`` 时
+                为空。
 
         Returns:
-            ``(token_ids, text, mm)``; ``mm`` is ``None`` for a text request. For
-            an image request the token ids are the processor's expanded ones, not
-            the tokenizer's.
+            ``(token_ids, text, mm)``；文本请求的 ``mm`` 是 ``None``。带图请求
+            的 token id 是处理器展开后的，不是分词器的。
 
         Raises:
-            MMError: The request carries ``images`` while a forced tool call is
-                active (400), or the image path refused (the status from
-                ``_prepare_mm``). The two are mutually exclusive because the
-                forced call needs the assistant turn to open the call, which
-                leaves no room for the vision delimiters.
+            MMError: 强制工具调用生效时请求带了 ``images``（400），或者图像路径
+                拒绝（状态码来自 ``_prepare_mm``）。两者互斥，因为强制调用需要
+                assistant 轮次直接开口就是调用，没有留给视觉分隔符的位置。
         """
         messages = req.get("messages", [])
         images = req.get("images") or []
@@ -769,42 +712,37 @@ class RuntimeChatMixin:
 
     @torch.inference_mode()
     def stream_chat(self, req: dict):
-        """``chat`` as a generator: one reply line per step, for SSE clients.
+        """把 ``chat`` 做成生成器：每步一行回复，供 SSE 客户端使用。
 
-        Yields ``type: "start"`` (prompt length and whether the prompt itself
-        opened the reasoning block), then one ``type: "token"`` per decoded piece,
-        then a final ``type: "done"`` with exactly the fields of the ``chat``
-        reply. That three-line framing is the whole contract the OpenAI entry point
-        forwards, so a new field belongs in ``done``, never in a new line type.
+        先产出 ``type: "start"``（prompt 长度，以及 prompt 自身是否已经打开了
+        推理段），然后每个解码出的片段产出一行 ``type: "token"``，最后是一个
+        ``type: "done"``，字段与 ``chat`` 回复完全一致。这三行就是 OpenAI 入口
+        转发的全部契约，所以新字段归 ``done``，绝不能新加一种行类型。
 
-        ``text`` on a token line is *incremental*: only the new token's ids are
-        decoded each step, so streaming stays linear in the answer length. The
-        previous step's ids are kept only while they end in the middle of a
-        multi-byte character, which is never more than a couple.
+        token 行上的 ``text`` 是*增量*的：每步只解码新 token 的 id，流式开销因此
+        与回答长度成线性。上一步的 id 只在它停在一个多字节字符中间时才留着，而这种
+        情况最多也就一两个 id。
 
-        A refused request is yielded as ``type: "error"`` with its status,
-        *before* the ``start`` line: SSE has already committed a 200 by then, so
-        the OpenAI entry point maps that line's status into the stream event instead of
-        pretending the request succeeded.
+        被拒绝的请求以 ``type: "error"`` 连同状态码产出，而且在 ``start`` 行
+        *之前*：那时 SSE 的 200 已经发出去了，OpenAI 入口会把这一行的状态码映射进
+        流事件，而不是假装请求成功了。
 
-        Speculative decode is deliberately not used here: the spec loop only
-        returns after a whole K+1 verification window, which is the opposite of
-        what a stream wants.
+        这里刻意不用投机解码：投机循环要等一整个 K+1 验证窗口才会返回，这正好与流式
+        想要的相反。
 
         Args:
-            req: The request dict: ``messages``, optional ``tools``, ``images``,
-                ``max_new``, ``temperature``, ``enable_thinking``,
-                ``tool_prefix`` and ``max_seconds``.
+            req: 请求字典：``messages``、可选的 ``tools``、``images``、
+                ``max_new``、``temperature``、``enable_thinking``、
+                ``tool_prefix`` 和 ``max_seconds``。
 
         Raises:
-            RuntimeError: The engine reported an error for this request. It is
-                raised after the ``start`` line, so the transport closes the
-                stream rather than sending a ``done`` that claims success.
+            RuntimeError: 引擎为这个请求报了错。它是在 ``start`` 行之后抛的，
+                所以传输层会关掉这条流，而不是发一个宣称成功的 ``done``。
         """
         prefix = str(req.get("tool_prefix") or "")
 
-        # A forced call must start the answer, so reasoning is off for that turn:
-        # the template would otherwise open ``<think>`` where the call has to go.
+        # 强制调用必须开在答案最前面，所以这一轮关掉推理：否则模板会在调用该出现
+        # 的位置先打开 ``<think>``。
         thinking_on = bool(req.get("enable_thinking", False)) and not prefix
         try:
             ids, prompt, mm = self._render_request(req, thinking_on, prefix)
@@ -823,7 +761,7 @@ class RuntimeChatMixin:
         t0 = time.time()
         seq, out_q = self._submit(ids, self._sampling(n, temp, deadline), mm=mm)
         out: list[int] = []
-        hold: list[int] = []             # token ids held back: partial UTF-8
+        hold: list[int] = []             # 暂扣的 token id：UTF-8 编码不完整
         t1 = time.time()
         while True:
             ev = out_q.get()
@@ -833,11 +771,10 @@ class RuntimeChatMixin:
             if nxt is not None:
                 out.append(nxt)
 
-                # Incremental decode: decoding the whole list every step is O(n^2)
-                # and dominates a long answer (a 20k-token reply would spend
-                # minutes in the tokenizer). A single token can end in the middle
-                # of a UTF-8 sequence, so its ids are held back and decoded
-                # together with the next ones until the character completes.
+                # 增量解码：每步解码整个列表是 O(n^2)，长回答里它会成为主要开销
+                # （一条 20k token 的回复要在分词器里耗掉几分钟）。单个 token 可能
+                # 停在 UTF-8 序列中间，所以它的 id 先扣住，和接下来的几个一起解码，
+                # 直到那个字符补齐。
                 held = hold + [nxt] if hold else [nxt]
                 text = self.tok.decode(held, skip_special_tokens=True)
                 if text.endswith("\ufffd"):
@@ -848,7 +785,7 @@ class RuntimeChatMixin:
                         yield {"type": "token", "id": nxt, "text": text}
             if ev["done"]:
                 break
-        if hold:                         # the sequence never completed (truncated)
+        if hold:                         # 这个字符始终没补全（被截断）
             text = self.tok.decode(hold, skip_special_tokens=True)
             if text:
                 yield {"type": "token", "id": hold[-1], "text": text}
@@ -856,9 +793,8 @@ class RuntimeChatMixin:
         t_pre = seq.prefill_s
         raw = self.tok.decode(out, skip_special_tokens=False)
 
-        # The forced opener lives in the *prompt*, so it is put back in front of
-        # the generated text before the call is parsed -- otherwise the block
-        # would look like `<function=...>` with no enclosing `<tool_call>`.
+        # 强制开头是在 *prompt* 里的，所以解析调用之前要先把它拼回生成文本前面——
+        # 否则那个块看起来就是一段没有 `<tool_call>` 包着的 `<function=...>`。
         full = prefix + raw
         thinking, answer = self._split(full, thinking_on)
         calls = parse_tool_calls(answer)
@@ -870,26 +806,24 @@ class RuntimeChatMixin:
                "prefill_ms": round(t_pre * 1000, 1),
                "decode_ms": round(t_dec * 1000, 1),
                "decode_tok_s": round(len(out) / t_dec, 2) if t_dec else None,
-               # why generation stopped, when the engine decided it itself
+               # 生成为什么停下（仅当是引擎自己判定的）
                "stopped": ("deadline" if deadline and time.time() >= deadline else None),
                "spec_k": 0, "spec": None}
 
     def handle(self, req: dict) -> dict:
-        """Serve one non-streaming op.
+        """处理一个非流式操作。
 
-        Diagnostics (bench/profile/ops/spec/reload/reset) touch the model
-        directly, so they are refused while requests are in flight and pause the
-        engine loop while they run: ``step`` and the diagnostic take the same
-        lock. Pausing is what makes them safe at all -- a reload tears the model
-        down, and a profiler capture would otherwise interleave with a live step.
+        诊断类操作（bench/profile/ops/spec/reload/reset）直接动模型，所以有请求
+        在飞时会被拒绝，跑的时候还会暂停引擎循环：``step`` 和诊断拿的是同一把锁。
+        暂停正是它们安全的前提——reload 会把模型拆掉，profiler 抓取否则会和活着的
+        一步交错在一起。
 
         Args:
-            req: One request dict; ``op`` defaults to ``ping``.
+            req: 一个请求字典；``op`` 默认是 ``ping``。
 
         Returns:
-            The reply dict, always with ``ok``. A refusal is ``ok: False`` plus an
-            ``error`` string, not an exception: the transport turns that into a
-            normal JSON line the client can read.
+            回复字典，总是带 ``ok``。拒绝是 ``ok: False`` 加一个 ``error`` 字符串，
+            不是异常：传输层会把它变成一行客户端能读的普通 JSON。
         """
         op = req.get("op", "ping")
         debug = op in ("reload", "reset", "bench", "profile", "ops", "spec")
@@ -911,59 +845,56 @@ class RuntimeChatMixin:
                 self._cv.notify_all()
 
     def _decode_one(self, logits: torch.Tensor) -> torch.Tensor:
-        """Feed the argmax of ``logits`` back through one decode step.
+        """把 ``logits`` 的 argmax 喂回去，走一次解码步。
 
-        Wraps the graph/eager choice the diagnostics need too: with capture off
-        the model has no graph to replay, so ``decode_step`` would raise. The two
-        entry points produce the same numbers, so a benchmark measures the launch
-        mechanism it actually has rather than failing on a missing graph.
+        它把诊断同样需要的图/eager 选择包了一层：关掉 capture 时模型没有图可回放，
+        ``decode_step`` 会抛异常。两个入口产出的数字一样，基准因此测的是它实际
+        拥有的启动方式，而不是因为缺一张图就失败。
 
         Args:
-            logits: ``[vocab]`` logits from the prefill or the previous step.
+            logits: 来自预填充或上一步的 ``[vocab]`` logits。
 
         Returns:
-            The next position's logits, in the same buffer either way.
+            下一个位置的 logits；两种路径下都是同一个缓冲区。
         """
         token = int(logits.argmax())
         return self.model.decode_step(token) if self.graph else self.model.logits(token)
 
     def _handle_impl(self, req: dict) -> dict:
-        """Dispatch one op and build its reply.
+        """分派一个操作并构造它的回复。
 
-        Every reply carries the same timing fields (``prefill_ms``,
-        ``decode_ms``, ``decode_tok_s``, ``cached_tokens``) so a probe can compare
-        paths without special-casing them. No locking here: the caller holds it.
+        每个回复都带同一组计时字段（``prefill_ms``、``decode_ms``、
+        ``decode_tok_s``、``cached_tokens``），探针比较各条路径时因此不用特判。
+        这里不加锁：调用方已经持有。
 
         Args:
-            req: The request dict; its keys depend on ``op``.
+            req: 请求字典；它的键取决于 ``op``。
 
         Returns:
-            The reply dict; ``{"ok": False, "error": ...}`` for an unknown op.
+            回复字典；未知操作为 ``{"ok": False, "error": ...}``。
         """
         op = req.get("op", "ping")
         self.n_req += 1
         if op == "ping":
             caps = backends.caps()
             out = {"ok": True, **self.info,
-                   # The effective decision, not just the model's readiness: with
-                   # capture disabled there is no graph, and reporting
-                   # ``graph_ready`` alone would read as a failed capture.
+                   # 报的是实际决定，而不只是模型就绪与否：capture 关掉时根本没有
+                   # 图，只报 ``graph_ready`` 会被读成 capture 失败。
                    "graph": self.graph and self.model.graph_ready,
                    "max_seq": self.max_seq,
                    "load_s": round(self.load_s, 1), "build_s": round(self.build_s, 1),
                    "n_req": self.n_req, "n_reload": self.n_reload,
-                   # The backend banner, verbatim: ``ping`` is what the HTTP shell
-                   # merges into ``/health``, so the fields an operator needs to
-                   # tell "wrong platform" from "slow platform" travel with it.
+                   # 后端横幅原样带出：HTTP 外壳会把 ``ping`` 的结果并进
+                   # ``/health``，运维分辨「平台不对」和「平台慢」需要的字段就随它
+                   # 一起走。
                    "backend": caps.name, "device": str(backends.device),
                    "native_ops": len(caps.native), "total_ops": len(backends.Ops.NAMES),
                    "int8": self.int8,
                    "vram_gib": round(allocated_gib(), 2),
                    "batch": bool(self.engine is not None and self.engine.batching),
                    "decode_capacity": int(getattr(self.model, "decode_capacity", 1)),
-                   # what image requests this server accepts; the OpenAI shell reads
-                   # ``vision`` to answer 503 up front instead of forwarding a request
-                   # the engine will reject anyway
+                   # 本服务接受什么样的带图请求；OpenAI 外壳读 ``vision`` 提前回
+                   # 503，而不是把一个引擎反正也会拒绝的请求转发下去
                    "vision": bool(self.vision and self.model.vision_sd),
                    "vision_int8": self.vision_int8,
                    "image_max_pixels": self.image_max_pixels,
@@ -1040,13 +971,12 @@ class RuntimeChatMixin:
                     "decode_tok_s": round(len(out) / t_dec, 2) if t_dec else None,
                     "stopped": ("deadline" if deadline and time.time() >= deadline else None),
                     "spec_k": k if spec else 0, "spec": spec,
-                    # what the image path actually did, so a probe can report it
+                    # 图像路径实际做了什么，供探针上报
                     "n_images": mm.num_images if mm is not None else 0,
                     "image_tokens": len(mm) if mm is not None else 0}
         if op == "spec":
-            # A/B the two decode paths on the same prompt. Both are warmed before
-            # timing, and the spec output is compared against plain greedy because
-            # a speculative loop that is only "about as good" is not a decoder.
+            # 在同一段 prompt 上把两条解码路径做 A/B。计时之前两者都先预热；投机
+            # 输出拿普通的贪心输出去比，因为一个「差不多一样好」的投机循环不算解码器。
             n = int(req.get("n", 48))
             ids = self.tok.encode(req.get("prompt") or "The quick brown fox")
             k = int(req.get("spec_k", self.spec_k or 1))
@@ -1067,7 +997,7 @@ class RuntimeChatMixin:
             ids = self.tok.encode(req.get("prompt") or "The quick brown fox")
             self.model.reset()
             logits = self.model.prefill(ids)
-            for _ in range(3):  # untimed: the first replay pays graph cache warming
+            for _ in range(3):  # 不计时：第一次回放要付图缓存预热的代价
                 logits = self._decode_one(logits)
             sync()
             t0 = time.time()
@@ -1099,8 +1029,8 @@ class RuntimeChatMixin:
                               "pct": round(100 * r.self_device_time_total / total, 1)}
                              for r in rows]}
         if op == "ops":
-            # eager (un-graphed) forward so each aten op is individually visible,
-            # grouped by op name with its self device time -> per-op attribution
+            # 走 eager（不经过图）的前向，每个 aten 算子才各自可见；按算子名归组
+            # 并统计它的自身设备时间 -> 逐算子归因
             n = int(req.get("n", 5))
             ids = self.tok.encode(req.get("prompt") or "The quick brown fox")
             self.model.reset()

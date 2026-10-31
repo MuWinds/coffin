@@ -1,37 +1,30 @@
-"""Moore Threads Moore Threads: the MUSA family, through the musa namespace.
+"""Moore Threads：MUSA 一族，走 musa 命名空间。
 
-Placeholder -- no kernels, no hardware. Included alongside Iluvatar and Enflame because it
-is the third of the domestic accelerators this engine is aimed at, and because its
-detection story is the clearest of the three, which makes it a good reference for how a
-new vendor should declare itself.
+占位实现——没有内核，没有硬件。它和 Iluvatar、Enflame 并列列出，是因为它是本引擎瞄准
+的第三家国产加速卡，也因为三家之中它的检测路径最清晰，正好当作新厂商如何声明自己的
+范本。
 
-What drove the declaration
---------------------------
-* **The namespace is ``musa``, and ``torch.cuda`` is deliberately not redirected.**
-  torchada's documentation states outright that ``torch.cuda.is_available()`` returns
-  ``False`` on a MUSA build so that platform detection works normally. That is the
-  ideal case for this layer: no shared-namespace ambiguity, no name rule needed, the
-  namespace alone identifies the vendor.
-* **The device name carries the part.** ``musaInfo`` reports names like
-  ``MTT S4000``, and downstream projects match on the ``MTT`` prefix. A name marker is
-  still declared even though the namespace already decides, because it costs nothing
-  and it makes the declaration robust if the vendor ever ships a compat layer that does
-  redirect ``cuda`` -- at which point the name is the only thing left.
+声明是怎么定下来的
 
-Everything else is open: packed math, graph capture, the extension path, and whether an
-int8 weight path pays off. The probes that settle them are in
-``.tmp_dsh/platforms/VENDORS.md``.
+* **命名空间是 ``musa``，且刻意不改写 ``torch.cuda``。** torchada 的文档直说在 MUSA
+  构建上 ``torch.cuda.is_available()`` 返回 ``False``，好让平台检测照常工作。这对本层
+  是最理想的情形：没有共享命名空间的歧义，不需要名字规则，光靠命名空间就能识别厂商。
+* **设备名里带着芯片型号。** ``musaInfo`` 报出的名字形如 ``MTT S4000``，下游项目按
+  ``MTT`` 前缀匹配。尽管命名空间已经能决定归属，这里仍然声明了名字标记，因为它不花
+  代价，而且万一厂商哪天出了改写 ``cuda`` 的兼容层，那份声明还站得住——到那时名字就是
+  仅剩的依据。
 
-Module: ``coffin/backends/vendors/moorethreads``. Declarative: imports only
-``backends.vendor``, plus ``torch`` for the dtype constant. Must be importable where no
-MUSA build exists.
+其余一切都没答案：packed 数学、图捕获、扩展路径，以及 int8 权重通路是否划算。能定下
+它们的探测在 ``.tmp_dsh/platforms/VENDORS.md``。
+
+Module: ``coffin/backends/vendors/moorethreads``。声明式：只 import
+``backends.vendor``，外加为 dtype 常量 import 的 ``torch``。在不存在 MUSA 构建的环境
+里也必须能 import。
 
 Constraints:
-    * ``name_markers`` are substrings matched case-insensitively. ``"mtt"`` is chosen
-      over the full product name because the part number changes per generation and the
-      prefix has not.
-    * Do not declare a capability this file cannot justify; see the sibling vendor
-      modules for the same rule stated at length.
+    * ``name_markers`` 是大小写不敏感的子串匹配。选 ``"mtt"`` 而不是完整产品名，是因为
+      型号数字每代都变，而前缀没变过。
+    * 不要声明本文件论证不了的能力；同一条规则在兄弟厂商模块里写得更长。
 """
 
 from __future__ import annotations
@@ -40,9 +33,9 @@ import torch
 
 from backends.vendor import Detection, VendorSpec
 
-#: Module-level declaration discovered by :mod:`coffin.backends.discovery`.
-#: The name marker is redundant while ``torch.cuda`` stays un-redirected, and becomes
-#: the only working discriminator if a compat layer ever changes that. Cheap insurance.
+#: 由 :mod:`coffin.backends.discovery` 发现的模块级声明。
+#: 在 ``torch.cuda`` 不被改写期间这个名字标记是多余的；一旦哪天有兼容层改了这一点，
+#: 它就是唯一还管用的区别依据。便宜的保险。
 SPEC = VendorSpec(
     name="moorethreads",
     detection=Detection(namespace="musa", name_markers=("mtt", "moore")),

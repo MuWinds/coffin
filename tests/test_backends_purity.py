@@ -1,42 +1,31 @@
-"""Purity gate: hardware detail must not leak out of ``coffin/backends``.
+"""纯度门禁：硬件细节不许漏出 ``coffin/backends``。
 
-Module: ``coffin/tests``. Standard library only, so the gate runs on a CPU-only
-host with no DCU and no compiled extension, and costs nothing at import time.
+Module: ``coffin/tests``。只用标准库，所以在没有 DCU、没有编译扩展的纯 CPU
+主机上也能跑，import 阶段不花代价。
 
-The one-shot ``hip_ops`` -> backend refactor touches roughly 150 call sites. This
-module is the safety net around that rename: it walks the real ``coffin`` tree on
-every run and fails when a file outside the backend package reaches into
-hardware-specific detail.
+``hip_ops`` -> 后端的一次性重构要动约 150 个调用点。本模块是那次改名周围的
+安全网：它每轮都走真实的 ``coffin`` 目录树，后端包之外的文件只要伸手去够硬件
+相关细节就失败。
 
 Constraints:
-    * Every run rescans the filesystem (``pathlib.Path.rglob``); a fixed list of
-      known offenders would go stale the moment a file is added, which is
-      exactly when the gate has to fire.
-    * Hits are grouped (``prod`` vs ``probe``) and each group carries its own
-      allowlist, so progress on production code cannot be masked by ``tests/``,
-      which is allowed to stay platform-specific longest. One-off probes live
-      outside this repository (in the parent tree's ``diag/``), so the gate never
-      sees them and a new probe never needs an allowlist entry.
-    * A group's allowlist is per file and holds the exact hit count of that file
-      today. More hits fail (a regression), fewer hits fail (the entry must be
-      lowered in the same change), and an entry whose file no longer offends
-      fails (delete it). That is what makes every allowlist converge on empty
-      instead of becoming a permanent exemption list.
-    * Comments and docstrings count as offenders. A hardware fact stated in a
-      comment outside the backend is the same coupling in prose: it tells the
-      next reader to edit the platform-specific file, so it moves with the
-      backend rather than staying behind.
-    * Counts are offending lines, and a line counts once per rule even when it
-      matches several patterns of that rule, so "hits" is a progress metric
-      rather than a regex match count.
-    * The scanner is exempt from its own rules: it necessarily spells out the
-      literals it searches for. Every rule is proven live by a synthetic bait
-      tree, so a green run still means clean code.
-    * The bait tree lives in ``coffin/.tmp_purity`` (gitignored), created with a
-      plain ``Path.mkdir()`` and removed with ``shutil.rmtree(ignore_errors=True)``.
-      Do not switch it to ``tempfile``: on Windows a directory created with mode
-      ``0o700`` (which ``mkdtemp`` uses) gets a DACL the sandboxed token cannot
-      delete, and the leftovers then break ``git status`` for everyone.
+    * 每次都重扫文件系统（``pathlib.Path.rglob``）；写死一份已知违规清单，
+      文件一新增就过期，而新增文件正是门禁必须触发的时刻。
+    * 命中按 ``prod`` / ``probe`` 分组，每组带自己的允许列表，``tests/`` 允许最晚
+      平台化，却不会因此掩盖生产代码的进度。一次性探针放在本仓库之外（父级目录
+      树的 ``diag/``），门禁看不到它们，新增探针也不必登记条目。
+    * 一个组的允许列表按文件记录该文件今天的精确命中行数。多一行失败（回归），
+      少一行失败（必须在同一次改动里下调），条目对应的文件不再违规也失败
+      （删掉它）。每份允许列表因此只能朝空收敛，不会变成永久豁免表。
+    * 注释和 docstring 也算违规。后端之外用注释写下的硬件事实是同一种耦合的
+      散文形态：它在提示下一个读者去改平台相关文件，所以它该随后端一起走。
+    * 计数单位是违规行；一行即使命中同一条规则的多个模式也只算一次，所以
+      「命中数」是进度指标，不是正则匹配次数。
+    * 扫描器不受自身规则约束：它必须原样写出要搜的字面量。每条规则都由一棵
+      合成诱饵树实跑验证，绿灯因此仍然意味着代码干净。
+    * 诱饵树放在 ``coffin/.tmp_purity``（已 gitignore），用普通 ``Path.mkdir()``
+      创建，用 ``shutil.rmtree(ignore_errors=True)`` 清理。不要换成 ``tempfile``：
+      Windows 上以 ``0o700`` 模式创建的目录（``mkdtemp`` 正是如此）会带上沙箱
+      令牌删不掉的 DACL，残留物随后会破坏所有人的 ``git status``。
 """
 
 from __future__ import annotations
@@ -51,12 +40,12 @@ from typing import Iterator
 
 ROOT = Path(__file__).resolve().parents[1]
 
-#: Posix path of this file, relative to ``coffin``. Exempted from every rule as
-#: explained in the module docstring.
+#: 本文件的 posix 路径，相对 ``coffin``。按模块 docstring 里所说的理由豁免全部
+#: 规则。
 SELF = "tests/test_backends_purity.py"
 
-#: Scratch root for the synthetic bait tree. Inside the workspace and gitignored
-#: so a crashed run cannot pollute ``git status``.
+#: 合成诱饵树的临时根目录。放在工作区内并已 gitignore，跑崩了也不会弄脏
+#: ``git status``。
 BAIT_ROOT = ROOT / ".tmp_purity"
 
 SOURCE_SUFFIXES = frozenset({".py", ".cu", ".c", ".h", ".cpp", ".cc", ".hpp"})
@@ -70,11 +59,11 @@ SKIP_DIRECTORIES = frozenset({
 
 @dataclass(frozen=True)
 class Pattern:
-    """One regex that recognises a hardware-specific token.
+    """一条识别硬件相关 token 的正则。
 
     Attributes:
-        label: Short name used in reports to split a rule's hits by flavour.
-        regex: Compiled expression; a match anywhere on a line is an offender.
+        label: 报告里用来按种类拆分同一规则命中的短名。
+        regex: 编译后的表达式；一行中任意位置命中即算违规。
     """
 
     label: str
@@ -83,13 +72,12 @@ class Pattern:
 
 @dataclass(frozen=True)
 class Group:
-    """A slice of the tree with its own budget, so progress is readable.
+    """目录树的一个切片，各自带预算，进度才读得出来。
 
     Attributes:
-        name: ``"prod"`` for code that ships, ``"probe"`` for ``tests/``,
-            which may stay platform-specific longest.
-        prefixes: Directory prefixes in this group. An empty tuple makes the
-            group the catch-all and it must be declared last.
+        name: 随代码发布的用 ``"prod"``，``tests/`` 用 ``"probe"``，后者允许
+            最晚保持平台相关。
+        prefixes: 该组的目录前缀。空元组让这个组成为兜底组，必须最后声明。
     """
 
     name: str
@@ -104,18 +92,17 @@ WITH_PROBES = (PROBE, PROD)
 
 @dataclass(frozen=True)
 class Rule:
-    """One purity rule, its scan scope, its groups, and the allowlist to shrink.
+    """一条纯度规则：扫描范围、分组，以及要往下压的允许列表。
 
     Attributes:
-        name: Stable rule id, used as the unittest method suffix and in reports.
-        summary: One sentence stating what the rule protects and why.
-        patterns: Recognisers; a line matching any of them is one offender line.
-        scope: Directory prefixes to scan. Empty means the whole tree.
-        exempt: Directory prefixes whose hits are reported but never budgeted --
-            the backend package itself. The scanner
-            file is always exempt as well.
-        groups: Budget slices, probe first then the ``prod`` catch-all.
-        budgets: Allowlist as ``group -> posix relative path -> exact lines``.
+        name: 稳定的规则 id，用作 unittest 方法名后缀和报告里的名字。
+        summary: 一句话说明这条规则保护什么、为什么重要。
+        patterns: 识别器；一行命中任意一条即算一个违规行。
+        scope: 要扫描的目录前缀。为空表示整棵树。
+        exempt: 目录前缀，落在其中的命中照常报告但不计入预算——那正是后端包
+            本身。扫描器文件也始终豁免。
+        groups: 预算切片，先是 probe，然后是兜底的 ``prod``。
+        budgets: 允许列表，形式为 ``组 -> posix 相对路径 -> 精确行数``。
     """
 
     name: str
@@ -129,7 +116,7 @@ class Rule:
 
 @dataclass(frozen=True)
 class Occurrence:
-    """A single offending line, addressed the way an editor jumps to it."""
+    """单条违规行，按编辑器能直接跳转的地址寻址。"""
 
     path: str
     line: int
@@ -137,25 +124,25 @@ class Occurrence:
     text: str
 
     def render(self) -> str:
-        """Format as ``path:line: text`` so a failure list is directly actionable.
+        """格式化成 ``path:line: text``，失败清单因此可以直接照着改。
 
         Returns:
-            One report line, truncated at 200 characters of source text.
+            一行报告，源文本在 200 字符处截断。
         """
         return f"{self.path}:{self.line}: {self.text[:200]}"
 
 
 @dataclass(frozen=True)
 class GroupReport:
-    """The scan result for one group of one rule.
+    """一条规则中一个组的扫描结果。
 
     Attributes:
-        group: The group this slice covers.
-        allowed: The allowlist in force for this group, ``path -> lines``.
-        per_file: Tracked hit count per file.
-        violations: Entries that are new, over budget, or under budget, as
-            ``(path, actual, allowed)`` with ``allowed = None`` for a new file.
-        stale: Budget keys that no longer offend; they must be deleted.
+        group: 本切片覆盖的组。
+        allowed: 该组生效的允许列表，``路径 -> 行数``。
+        per_file: 每个文件的命中数。
+        violations: 新增、超预算或低于预算的条目，形式为
+            ``(路径, 实际, 允许)``，新文件的 ``允许`` 为 ``None``。
+        stale: 已经不再违规的预算键，必须删除。
     """
 
     group: Group
@@ -166,24 +153,24 @@ class GroupReport:
 
     @property
     def budget(self) -> int:
-        """Total offending lines this group's allowlist still tolerates."""
+        """该组允许列表仍容忍的违规行总数。"""
         return sum(self.allowed.values())
 
     @property
     def tracked(self) -> int:
-        """Offending lines currently found in this group."""
+        """该组当前扫到的违规行数。"""
         return sum(self.per_file.values())
 
     @property
     def ok(self) -> bool:
-        """True when this group has no violation and no stale entry."""
+        """该组没有违规、也没有过期条目时为真。"""
         return not self.violations and not self.stale
 
     def totals_line(self) -> str:
-        """Format this slice's progress, which is the migration metric.
+        """格式化本切片的进度，它就是迁移指标。
 
         Returns:
-            ``"<group>: tracked=<n> budget=<n> files=<n>"``.
+            ``"<group>: tracked=<n> budget=<n> files=<n>"``。
         """
         return (f"{self.group.name}: tracked={self.tracked}"
                 f" budget={self.budget} files={len(self.per_file)}")
@@ -191,14 +178,14 @@ class GroupReport:
 
 @dataclass(frozen=True)
 class RuleReport:
-    """The scan result for one rule across all its groups.
+    """一条规则在它所有组上的扫描结果。
 
     Attributes:
-        rule: The rule that produced this report.
-        scanned: Number of source files visited under the scan root.
-        hits: All occurrences in scope, exempt ones included.
-        exempt: Occurrences under the rule's exempt roots, or in the scanner.
-        groups: Per-group results, in rule declaration order.
+        rule: 产出这份报告的规则。
+        scanned: 扫描根下访问到的源文件数。
+        hits: 范围内的全部命中，含豁免的部分。
+        exempt: 落在规则豁免根下或扫描器里的命中。
+        groups: 各组结果，顺序与规则里的声明一致。
     """
 
     rule: Rule
@@ -209,35 +196,35 @@ class RuleReport:
 
     @property
     def tracked(self) -> int:
-        """Offending lines in every group."""
+        """各组违规行之和。"""
         return sum(group.tracked for group in self.groups)
 
     @property
     def budget(self) -> int:
-        """Offending lines the whole allowlist still tolerates."""
+        """整份允许列表仍容忍的违规行总数。"""
         return sum(group.budget for group in self.groups)
 
     @property
     def ok(self) -> bool:
-        """True when every group passes."""
+        """所有组都通过时为真。"""
         return all(group.ok for group in self.groups)
 
     def totals_line(self) -> str:
-        """Format the progress line printed for this rule.
+        """格式化这条规则打印的进度行。
 
         Returns:
-            The rule name, then each group's slice, then the exempt count.
+            规则名、各组切片，最后是豁免计数。
         """
         slices = "  ".join(f"[{group.totals_line()}]" for group in self.groups)
         return (f"{self.rule.name}: {slices}  hits={len(self.hits)}"
                 f" exempt={len(self.exempt)}")
 
     def failure_lines(self) -> list[str]:
-        """Explain every violation and stale entry as actionable lines.
+        """把每条违规和过期条目写成可直接照办的说明行。
 
         Returns:
-            Human-readable lines; empty when the rule passes. Each offending file
-            gets its reason followed by its ``path:line: text`` occurrences.
+            供人阅读的行；规则通过时为空。每个违规文件先给出原因，再跟它的
+            ``path:line: text`` 命中行。
         """
         lines: list[str] = []
         for group in self.groups:
@@ -261,12 +248,12 @@ class RuleReport:
 
 @dataclass(frozen=True)
 class Scan:
-    """Every rule's report for one filesystem root.
+    """一个文件系统根下所有规则的报告。
 
     Attributes:
-        root: Root the scan walked.
-        scanned: Number of source files visited.
-        reports: Per-rule results keyed by rule name, in rule declaration order.
+        root: 本次扫描走过的根。
+        scanned: 访问到的源文件数。
+        reports: 按规则名索引的结果，顺序与规则声明一致。
     """
 
     root: Path
@@ -275,19 +262,19 @@ class Scan:
 
     @property
     def ok(self) -> bool:
-        """True when every rule passes."""
+        """所有规则都通过时为真。"""
         return all(report.ok for report in self.reports.values())
 
 
 def _under(path: str, prefixes: tuple[str, ...]) -> bool:
-    """True if a posix relative path is inside one of the directory prefixes.
+    """判断 posix 相对路径是否落在某个目录前缀之内。
 
     Args:
-        path: Posix relative path of a source file.
-        prefixes: Directory prefixes, with or without a trailing slash.
+        path: 源文件的 posix 相对路径。
+        prefixes: 目录前缀，末尾斜杠可有可无。
 
     Returns:
-        ``True`` when ``path`` equals a prefix or starts with it plus ``/``.
+        ``path`` 等于某个前缀、或以该前缀加 ``/`` 开头时为 ``True``。
     """
     for prefix in prefixes:
         trimmed = prefix.rstrip("/")
@@ -297,15 +284,15 @@ def _under(path: str, prefixes: tuple[str, ...]) -> bool:
 
 
 def _group_of(rule: Rule, path: str) -> Group:
-    """Pick the group a tracked path belongs to.
+    """挑出被统计路径所属的组。
 
     Args:
-        rule: Rule whose groups apply.
-        path: Posix relative path.
+        rule: 分组取自这条规则。
+        path: posix 相对路径。
 
     Returns:
-        The first group whose prefixes contain the path; the last group must be
-        the catch-all, so this never falls through for a well-formed rule.
+        前缀包含该路径的第一个组；最后一个组必须是兜底组，格式正确的规则因此
+        不会落到无组可归。
     """
     for group in rule.groups:
         if group.prefixes and _under(path, group.prefixes):
@@ -314,18 +301,17 @@ def _group_of(rule: Rule, path: str) -> Group:
 
 
 def _iter_sources(root: Path) -> Iterator[tuple[Path, str]]:
-    """Walk the tree and yield every source file with its posix relative path.
+    """遍历目录树，逐个产出源文件及其 posix 相对路径。
 
-    The walk is the point of the gate: it must see files the author of this test
-    has never heard of, so there is no suffix or directory list to keep in sync
-    with the tree.
+    遍历本身就是门禁的要点：它必须看见本测试作者从没听说过的文件，因此没有
+    后缀或目录清单需要跟着目录树同步。
 
     Args:
-        root: Directory to walk.
+        root: 要遍历的目录。
 
     Yields:
-        ``(absolute path, posix relative path)`` for each ``.py`` / CUDA / C /
-        C++ source file, sorted by path for a stable failure order.
+        每个 ``.py`` / CUDA / C / C++ 源文件对应的
+        ``(绝对路径, posix 相对路径)``，按路径排序以保证失败顺序稳定。
     """
     for path in sorted(root.rglob("*")):
         if not path.is_file() or path.suffix.lower() not in SOURCE_SUFFIXES:
@@ -337,14 +323,14 @@ def _iter_sources(root: Path) -> Iterator[tuple[Path, str]]:
 
 
 def _scan_rule(rule: Rule, root: Path) -> tuple[Occurrence, ...]:
-    """Collect every offending line for one rule under ``root``.
+    """收集 ``root`` 下某条规则的全部违规行。
 
     Args:
-        rule: Rule whose patterns and scope apply.
-        root: Scan root.
+        rule: 模式与范围取自这条规则。
+        root: 扫描根。
 
     Returns:
-        Offending lines in path then line order, at most one per line per rule.
+        先按路径、再按行号排序的违规行，同一行对同一规则至多记一次。
     """
     occurrences: list[Occurrence] = []
     for path, relative in _iter_sources(root):
@@ -361,17 +347,16 @@ def _scan_rule(rule: Rule, root: Path) -> tuple[Occurrence, ...]:
 
 
 def audit(root: Path = ROOT, budgets: dict[str, dict[str, dict[str, int]]] | None = None) -> Scan:
-    """Run every purity rule against a tree.
+    """对一棵树跑完所有纯度规则。
 
     Args:
-        root: Tree to scan; ``coffin`` by default.
-        budgets: Optional allowlist override as ``rule -> group -> path -> lines``.
-            ``None`` uses the declared allowlists; an empty mapping audits a tree
-            as if no allowlist existed, which is how the allowlists were
-            generated.
+        root: 要扫描的树，默认是 ``coffin``。
+        budgets: 可选的预算允许列表覆盖，形式为
+            ``规则 -> 组 -> 路径 -> 行数``。``None`` 用声明里的允许列表；传空映射
+            等于假装没有允许列表，现有允许列表就是这样生成的。
 
     Returns:
-        A :class:`Scan` with one report per rule.
+        一份 :class:`Scan`，每条规则一个报告。
     """
     root = Path(root)
     scanned = sum(1 for _ in _iter_sources(root))
@@ -407,10 +392,9 @@ def audit(root: Path = ROOT, budgets: dict[str, dict[str, dict[str, int]]] | Non
     return Scan(root=root, scanned=scanned, reports=reports)
 
 
-# Allowlists. Each entry is the exact number of offending lines that file
-# contains today, per group. Regenerate after a migration step with
-# ``python tests/test_backends_purity.py --emit-allowlist``; the gate fails on
-# NEW, OVER, LOOSE and STALE entries, so these tables can only shrink.
+# 允许列表。每个条目是该文件当前实际含有的违规行数，按组分开。迁移一步之后用
+# ``python tests/test_backends_purity.py --emit-allowlist`` 重新生成；门禁会在
+# NEW、OVER、LOOSE 和 STALE 条目上失败，所以这些表只能缩小。
 ALLOWLISTS: dict[str, dict[str, dict[str, int]]] = {
     "R1_hip_ops_import": {
         "probe": {
@@ -462,9 +446,9 @@ RULES: tuple[Rule, ...] = (
         patterns=(
             Pattern("import_hip_ops",
                     re.compile(r"^\s*(?:import\s+hip_ops\b|from\s+hip_ops\s+import\b)")),
-            # The import statement is not the only way in: a dynamic import and a
-            # ``sys.modules`` poke both reach the shim without a matching line,
-            # and those are exactly the forms a "temporary" bypass would use.
+            # 导入语句不是唯一的入口：动态导入和直接捅 ``sys.modules`` 都能
+            # 摸到 shim 而不留下一行匹配的 import，而这两种形式正是「临时」
+            # 绕过会用的写法。
             Pattern("dynamic_hip_ops",
                     re.compile(r"(?:import_module|sys\.modules)\s*[\(\[]\s*[\"']hip_ops[\"']")),
         ),
@@ -533,9 +517,8 @@ RULES: tuple[Rule, ...] = (
                 r"^\s*(?:from|import)\s+(?:coffin\.)?"
                 r"(?:ops|models|engine|serving|cache)(?:\.[\w.]*)?\s*"
                 r"(?:import\b|as\b|,|$)")),
-            # A relative import is the form a backend author actually reaches for
-            # ("from ..ops import x"), and it needs its own pattern: the absolute
-            # one above cannot match the leading dots.
+            # 相对导入是后端作者手边最顺的写法（``from ..ops import x``），
+            # 必须有单独的模式：上面那条绝对路径模式匹配不了开头的点。
             Pattern("relative_layer_import", re.compile(
                 r"^\s*from\s+\.{1,3}(?:ops|models|engine|serving|cache)\b")),
         ),
@@ -547,11 +530,11 @@ RULES: tuple[Rule, ...] = (
 
 
 def _write_tree(root: Path, files: dict[str, str]) -> None:
-    """Materialise a synthetic source tree for the bait cases.
+    """为诱饵用例实体化一棵合成源码树。
 
     Args:
-        root: Directory to create the files under.
-        files: Mapping of relative posix path to file body.
+        root: 在这些文件要建在其下的目录。
+        files: posix 相对路径到文件内容的映射。
     """
     for name, body in files.items():
         target = root / name
@@ -561,8 +544,8 @@ def _write_tree(root: Path, files: dict[str, str]) -> None:
 
 BAIT = {
     "bait_r1.py": "import hip_ops\n",
-    # The bypasses an import-statement-only rule would miss: a dynamic import and
-    # a ``sys.modules`` poke both reach the shim with no matching import line.
+    # 只看 import 语句的规则会漏掉的绕过方式：动态导入和直接捅
+    # ``sys.modules`` 都能摸到 shim 而不留下匹配的 import 行。
     "bait_r1_dyn.py": ('import importlib\n'
                        'SHIM = importlib.import_module("hip_ops")\n'),
     "bait_r1_modules.py": 'import sys\nCACHED = sys.modules["hip_ops"]\n',
@@ -570,8 +553,8 @@ BAIT = {
     "bait_r3.py": ('x = torch.zeros(1, device="cuda")\n'
                    'y = x.cuda()\ntorch.cuda.synchronize()\n'),
     "bait_r4.py": 'HERE = "kernels/gemv.cu"\nRATE = "12 kernels/step"\n',
-    # Rule 5 only scans ``backends/``, so its bait has to live there. The relative
-    # form is the one an author writing inside the package would reach for.
+    # 规则 5 只扫 ``backends/``，诱饵因此必须放在那里。相对导入正是包内作者
+    # 下笔时会用的形式。
     "backends/bait_r5.py": "from ops.dtypes import D\nimport models.qwen35\n",
     "backends/bait_r5_rel.py": "from ..ops.dtypes import D\n",
     "__pycache__/junk.py": "torch.cuda.synchronize()\n",
@@ -580,16 +563,15 @@ BAIT = {
 
 
 class PurityGateTest(unittest.TestCase):
-    """Every rule passes against the current tree and every allowlist is current."""
+    """每条规则都要在当前树上通过，每份允许列表都要是此刻的真实状态。"""
 
     scan: Scan
 
     @classmethod
     def setUpClass(cls) -> None:
-        """Scan once per run and print the per-rule totals.
+        """每轮只扫一次，并打印每条规则的合计。
 
-        The ``prod`` slice is the number that must reach zero; the totals line is
-        the migration progress metric for each rule.
+        ``prod`` 切片是必须归零的那个数；合计行则是每条规则各自的迁移进度。
         """
         cls.scan = audit()
         print(f"\n[platform purity] root={cls.scan.root} source_files={cls.scan.scanned}")
@@ -597,10 +579,10 @@ class PurityGateTest(unittest.TestCase):
             print(f"[platform purity] {report.totals_line()}")
 
     def _assert_rule(self, name: str) -> None:
-        """Fail with actionable lines when a rule has violations or stale entries.
+        """规则有违规或过期条目时抛出带可照办说明行的断言失败。
 
         Args:
-            name: Rule id from :data:`RULES`.
+            name: :data:`RULES` 里的规则 id。
         """
         report = self.scan.reports[name]
         if report.ok:
@@ -611,36 +593,33 @@ class PurityGateTest(unittest.TestCase):
         self.fail("\n".join(problem))
 
     def test_rule1_no_hip_ops_import_outside_backend(self):
-        """Only ``backends/`` may import ``hip_ops``."""
+        """只有 ``backends/`` 可以导入 ``hip_ops``。"""
         self._assert_rule("R1_hip_ops_import")
 
     def test_rule2_no_platform_build_literals_outside_backend(self):
-        """Architecture strings and extension build knobs live in the backend only."""
+        """架构字符串和扩展构建开关只属于后端。"""
         self._assert_rule("R2_platform_literal")
 
     def test_rule3_no_cuda_spelling_outside_backend(self):
-        """Device strings, ``.cuda()`` and ``torch.cuda`` are backend detail."""
+        """设备字符串、``.cuda()`` 和 ``torch.cuda`` 都是后端细节。"""
         self._assert_rule("R3_cuda_literal")
 
     def test_rule4_no_kernels_path_outside_backend(self):
-        """No caller outside the backend names a file under ``kernels/``."""
+        """后端之外的调用方一律不许指名 ``kernels/`` 下的文件。"""
         self._assert_rule("R4_kernels_path")
 
     def test_rule5_backends_do_not_import_upward(self):
-        """The backend package must not import the layers that depend on it."""
+        """后端包不许反向导入依赖它的那些层。"""
         self._assert_rule("R5_backend_dependency")
 
     def test_scan_reaches_the_known_tree(self):
-        """The walk must see the real tree, not an empty or partial one.
+        """遍历必须看见真实的树，不能是空的或残缺的。
 
-        Guards against a scan root that silently resolves to the wrong directory:
-        the gate would then pass without looking at anything.
-
-        The assertion is about files the *walk* visited, not about files that have
-        hits. Keying it on a hit pinned both the layout and the migration's own
-        progress: ``hip_ops.py`` stopped existing when the kernels moved into the
-        backend, and ``models/qwen35/model.py`` stopped offending once its device
-        literals were replaced -- a cleaner tree must not fail this test.
+        防的是扫描根悄悄指错目录：那样门禁什么都没看也会通过。断言的对象是
+        *遍历*访问到的文件，不是有命中的文件。以命中为基准会把目录布局和迁移
+        自身的进度一并钉死：内核搬进后端之后 ``hip_ops.py`` 就不再存在，
+        ``models/qwen35/model.py`` 的设备字面量被替换后也就不再违规——树更干净
+        不该让这个测试失败。
         """
         self.assertGreater(self.scan.scanned, 100)
         walked = {path.relative_to(self.scan.root).as_posix()
@@ -650,15 +629,14 @@ class PurityGateTest(unittest.TestCase):
             self.assertIn(expected, walked)
 
     def test_production_is_separated_from_probe_directories(self):
-        """Rule 3 must report shipping code apart from ``tests/``.
+        """规则 3 必须把随代码发布的代码与 ``tests/`` 分开报告。
 
-        A test-only allowance would otherwise hide a regressed production file,
-        and the production number is the one the migration had to drive to zero.
+        否则一条只对测试放宽的许可会把回归的生产文件遮过去，而迁移要压到零的
+        正是生产那个数。
 
-        Production is now at zero, so the assertion is that the split still exists
-        and that nothing in the ``prod`` group lives under a probe directory. It
-        used to also require ``prod`` to be non-empty; that pinned the migration's
-        own progress and would fail on the very state it was driving toward.
+        生产现在已经是零，所以断言换成：拆分还在，且 ``prod`` 组里没有任何路径
+        落在探针目录下。以前还要求 ``prod`` 非空，那等于钉住迁移自己的进度，
+        恰恰会在它努力奔向的状态上失败。
         """
         report = self.scan.reports["R3_cuda_literal"]
         groups = {group.group.name: group for group in report.groups}
@@ -667,18 +645,17 @@ class PurityGateTest(unittest.TestCase):
                             for path in groups["prod"].per_file))
         self.assertTrue(all(path.startswith("tests/")
                             for path in groups["probe"].per_file))
-        # The v3 rule's namesake property: no shipped file may still spell a
-        # vendor's device API. Probes may, and do.
+        # v3 规则同名的性质：已发布的文件一律不许再写出厂商的设备 API。探针
+        # 可以，而且确实还在写。
         self.assertEqual(groups["prod"].tracked, 0,
                          "shipped code must not name one vendor's device stack")
 
     def test_rules_catch_synthetic_offenders(self):
-        """Every rule fires on a bait tree, so a green run means clean code.
+        """每条规则都要在诱饵树上触发，绿灯才等于代码干净。
 
-        The bait also pins the noise handling: a violating file under
-        ``__pycache__`` or under the gate's own scratch root must be ignored, and
-        ``12 kernels/step`` (a rate, not a path) must not count as a kernel
-        reference. The budget outcomes pin the four verdicts the gate can return.
+        诱饵同时钉住噪音处理：``__pycache__`` 下或门禁自己临时根下的违规文件
+        必须忽略，``12 kernels/step``（一个速率，不是路径）不许算作内核引用。
+        预算那几组断言钉住门禁能给出的四种判决。
         """
         BAIT_ROOT.mkdir(parents=True, exist_ok=True)
         self.addCleanup(shutil.rmtree, BAIT_ROOT, ignore_errors=True)
@@ -720,14 +697,14 @@ class PurityGateTest(unittest.TestCase):
 
     @staticmethod
     def _per_file(scan: Scan, name: str) -> dict[str, int]:
-        """Merge a rule's per-group hit counts.
+        """合并一条规则在各组的命中数。
 
         Args:
-            scan: Scan result.
-            name: Rule id.
+            scan: 扫描结果。
+            name: 规则 id。
 
         Returns:
-            ``path -> offending lines`` across every group.
+            跨所有组的 ``路径 -> 违规行数``。
         """
         merged: dict[str, int] = {}
         for group in scan.reports[name].groups:
@@ -736,27 +713,27 @@ class PurityGateTest(unittest.TestCase):
 
     @staticmethod
     def _violations(scan: Scan, name: str) -> tuple[tuple[str, int, int | None], ...]:
-        """Collect a rule's violations across every group.
+        """收集一条规则在各组的全部违规。
 
         Args:
-            scan: Scan result.
-            name: Rule id.
+            scan: 扫描结果。
+            name: 规则 id。
 
         Returns:
-            Tuples of ``(path, actual, allowed)``.
+            ``(路径, 实际, 允许)`` 元组。
         """
         return tuple(violation for group in scan.reports[name].groups
                      for violation in group.violations)
 
 
 def format_allowlist(scan: Scan) -> str:
-    """Render the current per-file hit counts as an allowlist literal.
+    """把当前每文件命中数渲染成允许列表字面量。
 
     Args:
-        scan: A scan audited with empty budgets.
+        scan: 用空预算审出来的扫描结果。
 
     Returns:
-        Python source for :data:`ALLOWLISTS`, sorted, ready to paste.
+        :data:`ALLOWLISTS` 的 Python 源码，已排序，可直接粘贴。
     """
     blocks = []
     for name, report in scan.reports.items():
@@ -771,19 +748,18 @@ def format_allowlist(scan: Scan) -> str:
 
 
 def main(argv: list[str]) -> int:
-    """Print the audit, or the allowlist that matches the tree as it is now.
+    """打印审计结果，或者打印与当前树相符的允许列表。
 
-    ``--emit-allowlist`` refuses to run while the tree is red. Regenerating the
-    budgets from a red tree would bake the current offenders in as the new
-    baseline, which is the one way an allowlist can grow; requiring green first
-    turns that into an error the author has to fix rather than a silent accept.
+    树是红的时 ``--emit-allowlist`` 拒绝运行。从红树上重新生成预算，等于把当前
+    违规固化成新基线，那是允许列表唯一还能长大的途径；先要求绿灯，就把这件事变成
+    作者必须处理的错误，而不是默默接受。
 
     Args:
-        argv: Command line arguments; ``--report`` or ``--emit-allowlist``.
+        argv: 命令行参数；``--report`` 或 ``--emit-allowlist``。
 
     Returns:
-        Process exit code: 1 when the tree breaks a rule (or when
-        ``--emit-allowlist`` is asked for on a red tree), else 0.
+        进程退出码：树违反规则时（或者在红树上要 ``--emit-allowlist`` 时）为 1，
+        其余为 0。
     """
     if "--emit-allowlist" in argv:
         current = audit()

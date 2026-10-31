@@ -1,1 +1,10 @@
-"""Process entry points kept separate from engine and protocol implementations."""
+"""进程入口，与引擎和协议实现分开存放，便于单独启动。
+
+Module: ``coffin.entrypoints``。依赖方向单向：入口可以用 ``serving`` /
+``engine`` / ``utils``，反向没有 import。
+
+Constraints:
+    * 本包只负责解析命令行、拉起进程、装配依赖，不放推理逻辑。
+    * 入口脚本可能在没有加速卡的机器上被导入做参数检查，所以导入本包不得
+      触发设备初始化。
+"""

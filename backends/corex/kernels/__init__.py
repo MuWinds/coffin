@@ -1,32 +1,26 @@
-"""Build, or attach to a cached build of, the CoreX kernel extension.
+"""构建 CoreX 内核扩展，或附着到已有的缓存构建上。
 
-The extension is a torch JIT extension built from ``backends/corex/kernels/*.cu``
-with ``torch.utils.cpp_extension.load``. Nothing is compiled at import: this module
-is imported by ``backends/corex/__init__.py`` on every host that merely enumerates
-backend names, including a CPU-only one with no CoreX toolchain, so the build is
-lazy and its failure is memoised.
+该扩展是用 ``torch.utils.cpp_extension.load`` 从
+``backends/corex/kernels/*.cu`` 编出来的 torch JIT 扩展。import 时不编译任何
+东西：每个只枚举后端名字的主机都会 import 本模块（包括没有 CoreX 工具链的纯
+CPU 主机），所以构建是懒的，失败也被记忆化。
 
-Module: ``coffin/backends/corex``. Imports ``torch``, the standard library and the
-extension loader -- and nothing from ``coffin`` at all. The kernels it builds are
-C++/CUDA sources next to it; the op table above it calls :func:`load_kernels`.
+Module: ``coffin/backends/corex``。只 import ``torch``、标准库和扩展加载器，
+完全不用 ``coffin`` 里的东西。它构建的内核是紧挨着它的 C++/CUDA 源码；上层的
+算子表调用 :func:`load_kernels`。
 
 Constraints:
-    * ``TORCH_EXTENSIONS_DIR`` must come from the environment, never from a literal
-      here. Every deployment has to point at a per-deployment cache: a shared one
-      makes concurrent jobs contend on a single build baton and hang, and a cache
-      inside the source tree makes a checkout unwritable on the cluster.
-    * The build target is ``--cuda-gpu-arch=ivcore10`` (this part's ISA, read from
-      the driver as ``Caps.arch``). A different part needs a different arch string
-      passed in, not a second build path.
-    * The failure memo is the whole point of :func:`load_kernels`: a broken toolchain
-      costs one attempt per process, then costs nothing, and the op table falls back
-      to the reference backend instead of the process dying mid-request.
-    * Importing this module must not import ``torch.utils.cpp_extension`` at module
-      scope. The loader reads environment variables at import time, and a host that
-      never builds must not be reconfigured by an enumeration.
-    * The extension is compiled per arch, so the build directory is keyed by the arch
-      string: an ``ivcore10`` object file must never be attached to a run targeting a
-      different ISA.
+    * ``TORCH_EXTENSIONS_DIR`` 必须来自环境变量，绝不能在这里写死。每个部署都得
+      指向自己的缓存：共享缓存会让并发任务抢同一根构建锁并卡死，而源码树内的
+      缓存会让集群上的 checkout 变成不可写。
+    * 构建目标是 ``--cuda-gpu-arch=ivcore10``（本部件的 ISA，从驱动读到的
+      ``Caps.arch``）。换一个部件要传入不同的架构串，而不是再加一条构建路径。
+    * 失败记忆正是 :func:`load_kernels` 的意义：坏工具链在每进程只花一次
+      尝试，之后不花代价，算子表回退到参考实现，而不是让进程在请求中途死掉。
+    * import 本模块不得在模块作用域 import ``torch.utils.cpp_extension``。加载器
+      在 import 时读环境变量，一个永不构建的主机不该被一次枚举重新配置。
+    * 扩展按架构编译，所以构建目录以架构串为键：``ivcore10`` 的目标文件绝不能
+      附着到跑在不同 ISA 上的进程。
 """
 
 from __future__ import annotations
@@ -36,50 +30,46 @@ import time
 from pathlib import Path
 from typing import Any
 
-#: Directory holding the ``.cu``/``.cpp`` sources this module builds.
+#: 存放本模块要构建的 ``.cu``/``.cpp`` 源码的目录。
 KERNEL_DIR = Path(__file__).resolve().parent
 
-#: Translation units of the extension, in link order. Listing them here rather than
-#: globbing keeps a stray ``.cu`` (a probe, an experiment) out of the production build
-#: and keeps the list reviewable.
+#: 扩展的编译单元，按链接顺序。列在这里而不是 glob，是为了让散落的 ``.cu``
+#: （探针、实验）进不了生产构建，也让这份清单可复核。
 _SOURCES = ("bindings.cpp", "gemv.cu", "norm.cu", "attn.cu", "linear_attn.cu",
             "delta.cu", "solve.cu")
 
-#: ISA fallback when the driver does not report one. ``ivcore10`` is the BI-V100's arch
-#: (``COREX_PORT.md`` §0); a card that reports something else gets that value instead,
-#: which is why the loader takes ``arch`` as an argument.
+#: 驱动不报告 ISA 时的回退值。``ivcore10`` 是 BI-V100 的架构
+#: （``COREX_PORT.md`` §0）；报告了别的值的卡就用那个值，所以加载器把 ``arch``
+#: 作为参数接收。
 DEFAULT_ARCH = "ivcore10"
 
-#: Extension name. The suffix is the build-scheme version: bump it when a source change
-#: must not attach to an already-cached object tree. It is bumped with every kernel batch
-#: precisely because a stale cache is invisible -- the old objects load and answer.
+#: 扩展名。后缀是构建方案版本：某次源码改动不能附着到已缓存的目标树时递增
+#: 它。每批内核都递增，正是因为陈旧缓存是看不见的——旧目标照样加载并给出答案。
 #:
-#: Overridable through ``COFFIN_COREX_EXT`` because two people editing different ``.cu``
-#: files in one tree cannot both bump this: whoever commits second silently reuses the
-#: first one's objects and measures a kernel they did not change. A per-worker suffix gives
-#: each an independent object tree and an independent build baton, which is also what stops
-#: concurrent builds from serialising behind one lock.
+#: 可以用 ``COFFIN_COREX_EXT`` 覆盖，因为同一棵树里改不同 ``.cu`` 的两个人没
+#: 法都递增这个值：后提交的人会静默复用前者的目标文件，量的是一个自己没改过的
+#: 内核。按 worker 加后缀让各自拥有独立的目标树和独立的构建锁，这也是并发构建
+#: 不必串在同一把锁后面的原因。
 _EXTENSION = os.environ.get("COFFIN_COREX_EXT", "").strip() or "coffin_corex_ops_v13"
 
-#: Loaded extension, or ``None`` before the first attempt.
+#: 已加载的扩展，首次尝试之前是 ``None``。
 _module: Any = None
 
-#: ``"<ExceptionType>: <message>"`` from a failed build, or ``None``. Memoised so a
-#: broken toolchain costs one attempt per process.
+#: 构建失败留下的 ``<ExceptionType>: <message>`` 字符串，否则 ``None``。记忆化是
+#: 为了让坏工具链每进程只花一次尝试。
 _error: str | None = None
 
 
 def _flags(arch: str) -> dict[str, list[str]]:
-    """Return the compiler flags for one target ISA.
+    """返回某个目标 ISA 的编译选项。
 
     Args:
-        arch: Target ISA, i.e. ``Caps.arch`` (``"ivcore10"`` on a BI-V100).
+        arch: 目标 ISA，即 ``Caps.arch``（BI-V100 上是 ``"ivcore10"``）。
 
     Returns:
-        ``{"cflags": [...], "cuda_cflags": [...]}``. ``-O3`` on both sides because
-        the GEMV is a bare load/FMA loop with nothing to hide behind, and the
-        arch flag has to reach the device compiler or the build silently targets
-        whatever the driver defaults to.
+        ``{"cflags": [...], "cuda_cflags": [...]}``。两边都给 ``-O3``，因为 GEMV
+        就是一个裸的 load/FMA 循环，没什么可藏；架构选项必须送到设备编译器，否则
+        构建会静默地以驱动默认值为目标。
     """
     return {
         "cflags": ["-O3"],
@@ -88,36 +78,33 @@ def _flags(arch: str) -> dict[str, list[str]]:
 
 
 def _clear_stale_build_lock(cache: str) -> None:
-    """Remove a build lock left behind by a killed process.
+    """清掉被中断的进程留下的构建锁。
 
-    ``torch.utils.cpp_extension`` serialises builds with a baton file at
-    ``<cache>/<name>/lock``. Its ``wait()`` polls until the file disappears, and nothing
-    ages it out: a job killed between creating that file and removing it leaves every later
-    job on the cluster blocked forever, with no output on either stream, because the wait
-    happens inside an import.
+    ``torch.utils.cpp_extension`` 用 ``<cache>/<name>/lock`` 上的接力文件串行化构建。
+    它的 ``wait()`` 一直轮询到文件消失，没有任何机制让它过期：一个在创建该文件之后、
+    删除之前被杀掉的任务，会让集群上之后每个任务永久阻塞，两条输出流都没有内容，
+    因为等待发生在一次 import 内部。
 
-    This was not theoretical. Cancelling three submits whose imports were still resolving
-    the backend wedged the shared cache for every subsequent run, and the failure looked
-    exactly like a hang in device code -- the stack dump was the only thing that named it.
+    这不是理论问题。取消三个仍在解析后端的提交，就把共享缓存卡住了，之后每次运行
+    都跑不起来，现象看起来完全像设备代码里的 hang——只有调用栈能指出真凶。
 
-    Only a *stale* lock is removed. A fresh one belongs to a build that is genuinely
-    running, and deleting that would let two builds write the same object tree.
+    只删除 *陈旧* 的锁。新的锁属于真的在跑的构建，删掉它会让两个构建写同一份目标
+    树。
 
     Args:
-        cache: Value of ``TORCH_EXTENSIONS_DIR``.
+        cache: ``TORCH_EXTENSIONS_DIR`` 的值。
 
     Returns:
-        Nothing. Recovery is best effort: an unremovable lock is left to ``load``.
+        无。恢复是尽力而为：删不掉的锁交给 ``load`` 处理。
     """
     lock = Path(cache) / _EXTENSION / "lock"
     try:
         age = time.time() - lock.stat().st_mtime
     except OSError:
         return
-    # Ten minutes by default: longer than any successful build of these seven units, far
-    # shorter than the wall clock a blocked job would otherwise burn. The threshold is
-    # overridable because recovering from a wedge that is only seconds old needs a smaller
-    # value, and waiting ten minutes to clear a known-bad lock is its own bug.
+    # 默认十分钟：比这七个单元任何一次成功构建都长，又远短于一个被阻塞的任务本来
+    # 要烧掉的墙钟时间。阈值可以覆盖，因为从一个才卡了几秒的僵局里恢复需要更小的
+    # 值，而为了清一把已知坏掉的锁等十分钟本身就是 bug。
     limit = float(os.environ.get("COFFIN_BUILD_LOCK_MAX_AGE", "600"))
     if age < limit:
         return
@@ -128,21 +115,20 @@ def _clear_stale_build_lock(cache: str) -> None:
 
 
 def load_kernels(arch: str = DEFAULT_ARCH) -> Any:
-    """Build or attach the extension, once per process.
+    """构建或附着扩展，每进程一次。
 
     Args:
-        arch: Target ISA from the driver. Only the first call's value is used: the
-            loaded module is memoised, so a process cannot hold two builds and a
-            second arch would silently reuse the first one's objects.
+        arch: 驱动给出的目标 ISA。只用第一次调用的值：已加载的模块被记忆化，所以
+            一个进程不能持有两份构建，传第二个 arch 只会静默复用第一份的目标文件。
 
     Returns:
-        The extension module.
+        扩展模块。
 
     Raises:
-        RuntimeError: The build failed or ``TORCH_EXTENSIONS_DIR`` is unset. Raised
-            rather than returning ``None`` so the caller has one place to catch and
-            one message to log; ``backends/corex/__init__.py`` turns it into the
-            backend's ``reason()`` and the reference fallback.
+        RuntimeError: 构建失败，或 ``TORCH_EXTENSIONS_DIR`` 未设置。抛出而不是返回
+            ``None``，是为了让调用方只有一处能 catch、只有一条消息要记日志；
+            ``backends/corex/__init__.py`` 把它变成后端的 ``reason()`` 和参考实现
+            回退。
     """
     global _module, _error
     if _module is not None:
@@ -151,8 +137,8 @@ def load_kernels(arch: str = DEFAULT_ARCH) -> Any:
         raise RuntimeError(_error)
     cache = os.environ.get("TORCH_EXTENSIONS_DIR", "").strip()
     if not cache:
-        # A default here would put build artifacts in a shared or unwritable place
-        # and the two failure modes look identical from the outside.
+        # 在这里给默认值会把构建产物丢进共享目录或不可写目录，而这两种失败从外面
+        # 看起来一模一样。
         _error = ("TORCH_EXTENSIONS_DIR is not set; the CoreX kernels need a "
                   "per-deployment extension cache (a shared one serialises every "
                   "deployment behind one build lock)")
@@ -177,13 +163,12 @@ def load_kernels(arch: str = DEFAULT_ARCH) -> Any:
 
 
 def available() -> bool:
-    """Report whether the extension is loaded or loadable, without raising.
+    """报告扩展是否已加载或可加载，不抛异常。
 
     Returns:
-        ``True`` when :func:`load_kernels` has succeeded or can succeed now. On a
-        host with no toolchain this attempts the build once and then answers
-        ``False`` from the memo, which is what makes
-        ``backends/corex.usable()`` cheap to call repeatedly.
+        :func:`load_kernels` 已成功或此刻能够成功时为 ``True``。没有工具链的
+        主机上，这会尝试一次构建，之后从记忆里答 ``False``，正是这一点让
+        ``backends/corex.usable()`` 可以反复廉价调用。
     """
     if _module is not None:
         return True
@@ -195,35 +180,33 @@ def available() -> bool:
 
 
 def last_error() -> str | None:
-    """Return the memoised build failure, for the backend's ``reason()``.
+    """返回记忆下来的构建失败，供后端的 ``reason()`` 使用。
 
     Returns:
-        ``"<ExceptionType>: <message>"`` from the failed build, or ``None`` when the
-        build succeeded or was never attempted. Without this the startup log would
-        show a reference fallback and no cause.
+        失败构建留下的 ``<ExceptionType>: <message>`` 字符串；构建成功或从未尝试时为
+        ``None``。没有它，启动日志只会显示回退到了参考实现，却看不到原因。
     """
     return _error
 
 
 def errors() -> list[str]:
-    """Return the build failure as a one-element list, or an empty list.
+    """把构建失败包成单元素列表返回，没有失败则返回空列表。
 
     Returns:
-        ``[last_error()]`` when a build failed. It exists so a diagnostic can print
-        ``"\n".join(...)`` without a ``None`` check, which is the shape the diag
-        scripts in ``backends/corex/diag`` use.
+        构建失败时为 ``[last_error()]``。它存在是为了让诊断脚本可以
+        ``"\n".join(...)`` 而不必先查 ``None``——``backends/corex/diag`` 里的诊断
+        脚本用的就是这个形状。
     """
     err = last_error()
     return [] if err is None else [err]
 
 
 def reset() -> None:
-    """Forget the memoised module and error, so the next call rebuilds.
+    """忘掉记忆下来的模块和错误，让下次调用重新构建。
 
     Returns:
-        Nothing. Exists for a diagnostic that has just created
-        ``TORCH_EXTENSIONS_DIR`` or fixed the toolchain, and for tests that need the
-        "never attempted" state back.
+        无。给刚创建了 ``TORCH_EXTENSIONS_DIR`` 或修好工具链的诊断用，也给需要
+        回到「从未尝试」状态的测试用。
     """
     global _module, _error
     _module = None

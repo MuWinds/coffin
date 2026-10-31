@@ -1,47 +1,41 @@
-"""The dtype and mask constants every op in this layer agrees on, re-exported from the backend caps.
+"""本层所有算子共用的 dtype 与掩码常量，从后端能力记录再导出。
 
-The values are not this repository's to choose: they are hardware facts, so the
-single source is ``backends.caps()`` (``act_dtype`` / ``weight_dtype``). This
-module keeps the old names so that the ~200 ``from ops.dtypes import D`` call
-sites did not have to be renamed in the same change that moved the source.
+这些值轮不到本仓库来选：它们是硬件事实，所以唯一来源是
+``backends.caps()``（``act_dtype`` / ``weight_dtype``）。本模块保留旧名字，
+这样在搬走来源的同一次改动里，约 200 处 ``from ops.dtypes import D`` 的调用
+点不必跟着改名。
 
-Module: ``coffin/ops``. Depends on ``backends`` and ``torch``; imported by every
-other op module and by ``models/*``.
+Module: ``coffin/ops``。依赖 ``backends`` 和 ``torch``；被其余算子模块和
+``models/*`` 导入。
 
 Constraints:
-    * ``D`` and ``WF`` must stay *derived* names with no literal behind them. A
-      second literal here would be a platform assumption that silently disagrees
-      with the backend the process actually selected, which is the exact bug this
-      migration removed.
-    * The constants are bound at import, together with the backend selection
-      itself: there is no runtime hot swap (PLATFORMS.md §8), so a module that
-      reads them is reading a value that cannot change under it.
-    * ``NEG_INF`` is the attention-mask fill value; use it instead of a large
-      negative literal so the softmax underflow stays exact.
+    * ``D`` 和 ``WF`` 必须保持*推导*出来的名字，背后不能有字面量。这里再写
+      一份字面量等于把某个平台的假设固化下来，它会和进程实际选中的后端悄悄
+      不一致，而那正是这次迁移要消灭的 bug。
+    * 常量在 import 时连同后端选择一起绑定：没有运行时热切换（PLATFORMS.md
+      §8），所以读取它们的模块看到的值不可能在脚下改变。
+    * ``NEG_INF`` 是注意力掩码的填充值；用它而不是一个大负数写字面量，
+      这样 softmax 的下溢保持精确。
 """
 
 from __future__ import annotations
 
 from backends import caps as _caps
 
-#: The selected backend's capability record, read once. Kept private: callers
-#: that need a flag other than the two dtypes import ``backends.caps()`` directly
-#: rather than reaching into this module for a second copy of the record.
+#: 当前选中后端的能力记录，只读一次。保持私有：需要除两种 dtype 之外的
+#: 标志的调用方直接 import ``backends.caps()``，不要伸手进本模块拿第二份记录。
 _CAPS = _caps()
 
-#: Activation dtype for every fused kernel, including the int8 KV cache path.
-#: bf16 on every backend that has kernels today, and the reference runs it too
-#: because that is what the model allocates and what the KV quantiser is written
-#: against.
+#: 所有融合内核用的激活 dtype，包括 int8 KV 缓存那条路径。现有带内核的每个
+#: 后端都是 bf16，参考实现也跑它，因为模型分配的就是它、KV 量化器也是照它写的。
 D = _CAPS.act_dtype
 
-#: Projection-weight dtype. Not necessarily ``D``: the DCU this engine was tuned
-#: on has packed fp16 math and no packed bf16 math, so its prefill GEMM reaches
-#: 13-20 TFLOP/s on fp16 weights against 2.3 TFLOP/s on bf16 (wide-N shapes gain
-#: ~7x). Activations stay bf16 either way, and the decode GEMV copy loop is
-#: bandwidth-bound, so reading the weights as fp16 costs nothing there. A part with
-#: packed bf16 declares bf16 here instead and nothing else changes.
+#: 投影权重的 dtype。不一定等于 ``D``：本引擎调优用的 DCU 有 packed fp16
+#: 计算但没有 packed bf16 计算，所以它的预填充 GEMM 在 fp16 权重上能跑
+#: 13-20 TFLOP/s，而 bf16 上只有 2.3 TFLOP/s（宽 N 的形状拿到约 7x）。
+#: 激活无论如何都是 bf16，而解码 GEMV 的拷贝循环受带宽限制，在那里把权重
+#: 读成 fp16 不花代价。有 packed bf16 的型号在这里声明 bf16 即可，其余不变。
 WF = _CAPS.weight_dtype
 
-#: Mask fill value; `-inf` makes the softmax weight exactly zero.
+#: 掩码填充值；`-inf` 让 softmax 权重精确为零。
 NEG_INF = float("-inf")

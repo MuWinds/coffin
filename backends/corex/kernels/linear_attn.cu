@@ -1,49 +1,39 @@
 // @file linear_attn.cu
-// @brief The gated-delta-rule prologue, the depthwise causal conv1d that feeds it, and
-// the fused decode chain that runs both plus the recurrence and the gated norm.
+// @brief 门控 delta 规则的预处理、喂给它的深度因果 conv1d，以及把两者连同递推和门控
+// 归一化一起跑完的融合解码链。
 //
-// Module: coffin/backends/corex/kernels. Feeds the delta recursion the way
-// ``backends/hip/kernels/linear_attn.cu`` does on the DCU: this file produces the fp32
-// q/k/v/beta/g that the delta step consumes, so the two must agree on the layout and on
-// the 1e-6 L2 epsilon. ``delta_normed`` is the decode path of that pairing and lives here
-// rather than in ``delta.cu`` because its reductions have to reproduce this file's
-// ``block_sum2`` pairing exactly; ``delta.cu`` keeps the separate ``delta`` /
-// ``delta_batch`` entries the batch and verify paths still use.
+// Module: coffin/backends/corex/kernels。像 ``backends/hip/kernels/linear_attn.cu`` 在
+// DCU 上那样喂 delta 递推：本文件产出 delta 步消费的 fp32 q/k/v/beta/g，所以两者必须在
+// 布局和 1e-6 的 L2 epsilon 上一致。``delta_normed`` 是这套配对里的解码路径，它放在这里
+// 而不是 ``delta.cu``，因为它的归约必须精确复现本文件的 ``block_sum2`` 配对；
+// ``delta.cu`` 保留批处理和校验路径仍在用的独立 ``delta`` / ``delta_batch`` 入口。
 //
-// Why fused: before the delta kernel the engine L2-normalises q and k per head, scales
-// q, expands the 16 key heads to the 32 value heads, and builds
-// ``beta = sigmoid(b)`` and ``g = -exp(A) * softplus(a + dt_bias)``. As torch ops that
-// is ~16 small kernels per layer over 24 linear-attention layers, which at this card's
-// launch overhead is a large fraction of the step. One block per value head does all of
-// it and writes the fp32 the next kernel reads.
+// 为什么融合：在 delta 内核之前，引擎要按头对 q 和 k 做 L2 归一化、缩放 q、把 16 个键头
+// 扩成 32 个值头，并构造 ``beta = sigmoid(b)`` 与
+// ``g = -exp(A) * softplus(a + dt_bias)``。写成 torch 算子，那是每个层约 16 个小内核，
+// 24 个线性注意力层下来，按本卡的启动开销占了这一步的很大一块。每个值头一个 block 就能
+// 全做完，并写出下一个内核要读的 fp32。
 //
 // Constraints:
-//   * Every reduction is a shared-memory tree, not ``__shfl_down_sync``. This part's
-//     warp is 64 lanes wide, so a butterfly written for 32 would normalise q and k by
-//     the RMS of half their head -- wrong, and wrong by a plausible-looking amount. The
-//     tree is sized from ``blockDim`` at launch.
-//   * ``q`` and ``k`` are normalised in one reduction pass. They are always needed
-//     together, so two passes would double the barriers for the same result.
-//   * The 1e-6 epsilon in the q/k norms is part of the checkpoint's numerics, not a
-//     tuning knob: changing it changes the model's output.
-//   * Inputs that are column slices of the fused projection output take their row pitch
-//     from the tensor (``ldx`` / ``ldb`` / ``lda``). Assuming contiguity there reads the
-//     neighbouring third of the fused row, which produces plausible garbage.
-//   * ``conv_state`` is caller-owned and updated in place: it is the layer's short-term
-//     memory and has to be snapshotted with the recurrent state, so a kernel that
-//     returned a replacement buffer would break prefix reuse.
-//   * ``g`` must stay ``<= 0``. ``neg_expA`` is negative and softplus is positive, so
-//     the product is a decay; a sign slip would make the recurrence grow instead, which
-//     diverges rather than merely being wrong.
-//   * ``delta_normed`` must be bit-identical to the ``delta_prologue`` -> ``delta`` ->
-//     ``rms_norm_gated`` chain, because the decode step's greedy ids are the acceptance
-//     bar and a last-ulp shift moves them. That is why it reuses ``block_sum2`` and
-//     ``head_threads`` verbatim instead of growing its own reduction, and why it rounds
-//     the recurrence's fp32 output to bf16 before normalising -- the chain's
-//     ``RMSNormGated`` casts ``delta_out`` first, so the norm's inputs are bf16 there.
-//     A block therefore needs ``dv <= head_threads(dk)``; a wider value axis keeps the
-//     three-op chain, which the wrapper rejects with a shape error rather than silently
-//     changing the arithmetic.
+//   * 每次归约都用共享内存树，不用 ``__shfl_down_sync``。本部件的 warp 是 64 通道宽，为
+//     32 写的蝶形会拿半个头的 RMS 去归一化 q 和 k——错，而且错得像模像样。树的尺寸在启动
+//     时按 ``blockDim`` 定。
+//   * ``q`` 和 ``k`` 在同一趟归约里归一化。它们总是要一起用，两趟只会把屏障数量翻倍而结果
+//     不变。
+//   * q/k 归一化里的 1e-6 epsilon 是 checkpoint 数值的一部分，不是可调参数：改它就会改
+//     模型的输出。
+//   * 作为融合投影输出列切片的输入，行间距从张量里取（``ldx`` / ``ldb`` / ``lda``）。
+//     在那里假定连续会读到融合行相邻的那三分之一，产出看着合理的垃圾。
+//   * ``conv_state`` 归调用方所有、原地更新：它是这一层的短期记忆，必须和循环状态一起打
+//     快照，所以返回替代缓冲区的内核会破坏前缀复用。
+//   * ``g`` 必须保持 ``<= 0``。``neg_expA`` 是负的、softplus 是正的，所以乘积是衰减；
+//     符号写反会让递推增长，那是发散而不只是算错。
+//   * ``delta_normed`` 必须与 ``delta_prologue`` -> ``delta`` -> ``rms_norm_gated`` 链
+//     逐位相同，因为解码步的贪心 id 是验收标准，最后一个 ulp 的偏移就会挪动它们。这就是它
+//     逐字复用 ``block_sum2`` 和 ``head_threads`` 而不另造归约的原因，也是它把递推的 fp32
+//     输出先舍入成 bf16 再归一化的原因——链里的 ``RMSNormGated`` 先转换 ``delta_out``，
+//     所以那里归一化的输入是 bf16。因此一个 block 需要 ``dv <= head_threads(dk)``；值轴
+//     更宽就继续走三算子链，包装层用形状错误拒绝，而不是悄悄改变算术。
 
 #include "corex_ops.h"
 #include "corex_scalar.h"
@@ -54,57 +44,51 @@
 
 namespace {
 
-//: Epsilon of the checkpoint's q/k L2 normalisation. Part of the model's numerics.
+//: checkpoint 的 q/k L2 归一化 epsilon。属于模型的数值行为。
 constexpr float L2_EPS = 1e-6f;
 
-//: Above this, ``softplus(x) == x`` to fp32 precision, so the ``exp`` is skipped. The
-//: logit ``a + dt_bias`` is unbounded above, and ``exp`` of a large value overflows.
+//: 超过这个值，``softplus(x) == x`` 在 fp32 精度下成立，于是跳过 ``exp``。logit
+//: ``a + dt_bias`` 上方无界，而大值的 ``exp`` 会溢出。
 constexpr float SOFTPLUS_LINEAR = 20.f;
 
-//: Conv kernel width. The checkpoint uses a depthwise causal conv with 4 taps, and the
-//: state holds the previous 3 tokens.
+//: 卷积核宽度。checkpoint 用 4 抽头的深度因果卷积，状态里存前 3 个 token。
 constexpr int CONV_K = 4;
 constexpr int CONV_STATE = CONV_K - 1;
 
-//: Threads for a head-normalisation block: ``dk`` is 128 for this model, and the
-//: reduction needs a wavefront multiple.
+//: 头归一化 block 的线程数：这个模型 ``dk`` 是 128，而归约需要 wavefront 的整数倍。
 int head_threads(int dk) {
     int t = dk > 128 ? dk : 128;
     t = ((t + 63) / 64) * 64;
     return t > 512 ? 512 : t;
 }
 
-//: Threads ``norm.cu`` uses for a row of width ``N``, reproduced to check the fused kernel
-//: can stand in for the gated norm.
+//: ``norm.cu`` 给宽度为 ``N`` 的一行用多少线程，照抄过来是为了检查融合内核能否顶替门控
+//: 归一化。
 //:
-//: The rounding is deliberately the same expression, not a call: ``rms_norm_gated_kernel``
-//: lives in another translation unit behind an anonymous namespace, so there is nothing to
-//: call. The duplication is checked rather than trusted -- any drift makes ``delta_normed``
-//: reject a geometry it could have served, which is a documented fallback, whereas the
-//: reverse (accepting one whose reduction pairs differ) would silently change the ids.
+//: 这里的取整故意是同一个表达式而不是一次调用：``rms_norm_gated_kernel`` 在另一个编译
+//: 单元里、藏在匿名命名空间之后，没有东西可调。这份重复是被校验的而不是被信任的——任何
+//: 漂移都会让 ``delta_normed`` 拒绝一个它本来能服务的几何，那是有记录的回退；反过来
+//: （接受一个归约配对不同的几何）则会悄悄改变 id。
 int norm_threads(int n) {
     int t = n < 64 ? 64 : n;
     t = ((t + 63) / 64) * 64;
     return t > 1024 ? 1024 : t;
 }
 
-// @brief Block-wide sum of two values at once, through a shared tree.
+// @brief 一次通过共享树在块内求两个值的和。
 //
-// q and k are normalised together, so one pass suffices. Two separate reductions would
-// double the barrier count for a kernel that is entirely latency-bound: the head is 128
-// elements and the block has nothing else to hide the sync behind.
+// q 和 k 一起归一化，所以一趟就够。分成两次归约会把这个完全受延迟限制的内核的屏障数量
+// 翻倍：头只有 128 个元素，block 没有别的东西能在同步后面遮掩。
 //
-// @param a First contribution (q's sum of squares).
-// @param b Second contribution (k's sum of squares).
-// @param red Shared scratch of ``2 * blockDim.x`` floats; clobbered.
-// @param sum_a Out-parameter receiving the block sum of ``a``.
-// @param sum_b Out-parameter receiving the block sum of ``b``.
+// @param a 第一份贡献（q 的平方和）。
+// @param b 第二份贡献（k 的平方和）。
+// @param red ``2 * blockDim.x`` 个 float 的共享暂存；会被覆写。
+// @param sum_a 输出参数，接收 ``a`` 的块内和。
+// @param sum_b 输出参数，接收 ``b`` 的块内和。
 //
-// The closing barrier is required. The two sums are read out of ``red`` by every thread,
-// and the block then writes other shared regions that may be laid out over the same
-// memory. Without the barrier a fast thread can reach that write before a slow thread has
-// read the sums -- the bug that produced a 4.5e-02 error in ``delta.cu``'s equivalent
-// helper.
+// 结尾的屏障是必需的。两个和由每个线程从 ``red`` 里读出去，而块随后会写别的共享区域，
+// 那些区域可能铺在同一片内存上。没有屏障，快线程会在慢线程读完之前就走到那次写——
+// 就是在 ``delta.cu`` 对应辅助函数里造成 4.5e-02 误差的那个 bug。
 __device__ __forceinline__ void block_sum2(float a, float b, float* red, float* sum_a,
                                            float* sum_b) {
     const int t = threadIdx.x;
@@ -123,32 +107,29 @@ __device__ __forceinline__ void block_sum2(float a, float b, float* red, float* 
     __syncthreads();
 }
 
-// @brief Softplus with a linear tail, so a large logit cannot overflow the exponential.
+// @brief 尾部取线性的 softplus，让大 logit 不会把指数撑溢出。
 //
-// @param v Logit, i.e. ``a + dt_bias``.
-// @return ``log(1 + exp(v))`` for moderate ``v``, ``v`` itself when it is large.
+// @param v logit，即 ``a + dt_bias``。
+// @return ``v`` 适中时是 ``log(1 + exp(v))``，很大时就是 ``v`` 本身。
 __device__ __forceinline__ float softplus(float v) {
     return v > SOFTPLUS_LINEAR ? v : __logf(1.f + __expf(v));
 }
 
-// @brief Block-wide sum of one value, paired exactly as :func:`block_sum2` does it.
+// @brief 单个值的块内和，配对方式与 :func:`block_sum2` 完全一致。
 //
-// The gated norm's reduction is the other half of ``delta_normed``, and it has to combine
-// the same partners in the same order as ``rms_norm_gated_kernel``'s tree or the scale
-// moves in the last ulp. Sharing the tree shape rather than re-deriving it is what makes
-// that structural instead of a thing to keep in step by eye. ``block_sum2`` cannot serve
-// here: it sums two values and the epilogue has only one, and a second dummy column
-// would double the shared traffic of the kernel's last phase.
+// 门控归一化的归约是 ``delta_normed`` 的另一半，它必须按与 ``rms_norm_gated_kernel`` 的树
+// 相同的顺序组合相同的伙伴，否则 scale 会在最后一个 ulp 上移动。共用树的形状而不是重新
+// 推导它，才让这件事成为结构性的，而不是靠眼睛保持一致。这里不能用 ``block_sum2``：它求
+// 两个值的和，而尾声只有一个，加一列哑数据会让内核最后阶段的共享流量翻倍。
 //
-// @param v This thread's contribution.
-// @param red Shared scratch of ``blockDim.x`` floats; clobbered.
-// @return The block-wide sum, valid in every thread after the closing sync.
+// @param v 本线程的贡献。
+// @param red ``blockDim.x`` 个 float 的共享暂存；会被覆写。
+// @return 整个块的和，在结尾同步之后每个线程都拿得到。
 //
-// The closing barrier is required for the same reason as in ``block_sum2``: the caller
-// reads the sum out of ``red[0]`` and must not have a faster thread start overwriting
-// ``red`` first. ``delta_normed_kernel`` does reach that hazard -- it reuses ``red`` for
-// this reduction right after ``block_sum2`` returns -- so the barrier is load-bearing
-// there and is not omitted.
+// 结尾的屏障是必需的，理由和 ``block_sum2`` 里一样：调用方从 ``red[0]`` 把和读出去，不能
+// 让更快的线程先开始覆写 ``red``。``delta_normed_kernel`` 确实会撞上这个风险——它在
+// ``block_sum2`` 返回之后立刻把 ``red`` 复用于这次归约——所以屏障在那里是承重的，没有
+// 省略。
 __device__ __forceinline__ float block_sum_scalar(float v, float* red) {
     const int t = (int)threadIdx.x;
     red[t] = v;
@@ -162,25 +143,24 @@ __device__ __forceinline__ float block_sum_scalar(float v, float* red) {
     return total;
 }
 
-// @brief Build the fp32 q/k/v and the beta/g gates for one decode step.
+// @brief 为一个解码步构造 fp32 的 q/k/v 与 beta/g 门。
 //
-// One block per value head: the block normalises that head's q and k (shared with the
-// other value heads of the same key head, which is why each key head is normalised
-// ``rep`` times -- the extra reads are L2 hits and the alternative is another launch),
-// scales q, and writes beta/g from the raw logits.
+// 每个值头一个 block：block 归一化这个头的 q 和 k（与同一键头的其它值头共享，所以每个
+// 键头会被归一化 ``rep`` 次——多出来的读取都是 L2 命中，另一条路是再来一次启动）、缩放
+// q，并从原始 logits 写出 beta/g。
 //
-// @param q_raw [nkeys, dk] fp32 query, per key head.
-// @param k_raw [nkeys, dk] fp32 key, per key head.
-// @param v_raw [nv, dv] fp32 value; copied through so the delta step reads one dtype.
-// @param b,a [nv] bf16 raw logits feeding beta and g.
-// @param neg_expA,dt_bias [nv] fp32 checkpoint constants for the decay gate.
-// @param q_out [nv, dk] fp32 normalised and scaled query.
-// @param k_out [nv, dk] fp32 normalised key.
-// @param v_out [nv, dv] fp32 value.
-// @param beta [nv] fp32 write strength.
-// @param g [nv] fp32 log decay, ``<= 0``.
-// @param qscale ``dk ** -0.5``, folded into the normalised query.
-// @param rep Value heads per key head.
+// @param q_raw [nkeys, dk] fp32 查询，每个键头一份。
+// @param k_raw [nkeys, dk] fp32 键，每个键头一份。
+// @param v_raw [nv, dv] fp32 值；原样拷过去，让 delta 步只读一种 dtype。
+// @param b,a [nv] bf16 原始 logits，喂给 beta 和 g。
+// @param neg_expA,dt_bias [nv] fp32，衰减门的 checkpoint 常量。
+// @param q_out [nv, dk] fp32，归一化并缩放后的查询。
+// @param k_out [nv, dk] fp32，归一化后的键。
+// @param v_out [nv, dv] fp32 值。
+// @param beta [nv] fp32 写强度。
+// @param g [nv] fp32 对数衰减，``<= 0``。
+// @param qscale ``dk ** -0.5``，折进归一化后的查询。
+// @param rep 每个键头对应的值头数。
 __global__ void prologue_kernel(const float* __restrict__ q_raw,
                                 const float* __restrict__ k_raw,
                                 const float* __restrict__ v_raw,
@@ -218,26 +198,25 @@ __global__ void prologue_kernel(const float* __restrict__ q_raw,
     }
 }
 
-// @brief Depthwise causal conv (4 taps) followed by SiLU, for one token.
+// @brief 单 token 的深度因果卷积（4 抽头）接 SiLU。
 //
-// Thread ``c`` owns channel ``c`` and its three-tap window, so the read-then-write of the
-// state needs no synchronisation: no other thread touches that window.
+// 线程 ``c`` 独占通道 ``c`` 和它的三抽头窗口，所以对状态的「先读后写」不需要同步：没有
+// 别的线程碰那个窗口。
 //
-// Grid ``y`` is the batch row. A row's inputs and window are separate slabs, so the row
-// axis costs one block index and no traffic between rows; the pitches are passed in rather
-// than assumed, because the batched caller reads a column slice of the fused projection
-// whose row pitch is larger than ``C``.
+// 网格的 ``y`` 是批行。一行的输入和窗口是分开的板，所以行轴只花一个 block 下标、行与行
+// 之间没有流量；间距是传进来的而不是假定的，因为批处理调用方读的是融合投影的列切片，其
+// 行间距大于 ``C``。
 //
-// @param w [C, 4] fp32 taps, oldest first; the last tap multiplies the current input.
-// @param x [B, C] bf16 projection output with row pitch ``ldx``.
-// @param state [B, C, 3] fp32 previous inputs, shifted in place with row pitch ``lds``.
-// @param out [B, C] fp32 conv + SiLU result with row pitch ``ldo``.
-// @param C Channels, i.e. the width the ``x`` grid extent covers.
-// @param ldx Row pitch of ``x``, in elements. The verify body hands in ``qkv[:, j]``, a
-//        column slice of a ``[rows, c, conv_dim]`` view, so this is ``c * C`` there and a
-//        kernel that assumed ``C`` would silently read the neighbouring token's channels.
-// @param lds Row pitch of ``state``, in floats.
-// @param ldo Row pitch of ``out``, in floats.
+// @param w [C, 4] fp32 抽头，最老的在前；最后一个抽头乘当前输入。
+// @param x [B, C] bf16 投影输出，行间距 ``ldx``。
+// @param state [B, C, 3] fp32 的历史输入，带行间距 ``lds`` 原地平移。
+// @param out [B, C] fp32 的卷积加 SiLU 结果，行间距 ``ldo``。
+// @param C 通道数，即 ``x`` 网格覆盖的宽度。
+// @param ldx ``x`` 的行间距，以元素计。校验主体传进来的是 ``qkv[:, j]``，即
+//        ``[rows, c, conv_dim]`` 视图的一列切片，所以那里它是 ``c * C``，而假定 ``C`` 的
+//        内核会悄悄读到相邻 token 的通道。
+// @param lds ``state`` 的行间距，以 float 计。
+// @param ldo ``out`` 的行间距，以 float 计。
 __global__ void conv1d_silu_kernel(const float* __restrict__ w,
                                    const uint16_t* __restrict__ x,
                                    float* __restrict__ state, float* __restrict__ out,
@@ -257,21 +236,20 @@ __global__ void conv1d_silu_kernel(const float* __restrict__ w,
     s[2] = x3;
 }
 
-// @brief The same conv over a prefill chunk, carrying the window in registers.
+// @brief 同一个卷积跑在预填充分块上，窗口留在寄存器里。
 //
-// Thread ``c`` walks the sequence and keeps the three-tap ring in registers, so the pass
-// reads the bf16 activation once and writes fp32 once. The eager chain it replaces
-// (cat + fp32 promote + unfold + multiply + sum + SiLU) touches about six times the
-// bytes.
+// 线程 ``c`` 走过整个序列，把三抽头环留在寄存器里，所以这一趟只读一遍 bf16 激活、只写
+// 一遍 fp32。它替代的那条 eager 链（cat + 提升到 fp32 + unfold + 乘法 + 求和 + SiLU）
+// 要碰约六倍的字节数。
 //
-// At a fixed ``t`` neighbouring threads read neighbouring channels, so a wavefront still
-// covers a full cache line per step even though one thread strides by ``ldx``.
+// 固定 ``t`` 时相邻线程读相邻通道，所以即便单个线程按 ``ldx`` 跨步，一个 wavefront 每步
+// 仍然覆盖整条 cache line。
 //
-// @param w [C, 4] fp32 taps.
-// @param x [T, C] bf16 activations; the row pitch ``ldx`` may exceed ``C`` because the
-//        projections are read straight out of the fused GEMV output.
-// @param state [C, 3] fp32 window, updated in place to the last three inputs.
-// @param out [T, C] fp32, densely packed.
+// @param w [C, 4] fp32 抽头。
+// @param x [T, C] bf16 激活；行间距 ``ldx`` 可以大于 ``C``，因为这些投影是直接从融合
+//        GEMV 的输出里读的。
+// @param state [C, 3] fp32 窗口，原地更新为最近三个输入。
+// @param out [T, C] fp32，稠密打包。
 __global__ void conv1d_silu_seq_kernel(const float* __restrict__ w,
                                        const uint16_t* __restrict__ x,
                                        float* __restrict__ state, float* __restrict__ out,
@@ -302,19 +280,17 @@ __global__ void conv1d_silu_seq_kernel(const float* __restrict__ w,
     s[2] = s2;
 }
 
-// @brief Prefill head prep: the decode prologue over a whole chunk, in head-major layout.
+// @brief 预填充的头预处理：整个分块上做一遍解码预处理，输出头主序布局。
 //
-// One block per (value head, token). The transposes matter more than they look: handing
-// the chunked delta scan a transposed ``[H, C, d]`` view forces three strided copies
-// inside it, and a blocked strided copy on this part runs far below the achievable
-// bandwidth. Writing ``[H, T, d]`` here removes all three.
+// 每个（值头，token）一个 block。这些转置比看起来更要紧：把转置过的 ``[H, C, d]`` 视图
+// 交给分块 delta 扫描，会在它内部逼出三次带步长的拷贝，而在本部件上分块的带步长拷贝
+// 远跑不到可达带宽。在这里直接写出 ``[H, T, d]`` 就把这三次全消掉了。
 //
-// @param qkv [T, conv_dim] fp32 conv output laid out q | k | v; the heads are column
-//        slices of that row.
-// @param b,a [T, nv] bf16 with row pitches ``ldb`` / ``lda``.
-// @param q_out,k_out [nv, T, dk] fp32; ``v_out`` [nv, T, dv] fp32.
-// @param beta,g [nv, T] fp32.
-// @param kdim ``num_key_heads * dk``, the offset of the k third inside a row.
+// @param qkv [T, conv_dim] fp32 卷积输出，按 q | k | v 排列；各头是这一行的列切片。
+// @param b,a [T, nv] bf16，行间距 ``ldb`` / ``lda``。
+// @param q_out,k_out [nv, T, dk] fp32；``v_out`` [nv, T, dv] fp32。
+// @param beta,g [nv, T] fp32。
+// @param kdim ``num_key_heads * dk``，k 那一段在一行内的偏移。
 __global__ void delta_prep_seq_kernel(const float* __restrict__ qkv,
                                       const uint16_t* __restrict__ b,
                                       const uint16_t* __restrict__ a,
@@ -353,12 +329,12 @@ __global__ void delta_prep_seq_kernel(const float* __restrict__ qkv,
     }
 }
 
-// @brief Batched prologue: one block per (row, value head).
+// @brief 批处理预处理：每个（行，值头）一个 block。
 //
-// @param q,k [B, nkeys, dk] fp32; ``v`` [B, nv, dv] fp32.
-// @param b,a [B, nv] bf16.
-// @param q_out,k_out [B, nv, dk] fp32; ``v_out`` [B, nv, dv] fp32.
-// @param beta,g [B, nv] fp32.
+// @param q,k [B, nkeys, dk] fp32；``v`` [B, nv, dv] fp32。
+// @param b,a [B, nv] bf16。
+// @param q_out,k_out [B, nv, dk] fp32；``v_out`` [B, nv, dv] fp32。
+// @param beta,g [B, nv] fp32。
 __global__ void prologue_batch_kernel(const float* __restrict__ q,
                                       const float* __restrict__ k,
                                       const float* __restrict__ v,
@@ -398,48 +374,43 @@ __global__ void prologue_batch_kernel(const float* __restrict__ q,
     }
 }
 
-// @brief Prologue, recurrence and gated norm for one decode token, one block per head.
+// @brief 单解码 token 的预处理、递推与门控归一化，每个头一个 block。
 //
-// Why this is one kernel: the three it replaces are one memory problem, not three. The
-// prologue writes ``q_pro``/``k_pro``/``v_pro`` (3 x [nv, dk] fp32) plus ``beta``/``g``,
-// the recurrence reads them straight back and writes ``delta_out`` ([nv, dv] fp32), and
-// the gated norm reads *that* back: about 48 KB round tripped per layer per token, 24
-// times a step, purely to hand values between launches on a card whose launch floor is
-// 5.75 us. Everything the prologue produces for one value head fits in that head's block
-// -- ``q`` and ``k`` in ``2 * dk`` floats of shared memory (1 KB at dk = 128), ``v`` and
-// the two gate scalars in registers -- and the norm's reduction is over ``dv``, which is
-// exactly one block's span, so it folds into the epilogue with no extra reduction.
+// 为什么这是一个内核：它替代的那三个是一个内存问题，不是三个。预处理写出
+// ``q_pro``/``k_pro``/``v_pro``（3 x [nv, dk] fp32）加 ``beta``/``g``，递推把它们直接
+// 读回来并写 ``delta_out``（[nv, dv] fp32），门控归一化又把 *那个* 读回来：每层每 token
+// 往返约 48 KB，每步 24 次，纯粹是为了在一张启动下限 5.75 us 的卡上次次在启动之间递值。
+// 预处理为一个值头产出的东西全装得进这个头的 block——``q`` 和 ``k`` 占 ``2 * dk`` 个
+// float 的共享内存（dk = 128 时 1 KB），``v`` 和两个门的标量在寄存器里——而归一化的归约
+// 只跨 ``dv``，正好是一个 block 的跨度，所以它免费折进尾声，不需要额外的归约。
 //
-// The block shape is not a compromise between the three stages, it is the one shape all
-// three already use: ``prologue_kernel`` runs ``head_threads(dk)`` threads per value
-// head, ``delta_kernel`` runs ``min(dv, THREADS)``, and ``rms_norm_gated_kernel`` runs
-// ``rms_threads(dv)`` -- 128, 128 and 128 for this model, where dk = dv = 128. Sharing
-// that shape is what lets every reduction keep the chain's pairing, which is the
-// difference between bit-identical and merely close: the decode step's greedy ids are the
-// acceptance bar, and a last-ulp shift in any of these three reductions moves them.
+// 块形状不是三阶段之间的折中，而是三者在用的同一个形状：``prologue_kernel`` 每个值头跑
+// ``head_threads(dk)`` 个线程，``delta_kernel`` 跑 ``min(dv, THREADS)``，
+// ``rms_norm_gated_kernel`` 跑 ``rms_threads(dv)``——对这个模型（dk = dv = 128）分别是
+// 128、128 和 128。共用这个形状，才让每次归约都保持那条链的配对，而这正是逐位相同与仅仅
+// 接近的差别：解码步的贪心 id 是验收标准，这三次归约里任何一次的最后一个 ulp 偏移都会
+// 挪动它们。
 //
-// ``conv1d_silu`` deliberately stays its own launch. It is over ``conv_dim`` = 8192
-// channels rather than over a head, so folding it in would put a slice of a differently
-// shaped vector inside a block whose thread mapping exists to coalesce the state access.
+// ``conv1d_silu`` 故意保持自己的启动。它跨的是 ``conv_dim`` = 8192 个通道而不是一个头，
+// 折进来就会把一个形状不同的向量的切片塞进一个 block，而那个 block 的线程映射存在的目的
+// 是合并状态访问。
 //
-// @param q,k [nkeys, dk] fp32 raw projection output; normalised here, and ``q`` also
-//        scaled, so the caller applies no per-element fix-up.
-// @param v [nv, dv] fp32 value.
-// @param b,a [nv] bf16 raw beta/decay logits.
-// @param neg_expA,dt_bias [nv] fp32 checkpoint constants for the decay gate.
-// @param z [nv, dv] bf16 gate for the SiLU of the output norm.
-// @param nw [dv] bf16 gated-norm gain, per value head rather than the flattened width.
-// @param st [nv, dk, dv] fp32 state, updated in place.
-// @param out [nv, dv] written with the normed result; the element type only selects the
-//        container, because the value is the chain's bf16 result either way.
-// @param qscale ``dk ** -0.5``.
-// @param rep Value heads per key head.
+// @param q,k [nkeys, dk] fp32 原始投影输出；在这里归一化，``q`` 还做缩放，所以调用方不做
+//        任何逐元素修正。
+// @param v [nv, dv] fp32 值。
+// @param b,a [nv] bf16 原始 beta／衰减 logits。
+// @param neg_expA,dt_bias [nv] fp32，衰减门的 checkpoint 常量。
+// @param z [nv, dv] bf16，输出归一化 SiLU 用的门。
+// @param nw [dv] bf16 门控归一化增益，按值头而不是按展平宽度。
+// @param st [nv, dk, dv] fp32 状态，原地更新。
+// @param out [nv, dv] 写入归一化后的结果；元素类型只是选择容器，因为两种情况下值都是那条
+//        链的 bf16 结果。
+// @param qscale ``dk ** -0.5``。
+// @param rep 每个键头对应的值头数。
 //
-// ``ZT`` is the gate's storage type, not a precision choice. The op accepts bf16, which is
-// what the model's gate projection produces, and fp32, which the contract also allows; the
-// instantiation is selected on the host from ``z``'s dtype. Reading an fp32 ``z`` as bf16
-// would reinterpret every second half-word and gate the output with noise, so the two cases
-// cannot share an instantiation.
+// ``ZT`` 是门的存储类型，不是精度选择。算子接受 bf16（模型的门投影产出的就是它）和
+// fp32（契约也允许）；实例化在主机侧按 ``z`` 的 dtype 选。把 fp32 的 ``z`` 当 bf16 读会
+// 重新解释每两个半字，用噪声去门控输出，所以这两种情况不能共用一个实例化。
 template <typename OT, typename ZT>
 __global__ void delta_normed_kernel(const float* __restrict__ q,
                                     const float* __restrict__ k,
@@ -457,21 +428,19 @@ __global__ void delta_normed_kernel(const float* __restrict__ q,
     const int kh = vh / rep;
 
     extern __shared__ float sh[];
-    float* red = sh;                          // [2 * blockDim.x] the reduction tree
-    float* qs = sh + 2 * (int)blockDim.x;     // [dk] this head's normalised query
-    float* ks = qs + dk;                      // [dk] this head's normalised key
+    float* red = sh;                          // [2 * blockDim.x] 归约树
+    float* qs = sh + 2 * (int)blockDim.x;     // [dk] 本头归一化后的查询
+    float* ks = qs + dk;                      // [dk] 本头归一化后的键
 
-    // Head preparation: the same arithmetic, the same one-pass reduction and the same
-    // tree pairing as ``prologue_kernel``.
+    // 头预处理：与 ``prologue_kernel`` 相同的算术、相同的单趟归约和相同的树配对。
     const float qv = t < dk ? q[(size_t)kh * dk + t] : 0.f;
     const float kv = t < dk ? k[(size_t)kh * dk + t] : 0.f;
     float ssq = 0.f;
     float ssk = 0.f;
     block_sum2(qv * qv, kv * kv, red, &ssq, &ssk);
 
-    // Kept in shared memory rather than written out and read back: these two buffers are
-    // exactly the traffic the fusion exists to remove, and ``2 * dk`` floats covers one
-    // head's worth of it.
+    // 留在共享内存里而不是写出去再读回来：这两个缓冲区正是融合要消掉的那份流量，而
+    // ``2 * dk`` 个 float 正好装得下一个头的量。
     if (t < dk) {
         qs[t] = qv * rsqrtf(ssq + L2_EPS) * qscale;
         ks[t] = kv * rsqrtf(ssk + L2_EPS);
@@ -481,26 +450,24 @@ __global__ void delta_normed_kernel(const float* __restrict__ q,
     if (t == 0) {
         rate_sh = 1.f / (1.f + __expf(-CxScalar<uint16_t>::to_float(b[vh])));
         const float av = CxScalar<uint16_t>::to_float(a[vh]) + dt_bias[vh];
-        // The chain stores ``g`` in the prologue and exponentiates it in the recurrence;
-        // composing the two here rounds the product once, in fp32, either way. Doing it
-        // per thread instead would repeat one transcendental 128 times for no gain.
+        // 那条链在预处理里存下 ``g``、在递推里对它取指数；在这里把两步合起来，两种写法
+        // 都只在 fp32 下把乘积舍入一次。改成每线程各做一遍，只会把一次超越函数重复 128
+        // 次而毫无收益。
         decay_sh = __expf(neg_expA[vh] * softplus(av));
     }
     __syncthreads();
 
-    // A thread past ``dv`` must reach every ``__syncthreads()`` in this kernel and return
-    // only after the last one. Returning here -- before the norm's tree -- leaves the rest
-    // of the block waiting on a thread that is gone: a device-side deadlock with no
-    // traceback rather than a wrong number. That hazard is written up in ``delta.cu``,
-    // whose first version had it.
+    // 超出 ``dv`` 的线程必须走到本内核里的每一个 ``__syncthreads()``，并且只在最后一个
+    // 之后返回。在这里返回——也就是在归一化的树之前——会让块里其余线程等一个已经不在的
+    // 线程：设备侧死锁，没有 traceback，而不是一个错数字。这个风险在 ``delta.cu`` 里写过，
+    // 它的第一版就踩过。
     const bool active = t < dv;
     const float rate = rate_sh;
     const float decay = decay_sh;
 
-    // The recurrence, unchanged from ``delta_kernel``: thread ``j`` owns value column
-    // ``j`` outright and walks ``i`` over ``dk`` in registers, so both ``dk`` reductions
-    // stay thread-local and the state read at a fixed ``i`` is contiguous in ``j`` -- the
-    // only assignment that coalesces for a ``[nv, dk, dv]`` layout.
+    // 递推，和 ``delta_kernel`` 里一字未改：线程 ``j`` 独占值列 ``j``，在寄存器里把
+    // ``i`` 走过 ``dk``，所以两次 ``dk`` 归约都是线程本地的，固定 ``i`` 时读到的状态在
+    // ``j`` 上连续——这是 ``[nv, dk, dv]`` 布局下唯一能合并的分配方式。
     float result = 0.f;
     if (active) {
         const float value = v[(size_t)vh * dv + t];
@@ -517,56 +484,48 @@ __global__ void delta_normed_kernel(const float* __restrict__ q,
         }
     }
 
-    // The chain hands the gated norm a bf16 copy of ``delta_out``: ``RMSNormGated`` casts
-    // its fp32 input to the activation dtype before the kernel sees it, so the norm's
-    // input is already on the bf16 grid. Rounding here reproduces that. Skipping it would
-    // normalise a value up to half a bf16 ulp away from what the chain normalises, which
-    // is enough to move the ids -- this rounding is part of the chain's arithmetic, not an
-    // artefact of its storage.
+    // 那条链交给门控归一化的是 ``delta_out`` 的 bf16 副本：``RMSNormGated`` 在内核看到它
+    // 之前就把 fp32 输入转成激活 dtype，所以归一化的输入早就在 bf16 网格上了。在这里舍入一
+    // 次复现了这一点。跳过它，归一化的值最多会比那条链归一化的值偏半个 bf16 ulp，而这就
+    // 足够挪动 id——这次舍入是那条链算术的一部分，不是它存储方式的副产品。
     const float xb = active
                          ? CxScalar<uint16_t>::to_float(CxScalar<uint16_t>::from_float(result))
                          : 0.f;
-    // ``block_sum_scalar`` closes on a barrier, so ``red`` can be reused here by every
-    // thread -- including the ones that skipped the recurrence, which is why that barrier
-    // is not an optimisation to drop.
+    // ``block_sum_scalar`` 以一道屏障收尾，所以 ``red`` 可以被每个线程在这里复用——包括
+    // 跳过递推的那些线程，这就是那道屏障不是可以随手删掉的优化。
     const float inv = rsqrtf(block_sum_scalar(xb * xb, red) / (float)dv + L2_EPS);
     if (!active) return;
 
-    // ``y = rms(x) * w * silu(gate)`` in the chain's own operand order. The products
-    // associate left to right and reassociating them changes the last ulp, so the order is
-    // part of the specification rather than a style choice.
+    // ``y = rms(x) * w * silu(gate)``，按那条链自己的操作数顺序。乘积从左往右结合，换一种
+    // 结合方式会改变最后一个 ulp，所以这个顺序是规格的一部分，不是风格选择。
     //
-    // The gate is rounded to bf16 whatever its storage. ``RMSNormGated.__call__`` casts
-    // both operands to the activation dtype before the kernel sees them, so an fp32 gate
-    // reaching the chain would be narrowed there -- rounding here reproduces that, and for
-    // a gate already stored as bf16 the round is the identity.
+    // 不管门以什么形式存储，都要先舍入到 bf16。``RMSNormGated.__call__`` 在内核看到两个
+    // 操作数之前就把它们转成激活 dtype，所以 fp32 的门到了那条链上也会在那里被窄化——这里
+    // 的舍入复现了它，而对本来就存成 bf16 的门，这次舍入是恒等。
     const float gv = CxScalar<uint16_t>::to_float(CxScalar<uint16_t>::from_float(
         CxScalar<ZT>::to_float(z[(size_t)vh * dv + t])));
     const float silu = gv / (1.f + __expf(-gv));     // SiLU
     const float y = xb * inv * CxScalar<uint16_t>::to_float(nw[t]) * silu;
-    // The chain's norm emits bf16 and ``out_proj`` consumes that, so the destination's
-    // dtype is only a container: an fp32 one carries the same bf16 value rather than a
-    // more precise one, which is what keeps both call sites agreeing bit for bit.
+    // 那条链的归一化产出 bf16，而 ``out_proj`` 消费的就是它，所以目的地的 dtype 只是容器：
+    // fp32 容器装的是同一个 bf16 值而不是更精确的值，这正是两个调用点能逐位一致的原因。
     out[(size_t)vh * dv + t] = CxScalar<OT>::from_float(
         CxScalar<uint16_t>::to_float(CxScalar<uint16_t>::from_float(y)));
 }
 
-// @brief Launch the fused decode chain: one block per value head.
+// @brief 启动融合解码链：每个值头一个 block。
 //
-// @param out_bf16 Whether ``out`` is bf16 (as ``uint16_t``) or fp32.
-// @param z_bf16 Whether ``z`` is bf16 (as ``uint16_t``) or fp32.
-// @param threads Block size. The wrapper checks it against both ``head_threads(dk)`` and
-//        the block size the chain's other two reductions use, because a different size
-//        would sum the same values in a different order.
+// @param out_bf16 ``out`` 是 bf16（以 ``uint16_t`` 承载）还是 fp32。
+// @param z_bf16 ``z`` 是 bf16（以 ``uint16_t`` 承载）还是 fp32。
+// @param threads 块大小。包装层会把它同时对 ``head_threads(dk)`` 和那条链另外两次归约所用
+//        的块大小做检查，因为不同的大小会用不同的顺序对同样的值求和。
 void launch_normed(const float* q, const float* k, const float* v, const uint16_t* b,
                    const uint16_t* a, const float* neg_expA, const float* dt_bias,
                    const void* z, bool z_bf16, const uint16_t* nw, float* st, void* out,
                    bool out_bf16, float qscale, int nv, int dk, int dv, int rep,
                    int threads, cudaStream_t stream) {
     const size_t smem = (size_t)(2 * threads + 2 * dk) * sizeof(float);
-    // Four instantiations, because the destination dtype and the gate's storage dtype are
-    // independent choices. All four compute the same arithmetic -- the gate is rounded to
-    // bf16 inside the kernel either way -- so this is dispatch, not four behaviours.
+    // 四种实例化，因为目的地 dtype 和门的存储 dtype 是两个独立的选择。四种算的是同一套
+    // 算术——无论如何门都会在内核里舍入成 bf16——所以这是分派，不是四种行为。
     if (out_bf16) {
         if (z_bf16) {
             delta_normed_kernel<uint16_t, uint16_t><<<nv, threads, smem, stream>>>(
@@ -592,17 +551,16 @@ void launch_normed(const float* q, const float* k, const float* v, const uint16_
 
 }  // namespace
 
-// @brief Launch the single-token depthwise causal conv1d + SiLU.
+// @brief 启动单 token 的深度因果 conv1d 加 SiLU。
 //
-// One row, so the grid's ``y`` extent is 1 and every pitch is the row's own width. This is
-// the same kernel the batched entry launches, with the row axis collapsed, so the two paths
-// cannot drift apart in their arithmetic.
+// 只有一行，所以网格 ``y`` 方向是 1，每个间距都是这一行自己的宽度。批处理入口启动的是
+// 同一个内核，只是把行轴收成 1，所以两条路径的算术不可能各自漂移。
 //
-// @param conv_w [C, 4] fp32 taps.
-// @param x [C] bf16 projection output.
-// @param conv_state [C, 3] fp32 history, shifted in place.
-// @param out [C] fp32, written in place.
-// @throws c10::Error on a dtype or shape the kernel cannot index.
+// @param conv_w [C, 4] fp32 抽头。
+// @param x [C] bf16 投影输出。
+// @param conv_state [C, 3] fp32 历史，原地平移。
+// @param out [C] fp32，原地写入。
+// @throws c10::Error dtype 或形状是内核索引不了的。
 void conv1d_silu(torch::Tensor conv_w, torch::Tensor x, torch::Tensor conv_state,
                  torch::Tensor out) {
     const int C = (int)x.size(0);
@@ -615,17 +573,16 @@ void conv1d_silu(torch::Tensor conv_w, torch::Tensor x, torch::Tensor conv_state
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-// @brief Launch the chunked prefill conv1d + SiLU.
+// @brief 启动分块预填充的 conv1d 加 SiLU。
 //
-// @param conv_w [C, 4] fp32 taps.
-// @param x [T, C] bf16 with unit inner stride; the row pitch is honoured so a column
-//        slice of the fused GEMV output can be read in place.
-// @param conv_state [C, 3] fp32, updated in place so the next decode step continues the
-//        same recurrence -- which is what makes a chunked prefill agree with a one-shot
-//        prefill.
-// @return [T, C] fp32 conv + SiLU.
-// @throws c10::Error when ``x`` is not 2-D with unit inner stride; transpose the
-//         caller's slice rather than relaxing this.
+// @param conv_w [C, 4] fp32 抽头。
+// @param x [T, C] bf16，最内层步长为 1；行间距会被正确处理，所以融合 GEMV 输出的一列
+//        切片可以原地读取。
+// @param conv_state [C, 3] fp32，原地更新，让下一个解码步接着同一条递推——这正是分块
+//        预填充能与一次性预填充一致的原因。
+// @return [T, C] fp32 卷积加 SiLU。
+// @throws c10::Error ``x`` 不是二维或最内层步长不是 1；请转置调用方的切片，不要放宽
+//         这项检查。
 torch::Tensor conv1d_silu_seq(torch::Tensor conv_w, torch::Tensor x,
                               torch::Tensor conv_state) {
     TORCH_CHECK(x.dim() == 2 && x.stride(1) == 1,
@@ -643,25 +600,22 @@ torch::Tensor conv1d_silu_seq(torch::Tensor conv_w, torch::Tensor x,
     return out;
 }
 
-// @brief Launch the batched single-token conv1d + SiLU: one launch for every row.
+// @brief 启动批处理单 token conv1d 加 SiLU：所有行只用一次启动。
 //
-// The grid's ``y`` axis is the row, so the whole bucket costs one launch and keeps
-// ``rows * ceil(C/256)`` blocks in flight instead of the single row's 32. Measured, the old
-// per-row loop cost a flat 9.57 us per row for 368 KB of traffic per row -- 39 GB/s, which is
-// grid width and not bytes -- and a 4-row verify window paid it 96 times over its 24 linear
-// layers.
+// 网格的 ``y`` 轴是行，所以整个桶只花一次启动，在飞的是 ``rows * ceil(C/256)`` 个 block
+// 而不是单行的 32 个。实测旧的逐行循环每行固定 9.57 us、每行流量 368 KB——39 GB/s，那是
+// 网格宽度不够而不是字节多——一个 4 行的校验窗口在它 24 个线性注意力层上要付 96 次。
 //
-// The pitches come from the tensors rather than from ``C``, and that is load-bearing: the
-// verify body hands in ``qkv[:, j]``, a column slice of a ``[rows, c, conv_dim]`` view whose
-// row pitch is ``c * C``. Reading with a pitch of ``C`` made rows >= 1 take row 0's channel
-// block, which is invisible at ``rows == 1`` and would have been a silent wrong answer at
-// every width above it (measured: 3 of 4 rows wrong before this argument existed).
+// 间距从张量里取而不是从 ``C`` 推，这一条是承重的：校验主体传进来的是 ``qkv[:, j]``，即
+// ``[rows, c, conv_dim]`` 视图的一列切片，其行间距是 ``c * C``。按 ``C`` 去读会让第 1 行
+// 及以后都取到第 0 行的通道块，这在 ``rows == 1`` 时看不出来，而在宽度大于 1 时本会是一个
+// 静默的错答案（实测：这个参数出现之前，4 行里有 3 行是错的）。
 //
-// @param conv_w [C, 4] fp32 taps, shared by every row.
-// @param x [B, C] bf16 with row pitch honoured; a strided column slice is legal.
-// @param conv_state [B, C, 3] fp32, shifted in place.
-// @param out [B, C] fp32, written in place.
-// @throws c10::Error on a dtype, rank or inner stride the kernel cannot index.
+// @param conv_w [C, 4] fp32 抽头，所有行共用。
+// @param x [B, C] bf16，行间距会被正确处理；带步长的列切片也合法。
+// @param conv_state [B, C, 3] fp32，原地平移。
+// @param out [B, C] fp32，原地写入。
+// @throws c10::Error dtype、秩或最内层步长是内核索引不了的。
 void conv1d_silu_batch(torch::Tensor conv_w, torch::Tensor x, torch::Tensor conv_state,
                        torch::Tensor out) {
     TORCH_CHECK(x.dim() == 2, "activation must be [B, C]");
@@ -680,17 +634,17 @@ void conv1d_silu_batch(torch::Tensor conv_w, torch::Tensor x, torch::Tensor conv
         (int)x.stride(0), (int)conv_state.stride(0), (int)out.stride(0));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
-// @brief Launch the single-token gated-delta prologue.
+// @brief 启动单 token 的门控 delta 预处理。
 //
-// @param q,k [nkeys, dk] fp32, per key head.
-// @param v [nv, dv] fp32.
-// @param b,a [nv] bf16 raw logits.
-// @param neg_expA,dt_bias [nv] fp32 checkpoint constants.
-// @param q_out,k_out [nv, dk] fp32 and ``v_out`` [nv, dv] fp32, written in place.
-// @param beta,g [nv] fp32, written in place.
-// @param qscale ``dk ** -0.5``.
-// @param rep Value heads per key head.
-// @throws c10::Error when a dtype or shape contradicts the layout.
+// @param q,k [nkeys, dk] fp32，每个键头一份。
+// @param v [nv, dv] fp32。
+// @param b,a [nv] bf16 原始 logits。
+// @param neg_expA,dt_bias [nv] fp32 checkpoint 常量。
+// @param q_out,k_out [nv, dk] fp32 与 ``v_out`` [nv, dv] fp32，原地写入。
+// @param beta,g [nv] fp32，原地写入。
+// @param qscale ``dk ** -0.5``。
+// @param rep 每个键头对应的值头数。
+// @throws c10::Error dtype 或形状与布局矛盾。
 void delta_prologue(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor b,
                     torch::Tensor a, torch::Tensor neg_expA, torch::Tensor dt_bias,
                     torch::Tensor q_out, torch::Tensor k_out, torch::Tensor v_out,
@@ -713,18 +667,17 @@ void delta_prologue(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Te
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-// @brief Batched prologue: one row per batch entry, each identical to the decode form
-//        on that row alone.
+// @brief 批处理预处理：每个批条目一行，每一行都与单独跑解码形式的结果相同。
 //
-// @param q,k [B, nkeys, dk] fp32.
-// @param v [B, nv, dv] fp32.
-// @param b,a [B, nv] bf16.
-// @param neg_expA,dt_bias [nv] fp32, shared by every row.
-// @param q_out,k_out [B, nv, dk] fp32 and ``v_out`` [B, nv, dv] fp32, written in place.
-// @param beta,g [B, nv] fp32, written in place.
-// @param qscale ``dk ** -0.5``.
-// @param rep Value heads per key head.
-// @throws c10::Error when a dtype or shape contradicts the layout.
+// @param q,k [B, nkeys, dk] fp32。
+// @param v [B, nv, dv] fp32。
+// @param b,a [B, nv] bf16。
+// @param neg_expA,dt_bias [nv] fp32，所有行共用。
+// @param q_out,k_out [B, nv, dk] fp32 与 ``v_out`` [B, nv, dv] fp32，原地写入。
+// @param beta,g [B, nv] fp32，原地写入。
+// @param qscale ``dk ** -0.5``。
+// @param rep 每个键头对应的值头数。
+// @throws c10::Error dtype 或形状与布局矛盾。
 void delta_prologue_batch(torch::Tensor q, torch::Tensor k, torch::Tensor v,
                           torch::Tensor b, torch::Tensor a, torch::Tensor neg_expA,
                           torch::Tensor dt_bias, torch::Tensor q_out,
@@ -748,17 +701,16 @@ void delta_prologue_batch(torch::Tensor q, torch::Tensor k, torch::Tensor v,
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-// @brief Launch the chunked prefill gated-delta prologue into the head-major layout.
+// @brief 启动分块预填充的门控 delta 预处理，写出头主序布局。
 //
-// @param qkv [T, conv_dim] fp32 conv output laid out q | k | v.
-// @param b,a [T, nv] bf16.
-// @param neg_expA,dt_bias [nv] fp32 constants.
-// @param q_out,k_out [nv, T, dk] fp32 and ``v_out`` [nv, T, dv] fp32, written in place.
-// @param beta,g [nv, T] fp32, written in place.
-// @param qscale ``dk ** -0.5``.
-// @param rep Value heads per key head.
-// @throws c10::Error when ``qkv``/``b``/``a`` do not have unit inner stride; pass a
-//         slice, not a transpose.
+// @param qkv [T, conv_dim] fp32 卷积输出，按 q | k | v 排列。
+// @param b,a [T, nv] bf16。
+// @param neg_expA,dt_bias [nv] fp32 常量。
+// @param q_out,k_out [nv, T, dk] fp32 与 ``v_out`` [nv, T, dv] fp32，原地写入。
+// @param beta,g [nv, T] fp32，原地写入。
+// @param qscale ``dk ** -0.5``。
+// @param rep 每个键头对应的值头数。
+// @throws c10::Error ``qkv``/``b``/``a`` 的最内层步长不是 1；请传切片，不要传转置。
 void delta_prep_seq(torch::Tensor qkv, torch::Tensor b, torch::Tensor a,
                     torch::Tensor neg_expA, torch::Tensor dt_bias, torch::Tensor q_out,
                     torch::Tensor k_out, torch::Tensor v_out, torch::Tensor beta,
@@ -782,34 +734,29 @@ void delta_prep_seq(torch::Tensor qkv, torch::Tensor b, torch::Tensor a,
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-// @brief Prologue, recurrence and gated norm for one decode token, in one launch.
+// @brief 单解码 token 的预处理、递推与门控归一化，一次启动。
 //
-// The result is the three-op chain's, bit for bit, so the greedy ids cannot move: the
-// reductions reuse ``block_sum2`` and the block size both other stages use, the recurrence
-// runs the same ``fmaf`` chain against the same fp32 values, and the norm's input is
-// rounded to bf16 first because ``RMSNormGated`` casts it before the kernel sees it.
-// That equivalence is why the block size is a checked invariant rather than a tuned
-// parameter -- see the ``head_threads`` guard below.
+// 结果与那三算子链逐位相同，所以贪心 id 挪不动：归约复用 ``block_sum2`` 和另外两个阶段
+// 都在用的块大小，递推对同样的 fp32 值跑同样的 ``fmaf`` 链，而归一化的输入先舍入成 bf16，
+// 因为 ``RMSNormGated`` 在内核看到它之前就先转换了。正是这个等价关系让块大小成为被检查的
+// 不变量而不是调出来的参数——见下面的 ``head_threads`` 检查。
 //
-// @param q [nkeys, dk] fp32 raw query, normalised and scaled here.
-// @param k [nkeys, dk] fp32 raw key, normalised here.
-// @param v [nv, dv] fp32 value.
-// @param b [nv] bf16 beta logits; ``a`` [nv] bf16 decay logits.
-// @param neg_expA,dt_bias [nv] fp32 checkpoint constants for the decay gate.
-// @param z [nv, dv] bf16 gate for the SiLU of the output norm.
-// @param nw [dv] bf16 gated-norm gain, per value head.
-// @param st [nv, dk, dv] fp32 state, updated in place.
-// @param out [nv, dv] bf16 or fp32. bf16 is what the chain produces and what ``out_proj``
-//        reads, so pass that unless the caller needs the wider container; an fp32
-//        destination holds the same bf16 value rather than a more precise one.
-// @param qscale ``dk ** -0.5``.
-// @param rep Value heads per key head.
-// @return ``out``, for call chaining.
-// @throws c10::Error when a dtype, a shape or the head geometry disagrees with the
-//         kernel's indexing. The geometry case is the one worth reading: it means
-//         ``dk`` or ``dv`` is wide enough that the chain would reduce with a different
-//         block size, so this kernel could not reproduce its rounding and the caller
-//         must keep the three-op path.
+// @param q [nkeys, dk] fp32 原始查询，在这里归一化并缩放。
+// @param k [nkeys, dk] fp32 原始键，在这里归一化。
+// @param v [nv, dv] fp32 值。
+// @param b [nv] bf16 beta logits；``a`` [nv] bf16 衰减 logits。
+// @param neg_expA,dt_bias [nv] fp32，衰减门的 checkpoint 常量。
+// @param z [nv, dv] bf16，输出归一化 SiLU 用的门。
+// @param nw [dv] bf16 门控归一化增益，按值头。
+// @param st [nv, dk, dv] fp32 状态，原地更新。
+// @param out [nv, dv] bf16 或 fp32。bf16 是那条链产出的、也是 ``out_proj`` 读的，所以除非
+//        调用方需要更宽的容器，就传它；fp32 目的地装的是同一个 bf16 值而不是更精确的值。
+// @param qscale ``dk ** -0.5``。
+// @param rep 每个键头对应的值头数。
+// @return ``out``，便于调用链串接。
+// @throws c10::Error dtype、形状或头的几何与内核的索引方式矛盾。几何那一种是值得读的：
+//         它意味着 ``dk`` 或 ``dv`` 宽到那条链会用不同的块大小做归约，于是本内核无法复现
+//         它的舍入，调用方必须继续走三算子路径。
 torch::Tensor delta_normed(torch::Tensor q, torch::Tensor k, torch::Tensor v,
                            torch::Tensor b, torch::Tensor a,
                            torch::Tensor neg_expA, torch::Tensor dt_bias,
@@ -823,12 +770,12 @@ torch::Tensor delta_normed(torch::Tensor q, torch::Tensor k, torch::Tensor v,
                     && dt_bias.scalar_type() == torch::kFloat
                     && st.scalar_type() == torch::kFloat,
                 "q/k/v, neg_expA, dt_bias and the state are fp32");
-    // The two logit tensors are read as bf16 bit patterns, so a wider dtype would be
-    // reinterpreted rather than converted -- a silent wrong number, not a slow path.
+    // 两个 logit 张量是按 bf16 位模式读的，所以更宽的 dtype 会被重新解释而不是转换——那
+    // 是一个静默的错数字，不是一条慢路径。
     TORCH_CHECK(b.scalar_type() == torch::kBFloat16 && a.scalar_type() == torch::kBFloat16,
                 "beta and decay logits must be bf16");
-    // ``z`` is templated on its dtype instead, because the contract allows fp32 and the
-    // kernel rounds either form to bf16 before use, matching what the chain's cast does.
+    // ``z`` 反过来按 dtype 做模板，因为契约允许 fp32，而内核无论哪种形式都会先舍入成 bf16
+    // 再用，和那条链的转换一致。
     TORCH_CHECK(z.scalar_type() == torch::kBFloat16 || z.scalar_type() == torch::kFloat,
                 "the norm gate must be bf16 or fp32");
     TORCH_CHECK(nw.scalar_type() == torch::kBFloat16, "the norm gain must be bf16");
@@ -848,11 +795,10 @@ torch::Tensor delta_normed(torch::Tensor q, torch::Tensor k, torch::Tensor v,
     TORCH_CHECK(nw.numel() == (int64_t)dv, "norm gain must have dv elements");
     TORCH_CHECK(out.size(0) == nv && out.size(1) == dv, "out view must be [nv, dv]");
 
-    // One block per value head, and its size is fixed by the chain it replaces rather than
-    // chosen here. A block wider or narrower than ``head_threads(dk)`` would sum the q/k
-    // norms with different partners than ``prologue_kernel`` does, and one that did not also
-    // match the gated norm's block size would do the same to the second reduction -- either
-    // way the result is close but not equal, which is what moves the greedy ids.
+    // 每个值头一个 block，它的大小由被替代的那条链固定，而不是在这里选。比
+    // ``head_threads(dk)`` 更宽或更窄的 block 会用与 ``prologue_kernel`` 不同的伙伴去求 q/k
+    // 归一化；而不匹配门控归一化块大小的那个，会对第二次归约做出同样的事——两种情况结果都是
+    // 接近但不相等，而那就是挪动贪心 id 的东西。
     const int threads = head_threads(dk);
     TORCH_CHECK(dk <= threads && dv <= threads,
                 "delta_normed needs dk and dv within one block (dk=", dk, " dv=", dv,

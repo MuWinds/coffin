@@ -1,42 +1,35 @@
-"""The serving-facing surface of the engine: one checkpoint in, one session out.
+"""引擎面向服务的接口：一个 checkpoint 进，一个会话出。
 
-Module: ``coffin/`` (top of the dependency graph, model-agnostic). This is the
-only module that knows which model families exist; every other engine module
-talks to a family through the ``Model`` / ``PagedModel`` protocols declared
-here. Runtime and diagnostic code therefore never imports a model family through
-the dispatch layer, and a second family is added by one
-``register()`` call at the bottom of this file rather than by editing callers.
+Module: ``coffin/``（依赖图顶端，不感知模型族）。这是唯一知道有哪些模型族存在
+的模块；其他所有引擎模块都通过这里声明的 ``Model`` / ``PagedModel`` 协议与某个
+模型族打交道。运行时和诊断代码因此从不经由这层分派去 import 模型族，新增第二个
+模型族也只需在本文件末尾加一次 ``register()``，而不用去改调用方。
 
-The engine is split by responsibility:
+引擎按职责切分：
 
-    ops/                 device primitives shared by any model (GEMV, norms,
-                         RoPE, the chunked delta rule, the tied embedding)
-    models/<family>/     one architecture family: blocks, MTP head, weight
-                         loader, and the model class that owns the graphs
-    engine_api.py        this file: the ``Model`` contract, checkpoint -> model
-                         dispatch, and the reload used by the runtime service
+    ops/                 任何模型共用的设备原语（GEMV、归一化、RoPE、分块
+                         delta 规则、绑定嵌入）
+    models/<family>/     一个架构族：块、MTP 头、权重加载器，以及持有图的模型类
+    engine_api.py        本文件：``Model`` 契约、checkpoint -> 模型的分派，以及
+                         运行时服务用的 reload
 
-Dispatch is by checkpoint config, not by a flag: :func:`create_model` reads
-``config.json`` and matches a registered key against ``model_type`` /
-``architectures``. The key ``"qwen3_5"`` therefore matches both
-``Qwen3_5ForConditionalGeneration`` and a bare ``qwen3_5``. ``architecture=``
-overrides the detection for a checkpoint whose metadata lies.
+分派靠 checkpoint 配置而不是靠开关：:func:`create_model` 读 ``config.json``，把
+登记过的键去匹配 ``model_type`` / ``architectures``。所以键 ``"qwen3_5"`` 既能
+匹配 ``Qwen3_5ForConditionalGeneration``，也能匹配光秃秃的 ``qwen3_5``。对元数据
+说谎的 checkpoint，用 ``architecture=`` 覆盖检测结果。
 
 Constraints:
-    * Imports are absolute (``from models.qwen35 import ...``) because the entry
-      script puts ``coffin/`` itself on ``sys.path``; ``ops`` and ``models`` are
-      top-level packages beside ``hip_ops``, not subpackages of this module.
-    * Every engine module must be listed in ``_RELOAD_ORDER``. :func:`reload`
-      refuses to run otherwise, because a module missing from the list would
-      keep serving the class objects from before the reload while its importers
-      pick up new ones -- a type mismatch that only shows up at run time.
-    * The model class is imported at the *bottom* of the file (hence the
-      ``# noqa: E402``): the ``register()`` call that follows it needs
-      ``_Entry`` and ``_REGISTRY`` to exist, so this is the one module allowed
-      to import a family, and only after its own dispatch surface is defined.
-    * Nothing here allocates model memory. Weights arrive from
-      :func:`load_weights` and are passed back on a reload, so a rebuild is
-      seconds instead of a 9 GB disk read.
+    * 导入一律是绝对导入（``from models.qwen35 import ...``），因为入口脚本把
+      ``coffin/`` 本身放进了 ``sys.path``；``ops`` 和 ``models`` 是与
+      ``hip_ops`` 并列的顶层包，不是本模块的子包。
+    * 每个引擎模块都必须列进 ``_RELOAD_ORDER``。否则 :func:`reload` 会拒绝执行，
+      因为漏掉的模块会继续提供 reload 之前的类对象，而它的导入方已经拿到新的——
+      这种类型不匹配只在运行时才暴露。
+    * 模型类在文件*末尾*导入（所以才要 ``# noqa: E402``）：紧随其后的
+      ``register()`` 调用需要 ``_Entry`` 和 ``_REGISTRY`` 已存在，所以这是唯一
+      允许 import 模型族的模块，而且必须在自己的分派面定义完之后才 import。
+    * 这里不分配任何模型内存。权重由 :func:`load_weights` 送来，reload 时原样
+      传回，重建因此只要几秒，而不是再读一遍 9 GB。
 """
 
 from __future__ import annotations
@@ -51,23 +44,20 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 
 class Model(Protocol):
-    """One loaded model, driven one request at a time.
+    """一个已加载的模型，一次处理一个请求。
 
-    The server owns the tokenizer, the socket and the request loop; everything
-    below the token ids is the model's business. Attributes that the serving
-    layer reads directly:
+    分词器、socket 和请求循环归服务端所有；token id 以下的一切都归模型管。服务层
+    直接读取的属性有：
 
     ``max_seq``
-        Context window the KV cache and rope tables were built for.
+        KV 缓存和 RoPE 表按它构造的上下文窗口。
     ``pos1``
-        Length-1 device tensor holding the current position. The server and
-        ``PrefixCacheEngine`` read and write it to move the window, which is
-        why it is part of the contract rather than a private detail.
+        长度为 1 的设备张量，装着当前位置。服务端和 ``PrefixCacheEngine`` 靠读写
+        它来移动窗口，所以它属于契约，而不是私有细节。
     ``mtp``
-        Drafter object, or ``None`` when the checkpoint has no MTP head.
+        草稿模型对象；checkpoint 没有 MTP 头时为 ``None``。
     ``verify_c``
-        Verify-graph width: ``spec_generate`` can accept at most ``verify_c - 1``
-        drafts per step.
+        验证图宽度：``spec_generate`` 每步最多接受 ``verify_c - 1`` 个草稿。
     """
 
     max_seq: int
@@ -76,158 +66,144 @@ class Model(Protocol):
     mtp: Any | None
 
     def reset(self) -> None:
-        """Rewind every piece of per-sequence state to the empty context."""
+        """把每一项「按序列」的状态倒回空上下文。"""
 
     def prefill(self, tokens: list[int], chunk: int = 2048) -> "torch.Tensor":
-        """Process a prompt; returns the logits for the next token.
+        """处理一段 prompt，返回下一个 token 的 logits。
 
         Args:
-            tokens: Prompt tokens to run, starting at the current ``pos1``.
-            chunk: GEMM M to slice the prefill into; rocBLAS on this card tops
-                out around 2048 tokens per call.
+            tokens: 要跑的 prompt token，从当前 ``pos1`` 开始。
+            chunk: 把预填充切成多大的 GEMM M；这张卡上 rocBLAS 每次调用在 2048
+                token 附近到顶。
 
         Returns:
-            Logits of the last position, the distribution the next token is
-            drawn from.
+            最后一个位置的 logits，也就是下一个 token 的抽样分布。
 
         Raises:
-            RuntimeError: the model has no paged pool, so it has nowhere to put
-                the KV this prefill produces. Call ``enable_paging`` first.
-            ValueError: the prompt is empty, longer than ``max_seq``, or would
-                start past a reserved row.
+            RuntimeError: 模型没有分页池，这次预填充产出的 KV 无处安放。先调
+                ``enable_paging``。
+            ValueError: prompt 为空、超过 ``max_seq``，或者会从预留行之后开始。
         """
 
     def decode_step(self, token: int) -> "torch.Tensor":
-        """Advance one token through the captured decode graph.
+        """沿 capture 好的解码图推进一个 token。
 
         Args:
-            token: The token to append; the graph writes its KV at ``pos1`` and
-                advances the counter.
+            token: 要追加的 token；图会把它的 KV 写在 ``pos1`` 处并推进计数器。
 
         Returns:
-            Logits for the position after ``token``.
+            ``token`` 之后那个位置的 logits。
 
         Raises:
-            RuntimeError: the graphs were never captured, so there is no replay
-                to run; call ``capture`` before serving.
+            RuntimeError: 图从来没 capture 过，没有可回放的东西；服务之前先调
+                ``capture``。
         """
 
     def logits(self, token: int) -> "torch.Tensor":
-        """Un-captured single step (prefill fallback / debugging).
+        """不做 capture 的单步（预填充兜底 / 调试）。
 
         Args:
-            token: The token to append, exactly as ``decode_step`` would.
+            token: 要追加的 token，与 ``decode_step`` 完全一样。
 
         Returns:
-            The same logits ``decode_step`` would produce, without a graph. Used
-            where capture cannot apply: a shape the graphs do not cover, or a
-            numerical comparison against the captured path.
+            ``decode_step`` 会产出的同一份 logits，只是不走图。用于 capture 不
+            适用的场合：图没覆盖的形状，或者与 captured 路径做数值对比。
 
         Raises:
-            RuntimeError: the paged pool is missing, so the step has no slots to
-                write.
+            RuntimeError: 没有分页池，这一步没有槽位可写。
         """
 
     def capture(self, warmup: int = 3) -> None:
-        """Capture the decode step (and, when present, the drafter) once.
+        """把解码步（以及存在时的草稿模型）capture 一次。
 
         Args:
-            warmup: Untimed replays before capture, to settle allocator and
-                kernel state; 3 is enough to stop the first real step from
-                allocating inside an already-captured region.
+            warmup: capture 之前不计时的回放次数，用来把分配器和内核状态稳定下来；
+                3 次就足以让第一个真实步不会在已经 capture 的区域内部触发分配。
 
         Raises:
-            RuntimeError: paging was never enabled. The captured kernel bakes in
-                the pool tensors and the slot map, so capture without a pool
-                would produce a graph writing nowhere.
+            RuntimeError: 从来没开分页。captured 的内核把池张量和槽位表烧了进去，
+                没有池就 capture 只会得到一张写到空处的图。
         """
 
     @property
     def graph_ready(self) -> bool:
-        """True once :meth:`capture` has produced a replayable decode graph."""
+        """:meth:`capture` 产出可回放的解码图之后为真。"""
 
     def capture_verify(self, c: int = 4, warmup: int = 3) -> None:
-        """Capture the ``c``-token verification forward.
+        """capture 宽度为 ``c`` 个 token 的验证前向。
 
         Args:
-            c: Verify width, i.e. the drafts plus the anchor token. Bounds the
-                ``K`` that :meth:`spec_generate` accepts.
-            warmup: Untimed replays before capture for the same reason as
-                :meth:`capture`.
+            c: 验证宽度，即草稿数加锚 token。它限定了 :meth:`spec_generate`
+                能接受的 ``K``。
+            warmup: capture 之前不计时的回放次数，理由同 :meth:`capture`。
         """
 
     def spec_generate(self, prompt: list[int], max_new: int, K: int = 3,
                       eos: set[int] | None = None) -> list[int]:
-        """Greedy speculative decode from a prompt.
+        """从一段 prompt 开始做贪心投机解码。
 
         Args:
-            prompt: Prompt tokens, processed from the empty context.
-            max_new: Upper bound on generated tokens.
-            K: Drafts per step, at most ``verify_c - 1``. Higher is only worth
-                it when the drafter's acceptance rate stays high.
-            eos: Stop token ids; an EOS ends generation without being returned.
+            prompt: prompt 的 token，从空上下文开始处理。
+            max_new: 生成 token 数的上限。
+            K: 每步的草稿数，至多 ``verify_c - 1``。只有草稿模型的接受率能一直
+                保持高位时，调大才划算。
+            eos: 停止 token id；遇到 EOS 结束生成且不返回该 token。
 
         Returns:
-            The generated token ids. Identical to non-speculative greedy output,
-            because every draft is verified by the main model.
+            生成的 token id。与不投机的贪心输出完全一致，因为每份草稿都由主模型
+            验证过。
         """
 
     @property
     def spec_stats(self) -> dict:
-        """Acceptance report for the last :meth:`spec_generate` run."""
+        """最近一次 :meth:`spec_generate` 的接受率报告。"""
 
     def close(self) -> None:
-        """Drop the graphs and the layer objects so a reload can rebuild."""
+        """丢掉图和层对象，好让 reload 能重建。"""
 
 
 class PagedModel(Model, Protocol):
-    """``Model`` with the extra capabilities the prefix cache drives.
+    """在 ``Model`` 之上补齐前缀缓存需要的能力。
 
-    Hybrid (linear-attention) models do not hold their prefix as KV alone: 24
-    layers carry it forward as a fixed-size recurrent state, so a cached block
-    prefix is only reusable together with the state that produced it. These
-    three methods are what ``PrefixCacheEngine`` needs on top of ``Model``.
+    混合（线性注意力）模型并不是只用 KV 承载前缀：24 层把它以定长循环状态的
+    形式带下去，所以一段缓存的块前缀只有连同产生它的状态一起才能复用。这三个
+    方法就是 ``PrefixCacheEngine`` 在 ``Model`` 之外还需要的东西。
     """
 
     def enable_paging(self, num_blocks: int = 512, block_size: int = 64):
-        """Attach a shared paged KV pool; must run before :meth:`capture`.
+        """挂上一个共享的分页 KV 池；必须在 :meth:`capture` 之前跑。
 
         Args:
-            num_blocks: Blocks in the pool, the KV budget of every live request
-                combined.
-            block_size: Tokens per block; also the granularity at which the
-                radix tree can share a prefix.
+            num_blocks: 池里的块数，也就是所有活请求合起来的 KV 预算。
+            block_size: 每块的 token 数；同时也是基数树共享前缀的粒度。
 
         Returns:
-            The pool, which the caller drives through a
-            :class:`~radix_cache.RadixCache`.
+            这个池；调用方通过一个 :class:`~radix_cache.RadixCache` 来驱动它。
 
         Raises:
-            RuntimeError: paging was already enabled; a second pool would leave
-                the first one's blocks unreachable.
+            RuntimeError: 分页已经开过了；再开一个池会让第一个池的块永远无法
+                寻址。
         """
 
     def snapshot_linear_states(self) -> dict[int, tuple["torch.Tensor", "torch.Tensor"]]:
-        """Clone every linear-attention layer's (recurrent, conv) state.
+        """克隆每一层线性注意力的 (循环状态, conv 状态)。
 
         Returns:
-            Layer index -> (recurrent, conv) tensors, detached clones, so the
-            live state may keep advancing while the snapshot stays a record of
-            the boundary it was taken at.
+            层下标 -> (循环状态, conv 状态) 张量，都是脱离计算图的克隆，活状态
+            因此可以继续前进，而快照仍是它在那个边界上的记录。
         """
 
     def restore_linear_states(self, states) -> None:
-        """Adopt a snapshot taken by :meth:`snapshot_linear_states`.
+        """采用一份由 :meth:`snapshot_linear_states` 拍下的快照。
 
         Args:
-            states: The snapshot to install; it must describe this model's own
-                linear-attention layers, since the indices are used as keys.
+            states: 要装入的快照；它必须描述本模型自己的线性注意力层，因为层下标
+                就是按它做键的。
 
         Raises:
-            KeyError: ``states`` names a layer index this model does not have,
-                i.e. a snapshot from another architecture. Reject it rather than
-                restoring a partial state that silently pairs shared KV with the
-                wrong recurrent state.
+            KeyError: ``states`` 里出现了本模型没有的层下标，也就是来自另一个
+                架构的快照。宁可拒绝，也不要恢复一份残缺状态、把共享 KV 静默
+                配上错误的循环状态。
         """
 
 
@@ -237,53 +213,51 @@ class _Entry:
     load_weights: Callable[..., dict]
 
 
-#: Checkpoint-config key -> implementation. Keys are matched as lowercase
-#: substrings of the joined ``model_type`` / ``architectures`` strings.
+#: checkpoint 配置键 -> 实现。键按小写子串去匹配拼接后的 ``model_type`` /
+#: ``architectures`` 字符串。
 _REGISTRY: dict[str, _Entry] = {}
 
 
 def register(keys: tuple[str, ...], model: type,
              load_weights: Callable[..., dict]) -> None:
-    """Make ``model`` the implementation for checkpoints whose config says ``keys``.
+    """让 ``model`` 成为配置里写着 ``keys`` 的那些 checkpoint 的实现。
 
-    Called once per family at the bottom of this file. A later registration for
-    the same key wins, which is what makes a reload of this module take effect.
+    每个模型族在本文件末尾调用一次。同一个键后来的注册会覆盖前面的，reload 本
+    模块因此才能生效。
 
     Args:
-        keys: Lowercase substrings of ``model_type`` / ``architectures``. Keep
-            them short but distinctive: matching is a plain substring test, so
-            an over-general key would claim other families' checkpoints.
-        model: The family's model class; its constructor signature is the one
-            :func:`create_model` calls.
-        load_weights: The family's weight loader, called by
-            :func:`load_weights` with the checkpoint path.
+        keys: ``model_type`` / ``architectures`` 的小写子串。要短但要有辨识度：
+            匹配就是一次普通子串判断，键太泛会把别的族的 checkpoint 也认领走。
+        model: 该族的模型类；:func:`create_model` 调的就是它的构造签名。
+        load_weights: 该族的权重加载器，:func:`load_weights` 会用 checkpoint
+            路径调它。
     """
     for key in keys:
         _REGISTRY[key] = _Entry(model, load_weights)
 
 
 def registered() -> list[str]:
-    """The architecture keys this engine build can serve.
+    """这个引擎构建能服务的架构键。
 
     Returns:
-        Sorted keys, i.e. what ``architecture=`` accepts and what goes into an
-        error message when a checkpoint matches nothing.
+        排好序的键，也就是 ``architecture=`` 能接受的取值，以及 checkpoint 一个
+        都匹配不上时写进报错信息里的内容。
     """
     return sorted(_REGISTRY)
 
 
 def _arch_strings(config: dict) -> list[str]:
-    """Lowercased architecture hints from a checkpoint config.
+    """从 checkpoint 配置里取出小写的架构线索。
 
-    Both the top level and ``text_config`` are read, because a multimodal
-    checkpoint wraps the text model and names it only inside the nested section.
+    顶层和 ``text_config`` 都要读，因为多模态 checkpoint 把文本模型包了一层，只在
+    嵌套段里才点它的名。
 
     Args:
-        config: Parsed ``config.json``.
+        config: 解析后的 ``config.json``。
 
     Returns:
-        ``model_type`` and every ``architectures`` entry from both sections, in
-        that order, lowercased for substring matching.
+        两个段里的 ``model_type`` 和每一个 ``architectures`` 条目，按这个顺序，
+        统一转成小写以便做子串匹配。
     """
     out: list[str] = []
     for section in (config, config.get("text_config") or {}):
@@ -296,29 +270,28 @@ def _arch_strings(config: dict) -> list[str]:
 
 
 def detect_architecture(config: dict) -> str:
-    """Return the registry key for a checkpoint ``config.json``.
+    """返回某个 checkpoint ``config.json`` 对应的注册键。
 
-    Raises instead of guessing: serving a checkpoint through the wrong
-    implementation would produce garbage rather than an error.
+    猜不出来就抛异常：用错误的实现去服务一个 checkpoint，得到的是垃圾而不是
+    错误。
 
     Args:
-        config: Parsed ``config.json``.
+        config: 解析后的 ``config.json``。
 
     Returns:
-        A key present in the registry, suitable for ``architecture=`` and for
-        ``create_model``.
+        注册表里存在的键，可以传给 ``architecture=`` 和 ``create_model``。
 
     Raises:
-        RuntimeError: nothing registered matches the config and the geometry
-            fallback does not apply either. The caller must serve a different
-            checkpoint or register the family; there is no safe default.
+        RuntimeError: 没有任何登记项匹配这份配置，按几何特征的兜底也不适用。
+            调用方只能换一个 checkpoint 或把该模型族登记进来；没有安全的默认
+            选项。
     """
     text = " ".join(_arch_strings(config))
     for key in _REGISTRY:
         if key in text:
             return key
-    # A multimodal checkpoint can hide the text model behind a wrapper config;
-    # the Qwen3.5 text geometry is distinctive enough to use as a last resort.
+    # 多模态 checkpoint 可能把文本模型藏在包装配置后面；Qwen3.5 文本部分的几何
+    # 足够有辨识度，可以当最后手段用。
     text_config = config.get("text_config") or {}
     if "linear_num_value_heads" in text_config:
         return "qwen3_5"
@@ -328,20 +301,18 @@ def detect_architecture(config: dict) -> str:
 
 
 def _entry_for(model_dir: str | Path, architecture: str | None = None) -> _Entry:
-    """Resolve a checkpoint directory to its registry entry.
+    """把一个 checkpoint 目录解析成它的注册项。
 
     Args:
-        model_dir: Directory containing ``config.json``.
-        architecture: Explicit key overriding detection, for a checkpoint whose
-            metadata lies.
+        model_dir: 含有 ``config.json`` 的目录。
+        architecture: 覆盖检测结果的显式键，用于元数据说谎的 checkpoint。
 
     Returns:
-        The entry holding the model class and weight loader for that key.
+        该键对应的、装着模型类和权重加载器的注册项。
 
     Raises:
-        RuntimeError: the resolved key is not registered. The message lists what
-            is, since a bare "unknown architecture" leaves the caller with
-            nothing to correct.
+        RuntimeError: 解析出的键没有登记。报错里会列出已登记的键，因为单说一句
+            「未知架构」等于什么都没给调用方。
     """
     config = json.loads((Path(model_dir) / "config.json").read_text())
     key = architecture or detect_architecture(config)
@@ -355,39 +326,35 @@ def _entry_for(model_dir: str | Path, architecture: str | None = None) -> _Entry
 def create_model(model_dir: str | Path, max_seq: int = 4096, bench: bool = True,
                  weights: dict | None = None, paged: bool = False,
                  architecture: str | None = None, quant: bool = False) -> Model:
-    """Load the model implementation this checkpoint asks for.
+    """按这个 checkpoint 的要求加载模型实现。
 
-    ``weights`` is the resident tensor dict from :func:`load_weights`, passed
-    through on a reload so rebuilding skips the ~1 min disk read.
+    ``weights`` 是 :func:`load_weights` 得到的常驻张量字典，reload 时原样透传，
+    重建因此省掉约 1 分钟的磁盘读取。
 
-    ``quant`` applies only when ``weights`` is ``None``, i.e. when this call loads the
-    checkpoint itself. It exists because a caller that owns the dict has already chosen
-    the storage form, while a caller that does not would otherwise be stuck with the
-    loader's default of bf16 -- twice the resident size, which is the difference between
-    a 27B fitting a card and not fitting it. Passing ``quant`` together with ``weights``
-    is not an error and not a conversion: the dict is used as it is.
+    ``quant`` 只在 ``weights`` 为 ``None``、也就是本次调用自己去加载 checkpoint
+    时生效。要这个参数，是因为手里已经有那份字典的调用方早就自己选定了存储形式，
+    而手里没有的调用方否则只能吃加载器默认的 bf16——常驻体积翻倍，正是 27B 放得进
+    一张卡和放不进去的差别。同时传 ``quant`` 和 ``weights`` 不算错误，也不做转换：
+    字典原样使用。
 
     Args:
-        model_dir: Checkpoint directory.
-        max_seq: Context window the KV pool and rope tables are sized for. A
-            VRAM commitment, not a runtime check.
-        bench: Run the family's kernel-variant tuner at load time. Costs a few
-            seconds of start-up; tests turn it off.
-        weights: Already-loaded tensors to build from. ``None`` makes the family
-            read them from disk.
-        paged: Build the paged-KV variant. The prefix-cache and batched paths
-            need it; ``capture`` without paging bakes in the dense layout.
-        architecture: Registry key overriding config detection.
-        quant: Store the text projections as int8 when this call loads the checkpoint
-            itself. Ignored when ``weights`` is supplied.
+        model_dir: checkpoint 目录。
+        max_seq: KV 池和 RoPE 表按它定尺寸的上下文窗口。这是一笔显存承诺，不是
+            运行时检查。
+        bench: 加载时跑该族的内核变体调优。要多花几秒启动时间；测试里关掉。
+        weights: 用来构建的、已经加载好的张量。传 ``None`` 就让该族自己去磁盘读。
+        paged: 构造分页 KV 变体。前缀缓存和批处理路径需要它；不分页就
+            ``capture`` 会把稠密布局烧进去。
+        architecture: 覆盖配置检测的注册键。
+        quant: 在本次调用自己加载 checkpoint 时，把文本投影存成 int8。传了
+            ``weights`` 时忽略。
 
     Returns:
-        A ``Model``; cast it to ``PagedModel`` only when ``paged`` was set.
+        一个 ``Model``；只有 ``paged`` 为真时才该把它当 ``PagedModel`` 用。
 
     Raises:
-        RuntimeError: the checkpoint matches no registered family, or names one
-            that is not registered. Serve a supported checkpoint rather than
-            guessing an implementation.
+        RuntimeError: checkpoint 匹配不上任何已登记的族，或者点名的族没登记。
+            换一个受支持的 checkpoint，别去猜实现。
     """
     entry = _entry_for(model_dir, architecture)
     return entry.model(model_dir, max_seq=max_seq, bench=bench,
@@ -398,35 +365,34 @@ def load_weights(model_dir: str | Path, quant: bool = False,
                  weight_dtype: "torch.dtype | None" = None,
                  architecture: str | None = None, vision: bool | None = None,
                  vision_quant: bool = False) -> dict:
-    """Read this checkpoint's weights onto the GPU, for a resident server.
+    """把这个 checkpoint 的权重读上 GPU，供常驻服务使用。
 
-    Kept separate from :func:`create_model` because a reload rebuilds the model
-    from the tensors already in VRAM instead of reading 9 GB from disk again.
+    单独拆出来而不是塞进 :func:`create_model`，是因为 reload 用显存里已有的张量
+    重建模型，而不是再把 9 GB 从磁盘读一遍。
 
-    ``vision``/``vision_quant`` control the tower's tensors only: ``None`` means
-    "load them iff the checkpoint declares a ``vision_config``", and
-    ``vision_quant`` stores the tower's GEMM weights as int8 (a separate memory
-    policy from the text model's, which ``quant`` governs).
+    ``vision``/``vision_quant`` 只控制视觉塔的张量：``None`` 表示「checkpoint 声明
+    了 ``vision_config`` 就加载」，而 ``vision_quant`` 把塔的 GEMM 权重存成 int8
+    （这是独立于文本模型的另一套内存策略，后者由 ``quant`` 管）。
 
     Args:
-        model_dir: Checkpoint directory.
-        quant: Store the text model's 2-D projection weights as int8. On a 16 GB
-            card this is the difference between fitting the KV pool or not.
-        weight_dtype: Compute dtype for the tensors that stay dense. ``None``
-            uses the family's own default.
-        architecture: Registry key overriding config detection.
-        vision: Load the vision tower at all. ``False`` keeps it unloaded, so an
-            image request has to be rejected instead of silently mis-prefilled.
-        vision_quant: Store the tower's GEMM weights as int8 (~0.31 GiB instead
-            of ~0.62 GiB), at a small per-request cost.
+        model_dir: checkpoint 目录。
+        quant: 把文本模型的二维投影权重存成 int8。在 16 GB 的卡上，这就是 KV
+            池放不放得下的差别。
+        weight_dtype: 仍然保持稠密的张量所用的计算 dtype。``None`` 用该族自己的
+            默认值。
+        architecture: 覆盖配置检测的注册键。
+        vision: 是否加载视觉塔。``False`` 表示不加载，此时图像请求必须被拒绝，
+            而不是静默地错误预填充。
+        vision_quant: 把塔的 GEMM 权重存成 int8（常驻约 0.31 GiB 而不是
+            0.62 GiB），代价是每个请求多一点开销。
 
     Returns:
-        The resident tensor dict, keyed by checkpoint parameter name, to hand to
-        :func:`create_model` now and on every later reload.
+        常驻的张量字典，按 checkpoint 参数名索引，现在以及之后每次 reload 都交给
+        :func:`create_model`。
 
     Raises:
-        RuntimeError: the checkpoint matches no registered family, so there is
-            no loader that knows its layout.
+        RuntimeError: checkpoint 匹配不上任何已登记的族，也就没有加载器知道它的
+            布局。
     """
     entry = _entry_for(model_dir, architecture)
     kwargs: dict[str, Any] = {} if weight_dtype is None else {"weight_dtype": weight_dtype}
@@ -435,24 +401,21 @@ def load_weights(model_dir: str | Path, quant: bool = False,
 
 
 def describe(model_dir: str | Path, architecture: str | None = None) -> dict:
-    """What to log about a checkpoint: path, directory name and architecture.
+    """启动时要记下来的 checkpoint 信息：路径、目录名和架构。
 
-    The server prints this at startup and returns it from ``ping``, and the
-    OpenAI shell reads it back, so neither of them has to assume which model is
-    loaded -- the checkpoint config is the only source of truth.
+    服务启动时打印它，``ping`` 也返回它，OpenAI 外壳再把它读回去，这样谁都不用
+    假设加载的是哪个模型——checkpoint 配置是唯一的事实来源。
 
     Args:
-        model_dir: Checkpoint directory.
-        architecture: Registry key overriding detection.
+        model_dir: checkpoint 目录。
+        architecture: 覆盖检测的注册键。
 
     Returns:
-        ``model_path`` (as given), ``model`` (the directory's basename, which is
-        what ``/v1/models`` reports by default) and ``arch`` (the registry key
-        actually in use).
+        ``model_path``（原样）、``model``（目录的 basename，``/v1/models`` 默认
+        就报它）和 ``arch``（实际在用的注册键）。
 
     Raises:
-        RuntimeError: the checkpoint matches no registered family, so there is
-            no ``arch`` to report.
+        RuntimeError: checkpoint 匹配不上任何已登记的族，也就没有 ``arch`` 可报。
     """
     model_dir = Path(model_dir)
     config = json.loads((model_dir / "config.json").read_text())
@@ -460,9 +423,9 @@ def describe(model_dir: str | Path, architecture: str | None = None) -> dict:
             "arch": architecture or detect_architecture(config)}
 
 
-#: Dependency order: a module comes after everything it imports from, so that a
-#: ``from ops.gemv import GEMV`` at the top of a model module picks up the class
-#: object the just-reloaded ops module defines.
+#: 依赖顺序：一个模块排在它 import 的所有东西之后，这样模型模块顶部的
+#: ``from ops.gemv import GEMV`` 拿到的就是刚刚 reload 过的 ops 模块所定义的那个
+#: 类对象。
 _RELOAD_ORDER = (
     "backends.protocol", "backends.reference", "backends.vendor",
     "backends.discovery", "backends.hip", "backends.corex",
@@ -485,14 +448,14 @@ _RELOAD_ORDER = (
 
 
 def _engine_module(name: str) -> bool:
-    """Whether a ``sys.modules`` entry belongs to this engine.
+    """一个 ``sys.modules`` 条目是否属于本引擎。
 
     Args:
-        name: Fully qualified module name.
+        name: 完全限定的模块名。
 
     Returns:
-        ``True`` for the engine's own packages, so :func:`reload` can detect a
-        module that was added without being added to ``_RELOAD_ORDER``.
+        属于引擎自己的包时返回 ``True``，:func:`reload` 据此发现那些被加载了却
+        没被加进 ``_RELOAD_ORDER`` 的模块。
     """
     return (
         name in ("ops", "models", "engine", "cache", "utils")
@@ -502,18 +465,16 @@ def _engine_module(name: str) -> bool:
 
 
 def reload() -> None:
-    """Re-import every engine module, dependencies first.
+    """按依赖先后重新 import 每一个引擎模块。
 
-    The runtime calls this after unloading a model. Reloading only the top module
-    would leave
-    the implementation modules stale. The caller's module object is updated in
-    place, so ``engine_api.create_model`` is the new function afterwards.
+    运行时卸载模型之后会调它。只 reload 顶层模块的话，实现模块会停在旧版本上。
+    调用方持有的模块对象是就地更新的，所以此后的 ``engine_api.create_model``
+    就是新函数。
 
     Raises:
-        RuntimeError: a loaded engine module is missing from ``_RELOAD_ORDER``,
-            which would leave it serving pre-reload class objects while its
-            importers use the new ones. Add it to the list; the message names
-            the module.
+        RuntimeError: 有已加载的引擎模块没列进 ``_RELOAD_ORDER``。那种模块会继续
+            提供 reload 之前的类对象，而它的导入方已经用上新的。把它加进列表即可；
+            报错信息会点名是哪个模块。
     """
     import importlib
     import sys
@@ -528,10 +489,9 @@ def reload() -> None:
             importlib.reload(module)
 
 
-# The one permitted upward edge: engine_api reaches into a family, never the
-# reverse. Kept below the dispatch code so the module's own surface is defined
-# before a family is pulled in, and because the registration right after it needs
-# ``register`` and ``_Entry`` to exist. Files below it trigger ``# noqa: E402``.
+# 唯一允许向上的那条边：engine_api 伸进某个模型族，反方向永远不许。放在分派代码
+# 下面，是为了让本模块自己的接口面先定义完再拉进模型族，也因为它紧随其后的注册
+# 需要 ``register`` 和 ``_Entry`` 已存在。这一行以下的文件都会触发 ``# noqa: E402``。
 from models.qwen35 import Qwen35, load_weights as _qwen35_load_weights  # noqa: E402
 
 register(("qwen3_5", "qwen35"), Qwen35, _qwen35_load_weights)

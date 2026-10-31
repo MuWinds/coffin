@@ -1,18 +1,16 @@
-"""Engine configuration: every knob the server, scheduler and runner share.
+"""引擎配置：服务器、调度器和 runner 共用的全部开关。
 
-Module: ``coffin/`` (top level, imports nothing else from the engine). One
-``EngineConfig`` is built from CLI flags or by a test and passed down to
-``llm_engine`` / ``scheduler`` / ``model_runner``, so none of them has to know
-how the server was invoked. ``entrypoints/cli/runtime.py`` is the only place
-that parses runtime flags.
+Module: ``coffin/``（顶层，不 import 引擎里的任何其他模块）。一个
+``EngineConfig`` 从命令行或测试里构造出来，再往下传给 ``llm_engine`` /
+``scheduler`` / ``model_runner``，它们因此都不需要知道服务是怎么被拉起来的。
+``entrypoints/cli/runtime.py`` 是唯一解析运行时开关的地方。
 
 Constraints:
-    * Fields are read once at construction by the layers they configure; a few
-      (``num_blocks``) are resolved in ``__post_init__``. Mutating a field after
-      the engine is built will not re-provision anything that was sized from it.
-    * Defaults describe the 16 GB BI-V100 target. Raising ``max_seq``,
-      ``num_blocks`` or ``vision`` changes resident VRAM and must be checked
-      against that budget.
+    * 字段在被配置的那几层构造时读一次；少数几个（``num_blocks``）在
+      ``__post_init__`` 里定值。引擎建好之后再改字段，不会重新分配任何按它
+      计算过尺寸的东西。
+    * 默认值面向 16 GB 的 BI-V100。调大 ``max_seq``、``num_blocks`` 或开启
+      ``vision`` 都会改变常驻显存，必须拿这个预算核对。
 """
 
 from __future__ import annotations
@@ -22,102 +20,94 @@ from dataclasses import dataclass
 
 @dataclass(slots=True)
 class EngineConfig:
-    """Static configuration of one loaded engine.
+    """一个已加载引擎的静态配置。
 
-    The defaults are the ones the benchmark numbers in ``NOTES.md`` were
-    measured with; anything tuned for a different card belongs in the CLI layer
-    of ``entrypoints/cli/runtime.py`` rather than here.
+    默认值就是 ``NOTES.md`` 里那些基准数字的测量条件；为别的卡调出来的值应该
+    放在 ``entrypoints/cli/runtime.py`` 那一层，而不是这里。
     """
 
     model_dir: str
-    #: Context window. The KV pool and the rope tables are built for it up front,
-    #: so this is a VRAM commitment, not a limit checked at runtime.
+    #: 上下文窗口。KV 池和 RoPE 表都按它预先分配，所以这是一笔显存承诺，不是
+    #: 运行时才检查的上限。
     max_seq: int = 262144
-    #: Tuner flag of the model: measure a handful of kernel variants at load time
-    #: and keep the fastest. Costs a few seconds of start-up, so tests turn it off.
+    #: 模型的调优开关：加载时实测几种内核变体，留下最快的那个。要多花几秒启动
+    #: 时间，所以测试里关掉。
     bench: bool = True
-    #: Keep the 2D weights in int8 (4 GiB resident) instead of fp16 (8 GiB).
-    #: On a 16 GB card this is the difference between fitting the pool or not.
+    #: 二维权重保持 int8（常驻 4 GiB）而不是 fp16（8 GiB）。在 16 GB 的卡上，
+    #: 这就是 KV 池放得下和放不下的区别。
     quant: bool = True
-    #: Serve full-attention layers from the shared paged int8 pool.
+    #: 全注意力层从共享的分页 int8 池里取 KV。
     prefix_cache: bool = True
-    #: Tokens per KV block. Must divide ``max_seq`` cleanly enough for the radix
-    #: tree to land on block boundaries; 64 matches the snapshot interval floor.
+    #: 每个 KV 块的 token 数。要让 ``max_seq`` 能按它整除，基数树才落得在块边界
+    #: 上；64 是快照间隔的下限。
     block_size: int = 64
-    #: Physical blocks in the pool; ``-1`` means "one sequence's worth", resolved
-    #: in ``__post_init__`` from ``max_seq`` and ``block_size``.
+    #: 池里的物理块数；``-1`` 表示「一条序列的量」，在 ``__post_init__`` 里按
+    #: ``max_seq`` 和 ``block_size`` 算出来。
     num_blocks: int = -1
-    #: How many linear-attention recurrent-state snapshots the radix tree may
-    #: keep. A snapshot is ~50 MB, so this is the cache's VRAM budget in disguise.
+    #: 基数树最多保留多少个线性注意力循环状态快照。一个快照约 50 MB，所以这
+    #: 其实是缓存那笔显存预算的另一种写法。
     snapshots: int = 8
-    #: Snapshot every N tokens (rounded up to a whole block).
+    #: 每 N 个 token 打一次快照（向上取整到整块）。
     snapshot_interval: int = 512
-    #: Drafts per speculative step (0 = off). Needs the MTP head in the checkpoint.
+    #: 每个投机步的草稿数（0 = 关闭）。需要 checkpoint 里带 MTP 头。
     spec_k: int = 0
-    #: Allow speculation in the *batched* engine. Off by default: the batched
-    #: verify costs one weight pass per candidate token, so on this card it is
-    #: slower than a plain batched decode step (see NOTES.md) even though the
-    #: output is identical. Single-stream spec ignores this flag.
+    #: 允许在*批处理*引擎里做投机。默认关闭：批处理的验证每个候选 token 都要
+    #: 过一遍权重，在这张卡上比普通批解码步还慢（见 NOTES.md），尽管输出完全
+    #: 一致。单流投机不看这个开关。
     spec_batch: bool = False
-    #: Approximate KV selection for the batched verify: keep the top-k historical
-    #: KV blocks per row (picked from the drafter's lookahead and the target's last
-    #: attention) plus a recent window, instead of reading the whole context.
-    #: 0 = exact full attention. Implies ``spec_batch``.
+    #: 批验证用的近似 KV 选择：每行只保留得分最高的 k 个历史 KV 块（由草稿模型的
+    #: 前瞻和主模型最后一次注意力挑出）再加一个近期窗口，而不是读整个上下文。
+    #: 0 = 精确全注意力。隐含开启 ``spec_batch``。
     spec_sparse_k: int = 0
-    #: Only speculate in the batched engine once a sequence has at least this many
-    #: cached tokens: below it the greedy step is cheaper (the batched verify pays
-    #: an extra weight pass), above it the shared-KV verify wins. 0 = always.
+    #: 一条序列的缓存 token 达到这个数之后才在批处理引擎里投机：低于它时贪心
+    #: 步更便宜（批验证要多付一遍权重），高于它共享 KV 的验证才划算。0 = 总是。
     spec_min_ctx: int = 0
-    #: Prefill GEMM M. rocBLAS tops out around 2048 tokens on this card.
+    #: 预填充 GEMM 的 M 维。这张卡上 rocBLAS 在 2048 token 附近到顶。
     chunk: int = 2048
-    #: Prompt tokens one request may prefill in one scheduling step. This is a
-    #: *scheduling* knob and is deliberately not ``chunk``: ``chunk`` is the GEMM
-    #: tile the model was tuned for, while this is how long a single request may
-    #: hold the card before the scheduler gives another one a turn. Coupling them
-    #: would make a GEMM re-tune change who gets scheduled first.
+    #: 一个请求在一个调度步里最多能预填充多少 prompt token。这是*调度*开关，
+    #: 故意不复用 ``chunk``：``chunk`` 是模型调优时定下的 GEMM 分块，而这个决定
+    #: 单个请求能占着卡多久才轮到别人。两者耦合的话，重新调 GEMM 就会改变谁
+    #: 先被调度。
     prefill_quantum: int = 2048
-    #: Sequences decoded in one step. The scheduler never admits more than it can
-    #: serve, and row ``capacity-1`` stays reserved for a prefill.
+    #: 一步里解码的序列数。调度器不会放进超过它能服务的数量，且第
+    #: ``capacity-1`` 行留给预填充。
     max_num_seqs: int = 1
-    #: Token budget of one scheduling step (prefill chunking + decode tokens).
+    #: 一个调度步的 token 预算（预填充分块 + 解码 token）。
     max_num_batched_tokens: int = 2048
-    #: Hard wall-clock cap of one generation, seconds (0 = none).
+    #: 一次生成的硬墙钟上限，单位秒（0 = 不限）。
     max_seconds: float = 0.0
-    #: Capture the decode step into a device graph. ``False`` runs the eager step
-    #: for every token, which is slower but is the only way to serve a backend
-    #: whose graph replay is not trusted: a graph that replays stale outputs fails
-    #: silently, so the decision is a correctness switch, not a tuning knob. The
-    #: server ANDs this with ``caps.graph`` before it gets here.
+    #: 把解码步 capture 成设备图。``False`` 表示每个 token 都跑 eager 步，更慢，
+    #: 但这是服务一个图回放不可信的后端的唯一办法：图如果回放了过期输出，是
+    #: 静默失败，所以这个决定关乎正确性，不是调优项。传到这之前，服务端已经
+    #: 把它和 ``caps.graph`` 取了与。
     graph: bool = True
 
-    # Multimodal (image) serving.
-    #: Serve images at all. ``False`` (``--no-vision``) keeps the vision tower
-    #: unloaded and answers an image request with a readable 503 instead of the
-    #: silent garbage a text-only prefill of image placeholders would produce.
+    # 多模态（图像）服务。
+    #: 一个可读的 503，而不是让图像占位符走纯文本预填充、产出一堆没人看得懂的
+    #: 是否支持图像。``False``（``--no-vision``）不加载视觉塔，带图请求直接回
+    #: 垃圾输出。
     vision: bool = True
-    #: Keep the tower's 2-D weights int8 (+ per-row fp32 scale) instead of fp16:
-    #: ~0.31 GiB resident instead of ~0.62 GiB, at a small per-request cost.
+    #: 视觉塔的二维权重保持 int8（外加每行 fp32 scale）而不是 fp16：常驻约
+    #: 0.31 GiB 而不是 0.62 GiB，代价是每个请求多一点点开销。
     vision_int8: bool = False
-    #: The only real VRAM/latency knob: the processor downsamples anything larger.
-    #: 1 MP is ~1024 image tokens -- about the same prefill cost as 1k text tokens.
+    #: 唯一真正影响显存和延迟的开关：更大的图会被处理器降采样。1 MP 约等于
+    #: 1024 个图像 token，预填充代价与 1k 文本 token 相当。
     image_max_pixels: int = 1048576
-    #: Official floor: a smaller image is *upscaled* to this, so an image never
-    #: costs fewer than 64 tokens.
+    #: 官方下限：更小的图会被*放大*到这个尺寸，所以一张图最少也要 64 个 token。
     image_min_pixels: int = 65536
-    #: Images per request (four is 4k image tokens, already a large prefill).
+    #: 每个请求的图像数（四张就是 4k 图像 token，已经是一次很大的预填充）。
     max_images: int = 4
-    #: Decoded bytes of one image (a base64 part is 4/3 of that in the request).
+    #: 单张图像解码后的字节数（请求里 base64 表示约为它的 4/3）。
     max_image_bytes: int = 8388608
-    #: Base64 characters of all image parts of one request (before decoding).
+    #: 一个请求里所有图像片段的 base64 字符数（解码前）。
     max_image_total_bytes: int = 16777216
 
     def __post_init__(self) -> None:
-        """Resolve sentinel defaults into concrete sizes.
+        """把哨兵默认值换算成具体尺寸。
 
-        ``num_blocks = -1`` means "one sequence's worth", which is all the
-        single-stream engine needs. Batched serving wants a pool shared by
-        several sequences, so the field stays explicit rather than being derived
-        at the allocation site.
+        ``num_blocks = -1`` 表示「一条序列的量」，单流引擎也就只需要这么多。
+        批处理服务要的是一个多序列共用的池，所以这个字段保持显式，而不是到
+        分配现场再推。
         """
         if self.num_blocks < 0:
             self.num_blocks = (self.max_seq + self.block_size - 1) // self.block_size

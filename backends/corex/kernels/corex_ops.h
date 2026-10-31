@@ -1,25 +1,21 @@
 // @file corex_ops.h
-// @brief Declarations of the CoreX extension entry points bound in ``bindings.cpp``.
+// @brief 在 ``bindings.cpp`` 里绑定的 CoreX 扩展入口声明。
 //
-// Module: coffin/backends/corex/kernels. The only header the kernels and the binding
-// share; it is a pure interface, so it must stay free of device code -- ``bindings.cpp``
-// is compiled by the host compiler, which has no ``__device__``. The bf16 conversions
-// live in ``corex_scalar.h`` for that reason.
+// Module: coffin/backends/corex/kernels。内核和绑定共享的唯一头文件；它是纯接口，
+// 所以必须不含设备代码——``bindings.cpp`` 由主机编译器编译，那里没有 ``__device__``。
+// bf16 转换因此放在 ``corex_scalar.h``。
 //
 // Constraints:
-//   * Declarations here are binding names: ``backends/corex/kernels/__init__.py``
-//     looks them up by string. A rename has to land on both sides in one change or the
-//     extension imports with a missing symbol.
-//   * Every wrapper takes the shape it indexes and TORCH_CHECKs the layout it assumes
-//     (dtype, contiguity, 2-D-ness). The kernels index without bounds checks, so a
-//     wrong layout must fail on the host rather than read past the buffer.
-//   * Weights are ``[K, N]`` throughout -- the layout ``Caps.weight_layout == "kn"``
-//     promises. A ``[N, K]`` tensor handed to these entry points produces plausible
-//     numbers from the wrong elements, so the Python side owns the transpose and the
-//     wrapper only checks the dtype.
-//   * Every wrapper launches on the current torch stream. A kernel on the legacy
-//     default stream is not part of a ``torch.cuda.graph`` capture, so it would be
-//     dropped from the decode graph and replay stale output.
+//   * 这里的声明就是绑定名：``backends/corex/kernels/__init__.py`` 按字符串查找它们。
+//     改名必须在同一次改动里落到两边，否则扩展 import 时会缺符号。
+//   * 每个包装层接收它要索引的形状，并 TORCH_CHECK 它假定的布局（dtype、连续性、
+//     二维性）。内核索引时不做边界检查，所以错误的布局必须在主机侧失败，而不是读穿
+//     缓冲区。
+//   * 权重全程是 ``[K, N]``——``Caps.weight_layout == "kn"`` 承诺的布局。把 ``[N, K]``
+//     张量交给这些入口，会拿错元素算出看着合理的数，所以转置归 Python 侧负责，包装层
+//     只查 dtype。
+//   * 每个包装层都在当前 torch stream 上启动。在 legacy 默认流上跑的内核不属于
+//     ``torch.cuda.graph`` 的捕获范围，会被解码图丢掉并重放陈旧输出。
 
 #pragma once
 
@@ -27,224 +23,211 @@
 
 #include <cstdint>
 
-// Projections: y[m, n] = sum_k x[m, k] * wt[k, n].
+// 投影：y[m, n] = sum_k x[m, k] * wt[k, n]。
 
-// @brief Decode-time GEMV over one activation vector, one thread per output column.
+// @brief 解码期 GEMV：一个激活向量，每个输出列一个线程。
 //
-// @param wt [K, N] weights, contiguous, bf16, fp16 or fp32.
-// @param x [K] activations, bf16 or fp32. The output takes its dtype.
-// @param threads Threads per block; ``0`` picks from ``N``.
-// @param unroll K-loop unroll factor, ``2`` or ``4``; ``0`` means 4.
-// @param split Split-K width; ``0`` picks from ``N`` and ``K``, ``1`` forces the
-//        single-pass kernel.
-// @return [N] in ``x``'s dtype.
-// @throws c10::Error on a shape, dtype or layout the kernels cannot index.
+// @param wt [K, N] 权重，连续存放，bf16、fp16 或 fp32。
+// @param x [K] 激活，bf16 或 fp32。输出的 dtype 跟随它。
+// @param threads 每块线程数；``0`` 表示按 ``N`` 选。
+// @param unroll K 循环展开因子，``2`` 或 ``4``；``0`` 表示 4。
+// @param split Split-K 宽度；``0`` 表示按 ``N`` 和 ``K`` 选，``1`` 强制单趟内核。
+// @return [N]，dtype 同 ``x``。
+// @throws c10::Error 形状、dtype 或布局是内核索引不了的。
 torch::Tensor gemv_kn(torch::Tensor wt, torch::Tensor x, int64_t threads,
                       int64_t unroll, int64_t split);
 
-// @brief Small-M batched GEMV: one weight read produces ``M`` activation rows.
+// @brief 小 M 批处理 GEMV：一次权重读取产出 ``M`` 行激活。
 //
-// @param wt [K, N] weights, contiguous, bf16, fp16 or fp32.
-// @param x [M, K] activations, ``M`` in ``[1, 8]``.
-// @param threads Threads per block; ``0`` picks from ``N``.
-// @param unroll K-loop unroll factor; ``0`` means 4.
-// @return [M, N] in ``x``'s dtype.
-// @throws c10::Error on a shape, dtype or layout the kernels cannot index.
+// @param wt [K, N] 权重，连续存放，bf16、fp16 或 fp32。
+// @param x [M, K] 激活，``M`` 在 ``[1, 8]``。
+// @param threads 每块线程数；``0`` 表示按 ``N`` 选。
+// @param unroll K 循环展开因子；``0`` 表示 4。
+// @return [M, N]，dtype 同 ``x``。
+// @throws c10::Error 形状、dtype 或布局是内核索引不了的。
 torch::Tensor gemv_kn_m(torch::Tensor wt, torch::Tensor x, int64_t threads,
                         int64_t unroll);
 
-// @brief Decode W8A16 projection: int8 weights plus one fp32 scale per output column.
+// @brief 解码 W8A16 投影：int8 权重，外加每个输出列一个 fp32 scale。
 //
-// Halves the bytes read per weight against :func:`gemv_kn`. The scale applies once to the
-// finished dot product, never per element and never folded into the activation.
+// 相比 :func:`gemv_kn` 把每个权重读的字节数减半。scale 只乘一次，乘在算完的点积上，
+// 绝不逐元素乘，也绝不折进激活。
 //
-// @param wt [K, N] int8 weights, contiguous.
-// @param x [K] activations, bf16 or fp32.
-// @param scale [N] fp32 absmax scale, one per output column.
-// @param threads Threads per block; ``0`` picks from ``N``.
-// @param unroll K-loop unroll factor; ``0`` means 4.
-// @param split Split-K width; ``0`` picks, ``1`` forces the single-pass kernel.
-// @param width Adjacent output columns one thread owns, which is also the number of
-//        contiguous weight bytes it loads per k step: ``2`` is one 16-bit load, ``4`` one
-//        32-bit, ``8`` one 64-bit. Legal values are ``1``, ``2``, ``4``, ``8`` and ``16``;
-//        any other non-zero value is rejected rather than rounded, and ``N % width`` must
-//        be ``0`` (the launch falls back to ``1`` when it is not, so a weight whose width
-//        is not a multiple of ``width`` stays correct instead of reading across a row
-//        boundary). ``0`` means auto, which reproduces the dispatch that predates this
-//        argument exactly: four-wide above a column floor, scalar below. Reading wider
-//        divides the thread count by ``width``, so the best value is a measured trade-off
-//        per shape rather than a constant -- see ``diag/tune_gemv_i8_wide.py``.
-// @return [N] in ``x``'s dtype.
-// @throws c10::Error on a non-int8 weight, a scale length other than ``N``, an unsupported
-//         ``width``, or a layout the kernels cannot index.
+// @param wt [K, N] int8 权重，连续存放。
+// @param x [K] 激活，bf16 或 fp32。
+// @param scale [N] fp32 absmax scale，每个输出列一个。
+// @param threads 每块线程数；``0`` 表示按 ``N`` 选。
+// @param unroll K 循环展开因子；``0`` 表示 4。
+// @param split Split-K 宽度；``0`` 表示自动选，``1`` 强制单趟内核。
+// @param width 一个线程负责的相邻输出列数，同时也是它每个 k 步加载的连续权重字节数：
+//        ``2`` 是一次 16 位加载，``4`` 一次 32 位，``8`` 一次 64 位。合法值是 ``1``、
+//        ``2``、``4``、``8`` 和 ``16``；其它非零值直接拒绝而不是四舍五入，并且
+//        ``N % width`` 必须为 ``0``（不满足时启动会退回 ``1``，这样一个宽度不是
+//        ``width`` 整数倍的权重仍然正确，而不是跨行读）。``0`` 表示自动，精确复现
+//        引入这个参数之前的分派：列数超过门槛走四宽，否则走标量。读得更宽会把线程数
+//        除以 ``width``，所以最优值是按形状实测出来的取舍而不是常量——见
+//        ``diag/tune_gemv_i8_wide.py``。
+// @return [N]，dtype 同 ``x``。
+// @throws c10::Error 权重不是 int8、scale 长度不是 ``N``、``width`` 不受支持，或布局
+//         是内核索引不了的。
 torch::Tensor gemv_kn_i8(torch::Tensor wt, torch::Tensor x, torch::Tensor scale,
                          int64_t threads, int64_t unroll, int64_t split,
                          int64_t width);
 
-// @brief Batched W8A16 projection: M rows of activations read the int8 weight once.
+// @brief 批处理 W8A16 投影：M 行激活只读一遍 int8 权重。
 //
-// Without this entry the int8 branch of ``linear_m`` has no kernel to call, so it
-// loops the single-row GEMV and pays one full weight read per row -- on this part
-// M=8 costs 8.19x M=1 (measured, five decode shapes). That is the reason a
-// c-token speculative verify could not beat c plain steps; see ``PERF_COREX.md``
-// section 14.
+// 没有这个入口，``linear_m`` 的 int8 分支就没有内核可调，只能循环单行 GEMV，每行付
+// 一次完整权重读取——在本部件上 M=8 是 M=1 的 8.19 倍（实测，五个解码形状）。这就是
+// 一次 c-token 投机校验打不过 c 个普通步的原因；见 ``PERF_COREX.md`` 第 14 节。
 //
-// @param wt [K, N] int8 weight, contiguous.
-// @param x [M, K] activations, bf16 or fp32. The output takes its dtype.
-// @param scale [N] fp32 absmax scale, one per output column.
-// @param threads Threads per block; ``0`` picks from ``N``.
-// @param unroll K-loop unroll; the launcher pins it, so this is reserved for a sweep.
-// @return [M, N] in ``x``'s dtype.
-// @throws c10::Error on a non-int8 weight, a scale length other than N, or a layout and
-//         dtype the kernel cannot index.
+// @param wt [K, N] int8 权重，连续存放。
+// @param x [M, K] 激活，bf16 或 fp32。输出的 dtype 跟随它。
+// @param scale [N] fp32 absmax scale，每个输出列一个。
+// @param threads 每块线程数；``0`` 表示按 ``N`` 选。
+// @param unroll K 循环展开；启动器会定死它，所以这个参数留给扫描用。
+// @return [M, N]，dtype 同 ``x``。
+// @throws c10::Error 权重不是 int8、scale 长度不是 N，或布局与 dtype 是内核索引不
+//         了的。
 torch::Tensor gemv_kn_i8_m(torch::Tensor wt, torch::Tensor x, torch::Tensor scale,
                             int64_t threads, int64_t unroll);
 
-// Normalisation.
+// 归一化。
 
-// @brief Zero-centred RMSNorm over the last axis of ``[M, N]`` with a row pitch.
+// @brief 带行间距的 ``[M, N]`` 最后一轴零中心 RMSNorm。
 //
-// @param x [M, N] activations with unit innermost stride; the rows are pitched
-//        ``stride`` elements apart, which is what lets a column slice normalise in
-//        place.
-// @param w [N] gain, already carrying the checkpoint's ``1 + w`` offset.
-// @param stride Element pitch between rows; ``0`` means ``N``.
-// @param eps Variance floor, added inside the rsqrt.
-// @return [M, N], densely packed, in ``x``'s dtype.
-// @throws c10::Error on a dtype the kernel has no instantiation for, or a pitch
-//         narrower than the row.
+// @param x [M, N] 激活，最内层步长为 1；行之间相隔 ``stride`` 个元素，这让一个列切片
+//        可以原地归一化。
+// @param w [N] 增益，已经带上了 checkpoint 的 ``1 + w`` 偏移。
+// @param stride 行之间的元素间距；``0`` 表示 ``N``。
+// @param eps 方差下限，在 rsqrt 内部相加。
+// @return [M, N]，稠密打包，dtype 同 ``x``。
+// @throws c10::Error dtype 没有对应实例化，或间距窄于行宽。
 torch::Tensor rms_norm(torch::Tensor x, torch::Tensor w, int64_t stride, double eps);
 
-// @brief Residual add followed by the zero-centred RMSNorm, in one launch.
+// @brief 残差相加接零中心 RMSNorm，一次启动。
 //
-// Every decoder layer does ``x = x + h`` and then normalises ``x``. As two ops that is two
-// launches and reads the residual buffer twice; fused it is one launch and one pass, and
-// the sum has a single home. A separate entry rather than an optional argument on
-// :func:`rms_norm` so a backend without it falls back to the reference implementation --
-// which is correct, only slower -- instead of silently dropping the add.
+// 每个解码层都做 ``x = x + h`` 然后归一化 ``x``。拆成两个算子就是两次启动、两遍读
+// 残差缓冲区；融合后是一次启动、一遍读取，而且这个和只有一个家。做成独立入口而不是
+// :func:`rms_norm` 的一个可选参数，是为了让没有这个内核的后端回退到参考实现——正确，
+// 只是慢——而不是悄悄把相加丢掉。
 //
-// @param x [M, N] residual stream, accumulated in place with ``add``.
-// @param add [M, N] mixer output to accumulate.
-// @param w [N] gain, already carrying the ``1 + w`` offset.
-// @param stride Element pitch between rows of ``x``; ``0`` means ``N``.
-// @param eps Variance floor.
-// @param out [M, N] normalised result, written in place. It must not alias ``x``: the
-//        residual sum stays live for the rest of the layer.
-// @return ``out``, for call chaining.
-// @throws c10::Error on a shape, dtype or aliasing the kernel cannot serve.
+// @param x [M, N] 残差流，用 ``add`` 原地累加。
+// @param add [M, N] 待累加的混合器输出。
+// @param w [N] 增益，已经带上了 ``1 + w`` 偏移。
+// @param stride ``x`` 行之间的元素间距；``0`` 表示 ``N``。
+// @param eps 方差下限。
+// @param out [M, N] 归一化结果，原地写入。不得与 ``x`` 重叠：残差和在这层剩下的部分
+//        里还要活着。
+// @return ``out``，便于调用链串接。
+// @throws c10::Error 形状、dtype 或重叠是内核服务不了的。
 torch::Tensor add_rms_norm(torch::Tensor x, torch::Tensor add, torch::Tensor w,
                            torch::Tensor out, int64_t stride, double eps);
 
-// @brief RMSNorm scaled by the SiLU of a gate, normalised per head.
+// @brief 乘以门 SiLU 的 RMSNorm，按头归一化。
 //
-// @param x [M, N] activations, contiguous, bf16 or fp32.
-// @param w [N] per-head gain.
-// @param gate [M, N] gate in the same layout and dtype as ``x``.
-// @param eps Variance floor.
-// @return [M, N] in ``x``'s dtype.
-// @throws c10::Error on a dtype the kernel has no instantiation for, or a gate whose
-//         shape differs from ``x``.
+// @param x [M, N] 激活，连续存放，bf16 或 fp32。
+// @param w [N] 按头的增益。
+// @param gate [M, N] 门，布局和 dtype 同 ``x``。
+// @param eps 方差下限。
+// @return [M, N]，dtype 同 ``x``。
+// @throws c10::Error dtype 没有对应实例化，或门的形状与 ``x`` 不一致。
 torch::Tensor rms_norm_gated(torch::Tensor x, torch::Tensor w, torch::Tensor gate,
                              double eps);
 
-// @brief Symmetric int8 quantisation of ``[M, N]``, one scale per row, in one launch.
+// @brief ``[M, N]`` 的对称 int8 量化，每行一个 scale，一次启动。
 //
-// Replaces the torch chain ``abs -> amax -> clamp_min -> div -> round -> clamp_ -> to``,
-// which is six launches per call and is called twice per full-attention layer (k and v).
-// At this card's launch floor the six cost about 82 us for a few microseconds of
-// arithmetic; one launch costs about six.
+// 替代那条 torch 链 ``abs -> amax -> clamp_min -> div -> round -> clamp_ -> to``：它每次
+// 调用六次启动，而每个全注意力层要调两次（k 和 v）。按本卡的启动下限，这六次要花约
+// 82 us，只为几微秒的算术；一次启动只花约六分之一。
 //
-// @param x [M, N] bf16 activation to quantise.
-// @param out_q [M, N] int8 destination, written in place.
-// @param out_s [M] fp32 destination for the per-row scale, written in place.
-// @return ``out_q``, for call chaining.
-// @throws c10::Error when a dtype or shape disagrees with the destinations.
+// @param x [M, N] 待量化的 bf16 激活。
+// @param out_q [M, N] int8 目的地，原地写入。
+// @param out_s [M] 每行 scale 的 fp32 目的地，原地写入。
+// @return ``out_q``，便于调用链串接。
+// @throws c10::Error dtype 或形状与目的地不一致。
 torch::Tensor kv_quant(torch::Tensor x, torch::Tensor out_q, torch::Tensor out_s);
 
-// @brief ``out = silu(gate) * up``, the SwiGLU product, in one launch.
+// @brief ``out = silu(gate) * up``，即 SwiGLU 乘积，一次启动。
 //
-// The fused ``gate_up`` projection returns both halves from one weight read, so the only
-// work between it and the down projection is this product. As ``aten::silu`` +
-// ``aten::mul`` it is two launches and two ``[intermediate]`` temporaries per layer, which
-// at this card's launch floor costs more than the arithmetic.
+// 融合的 ``gate_up`` 投影一次读取权重就交出两半，所以它和 down 投影之间唯一的工作就是
+// 这个乘积。拆成 ``aten::silu`` + ``aten::mul`` 是每层两次启动加两个
+// ``[intermediate]`` 临时张量，按本卡的启动下限，代价超过算术本身。
 //
-// @param gate [M] or [M, N] gate half, contiguous.
-// @param up Up half, same shape as ``gate``.
-// @param out Destination of the same shape. It may alias ``up``: the product overwrites
-//        it and nothing reads ``up`` afterwards, which is what lets a caller avoid both
-//        the allocation and the extra read.
-// @return ``out``, for call chaining.
-// @throws c10::Error on a shape, dtype or overlap the kernel cannot serve.
+// @param gate [M] 或 [M, N] 门那一半，连续存放。
+// @param up 另一半，形状同 ``gate``。
+// @param out 同形状的目的地。它可以与 ``up`` 重叠：乘积覆写它，之后再没人读 ``up``，
+//        调用方因此既省掉分配也省掉那一次额外读取。
+// @return ``out``，便于调用链串接。
+// @throws c10::Error 形状、dtype 或重叠是内核服务不了的。
 torch::Tensor silu_mul(torch::Tensor gate, torch::Tensor up, torch::Tensor out);
 
-// @brief Rotate the leading ``rotary_dim`` channels of every q/k head, in one launch.
+// @brief 旋转每个 q/k 头最前面 ``rotary_dim`` 个通道，一次启动。
 //
-// Replaces the torch chain ``to -> mul -> cat -> mul -> add -> cat`` that ``apply_rope``
-// runs per layer: about ten launches on ``[16, 256]`` and ``[4, 256]`` tensors, where the
-// arithmetic is a few thousand FMAs. At this card's launch floor that chain costs nearly a
-// millisecond per step and almost none of it is work.
+// 替代 ``apply_rope`` 每层跑的那条 torch 链 ``to -> mul -> cat -> mul -> add -> cat``：
+// 在 ``[16, 256]`` 和 ``[4, 256]`` 张量上约十次启动，而算术只是几千次 FMA。按本卡的
+// 启动下限，那条链每个步要花掉近一毫秒，而其中几乎没多少是真正的工作。
 //
-// One shape serves both paths: ``M == 1`` is decode, ``M == T`` is a prefill chunk or a
-// verify window, so a single kernel keeps them numerically identical.
+// 一种形状服务两条路径：``M == 1`` 是解码，``M == T`` 是预填充分块或校验窗口，所以
+// 单一内核让两者数值上完全一致。
 //
-// @param q [M, nh, hd] bf16 queries.
-// @param k [M, nkv, hd] bf16 keys.
-// @param cos [M, rotary_dim] fp32, already gathered for the rows being rotated.
-// @param sin Same layout as ``cos``.
-// @param q_out Destination of the rotated queries, ``q``'s shape. Must not alias ``q``.
-// @param k_out Destination of the rotated keys, ``k``'s shape. Must not alias ``k``.
-// @param rotary_dim Channels to rotate; the trailing ``hd - rotary_dim`` pass through
-//        untouched, which is what partial-rotary checkpoints require.
-// @return ``q_out``, for call chaining.
-// @throws c10::Error on a shape, dtype or aliasing the kernel cannot serve.
+// @param q [M, nh, hd] bf16 查询。
+// @param k [M, nkv, hd] bf16 键。
+// @param cos [M, rotary_dim] fp32，已经按被旋转的行收集好。
+// @param sin 布局同 ``cos``。
+// @param q_out 旋转后查询的去向，形状同 ``q``。不得与 ``q`` 重叠。
+// @param k_out 旋转后键的去向，形状同 ``k``。不得与 ``k`` 重叠。
+// @param rotary_dim 要旋转的通道数；尾部的 ``hd - rotary_dim`` 原样通过，这正是部分
+//        旋转的 checkpoint 所要求的。
+// @return ``q_out``，便于调用链串接。
+// @throws c10::Error 形状、dtype 或重叠是内核服务不了的。
 torch::Tensor rope_apply(torch::Tensor q, torch::Tensor k, torch::Tensor cos,
                          torch::Tensor sin, torch::Tensor q_out, torch::Tensor k_out,
                          int64_t rotary_dim);
 
-// Attention over the int8 KV cache: dense, paged, batched and draft-verify.
+// 在 int8 KV 缓存上做注意力：稠密、分页、批处理和草稿校验。
 //
-// ``part_acc``/``part_ml`` carry the split-K width on their own shape, so a caller that
-// sizes them from ``Caps.attn_split`` cannot disagree with the kernels about the ABI.
+// ``part_acc``/``part_ml`` 用自身的形状携带 split-K 宽度，所以按
+// ``Caps.attn_split`` 定尺寸的调用方不会和内核在 ABI 上产生分歧。
 
-// @brief One decode token over the dense int8 KV cache.
+// @brief 在稠密 int8 KV 缓存上算一个解码 token。
 //
-// @param q [nh, hd] bf16 query, already rotated and scaled.
-// @param gate [nh, hd] bf16 output gate; sigmoid is applied after normalisation.
-// @param kcache,vcache [nkv, S, hd] int8, head-major.
-// @param kscale,vscale [nkv, S] fp32 per-token scales.
-// @param out [nh, hd] bf16, written in place.
-// @param pos 1-element int64 tensor: the token index and the causal bound, read on the
-//        device so a captured replay sees the live position.
-// @param rep Query heads per KV head.
-// @param scale ``hd ** -0.5``.
-// @param part_acc [nh, split, hd] fp32 split-K numerator.
-// @param part_ml [nh, split, 2] fp32 split-K (max, sum).
-// @return ``out``, for call chaining.
+// @param q [nh, hd] bf16 查询，已经旋转并缩放好。
+// @param gate [nh, hd] bf16 输出门；sigmoid 在归一化之后施加。
+// @param kcache,vcache [nkv, S, hd] int8，头主序。
+// @param kscale,vscale [nkv, S] fp32，每个 token 一个 scale。
+// @param out [nh, hd] bf16，原地写入。
+// @param pos 单元素 int64 张量：token 下标兼因果上界，在设备上读取，所以被捕获的重放
+//        看到的是当前的位置。
+// @param rep 每个 KV 头对应的查询头数。
+// @param scale ``hd ** -0.5``。
+// @param part_acc [nh, split, hd] fp32，split-K 分子。
+// @param part_ml [nh, split, 2] fp32，split-K 的（最大值，和）。
+// @return ``out``，便于调用链串接。
 torch::Tensor attn_decode(torch::Tensor q, torch::Tensor gate, torch::Tensor kcache,
                           torch::Tensor vcache, torch::Tensor kscale,
                           torch::Tensor vscale, torch::Tensor out, torch::Tensor pos,
                           int64_t rep, double scale, torch::Tensor part_acc,
                           torch::Tensor part_ml);
 
-// @brief One decode token over a layer's paged int8 pool.
+// @brief 在某一层的分页 int8 池上算一个解码 token。
 //
-// @param kpool,vpool [nslots, nkv, hd] int8, token-major.
-// @param kscale,vscale [nslots, nkv] fp32 per-slot scales.
-// @param pos2slot [max_pos] int64 device map; only the first ``pos + 1`` entries are read.
-// @param max_pos Window length, i.e. the row stride of the slot map.
-// @return ``out``, for call chaining.
+// @param kpool,vpool [nslots, nkv, hd] int8，token 主序。
+// @param kscale,vscale [nslots, nkv] fp32，每个槽位一个 scale。
+// @param pos2slot [max_pos] int64 设备侧映射；只读前 ``pos + 1`` 项。
+// @param max_pos 窗口长度，即槽位表的行间距。
+// @return ``out``，便于调用链串接。
 torch::Tensor attn_paged(torch::Tensor q, torch::Tensor gate, torch::Tensor kpool,
                          torch::Tensor vpool, torch::Tensor kscale,
                          torch::Tensor vscale, torch::Tensor pos2slot, torch::Tensor out,
                          torch::Tensor pos, int64_t max_pos, int64_t rep, double scale,
                          torch::Tensor part_acc, torch::Tensor part_ml);
 
-// @brief One decode token for a bucket of rows, each with its own context length.
+// @brief 一个桶的行各带自身上下文长度，一次算一个解码 token。
 //
-// @param q [B, nh, hd] bf16 queries.
-// @param slots [B, max_seq] int64 per-row slot maps.
-// @param context_lens [B] int32 per-row key counts.
-// @return ``out`` [B, nh, hd], for call chaining.
+// @param q [B, nh, hd] bf16 查询。
+// @param slots [B, max_seq] int64，每行的槽位表。
+// @param context_lens [B] int32，每行的键数。
+// @return ``out`` [B, nh, hd]，便于调用链串接。
 torch::Tensor attn_paged_batch(torch::Tensor q, torch::Tensor gate, torch::Tensor kpool,
                                torch::Tensor vpool, torch::Tensor kscale,
                                torch::Tensor vscale, torch::Tensor slots,
@@ -252,13 +235,12 @@ torch::Tensor attn_paged_batch(torch::Tensor q, torch::Tensor gate, torch::Tenso
                                int64_t max_seq, int64_t rep, double scale,
                                torch::Tensor part_acc, torch::Tensor part_ml);
 
-// @brief Speculative verify: ``c`` draft queries per row share one history pass.
+// @brief 投机校验：每行 ``c`` 个草稿查询共用一遍历史读取。
 //
-// @param q [B, c, nh, hd] bf16 draft queries.
-// @param ctx_lens [B] int32 per-row history length, excluding the drafts.
-// @param block_mask uint8 ``[B, n_blocks]`` keep mask; an empty tensor means exact
-//        attention.
-// @return ``out`` [B, c, nh, hd], for call chaining.
+// @param q [B, c, nh, hd] bf16 草稿查询。
+// @param ctx_lens [B] int32，每行的历史长度，不含草稿本身。
+// @param block_mask uint8 ``[B, n_blocks]`` 保留掩码；空张量表示精确注意力。
+// @return ``out`` [B, c, nh, hd]，便于调用链串接。
 torch::Tensor attn_paged_multi_q(torch::Tensor q, torch::Tensor gate, torch::Tensor kpool,
                                  torch::Tensor vpool, torch::Tensor kscale,
                                  torch::Tensor vscale, torch::Tensor slots,
@@ -267,123 +249,116 @@ torch::Tensor attn_paged_multi_q(torch::Tensor q, torch::Tensor gate, torch::Ten
                                  torch::Tensor part_acc, torch::Tensor part_ml,
                                  torch::Tensor block_mask, int64_t mask_block);
 
-// Gated DeltaNet: the depthwise conv that feeds the recurrence, the head prologue, and
-// the recurrence itself.
+// 门控 DeltaNet：喂给递推的深度卷积、头预处理，以及递推本身。
 
-// @brief Depthwise causal conv (4 taps) + SiLU for one token, shifting the window.
+// @brief 单 token 的深度因果卷积（4 抽头）加 SiLU，同时平移窗口。
 //
-// @param conv_w [C, 4] fp32 taps.
-// @param x [C] bf16 projection output.
-// @param conv_state [C, 3] fp32 history, shifted in place.
-// @param out [C] fp32, written in place.
+// @param conv_w [C, 4] fp32 抽头。
+// @param x [C] bf16 投影输出。
+// @param conv_state [C, 3] fp32 历史，原地平移。
+// @param out [C] fp32，原地写入。
 void conv1d_silu(torch::Tensor conv_w, torch::Tensor x, torch::Tensor conv_state,
                  torch::Tensor out);
 
-// @brief The same conv over a prefill chunk, carrying the window across chunks.
+// @brief 同一个卷积跑在预填充分块上，窗口跨分块携带。
 //
-// @param x [T, C] bf16 with unit inner stride; the row pitch is honoured.
-// @param conv_state [C, 3] fp32, updated in place.
-// @return [T, C] fp32.
+// @param x [T, C] bf16，最内层步长为 1；行间距会被正确处理。
+// @param conv_state [C, 3] fp32，原地更新。
+// @return [T, C] fp32。
 torch::Tensor conv1d_silu_seq(torch::Tensor conv_w, torch::Tensor x,
                               torch::Tensor conv_state);
 
-// @brief Batched depthwise causal conv + SiLU, one row per batch entry.
+// @brief 批处理的深度因果卷积加 SiLU，每个批条目一行。
 //
-// @param x [B, C] bf16.
-// @param conv_state [B, C, 3] fp32, shifted in place.
-// @param out [B, C] fp32, written in place.
+// @param x [B, C] bf16。
+// @param conv_state [B, C, 3] fp32，原地平移。
+// @param out [B, C] fp32，原地写入。
 void conv1d_silu_batch(torch::Tensor conv_w, torch::Tensor x, torch::Tensor conv_state,
                        torch::Tensor out);
 
-// @brief q/k L2 norm, head expansion and the beta/g gates for one decode step.
+// @brief 一个解码步的 q/k L2 归一化、头扩展以及 beta/g 门。
 //
-// @param q,k [nkeys, dk] fp32; ``v`` [nv, dv] fp32.
-// @param b,a [nv] bf16 raw logits.
-// @param neg_expA,dt_bias [nv] fp32 checkpoint constants.
-// @param q_out,k_out [nv, dk] fp32 and ``v_out`` [nv, dv] fp32, written in place.
-// @param beta,g [nv] fp32, written in place.
-// @param qscale ``dk ** -0.5``.
-// @param rep Value heads per key head.
+// @param q,k [nkeys, dk] fp32；``v`` [nv, dv] fp32。
+// @param b,a [nv] bf16 原始 logits。
+// @param neg_expA,dt_bias [nv] fp32 checkpoint 常量。
+// @param q_out,k_out [nv, dk] fp32 与 ``v_out`` [nv, dv] fp32，原地写入。
+// @param beta,g [nv] fp32，原地写入。
+// @param qscale ``dk ** -0.5``。
+// @param rep 每个键头对应的值头数。
 void delta_prologue(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor b,
                     torch::Tensor a, torch::Tensor neg_expA, torch::Tensor dt_bias,
                     torch::Tensor q_out, torch::Tensor k_out, torch::Tensor v_out,
                     torch::Tensor beta, torch::Tensor g, double qscale, int64_t rep);
 
-// @brief Batched prologue: a leading row dim on every argument.
+// @brief 批处理版预处理：每个参数多一个前导行维度。
 void delta_prologue_batch(torch::Tensor q, torch::Tensor k, torch::Tensor v,
                           torch::Tensor b, torch::Tensor a, torch::Tensor neg_expA,
                           torch::Tensor dt_bias, torch::Tensor q_out,
                           torch::Tensor k_out, torch::Tensor v_out, torch::Tensor beta,
                           torch::Tensor g, double qscale, int64_t rep);
 
-// @brief Prefill head prep into the head-major layout the chunked scan reads.
+// @brief 预填充的头预处理，写出分块扫描读取的头主序布局。
 //
-// @param qkv [T, conv_dim] fp32 conv output laid out q | k | v.
-// @param q_out,k_out [nv, T, dk] fp32 and ``v_out`` [nv, T, dv] fp32.
-// @param beta,g [nv, T] fp32.
+// @param qkv [T, conv_dim] fp32 卷积输出，按 q | k | v 排列。
+// @param q_out,k_out [nv, T, dk] fp32 与 ``v_out`` [nv, T, dv] fp32。
+// @param beta,g [nv, T] fp32。
 void delta_prep_seq(torch::Tensor qkv, torch::Tensor b, torch::Tensor a,
                     torch::Tensor neg_expA, torch::Tensor dt_bias, torch::Tensor q_out,
                     torch::Tensor k_out, torch::Tensor v_out, torch::Tensor beta,
                     torch::Tensor g, double qscale, int64_t rep);
 
-// @brief One gated-delta-rule decode step, advancing the state in place.
+// @brief 门控 delta 规则的一个解码步，原地推进状态。
 //
-// @param q,k [heads, dk] fp32, already normalised by the prologue.
-// @param v [heads, dv] fp32.
-// @param beta,g [heads] fp32; ``g <= 0`` or the recurrence grows.
-// @param st [heads, dk, dv] fp32, updated in place.
-// @param out [heads, dv] fp32, read from the updated state.
-// @return ``out``, for call chaining.
+// @param q,k [heads, dk] fp32，已经由预处理归一化过。
+// @param v [heads, dv] fp32。
+// @param beta,g [heads] fp32；``g <= 0``，否则递推会发散。
+// @param st [heads, dk, dv] fp32，原地更新。
+// @param out [heads, dv] fp32，从更新后的状态读出。
+// @return ``out``，便于调用链串接。
 torch::Tensor delta(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor beta,
                     torch::Tensor g, torch::Tensor st, torch::Tensor out);
 
-// @brief Batched delta step: one independent state row per batch entry.
+// @brief 批处理 delta 步：每个批条目一行独立状态。
 //
-// @return ``out`` [B, heads, dv], for call chaining.
+// @return ``out`` [B, heads, dv]，便于调用链串接。
 torch::Tensor delta_batch(torch::Tensor q, torch::Tensor k, torch::Tensor v,
                           torch::Tensor beta, torch::Tensor g, torch::Tensor st,
                           torch::Tensor out);
 
-// @brief Prologue, recurrence and gated norm for one decode token, in one launch.
+// @brief 单解码 token 的预处理、递推与门控归一化，一次启动。
 //
-// Replaces the ``conv1d_silu`` -> ``delta_prologue`` -> ``delta`` -> ``rms_norm_gated``
-// chain. Those four launches write and re-read about 48 KB of fp32 scratch per layer per
-// token (``q_pro``/``k_pro``/``v_pro`` = 3 x [32, 128], ``delta_out`` = [32, 128]), and at
-// this card's ~5.75 us launch floor the round trips cost more than the arithmetic. One
-// block per value head keeps every intermediate in shared memory and registers, and the
-// gated norm's reduction is over exactly one head's ``dv``, so it folds into the epilogue
-// for free.
+// 替代 ``conv1d_silu`` -> ``delta_prologue`` -> ``delta`` -> ``rms_norm_gated`` 那条
+// 链。那四次启动每层每个 token 要写并重读约 48 KB 的 fp32 暂存（``q_pro``/``k_pro``/
+// ``v_pro`` = 3 x [32, 128]，``delta_out`` = [32, 128]），按本卡约 5.75 us 的启动下限，
+// 这些往返比算术本身更贵。每个值头一个 block 把全部中间结果留在共享内存和寄存器里，
+// 而门控归一化的归约正好只跨一个头的 ``dv``，所以它免费折进尾声。
 //
-// @param conv ``[nv, dv]`` fp32, the conv-and-SiLU output for this token. The q and k
-//        thirds of that buffer are read by column, at ``dk`` per head, so the layout is
-//        q | k | v with ``nv == nkeys * rep``; heads repeat their key head ``rep`` times.
-//        Passed in three slices by the caller rather than as one row, because the conv
-//        output is ``conv_dim`` wide and only its head column of each third is read here.
-// @param b,a ``[nv]`` bf16 raw beta/decay logits.
-// @param neg_expA,dt_bias ``[nv]`` fp32 checkpoint constants for the decay gate.
-// @param z ``[nv, dv]`` fp32-or-bf16 gate projection for the SiLU of the output norm.
-// @param nw ``[dv]`` bf16 gated-norm gain, per value head rather than per flattened width.
-// @param st ``[nv, dk, dv]`` fp32 recurrent state, updated in place.
-// @param out ``[nv, dv]`` fp32, written from the updated state and already normed.
-// @param qscale ``dk ** -0.5``.
-// @param rep Value heads per key head.
-// @return ``out``, for call chaining.
-// @throws c10::Error when a dtype, a head count or a layout contradicts the state.
+// @param conv ``[nv, dv]`` fp32，本 token 的卷积加 SiLU 输出。该缓冲区的 q、k 两段按列
+//        读取，每头 ``dk`` 个，所以布局是 q | k | v 且 ``nv == nkeys * rep``；头把它的
+//        键头重复 ``rep`` 次。调用方分三段传入而不是传一整行，因为卷积输出宽
+//        ``conv_dim``，而这里每段只读它的头部列。
+// @param b,a ``[nv]`` bf16 原始 beta／衰减 logits。
+// @param neg_expA,dt_bias ``[nv]`` fp32，衰减门的 checkpoint 常量。
+// @param z ``[nv, dv]`` fp32 或 bf16，输出归一化的 SiLU 门投影。
+// @param nw ``[dv]`` bf16 门控归一化增益，按值头而不是按展平宽度。
+// @param st ``[nv, dk, dv]`` fp32 循环状态，原地更新。
+// @param out ``[nv, dv]`` fp32，从更新后的状态写出，且已经归一化。
+// @param qscale ``dk ** -0.5``。
+// @param rep 每个键头对应的值头数。
+// @return ``out``，便于调用链串接。
+// @throws c10::Error dtype、头数或布局与状态矛盾。
 torch::Tensor delta_normed(torch::Tensor q, torch::Tensor k, torch::Tensor v,
                            torch::Tensor b, torch::Tensor a,
                            torch::Tensor neg_expA, torch::Tensor dt_bias,
                            torch::Tensor z, torch::Tensor nw, torch::Tensor st,
                            torch::Tensor out, double qscale, int64_t rep);
 
-// Triangular solve: the one library operation the chunked delta rule needs, and the one
-// this card's cuSOLVER cannot answer.
+// 三角求解：分块 delta 规则唯一需要的库操作，也是本卡 cuSOLVER 答不了的那一个。
 
-// @brief Solve ``A X = B`` for a unit-lower-triangular ``A``.
+// @brief 为单位下三角 ``A`` 解 ``A X = B``。
 //
-// @param lower [bn, L, L] unit-lower-triangular coefficients; the diagonal is taken as 1
-//        and the upper triangle is never read.
-// @param rhs [bn, L, n] right-hand side, same dtype as ``lower``.
-// @return [bn, L, n] in ``rhs``'s dtype.
-// @throws c10::Error on a shape or layout the kernel cannot index, including an ``L`` that
-//         would not fit in shared memory.
+// @param lower [bn, L, L] 单位下三角系数；对角线按 1 处理，上三角永不读取。
+// @param rhs [bn, L, n] 右端项，dtype 同 ``lower``。
+// @return [bn, L, n]，dtype 同 ``rhs``。
+// @throws c10::Error 形状或布局是内核索引不了的，包括 ``L`` 大到装不进共享内存。
 torch::Tensor triangular_solve(torch::Tensor lower, torch::Tensor rhs);

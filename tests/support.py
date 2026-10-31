@@ -1,31 +1,26 @@
-"""Shared fixtures, skip gates and path setup for the engine test suite.
+"""测试套件共用的 fixture、跳过门与路径设置。
 
-Module: ``coffin/tests``. Imported first by every other test module, so it may
-not import any of them; it is the only test file that touches ``sys.path`` and
-the only one that loads a checkpoint.
+Module: ``coffin/tests``。每个测试模块都最先导入它，所以它不能反过来导入其中
+任何一个；它也是唯一碰 ``sys.path``、唯一加载 checkpoint 的测试文件。
 
 Constraints:
-    * ``MKL_THREADING_LAYER=GNU`` has to be exported before torch initialises
-      MKL, hence it is set between the imports rather than in a fixture.
-    * ``support`` is imported by flat name, so every test module must be run
-      through the ``discover -s tests`` layout that puts ``tests/`` on
-      ``sys.path``; ``coffin/`` is then added here so ``ops`` / ``models`` /
-      ``engine_api`` import as top-level packages.
-    * At most one model is resident at a time: the card is 16 GB and a second
-      copy of the 4B weights plus both KV caches does not fit, so a test
-      requests its configuration through the fixture instead of building its
-      own model.
-    * The skip gates are evaluated at import time, so a test module that needs
-      the checkpoint must import ``support`` before decorating its classes.
+    * ``MKL_THREADING_LAYER=GNU`` 必须在 torch 初始化 MKL 之前导出，所以写在
+      两条 import 之间，而不是放进 fixture。
+    * 各测试模块按扁平名字导入 ``support``，因此都必须走 ``discover -s tests``
+      这套布局，让 ``tests/`` 进入 ``sys.path``；``coffin/`` 再由本文件加进去，
+      这样 ``ops`` / ``models`` / ``engine_api`` 才能按顶层包导入。
+    * 同一时刻最多驻留一个模型：卡只有 16 GB，再加一份 4B 权重和两份 KV 缓存
+      放不下，所以测试通过 fixture 申请配置，而不是自己另建一个模型。
+    * 跳过门在导入时求值，需要 checkpoint 的测试模块必须在装饰类之前先导入
+      ``support``。
 
-The suite runs in two places, and the skip rules are what make that work:
+套件在两个地方跑，跳过规则正是让两边都能用的原因：
 
-* a dev box without a DCU -- the kernel/model tests skip, the package-structure
-  tests still run;
-* the SCNet container -- everything runs against the real HIP kernels and the
-  checkpoint at ``$SCNET_MODEL`` (default ``/root/private_data/models/Qwen3.5-4B``).
+* 没有 DCU 的开发机：内核与模型测试跳过，包结构测试照跑；
+* SCNet 容器：全部跑在真实 HIP 内核与 ``$SCNET_MODEL`` 指向的 checkpoint 上
+  （默认 ``/root/private_data/models/Qwen3.5-4B``）。
 
-Run it with::
+运行方式::
 
     cd /root/private_data/engine
     MKL_THREADING_LAYER=GNU PYTHONPATH=/root/private_data/engine \
@@ -36,8 +31,8 @@ from __future__ import annotations
 
 import os
 
-# Must be set before torch initialises MKL: the container ships only the GNU
-# thread layer, and the default dispatch aborts with a FATAL ERROR (NOTES.md).
+# 必须在 torch 初始化 MKL 之前设置：容器只带了 GNU 线程层，默认分派会以
+# FATAL ERROR 直接中止（见 NOTES.md）。
 os.environ.setdefault("MKL_THREADING_LAYER", "GNU")
 
 import gc
@@ -47,32 +42,30 @@ from pathlib import Path
 
 import torch
 
-#: ``coffin/`` is the ``sys.path`` root for everything, so ``ops`` and ``models``
-#: are top-level packages.
+#: ``coffin/`` 是所有包的 ``sys.path`` 根，``ops`` 与 ``models`` 才能是顶层包。
 ENGINE_DIR = Path(__file__).resolve().parent.parent
 if str(ENGINE_DIR) not in sys.path:
     sys.path.insert(0, str(ENGINE_DIR))
 
-#: Checkpoint under test.  ``$SCNET_MODEL`` wins; the default is where the
-#: container keeps it.
+#: 被测 checkpoint。``$SCNET_MODEL`` 优先，默认值是容器里存放它的位置。
 MODEL_DIR = Path(os.environ.get("SCNET_MODEL")
                  or "/root/private_data/models/Qwen3.5-4B")
 
-#: Checked-in config-shaped fixture: lets the dispatch tests run without a
-#: checkpoint (and without a writable system temp dir).
+#: 随仓库提交的配置形状 fixture：让分派测试在没有 checkpoint（也没有可写的
+#: 系统临时目录）时也能跑。
 FIXTURE_MODEL_DIR = Path(__file__).resolve().parent / "fixtures" / "qwen3_5"
 
 
 def has_cuda() -> bool:
-    """Whether a DCU is visible; the skip gates are built from this at import time."""
+    """是否有可见的 DCU；导入时据此构造跳过门。"""
     return torch.cuda.is_available()
 
 
 def has_hip() -> bool:
-    """True when the HIP extension is built/loadable (never builds on a CPU box).
+    """HIP 扩展已构建且可加载时返回真（在纯 CPU 机器上永远不会构建）。
 
-    The import is deferred inside the function: importing ``hip_ops`` loads the
-    compiled extension, which aborts on a box with no DCU driver.
+    导入放在函数内部：导入 ``hip_ops`` 会加载编译好的扩展，在没有 DCU 驱动的
+    机器上会直接中止进程。
     """
     if not torch.cuda.is_available():
         return False
@@ -81,35 +74,34 @@ def has_hip() -> bool:
 
 
 def has_model() -> bool:
-    """Whether the checkpoint exists on disk; cheap enough to call at import time."""
+    """checkpoint 是否在磁盘上；开销够小，可以在导入时调用。"""
     return (MODEL_DIR / "config.json").is_file()
 
 
-#: Needs a DCU.  Pure-torch kernels still need one to hold the tensors.
+#: 需要 DCU。纯 torch 内核也要靠它持有张量。
 needs_gpu = unittest.skipUnless(has_cuda(), "needs a DCU (torch.cuda unavailable)")
-#: Needs the hand-written HIP kernels (gemv / attn / delta / norm).
+#: 需要手写的 HIP 内核（gemv / attn / delta / norm）。
 needs_hip = unittest.skipUnless(has_hip(), "needs the HIP extension")
-#: Needs the checkpoint on disk (also implies a DCU).
+#: 需要磁盘上的 checkpoint（同时意味着需要 DCU）。
 needs_model = unittest.skipUnless(
     has_cuda() and has_model(), f"needs a DCU and the checkpoint at {MODEL_DIR}")
 
 
 def rel_err(got: torch.Tensor, ref: torch.Tensor) -> float:
-    """Max relative error against ``ref`` (same metric the old probes printed).
+    """相对 ``ref`` 的最大相对误差（与旧探针打印的是同一个度量）。
 
-    Normalised by ``ref``'s largest magnitude so a tolerance reads the same at
-    every layer depth; an absolute tolerance would have to be re-tuned per layer.
+    用 ``ref`` 的最大幅值归一化，容差在任意层深下读起来都是同一个数；换成绝对
+    容差就得逐层重新调。
     """
     return ((got - ref).abs().max() / ref.abs().max()).item()
 
 
 class ModelFixture:
-    """The one resident model, rebuilt only when the requested configuration changes.
+    """唯一驻留的那个模型，只有请求的配置变化时才重建。
 
-    Rebuilding is expensive (weights load, graph capture), so the key is the full
-    constructor tuple: two tests sharing a configuration share the model, and a
-    test that changes one knob pays one reload rather than running against a
-    model configured for somebody else.
+    重建代价很高（加载权重、捕获计算图），所以 key 用完整的构造参数元组：配置
+    相同的两个测试共用模型，改动一个旋钮的测试只付一次重载，而不是跑在一个为
+    别人配置好的模型上。
     """
 
     _key: tuple | None = None
@@ -119,21 +111,21 @@ class ModelFixture:
     @classmethod
     def get(cls, *, quant: bool = True, max_seq: int = 2048,
             paged: bool = False, bench: bool = False, weight_dtype=None):
-        """Return the shared model, reloading it first if the configuration differs.
+        """返回共享模型；配置不同时先重载。
 
         Args:
-            quant: Store weights as INT8 (W8A16) rather than the checkpoint dtype.
-            max_seq: KV capacity; a longer request than this is truncated by the
-                model, so a test that probes a long context must raise it.
-            paged: Enable the paged KV cache. The paged and flat paths allocate
-                differently, so they cannot share one instance.
-            bench: Allocate the benchmark-shaped buffers.
-            weight_dtype: Override the weight storage dtype (``torch.float16`` /
-                ``torch.bfloat16``); ``None`` keeps the checkpoint's own dtype.
+            quant: 权重按 INT8（W8A16）存放，而不是 checkpoint 自带的 dtype。
+            max_seq: KV 容量。超长的请求会被模型截断，所以探测长上下文的测试
+                必须把它调大。
+            paged: 启用分页 KV 缓存。分页路径与平坦路径的分配方式不同，不能共用
+                同一个实例。
+            bench: 分配基准测试形状的缓冲区。
+            weight_dtype: 覆盖权重存放的 dtype（``torch.float16`` /
+                ``torch.bfloat16``）；``None`` 沿用 checkpoint 自己的 dtype。
 
         Returns:
-            The live model. It is owned by this class, not by the caller: do not
-            close it, call :meth:`close` only when you need the VRAM back.
+            活着的模型。它归这个类所有，不归调用方：不要关掉它，只在确实要拿回
+            显存时才调 :meth:`close`。
         """
         key = (quant, max_seq, paged, bench, weight_dtype)
         if cls._key != key:
@@ -149,10 +141,10 @@ class ModelFixture:
 
     @classmethod
     def close(cls) -> None:
-        """Drop the model and return its VRAM, so the next :meth:`get` reloads.
+        """丢弃模型并交还显存，下次 :meth:`get` 会重新加载。
 
-        Skipping this between differently-configured models would leave the
-        previous one resident and the 16 GB card over-subscribed.
+        在不同配置的模型之间省掉这一步，上一个模型会继续驻留，16 GB 的卡就被
+        超订了。
         """
         if cls._model is not None:
             try:
@@ -163,9 +155,8 @@ class ModelFixture:
         cls._key = None
         gc.collect()
         if torch.cuda.is_available():
-            # A captured graph pins a private memory pool; the pool only goes back
-            # to the driver once the graph objects are gone, which needs a sync +
-            # collect before empty_cache can actually release the segment.
+            # 捕获过的图会钉住一块私有内存池；只有图对象释放后池子才回到驱动
+            # 手里，而这需要先同步再加一次回收，empty_cache 才真能释放这段。
             torch.cuda.synchronize()
             gc.collect()
             torch.cuda.empty_cache()
@@ -173,17 +164,17 @@ class ModelFixture:
 
 
 def ensure_captured(model):
-    """Capture the decode graph once; ``decode_step`` needs a replayed graph."""
+    """把 decode 图捕获一次；``decode_step`` 需要一张可重放的图。"""
     if not model.graph_ready:
         model.capture()
     return model
 
 
 class ModelTestCase(unittest.TestCase):
-    """Base class for tests that drive a loaded model.
+    """驱动已加载模型的测试的基类。
 
-    Subclasses set ``QUANT`` / ``MAX_SEQ`` / ``PAGED``; ``setUp`` gets the shared
-    fixture and rewinds it so every test starts from the empty context.
+    子类设置 ``QUANT`` / ``MAX_SEQ`` / ``PAGED``；``setUp`` 取得共享 fixture 并
+    把它倒回空上下文，让每个测试都从头开始。
     """
 
     QUANT = True
@@ -193,17 +184,17 @@ class ModelTestCase(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        """Skip the class with a readable reason instead of failing in ``setUp``."""
+        """以可读的理由跳过整个类，而不是在 ``setUp`` 里失败。"""
         if not (has_cuda() and has_model()):
             raise unittest.SkipTest(f"needs a DCU and the checkpoint at {MODEL_DIR}")
 
     def setUp(self) -> None:
-        """Take the shared model and rewind its context to empty."""
+        """取共享模型，并把它的上下文倒回空。"""
         self.model = ModelFixture.get(quant=self.QUANT, max_seq=self.MAX_SEQ,
                                       paged=self.PAGED,
                                       weight_dtype=self.WEIGHT_DTYPE)
         self.model.reset()
 
     def tearDown(self) -> None:
-        """Rewind the context so the next test cannot inherit this request's state."""
+        """倒回上下文，免得下一个测试继承本次请求的状态。"""
         self.model.reset()

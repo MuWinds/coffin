@@ -1,7 +1,12 @@
-"""OpenAI request normalization and cheap image validation.
+"""OpenAI 请求归一化，以及代价很低的图像校验。
 
-Module: ``coffin.serving``. This module is standard-library only and runs before
-anything reaches the engine socket.
+Module: ``coffin.serving``。只用标准库，并且跑在任何东西到达引擎 socket 之前。
+
+Constraints:
+    * 校验必须便宜：只做 base64 解码和大小检查，不解码像素。真正的图像
+      处理在引擎侧的处理器里。
+    * 纯文本请求的渲染结果必须与改造前逐字节一致，任何归一化都只能作用于
+      带图消息。
 """
 
 from __future__ import annotations
@@ -28,35 +33,32 @@ _DATA_URL = re.compile(
 )
 
 class ImagePartError(ValueError):
-    """A client-supplied image part this process refuses.
+    """客户端送来的、本进程拒绝接收的图像片段。
 
-    Subclasses ``ValueError`` so a caller that only catches broad request errors
-    still handles it; the handler maps it to HTTP 400, because every trigger is
-    something the client sent wrong and can fix by rewriting the request.
+    继承 ``ValueError``，只捕获宽泛请求异常的调用方也能兜住；处理器把它映射
+    成 HTTP 400，因为每次触发都是客户端送错了东西，改一下请求就能解决。
     """
 
 
 def _decode_data_url(url: str) -> tuple[bytes, str]:
-    """``data:image/png;base64,...`` -> ``(raw bytes, mime)``.
+    """把 ``data:image/png;base64,...`` 解成 ``(原始字节, mime)``。
 
-    Only base64 data URLs are accepted: v1 does not fetch ``http(s)`` URLs (the
-    container has no egress and a fetch would be an SSRF surface), and a URL that
-    would make the *server* do the I/O is exactly the thing a caller cannot audit.
+    只接受 base64 data URL：v1 不抓 ``http(s)`` URL（容器没有出网能力，抓取
+    本身就是 SSRF 面），而且让*服务端*去做 I/O 的 URL 正是调用方无法审计的
+    东西。
 
     Args:
-        url: The ``image_url.url`` value as the client sent it.
+        url: 客户端原样送来的 ``image_url.url`` 值。
 
     Returns:
-        ``(raw, mime)``: the decoded bytes and the normalised media type. There
-        is no need to re-encode here beyond what the engine expects -- the caller
-        base64s the raw bytes for the socket request.
+        ``(raw, mime)``：解码后的字节和归一化后的媒体类型。这里不需要任何
+        超出引擎所需的重编码——调用方会再把这些字节 base64 一次发给 socket。
 
     Raises:
-        ImagePartError: The value is empty, is not a ``data:`` URL (a remote
-            ``http(s)`` URL names the supported form in the message), carries an
-            unsupported media type, is not base64, decodes to nothing, or exceeds
-            ``MAX_IMAGE_BYTES``. All are request errors: report 400 and let the
-            client resend a smaller or correctly encoded image.
+        ImagePartError: 值为空；不是 ``data:`` URL（远端 ``http(s)`` URL 会在
+            报错信息里点名受支持的写法）；媒体类型不支持；不是 base64；解码
+            结果为空；或超过 ``MAX_IMAGE_BYTES``。这些都是请求错误：回 400，
+            让客户端重发一张更小或编码正确的图像。
     """
     if not isinstance(url, str) or not url:
         raise ImagePartError("image_url.url must be a non-empty string")
@@ -95,34 +97,30 @@ def _decode_data_url(url: str) -> tuple[bytes, str]:
 
 
 def _split_parts(content, budget: dict) -> tuple[object, list[dict]]:
-    """Split one message's ``content`` into (template-safe content, image payloads).
+    """把一条消息的 ``content`` 拆成（模板可用的内容, 图像载荷）。
 
-    An OpenAI vision message is a *parts* array in which one part carries the
-    image bytes and the rest carry text. The checkpoint's chat template knows only
-    two things: text, and a ``{"type": "image"}`` marker that it renders as
-    ``<|vision_start|><|image_pad|><|vision_end|>`` (the placeholders the engine's
-    processor later expands to one token per visual patch). So the image parts are
-    lifted out of the array -- their bytes become ``images[]`` on the engine
-    request -- and replaced in place by that marker, which keeps the *order* of
-    text and images exactly as the client wrote it.
+    OpenAI 的视觉消息是 *parts* 数组，其中一段放图像字节，其余放文本。
+    checkpoint 的对话模板只认识两样东西：文本，以及 ``{"type": "image"}`` 标记；
+    模板把这个标记渲染成 ``<|vision_start|><|image_pad|><|vision_end|>``（引擎
+    侧处理器随后再把这些占位符展开成每个视觉 patch 一个 token）。所以图像
+    片段要从数组里摘出来——字节变成引擎请求上的 ``images[]``——原位只留那个
+    标记，文本与图像的*顺序*因此与客户端写的完全一致。
 
     Args:
-        content: The message's ``content``: a string, a parts array, or ``None``.
-        budget: Mutable per-request accumulator ``{"images": n, "b64": chars}``, so
-            the limits apply to the whole request rather than per message. ``b64``
-            counts the *data URL* characters the client sent -- what travels over
-            the wire and is held in memory -- not just the payload.
+        content: 消息的 ``content``：字符串、parts 数组或 ``None``。
+        budget: 每个请求共用的可变累加器 ``{"images": n, "b64": 字符数}``，
+            让限额作用在整个请求而不是单条消息上。``b64`` 统计的是客户端
+            发来的 *data URL* 字符数——真正走线、也真正占内存的量——而不是
+            只有载荷部分。
 
     Returns:
-        ``(content, images)``. ``content`` is the untouched value when the message
-        has no image part, which is what keeps the text-only request path
-        byte-for-byte what it was.
+        ``(content, images)``。消息里没有图像片段时 ``content`` 保持原值，
+        纯文本请求路径因此逐字节不变。
 
     Raises:
-        ImagePartError: A part is not an object, is a video or audio part (this
-            build cannot bound their token count), is an unknown type, carries no
-            usable ``image_url.url``, or the request is over its image count or
-            total-size budget. The handler turns it into 400.
+        ImagePartError: 某个片段不是对象；是视频或音频片段（本构建无法给它们
+            的 token 数设上界）；类型未知；没有可用的 ``image_url.url``；或
+            请求超出图像数量、总大小预算。处理器把它转成 400。
     """
     if not isinstance(content, list):
         return content, []
@@ -162,8 +160,7 @@ def _split_parts(content, budget: dict) -> tuple[object, list[dict]]:
                 f"`{kind}` part has no `image_url.url`; send "
                 "{{\"type\": \"image_url\", \"image_url\": {{\"url\": "
                 "\"data:image/png;base64,...\"}}}}")
-        # Checked before the decode: a request that already has too many images
-        # should not pay to base64-decode one more.
+        # 解码之前先查：已经超量了的请求不该再为多解一张图付出 base64 的代价。
         if budget.get("images", 0) >= MAX_IMAGES:
             raise ImagePartError(
                 f"too many images: {MAX_IMAGES} per request is the limit")
@@ -176,28 +173,27 @@ def _split_parts(content, budget: dict) -> tuple[object, list[dict]]:
                 f"or smaller images")
         raw, mime = _decode_data_url(url)
         images.append({"b64": base64.b64encode(raw).decode(), "mime": mime})
-        parts.append({"type": "image"})      # the template's own marker
+        parts.append({"type": "image"})      # 模板自己的标记，不是 OpenAI 的字段
     return parts, images
 
 
 def _split_messages(messages: list) -> tuple[list, list[dict], str | None]:
-    """Pull every image out of a request's ``messages``.
+    """把请求 ``messages`` 里的图像全部摘出来。
 
-    The three rules that cannot be deferred to the engine, because the engine
-    would surface them as an opaque failure:
+    有三条规则不能留给引擎处理，否则客户端只会收到一个看不懂的失败：
 
-    * a ``system`` message may not carry an image -- the template raises on it, so
-      the client would otherwise get a 500 from a generation it cannot debug;
-    * the per-request count and size budget (see ``_split_parts``);
-    * an image part in a role whose content the template never renders as media.
+    * ``system`` 消息不能带图——模板会直接抛异常，客户端就会拿到一个来自
+      自己无法调试的生成的 500；
+    * 每请求的图像数量与总大小预算（见 ``_split_parts``）；
+    * 图像片段出现在模板从不把其内容渲染成媒体的角色里。
 
     Args:
-        messages: The request's raw ``messages`` array, unvalidated.
+        messages: 请求原始的 ``messages`` 数组，未校验。
 
     Returns:
-        ``(messages, images, error)``. ``error`` is a human-readable 400 message
-        or ``None``; when it is set the other two are empty. ``images`` are the
-        engine-request payloads (``{"b64", "mime"}``), in prompt order.
+        ``(messages, images, error)``。``error`` 是可读的 400 提示或 ``None``；
+        一旦它有值，另外两个都是空的。``images`` 是引擎请求的载荷
+        （``{"b64", "mime"}``），按 prompt 顺序排列。
     """
     budget: dict = {"images": 0, "b64": 0}
     out: list = []
@@ -213,21 +209,20 @@ def _split_messages(messages: list) -> tuple[list, list[dict], str | None]:
             return [], [], str(exc)
         if found:
             if role in ("system", "developer"):
-                # The template itself raises for this, so reject it with a message
-                # that says what to do instead of surfacing a jinja traceback.
+                # 模板自己会为这个抛异常，所以这里回一条说明该怎么办的提示，
+                # 别把 jinja 的 traceback 甩给客户端。
                 return [], [], ("a system message cannot contain images: the chat "
                                 "template rejects it; put the image in a user turn")
             if role == "assistant":
-                # Historical assistant turns carry text; an image there has no
-                # template rendering and would be silently dropped.
+                # 历史的 assistant 轮次只承载文本；图像在那里没有对应的模板
+                # 渲染，会被静默丢掉。
                 return [], [], ("an assistant message cannot carry images; put the "
                                 "image in a user or tool message")
-            # ``tool`` IS accepted: an agent that calls a screenshot tool gets the
-            # capture back as the tool result, and that is the single most common
-            # way images enter this server. The template renders it exactly like a
-            # user image (vision_start/image_pad/vision_end inside the message),
-            # and the processor expands it in prompt order, so collecting the
-            # payload here is the only special case needed.
+            # ``tool`` 是接受的：调了截图工具的 agent 会把截屏当成工具结果拿
+            # 回来，这是图像进入本服务最常见的途径。模板渲染它的方式与用户
+            # 图像完全相同（消息里出现 vision_start/image_pad/vision_end），
+            # 处理器按 prompt 顺序展开，所以在这里收下载荷就是唯一需要的
+            # 特殊处理。
             images.extend(found)
         m["content"] = content
         out.append(m)
@@ -235,16 +230,15 @@ def _split_messages(messages: list) -> tuple[list, list[dict], str | None]:
 
 
 def _text_of(content) -> str:
-    """Flatten OpenAI's string-or-parts content into the plain string the template wants.
+    """把 OpenAI 的「字符串或 parts 数组」内容压成模板要的纯字符串。
 
     Args:
-        content: A string, a parts array, ``None``, or anything else a client sent.
+        content: 字符串、parts 数组、``None``，或客户端发来的任何别的东西。
 
     Returns:
-        The concatenated text. Image parts contribute nothing here -- the caller
-        only reaches this for a message with no image (see ``_template_content``).
-        A value that is neither a string nor a list is stringified rather than
-        dropped, so an odd client shape still renders something.
+        拼接后的文本。图像片段在这里不出力——调用方只在消息无图时才会走到
+        这里（见 ``_template_content``）。既不是字符串也不是列表的值会被
+        转成字符串而不是丢掉，形状再怪的客户端也还能渲染出点东西。
     """
     if content is None:
         return ""
@@ -262,35 +256,33 @@ def _text_of(content) -> str:
 
 
 def _has_image_part(content) -> bool:
-    """Whether a ``content`` parts array carries an image marker.
+    """``content`` parts 数组里是否带图像标记。
 
     Args:
-        content: The message's ``content``.
+        content: 消息的 ``content``。
 
     Returns:
-        ``True`` for a parts array with at least one image part. Drives the
-        string-vs-parts decision in ``_template_content``.
+        至少含一个图像片段的 parts 数组返回 ``True``。``_template_content``
+        据此决定给模板字符串还是 parts 数组。
     """
     return isinstance(content, list) and any(
         isinstance(p, dict) and p.get("type") in ("image", "image_url") for p in content)
 
 
 def _template_content(content):
-    """What the chat template should receive for one message's ``content``.
+    """一条消息的 ``content`` 应该以什么形状交给对话模板。
 
-    Text-only content is flattened to a string, exactly as before, so a text-only
-    request renders byte-for-byte what it used to. A message that carries an image
-    keeps its *parts array*, because that is the only shape the template
-    understands for media: each ``{"type": "image"}`` marker becomes
-    ``<|vision_start|><|image_pad|><|vision_end|>`` in place, preserving the
-    interleaving of text and images the client wrote.
+    纯文本内容压成字符串，与改造前完全一样，纯文本请求因此逐字节不变。带图
+    消息保留 *parts 数组*，因为这是模板唯一能理解媒体的形状：每个
+    ``{"type": "image"}`` 标记原位变成
+    ``<|vision_start|><|image_pad|><|vision_end|>``，客户端写的图文交替顺序
+    原样保留。
 
     Args:
-        content: The message's ``content``.
+        content: 消息的 ``content``。
 
     Returns:
-        A plain string for text-only content, or a rewritten parts array for
-        content with an image.
+        纯文本内容返回纯字符串，带图内容返回重写后的 parts 数组。
     """
     if not _has_image_part(content):
         return _text_of(content)
@@ -308,32 +300,28 @@ def _template_content(content):
 
 
 def _norm_messages(messages: list) -> list[dict]:
-    """Make the client's message list safe for the checkpoint's jinja template.
+    """把客户端的消息列表修成 checkpoint 里 jinja 模板能接受的样子。
 
-    Three shapes actually break it, all of them seen from real clients:
+    真正会把它弄坏的有三种形状，都是从真实客户端上见到的：
 
-    * ``content`` as a parts array;
-    * a role the template does not know -- OpenAI's newer ``developer`` (or a
-      harness inventing its own) makes the template raise *"Unexpected message
-      role."* and the whole request fails;
-    * a ``system`` message that is not first, or no user turn at all, which the
-      template rejects outright;
+    * ``content`` 是 parts 数组；
+    * 模板不认识的 role——OpenAI 较新的 ``developer``（或者某个自造 role 的
+      harness）会让模板抛 *"Unexpected message role."*，整个请求直接失败；
+    * ``system`` 消息不在首位，或者根本没有 user 轮次，模板都会直接拒绝；
 
-    and one whose ``arguments`` is the OpenAI JSON *string* rather than a mapping
-    -- the template iterates that field with ``|items``.
+    还有一种：``arguments`` 是 OpenAI 的 JSON *字符串*而不是映射，而模板要用
+    ``|items`` 遍历这个字段。
 
-    A parts array that carries images is *not* flattened: the template renders
-    ``{"type": "image"}`` itself (see ``_template_content``).
+    带图像的 parts 数组*不*压平：``{"type": "image"}`` 由模板自己渲染
+    （见 ``_template_content``）。
 
     Args:
-        messages: The request's messages, after ``_split_messages`` removed the
-            image payloads.
+        messages: 已经由 ``_split_messages`` 摘掉图像载荷的消息。
 
     Returns:
-        The normalised messages in the template's expected shape. A non-dict entry
-        is dropped rather than raising, because a partial request is still worth
-        answering. The template also requires a user turn and a leading system
-        turn, so those are synthesised when the client left them out.
+        模板期望形状的归一化消息。非字典项直接丢掉而不是抛异常，请求残缺
+        也仍然值得回一个结果。模板还要求有一个 user 轮次和位于首位的 system
+        轮次，客户端没写时这里补上。
     """
     out: list[dict] = []
     for msg in messages:
@@ -341,7 +329,7 @@ def _norm_messages(messages: list) -> list[dict]:
             continue
         m = dict(msg)
         role = str(m.get("role") or "user").lower()
-        if role == "developer":              # the newer name for the system role
+        if role == "developer":              # system 角色的新名字
             role = "system"
         elif role == "function":
             role = "tool"
@@ -369,7 +357,7 @@ def _norm_messages(messages: list) -> list[dict]:
 
     if out and out[0]["role"] == "system":
         pass
-    elif any(m["role"] == "system" for m in out):     # hoist it, demote the rest
+    elif any(m["role"] == "system" for m in out):     # 提到最前，其余的降级
         first = next(m for m in out if m["role"] == "system")
         out = [first] + [{**m, "role": "user"} if m["role"] == "system" else m
                          for m in out if m is not first]
@@ -379,25 +367,22 @@ def _norm_messages(messages: list) -> list[dict]:
 
 
 def _max_tokens(body: dict, state: dict | None = None) -> int:
-    """The output budget the client asked for, else the configured default.
+    """客户端要的输出预算；没写就用配置的默认值。
 
-    ``max_completion_tokens`` is the field the newer OpenAI clients (and coding
-    agents) send; reading only ``max_tokens`` used to fall through to a small
-    default, which truncates exactly the answers people ask a long-context model
-    for -- a file of code.
+    ``max_completion_tokens`` 是较新 OpenAI 客户端（以及编码 agent）发的字段；
+    以前只读 ``max_tokens`` 会落到一个很小的默认值上，而被截断的恰好是人们
+    向长上下文模型要的东西——一整个代码文件。
 
-    When the client states nothing at all, ``--default-max-tokens`` applies rather
-    than "the whole window": the engine is single-stream, so an unbounded request
-    that nobody is waiting for any more keeps every later request queued until it
-    finishes on its own (measured: a 117 s generation with no client attached).
+    客户端什么都没说时，用的是 ``--default-max-tokens`` 而不是「整个窗口」：
+    引擎是单流的，一个已经没人在等、又没有长度上界的请求会让后面所有请求
+    一直排队，直到它自己跑完（实测：没人连着也能生成 117 s）。
 
     Args:
-        body: The request body.
+        body: 请求体。
 
     Returns:
-        The budget in tokens. ``-1`` means "the whole window", and the engine
-        clamps it to the room the prompt leaves. An unparsable value falls through
-        to the next spelling rather than failing the request.
+        以 token 计的预算。``-1`` 表示「整个窗口」，引擎会再按 prompt 占掉的
+        空间收紧。解析不出来的值会往下一个写法退，而不是让请求失败。
     """
     for key in ("max_completion_tokens", "max_tokens", "max_new_tokens"):
         val = body.get(key)
@@ -410,24 +395,22 @@ def _max_tokens(body: dict, state: dict | None = None) -> int:
 
 
 def _thinking_flag(body: dict, default: bool) -> bool:
-    """Does this request want the model's reasoning block?
+    """这个请求要不要模型的推理段。
 
-    Clients spell it differently, so all the shapes actually seen are accepted:
-    ``enable_thinking`` (vLLM/Qwen), ``chat_template_kwargs.enable_thinking``,
-    ``thinking`` as a bool/string/``{"type": "enabled"}``, and ``reasoning_effort``
-    (anything but none/off, which is how the newer OpenAI-style agents ask).
+    各家客户端的写法不同，实际见过的形状都接受：``enable_thinking``
+    （vLLM/Qwen）、``chat_template_kwargs.enable_thinking``、``thinking``
+    （布尔/字符串/``{"type": "enabled"}``），以及 ``reasoning_effort``
+    （只要不是 none/off，新的 OpenAI 风格 agent 就是这么问的）。
 
-    The precedence is fixed by the order of the checks below: an explicit
-    ``enable_thinking`` or ``thinking`` wins over the ``reasoning_effort``
-    approximation, so setting both gives the specific field.
+    优先级由下面的检查顺序决定：显式的 ``enable_thinking`` 或 ``thinking``
+    压过 ``reasoning_effort`` 这个近似写法，两个都设时以具体字段为准。
 
     Args:
-        body: The request body.
-        default: The server-wide ``--enable-thinking`` choice, used when the
-            request says nothing.
+        body: 请求体。
+        default: 服务级的 ``--enable-thinking`` 选择，请求没表态时用它。
 
     Returns:
-        Whether the template should open the reasoning block.
+        模板是否应该打开推理段。
     """
     for key in ("enable_thinking", "thinking"):
         val = body.get(key)
@@ -451,30 +434,26 @@ def _thinking_flag(body: dict, default: bool) -> bool:
 
 
 def _tool_plan(body: dict) -> tuple[list | None, str]:
-    """``(tools to render, forced assistant opener)`` per OpenAI's tool_choice.
+    """按 OpenAI 的 tool_choice 给出 ``(要渲染的 tools, 强制的 assistant 开头)``。
 
-    The definition (``ChatCompletionToolChoiceOption``) says: ``none`` -- the model
-    must not call a tool; ``auto`` (the default when tools are present) -- it picks;
-    ``required`` -- it **must** call one or more tools; and
-    ``{"type": "function", "function": {"name": X}}`` -- it must call exactly X.
-    The deprecated-but-still-in-the-definition ``functions`` / ``function_call``
-    fields mean the same thing and map onto the same two fields here.
+    定义（``ChatCompletionToolChoiceOption``）规定：``none``——模型不许调用工具；
+    ``auto``（带 tools 时的默认值）——由模型自己决定；``required``——它**必须**
+    调用一个或多个工具；``{"type": "function", "function": {"name": X}}``——必须
+    恰好调用 X。已废弃但仍在定义里的 ``functions`` / ``function_call`` 字段
+    意思相同，在这里映射到同样两个字段。
 
-    ``required`` is honoured by *forcing the opener*: the engine appends the
-    template's call header to the prompt, so the turn can only continue as a call
-    (a 4B model otherwise often answers in prose while tools are attached -- which
-    is exactly the reported symptom). With a named choice the function name is
-    forced too.
+    ``required`` 靠*强制开头*落实：引擎把模板的调用头追加到 prompt 后面，这一轮
+    就只能续写成一个调用（4B 模型在挂了工具时经常改用散文回答——正是被报告
+    的那个症状）。指定了名字时函数名也一起强制。
 
     Args:
-        body: The request body.
+        body: 请求体。
 
     Returns:
-        ``(tools, opener)``. ``tools`` is ``None`` when the choice is ``none``, so
-        the template renders no tool schemas at all. ``opener`` is the template
-        text appended to the assistant header, empty when nothing is forced. An
-        unrecognised choice string is treated as ``auto``: that is what a client
-        means when it sends a value this build does not know.
+        ``(tools, opener)``。选择为 ``none`` 时 ``tools`` 是 ``None``，模板
+        因此一个工具 schema 都不渲染。``opener`` 是追加到 assistant 头后面的
+        模板文本，没有强制时为空。不认识的选择字符串按 ``auto`` 处理：客户端
+        发来本构建不认识的取值时，它的意思就是让模型自己决定。
     """
     tools = body.get("tools")
     legacy = body.get("functions")
@@ -496,7 +475,7 @@ def _tool_plan(body: dict) -> tuple[list | None, str]:
             return None, ""
         if mode in ("required", "any"):
             return tools, TOOL_OPEN + "\n"
-        return tools, ""                       # "auto", and anything unrecognised
+        return tools, ""                       # "auto"，以及任何认不出的值
     if isinstance(choice, dict):
         kind = str(choice.get("type") or "").lower()
         if kind == "none":
@@ -516,15 +495,14 @@ def _tool_plan(body: dict) -> tuple[list | None, str]:
 
 
 def _include_usage(body: dict) -> bool:
-    """``stream_options.include_usage``: one extra chunk with ``choices: []``.
+    """``stream_options.include_usage``：额外一块 ``choices: []`` 的用量块。
 
     Args:
-        body: The request body.
+        body: 请求体。
 
     Returns:
-        Whether the client asked for the definition's separate usage chunk. It
-        is absent by default because the definition says usage is omitted unless
-        requested.
+        客户端是否要了定义里那个独立的用量块。默认不发，因为定义规定除非
+        显式要求，否则省略 usage。
     """
     opts = body.get("stream_options")
     return bool(isinstance(opts, dict) and opts.get("include_usage"))

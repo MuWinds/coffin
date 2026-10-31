@@ -1,33 +1,25 @@
-"""Batched speculative decoding: per-row drafter, verify and rollback.
+"""批处理的投机解码：逐行草稿、校验与回滚。
 
-Module: ``coffin/tests``. Drives ``model.spec_step_batch`` through the batched
-model API; the scheduler never calls this path in production yet, so this file
-is its only functional gate.
+Module: ``coffin/tests``。经批处理模型接口驱动 ``model.spec_step_batch``；
+调度器目前还没有在生产路径上调用它，因此这个文件是它唯一的功能门禁。
 
 Constraints:
-    * Speculation may only change speed: every token the batched spec path emits
-      has to be the token the plain batched greedy path would emit at that
-      position. Per row, bit for bit, for the per-token verify path.
-    * The batch, MTP and rollback graphs peak around 6 GiB, which does not fit
-      next to the other classes on a 16 GB card; hence the ``RUN_SPEC_BATCH``
-      opt-in skip rather than a normal test.
-    * A row hole is part of the contract, not an edge case: the engine fixes a
-      row per sequence and pads holes with sentinels, so a test with contiguous
-      rows only would never exercise the padding.
-    * The one-forward verify path is judged by token agreement instead of bitwise
-      logits, because its wide-M kernel has a ULP-level difference from the greedy
-      kernel by design.
+    * 投机只允许改变速度：批处理投机路径吐出的每个 token，都必须是纯批处理
+      贪心路径在同一位置会吐出的那个。对逐 token 校验路径，要逐行按位一致。
+    * 批处理图、MTP 图和回滚图的峰值约 6 GiB，16 GB 的卡上放不进同一批的其他
+      测试类旁边；所以用 ``RUN_SPEC_BATCH`` 选择加入，而不是当成正常测试。
+    * 行空洞是契约的一部分，不是边角情况：引擎按序列固定行，并用哨兵填洞，
+      只测连续行的用例永远覆盖不到填充逻辑。
+    * 一次性前向校验路径按 token 一致判定，而不比对逐位 logits：它的宽 M 内核
+      与贪心内核存在设计内的 ULP 级差异。
 
-Speculation may only change speed: every token the batched spec path emits has to
-be the token the plain batched greedy path would emit at that position.  That is
-the strong claim tested here -- per row, bit for bit:
+批处理投机只允许改变速度：它吐出的每个 token，都必须是纯批处理贪心路径在同一
+位置会吐出的那个。这里验证的就是这条强断言——逐行、按位：
 
-* the drafter (MTP head, now with per-row paged KV and a bucket graph) proposes
-  K tokens per row;
-* the main model verifies ``K+1`` tokens per row in one captured forward, with
-  the recurrent state snapshotted after every verified token;
-* each row independently accepts the matching prefix, restores its own state from
-  that token's snapshot and continues.
+* 草稿模型（MTP 头，现在带逐行分页 KV 与桶图）为每行提出 K 个 token；
+* 主模型在一次捕获好的前向里校验每行的 ``K+1`` 个 token，每校验完一个就把
+  循环状态打一次快照；
+* 每行各自接受匹配的前缀，从那个 token 的快照恢复自己的状态后继续。
 """
 
 from __future__ import annotations
@@ -46,13 +38,12 @@ BATCH_CAP = DECODE_CAP + 1
 BUCKETS = (1, 2, 4, 8)
 K = 1
 WIDTH = K + 1
-STEPS = 10                     # spec steps; each yields at least one token
-GEN = 8                        # greedy tokens to compare against
+STEPS = 10                     # 投机步数；每一步至少产出一个 token
+GEN = 8                        # 用来比对的贪心 token 数
 NUM_BLOCKS = 256
 
-#: This class needs the model plus batched graphs, the batched MTP graphs and the
-#: per-row rollback snapshots (~6 GiB peak), which does not fit next to the other
-#: classes on a 16 GB card.  The full suite therefore skips it; run it alone:
+#: 这个类要占模型、批处理图、批处理 MTP 图和逐行回滚快照（峰值约 6 GiB），
+#: 16 GB 的卡上放不进同一批的其他测试类旁边。所以全量套件会跳过它，单独跑：
 #:     RUN_SPEC_BATCH=1 python3 -m unittest discover -s tests -p "test_spec_batch.py" -v
 RUN_SPEC_BATCH = os.environ.get("RUN_SPEC_BATCH") == "1"
 
@@ -68,7 +59,7 @@ def _tokens(n: int, off: int = 0) -> list[int]:
 @unittest.skipUnless(RUN_SPEC_BATCH,
                      "needs ~6 GiB; run with RUN_SPEC_BATCH=1")
 class BatchSpecTest(support.ModelTestCase):
-    """The batched spec loop must emit exactly the plain batched greedy tokens, per row."""
+    """批处理投机循环必须逐行产出与纯批处理贪心完全相同的 token。"""
 
     QUANT = True
     MAX_SEQ = 2048
@@ -76,7 +67,7 @@ class BatchSpecTest(support.ModelTestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        """Capture the batch graphs and then the spec graphs that replay them."""
+        """先捕获批处理图，再捕获重放它们的投机图。"""
         super().setUpClass()
         cls.model = support.ModelFixture.get(quant=cls.QUANT, max_seq=cls.MAX_SEQ,
                                              paged=True, bench=False)
@@ -87,19 +78,19 @@ class BatchSpecTest(support.ModelTestCase):
 
     @classmethod
     def tearDownClass(cls) -> None:
-        """Release the ~6 GiB of spec graphs; the next module needs the card."""
+        """释放约 6 GiB 的投机图；下一个模块要用这张卡。"""
         support.ModelFixture.close()
 
     def _alloc(self, n_tokens: int) -> list[int]:
-        """Blocks for the prompt plus the speculative headroom each step may append."""
+        """prompt 加上每一步可能追加的投机余量所需的块。"""
         return [self.pool.alloc() for _ in range(-(-(n_tokens + STEPS * WIDTH + WIDTH) // BLOCK))]
 
     def _free(self, blocks: list[int]) -> None:
-        """Return blocks to the pool; every ``_alloc`` is paired with this."""
+        """把块还给池；每次 ``_alloc`` 都对应一次这个调用。"""
         self.pool.free_blocks(blocks)
 
     def _prefill(self, prompts: list[list[int]], rows=None):
-        """Group-prefill the prompts on their rows; returns the blocks and the last-token logits."""
+        """按行分组预填充，返回块表和最后一个 token 的 logits。"""
         rows = list(range(len(prompts))) if rows is None else list(rows)
         blocks = [self._alloc(len(p)) for p in prompts]
         seqs = [SimpleNamespace(token_ids=p, row=r, block_table=b)
@@ -108,7 +99,7 @@ class BatchSpecTest(support.ModelTestCase):
         return blocks, [lg.float().clone() for lg in logits]
 
     def _greedy(self, prompts: list[list[int]], rows=None) -> list[list[int]]:
-        """The oracle: plain batched greedy decoding of the same prompts on the same rows."""
+        """对照实现：在同样的行上对同样的 prompt 做纯批处理贪心解码。"""
         k = len(prompts)
         rows = list(range(k)) if rows is None else list(rows)
         blocks, logits = self._prefill(prompts, rows)
@@ -129,7 +120,7 @@ class BatchSpecTest(support.ModelTestCase):
                 self._free(blk)
 
     def _spec(self, prompts: list[list[int]], rows=None):
-        """Run the batched spec loop; returns emitted tokens per row + acceptance."""
+        """跑批处理投机循环，返回每行产出的 token 与接受记录。"""
         k = len(prompts)
         rows = list(range(k)) if rows is None else list(rows)
         blocks, logits = self._prefill(prompts, rows)
@@ -153,7 +144,7 @@ class BatchSpecTest(support.ModelTestCase):
                 self._free(blk)
 
     def test_spec_matches_greedy_per_batch_size(self):
-        """Every batch size must reproduce greedy exactly; a rollback bug only appears once two rows roll back differently."""
+        """每个批大小都必须精确复现贪心；回滚 bug 只有在两行以不同方式回滚时才会露出来。"""
         lengths = [37, 53, 71, 44, 89, 64, 102, 47]
         for k in (1, 2, 4, 8):
             with self.subTest(k=k):
@@ -167,7 +158,7 @@ class BatchSpecTest(support.ModelTestCase):
                                      f"k={k} row={row}: spec tokens diverge from greedy")
 
     def test_spec_with_row_holes(self):
-        """Fixed rows with a hole between them (engine scheduling shape)."""
+        """固定行之间留一个空洞（引擎调度时的形状）。"""
         prompts = [_tokens(45, 0), _tokens(70, 2)]
         rows = [0, 2]
         greedy = self._greedy(prompts)
@@ -177,7 +168,7 @@ class BatchSpecTest(support.ModelTestCase):
                              f"row={rows[i]}: spec tokens diverge from greedy")
 
     def test_bucket_padding_does_not_leak(self):
-        """Three real rows in bucket 4: the sentinel row must not affect them."""
+        """桶 4 里只有三行是真的：哨兵行不得影响它们。"""
         prompts = [_tokens(40, 0), _tokens(55, 1), _tokens(72, 2)]
         greedy = self._greedy(prompts)
         produced, _acc = self._spec(prompts)
@@ -189,11 +180,10 @@ class BatchSpecTest(support.ModelTestCase):
 @support.needs_model
 @unittest.skipUnless(RUN_SPEC_BATCH, "needs ~6 GiB; run with RUN_SPEC_BATCH=1")
 class BatchSpecOnceTest(support.ModelTestCase):
-    """The one-forward verify (task-13) must also be token-identical to greedy.
+    """一次性前向校验（task-13）也必须与贪心逐 token 相同。
 
-    On a tree that does not yet have the task-12 wide-M GEMV this falls back to
-    the prefill projection path (correct, slow); the point here is the graph /
-    buffer / rollback layout of the one-forward verify, not its speed.
+    在没有 task-12 宽 M GEMV 的代码树上，它会回退到预填充投影路径（正确但慢）；
+    这里关心的是这个一次性前向校验的图 / 缓冲区 / 回滚布局，不是它的速度。
     """
 
     QUANT = True
@@ -202,7 +192,7 @@ class BatchSpecOnceTest(support.ModelTestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        """Capture a narrower bucket set with the one-forward verify mode; the assert pins the mode the class measures."""
+        """以一次性前向校验模式捕获一组更窄的桶；紧随其后的断言钉住本类所测的模式。"""
         super().setUpClass()
         cls.model = support.ModelFixture.get(quant=cls.QUANT, max_seq=cls.MAX_SEQ,
                                              paged=True, bench=False)
@@ -214,10 +204,10 @@ class BatchSpecOnceTest(support.ModelTestCase):
 
     @classmethod
     def tearDownClass(cls) -> None:
-        """Release the model; this class runs the whole card too."""
+        """释放模型；这个类同样要吃满整张卡。"""
         support.ModelFixture.close()
 
-    # reuse the helpers/buffers of the main class
+    # 复用主类的辅助函数与缓冲区
     _alloc = BatchSpecTest._alloc
     _free = BatchSpecTest._free
     _prefill = BatchSpecTest._prefill
@@ -225,19 +215,18 @@ class BatchSpecOnceTest(support.ModelTestCase):
     _spec = BatchSpecTest._spec
 
     def test_one_forward_verify_matches_greedy(self):
-        """The one-forward verify must agree with the token path and with greedy, so the wider graph is a speed change only.
+        """一次性前向校验必须同时与逐 token 路径和贪心一致，这样更宽的图才只是速度变化。
 
-        The wide-M projection kernel the one-forward verify needs (kernels
-        task-12) has a ULP-level difference from the greedy kernel, so this path
-        is judged by token agreement (the per-token path above stays bitwise).
+        一次性前向校验需要的宽 M 投影内核（kernels task-12）与贪心内核存在 ULP 级
+        差异，所以这条路径按 token 一致判定（上面的逐 token 路径仍然按位比对）。
         """
         prompts = [_tokens(41, off=0), _tokens(63, off=2)]
         greedy = self._greedy(prompts)
         produced_once, accepted = self._spec(prompts)
         self.assertTrue(accepted and isinstance(accepted[0], int))
 
-        # Same step, token-path verify, same model (graphs re-captured), for the
-        # once-vs-token consistency check.
+        # 同一步、换回逐 token 校验路径、同一模型（图会重新捕获），
+        # 用来做 once 与 token 两条路径的一致性检查。
         self.model.set_verify_mode("token")
         produced_tok, _acc = self._spec(prompts)
         self.model.set_verify_mode("once")

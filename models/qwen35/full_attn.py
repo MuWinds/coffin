@@ -1,42 +1,33 @@
-"""GQA full attention with an output gate, partial RoPE and an int8 KV cache.
+"""带输出门、部分 RoPE 和 int8 KV 缓存的 GQA 全注意力。
 
-Module: ``coffin/models/qwen35``. One of the two per-layer attention kinds the
-family composes (the other is ``linear_attn``); ``blocks.Layer`` picks one per
-layer index and ``model.py`` builds all 32. Depends downward on ``backends`` for
-the attention ops, the device and the split-K width, and on ``ops`` for
-dtypes/rope/norm/proj plus ``models/qwen35/batch`` for the batched projections.
-Nothing outside this family may import it directly.
+Module: ``coffin/models/qwen35``。本族组合的两种逐层注意力之一（另一种是
+``linear_attn``）；``blocks.Layer`` 按层下标二选一，``model.py`` 建出全部
+32 层。向下依赖 ``backends``（注意力算子、设备和 split-K 宽度）、``ops`
+（dtype / rope / 归一化 / 投影），以及 ``models/qwen35/batch`` 的批处理投影。
+本族之外不许直接 import 它。
 
-Eight of the 32 layers are this kind.  The decode step always spans the whole
-``max_seq`` window and masks entries past a device-side position counter, so
-its shape never changes and the graph is captured once; prefill uses online
-softmax over key blocks so the score block stays ~34 MB whatever the context
-length.  The split-K partial buffers live here because the captured graph needs
-stable addresses.
+32 层里有 8 层是这一种。解码步总是覆盖整个 ``max_seq`` 窗口，用设备侧位置计数器
+掩掉越界项，所以形状永远不变，图只捕获一次；预填充在 key 块上做 online softmax，
+score 块无论上下文多长都保持在 ~34 MB。split-K 的分片缓冲区住在这里，因为捕获图
+需要稳定地址。
 
 Constraints:
-    * The KV cache is int8 with a separate fp32 per-(head, token) scale. The
-      quantiser is ``_quant`` for one token and ``_quant_rows`` /
-      ``_quant_seq`` for a batch; all three must stay bit-identical, because
-      the kernel dequantises with the same scale the writer stored.
-    * The split-K width of the partial buffers is ``caps.attn_split``, never a
-      literal: this side owns the buffers and the backend's kernel indexes them,
-      so a mismatch corrupts attention instead of failing a shape check. A backend
-      that does not split reports ``1`` and the buffers shrink with it.
-    * Decode buffers have static shapes and stable addresses. Anything the
-      captured graph writes must be allocated before ``capture()`` and never
-      reassigned afterwards; ``enable_batching`` and ``attach_pool`` are the
-      only resizers, and both must run pre-capture.
-    * There is no eager fallback in this file. Every path calls the op table, and
-      a backend with no native kernel gets the reference implementation from it --
-      which is what removes the old per-call availability check that appeared once
-      per attention site.
-    * Recurrent state does not exist here -- the KV is position-indexed, so
-      rollback is a position counter -- but the cache must still be snapshotted
-      and restored with it for prefix reuse, or a shared KV pairs a restored
-      position counter with someone else's tail.
-    * All mutation is single-threaded, driven by ``llm_engine``; there is no
-      locking and none may be added.
+    * KV 缓存是 int8，另带一份 fp32 的逐 (头, token) scale。量化器：单 token 用
+      ``_quant``，批处理用 ``_quant_rows`` / ``_quant_seq``；三者必须逐位一致，
+      因为内核反量化时用的就是写入方存下的那个 scale。
+    * 分片缓冲区的 split-K 宽度取自 ``caps.attn_split``，绝不写字面量：这一侧持有
+      缓冲区，索引它们的是后端的内核，不一致会弄坏注意力而不是让形状检查失败。
+      不切分的后端报 ``1``，缓冲区随之收缩。
+    * 解码缓冲区形状静态、地址稳定。捕获图写的东西必须在 ``capture()`` 之前分配
+      好，之后绝不重新指派；``enable_batching`` 和 ``attach_pool`` 是仅有的两个
+      重定尺寸入口，都必须跑在捕获之前。
+    * 本文件没有即时执行的回退分支。每条路径都调算子表，没有原生内核的后端从
+      算子表拿到参考实现——正是它消掉了过去每个注意力调用点各写一次的内核可用性
+      检查。
+    * 这里没有循环状态——KV 按位置索引，回滚就是移动位置计数器——但前缀复用时
+      缓存仍必须连同它一起打快照、一起恢复，否则共享的 KV 会把恢复后的位置计数器
+      和别人的尾巴配在一起。
+    * 所有改写都是单线程的，由 ``llm_engine`` 驱动；没有加锁，也不许加。
 """
 
 from __future__ import annotations
@@ -52,36 +43,33 @@ from ops.dtypes import D, NEG_INF, WF
 from ops.gemv import _proj
 from ops.norm import RMSNorm
 
-#: The selected backend's capability record, read once. ``batch_attn`` decides
-#: whether a bucket costs one attention launch or one per row; both are correct,
-#: which is why this is a speed branch and not a fallback branch.
+#: 当前选中后端的能力记录，只读一次。``batch_attn`` 决定一个 bucket 是只花一次
+#: 注意力 launch 还是每行一次；两者都正确，所以这是速度分支而非回退分支。
 _CAPS = _caps()
 
 
 class FullAttn:
-    """GQA attention with an output gate, partial rotary and an int8 KV cache.
+    """带输出门、部分旋转和 int8 KV 缓存的 GQA 注意力。
 
-    Attention spans the whole ``max_seq`` window; entries past the current
-    position are masked, so the shapes stay static for graph capture.
+    注意力覆盖整个 ``max_seq`` 窗口；当前位置之后的项被掩掉，形状因此保持静态，
+    便于图捕获。
     """
 
     def __init__(self, sd: dict, p: str, cfg: dict, bench: bool, max_seq: int,
                  paged: bool = False) -> None:
-        """Load one layer's attention weights and size its KV buffers.
+        """加载一层的注意力权重并确定它的 KV 缓冲区尺寸。
 
         Args:
-            sd: Full state dict; this layer reads the ``{p}.*`` keys only.
-            p: Checkpoint prefix of the layer, e.g. ``model.layers.3.self_attn``.
-            cfg: Model config; ``num_attention_heads`` (16),
-                ``num_key_value_heads`` (4), ``head_dim`` (256) and
-                ``rope_parameters.partial_rotary_factor`` (0.25 -> 64 rotated
-                dims) come from here.
-            bench: Thread the flag into ``_proj``, which selects the benchmark
-                weight layout.
-            max_seq: Window in tokens; the dense cache is ``[nkv, max_seq, hd]``.
-            paged: Skip the dense cache entirely because a pool will own the KV.
-                See the comment on the allocation below -- this is a memory
-                decision, not a mode switch.
+            sd: 完整 state dict；本层只读 ``{p}.*`` 这些键。
+            p: 该层在 checkpoint 里的前缀，例如 ``model.layers.3.self_attn``。
+            cfg: 模型配置；``num_attention_heads``（16）、
+                ``num_key_value_heads``（4）、``head_dim``（256）和
+                ``rope_parameters.partial_rotary_factor``（0.25 -> 旋转 64 维）
+                都来自这里。
+            bench: 把这个标志透传给 ``_proj``，由它选择基准权重布局。
+            max_seq: 窗口的 token 数；稠密缓存形状是 ``[nkv, max_seq, hd]``。
+            paged: 完全跳过稠密缓存，因为 KV 将由池持有。见下面关于分配的注释
+                ——这是内存决策，不是模式开关。
         """
         self.nh = cfg["num_attention_heads"]        # 16
         self.nkv = cfg["num_key_value_heads"]       # 4
@@ -96,12 +84,10 @@ class FullAttn:
         self.q_norm = RMSNorm(sd[f"{p}.q_norm.weight"])
         self.k_norm = RMSNorm(sd[f"{p}.k_norm.weight"])
 
-        # int8 KV cache: symmetric per-(head, token) quantisation. With a paged
-        # pool attached these private buffers are dropped and the pool is used
-        # instead (see ``attach_pool``).  ``paged=True`` skips allocating them in
-        # the first place: at a 256k window they are 4 GB of memory that the pool
-        # then needs back, and the allocator cannot reliably reuse the freed
-        # 0.5 GB-per-layer segments for the pool's single large tensors.
+        # int8 KV 缓存：按 (头, token) 对称量化。挂上分页池之后这些私有缓冲区被丢弃，
+        # 改用池（见 ``attach_pool``）。``paged=True`` 干脆一开始就不分配：256k 窗口
+        # 下它们是 4 GB 内存，池紧接着就要这块；而分配器没法可靠地把释放掉的每层
+        # 0.5 GB 段复用来装池那几个大张量。
         if not paged:
             self.kcache = torch.zeros(self.nkv, max_seq, self.hd, dtype=torch.int8,
                                       device=_device)
@@ -111,27 +97,24 @@ class FullAttn:
             self.vscale = torch.zeros(self.nkv, max_seq, dtype=torch.float32, device=_device)
         else:
             self.kcache = self.vcache = self.kscale = self.vscale = None
-        # Per-row buffers for the batch path: the leading dim is the batch row
-        # (capacity 1 = the single-stream engine, whose kernels get the row-0
-        # views below).  ``enable_batching`` reallocates them with more rows;
-        # ``prefill_row`` is the row the single-stream prefill/verify path uses,
-        # kept apart from the decode rows by ``Qwen35.enable_batching``.
+        # 批处理路径的逐行缓冲区：首维是批行（容量 1 即单流引擎，它的内核拿到下面
+        # 的第 0 行视图）。``enable_batching`` 会用更多行重新分配它们；
+        # ``prefill_row`` 是单流预填充/校验路径用的行，由 ``Qwen35.enable_batching``
+        # 与解码行分开。
         self._bcap = 1
         self.prefill_row = 0
         self.attn_out = torch.zeros(1, self.nh, self.hd, dtype=D, device=_device)
-        # Quantisation destinations for the decode and batch paths. Caller-owned and
-        # written in place, like every other buffer here, for three reasons: the fused
-        # ``kv_quant`` kernel is one launch instead of the chain's six or seven, the
-        # addresses have to be stable if the decode step is ever captured, and the
-        # chain allocated five tensors per call where these four are allocated once.
+        # 解码和批处理路径的量化目标。和这里其他缓冲区一样由调用方持有、就地写入，
+        # 理由有三：融合的 ``kv_quant`` 内核只 launch 一次，而不是原来那串六七个；
+        # 解码步一旦被捕获，地址就必须稳定；原来那串每次调用分配五个张量，这四个
+        # 只分配一次。
         self.k_i8, self.k_s, self.v_i8, self.v_s = self._quant_buffers(1)
-        # Destinations for the fused rotation. One token's worth is enough: the decode path
-        # is one row per call, and the prefill path allocates its own (see ``rope``).
+        # 融合旋转的目标缓冲区。一个 token 的量就够：解码路径每次调用只有一行，
+        # 预填充路径自己分配（见 ``rope``）。
         self.q_rot = torch.empty(1, self.nh, self.hd, dtype=D, device=_device)
         self.k_rot = torch.empty(1, self.nkv, self.hd, dtype=D, device=_device)
-        # Per-key-slice partials for the split decode attention (see attn.cu);
-        # kept here because the decode step is a captured graph and needs fixed
-        # buffers.
+        # split 解码注意力用的逐 key 切片分片量（见 attn.cu）；放在这里是因为解码步
+        # 是捕获图，需要固定缓冲区。
         self.part_acc = torch.zeros(1, self.nh, ATTN_SPLIT, self.hd, dtype=torch.float32,
                                     device=_device)
         self.part_ml = torch.zeros(1, self.nh, ATTN_SPLIT, 2, dtype=torch.float32,
@@ -141,29 +124,28 @@ class FullAttn:
         self.pidx = 0
 
     def _quant_buffers(self, rows: int) -> tuple[torch.Tensor, ...]:
-        """Allocate the four destinations one decode or batch step quantises into.
+        """分配一次解码或批处理步要量化进去的四个目标缓冲区。
 
-        Kept as one helper so the decode path, the batch path and the resizers cannot
-        disagree about the layout: ``[rows, nkv, hd]`` int8 and ``[rows, nkv]`` fp32, which
-        is the same shape the pool's indexed write takes, so no reshape or copy sits
-        between the kernel and the cache.
+        收成一个辅助函数，解码路径、批处理路径和各重定尺寸入口就不会对布局产生
+        分歧：``[rows, nkv, hd]`` 的 int8 和 ``[rows, nkv]`` 的 fp32，正是池的
+        索引写入所取的形状，内核和缓存之间因此不夹任何 reshape 或拷贝。
 
         Args:
-            rows: Leading capacity; one row for the single-stream decode.
+            rows: 前导容量；单流解码为一行。
 
         Returns:
-            ``(k_i8, k_scale, v_i8, v_scale)``, all freshly allocated and uninitialised.
+            ``(k_i8, k_scale, v_i8, v_scale)``，全部新分配且未初始化。
         """
         i8 = torch.empty(rows, self.nkv, self.hd, dtype=torch.int8, device=_device)
         sc = torch.empty(rows, self.nkv, dtype=torch.float32, device=_device)
         return i8, sc, i8.clone(), sc.clone()
 
     def _bind_single_views(self) -> None:
-        """Row views the single-stream (prefill / verify) path writes.
+        """单流（预填充 / 校验）路径写入的行视图。
 
-        Re-bound, never reallocated: the captured decode/prefill graphs were
-        recorded against these exact addresses, so ``enable_batching`` calls
-        this after resizing the parents instead of binding views per call.
+        只重新绑定，从不重新分配：捕获的解码/预填充图就是按这些地址录的，所以
+        ``enable_batching`` 在给父缓冲区重定尺寸之后调用它，而不是每次调用都绑定
+        一遍视图。
         """
         pr = self.prefill_row
         self.attn_out1 = self.attn_out[pr]
@@ -176,42 +158,39 @@ class FullAttn:
 
     def rope(self, q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor,
              sin: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Rotate ``q`` and ``k``, one launch for the whole call.
+        """旋转 ``q`` 和 ``k``，整次调用只 launch 一次。
 
-        ``ops.rope.apply_rope`` is a torch chain of ten to twelve launches -- two table
-        casts, four multiplies, two ``cat`` for ``rotate_half``, two adds and two rejoining
-        ``cat``s -- over tensors no wider than ``[16, 256]``. There are 8 full-attention
-        layers per decode step, so ~80-96 of the step's launches are this, and at this
-        card's 5.75 us launch floor essentially all of that time is launch overhead rather
-        than arithmetic. The fused entry is one launch.
+        ``ops.rope.apply_rope`` 是十到十二次 launch 的 torch 链——两次表类型转换、四次
+        乘法、两次给 ``rotate_half`` 用的 ``cat``、两次加法、两次拼回去的 ``cat``——
+        而张量宽度不超过 ``[16, 256]``。每个解码步有 8 个全注意力层，所以这一步约
+        80-96 次 launch 都花在这里；在这张卡 5.75 us 的 launch 下限面前，那些时间
+        几乎全是 launch 开销而不是算术。融合入口是一次 launch。
 
-        The rounding is subtle enough to be worth stating where a caller will see it: the
-        kernel narrows ``cos``/``sin`` to bf16, each product to bf16, and the sum to bf16,
-        because that is what the chain's ``cos.to(q.dtype)`` followed by bf16 ``mul``/``add``
-        does. An fp32 version differs on ~30% of elements and changes the logits.
+        舍入方式微妙到值得写在调用方看得见的地方：内核把 ``cos``/``sin`` 收窄成
+        bf16、每个乘积收窄成 bf16、和也收窄成 bf16，因为链里 ``cos.to(q.dtype)``
+        之后那几次 bf16 ``mul``/``add`` 就是这么做的。改成 fp32 会有约 30% 的元素
+        不同，并改变 logits。
 
-        The write is **not** in place even though the destination is usually the size of the
-        source: the rotation pairs channel ``i`` with ``i + rotary_dim/2``, so a lane writing
-        into the same buffer could have its partner already overwritten by another lane.
-        There is no ordering between lanes, so this is a race, not a rounding question. The
-        decode path therefore writes into the layer's own persistent buffers (which removes
-        the chain's per-step allocations), and the prefill path allocates, because its row
-        count is the chunk length and a resident buffer for the worst chunk would be tens of
-        megabytes per layer for a path that runs once per request.
+        即使目标缓冲区通常和源一样大，这里也**不是**就地写：旋转把通道 ``i`` 与
+        ``i + rotary_dim/2`` 配对，写进同一缓冲区的 lane 可能发现自己的搭档已经被
+        另一个 lane 覆盖了。lane 之间没有顺序，所以这是竞态，不是舍入问题。解码
+        路径因此写进层自己常驻的缓冲区（顺带消掉链里每步的分配），预填充路径则
+        现分配，因为它行数就是分块长度，为一个每请求只跑一次、却要为最坏分块常驻
+        几十 MB 每层的路径留缓冲区不值。
 
         Args:
-            q: Queries, ``[nh, hd]`` or ``[C, nh, hd]``, bf16, contiguous.
-            k: Keys, ``[nkv, hd]`` or ``[C, nkv, hd]``, bf16, contiguous.
-            cos: Cosine rows, ``[1, rotary_dim]`` or ``[C, rotary_dim]``, fp32.
-            sin: Sine rows, same shape as ``cos``.
+            q: 查询，``[nh, hd]`` 或 ``[C, nh, hd]``，bf16，连续。
+            k: 键，``[nkv, hd]`` 或 ``[C, nkv, hd]``，bf16，连续。
+            cos: 余弦行，``[1, rotary_dim]`` 或 ``[C, rotary_dim]``，fp32。
+            sin: 正弦行，形状同 ``cos``。
 
         Returns:
-            ``(q_rot, k_rot)`` in the caller's rank -- ``[nh, hd]`` / ``[nkv, hd]`` for one
-            token, or the ``[C, ...]`` forms for a chunk.
+            ``(q_rot, k_rot)``，维数与调用方一致——单 token 是 ``[nh, hd]`` /
+            ``[nkv, hd]``，一个分块则是 ``[C, ...]`` 形式。
 
         Raises:
-            ValueError: ``q`` and ``k`` disagree about the token count, which would rotate
-                the wrong rows instead of failing a shape check in the kernel.
+            ValueError: ``q`` 和 ``k`` 的 token 数不一致，否则会旋转错误的行，而不是
+                在内核里让形状检查失败。
         """
         single = q.dim() == 2
         q3 = q.unsqueeze(0) if single else q
@@ -221,9 +200,8 @@ class FullAttn:
             raise ValueError(f"rope: q has {rows} rows, k has {k3.shape[0]}")
         c2 = cos if cos.dim() == 2 else cos.reshape(rows, -1)
         s2 = sin if sin.dim() == 2 else sin.reshape(rows, -1)
-        # The decode path reuses the layer's buffers, so a per-token step allocates nothing.
-        # ``rows`` is 1 there and the chunk length on the prefill path, which is exactly the
-        # branch: a resident buffer only has to cover the decode row.
+        # 解码路径复用层自己的缓冲区，所以逐 token 的一步不分配任何东西。那里 ``rows``
+        # 是 1，预填充路径上是分块长度，这正是那个分支：常驻缓冲区只需覆盖解码那一行。
         if rows == 1:
             qo, ko = self.q_rot, self.k_rot
         else:
@@ -233,18 +211,16 @@ class FullAttn:
         return (qo[0], ko[0]) if single else (qo, ko)
 
     def enable_batching(self, capacity: int, prefill_row: int) -> None:
-        """Give the attention buffers one row per batch entry (before capture).
+        """让注意力缓冲区按批条目各占一行（须在捕获之前）。
 
         Args:
-            capacity: Rows the batch needs, already including the prefill row.
-            prefill_row: Row reserved for single-stream prefill and verify. The
-                batched decode must never write it, so the model keeps it out of
-                the row pool.
+            capacity: 批需要的行数，已包含预填充行。
+            prefill_row: 留给单流预填充和校验的行。批处理解码绝不能写它，所以模型
+                把它排除在行池之外。
 
         Returns:
-            Nothing. A no-op when the buffers already have this capacity and the
-            staging row is unchanged, which keeps the captured graph addresses
-            valid across an engine that runs both modes.
+            无。缓冲区已是这个容量且暂存行未变时是空操作，一个同时跑两种模式的
+            引擎因此保持捕获图的地址有效。
         """
         capacity = max(int(capacity), 1)
         if capacity == 1 and self.prefill_row == 0:
@@ -260,22 +236,20 @@ class FullAttn:
         self._bind_single_views()
 
     def attach_pool(self, pool, idx: int) -> None:
-        """Serve this layer's KV from ``pool`` slot ``idx`` instead of the dense cache.
+        """让本层的 KV 从 ``pool`` 的槽位 ``idx`` 取得，而不是稠密缓存。
 
-        Called before any graph is captured: the captured decode step bakes in the
-        pool tensors, so switching afterwards would leave a graph writing to the
-        wrong place. The private dense buffers are released.
+        必须在捕获任何图之前调用：捕获的解码步会把池张量烘进去，之后再切换只会
+        留下一张写错地方的图。私有稠密缓冲区会被释放。
 
         Args:
-            pool: The paged KV pool (``paged_cache``); its slot maps are read on
-                every step, its tensors are written in place.
-            idx: This layer's slot inside the pool, i.e. its position in the
-                per-layer dimension of ``pool.k`` / ``pool.v``.
+            pool: 分页 KV 池（``paged_cache``）；它的槽位表每步都要读，张量就地
+                写入。
+            idx: 本层在池里的槽位，也就是它在 ``pool.k`` / ``pool.v`` 逐层维度上
+                的位置。
 
         Returns:
-            Nothing. After this call the dense cache attributes are ``None``;
-            any code path that still reads them will fail loudly rather than
-            quietly write to a stale buffer.
+            无。调用之后稠密缓存属性都是 ``None``；还去读它们的代码路径会大声
+            报错，而不是悄悄写进一个过期的缓冲区。
         """
         self.pool = pool
         self.pidx = idx
@@ -285,11 +259,11 @@ class FullAttn:
         self.vscale = None
 
     def _pool_views(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """This layer's slices of the pool, in the order the kernels take them.
+        """本层在池里的切片，顺序与内核取用一致。
 
         Returns:
-            ``(k, v, kscale, vscale)`` views, already indexed by ``pidx``. They
-            point into the pool, so writing through them is the cache write.
+            ``(k, v, kscale, vscale)`` 视图，已按 ``pidx`` 索引。它们指向池内部，
+            所以透过它们写入就是缓存写入。
         """
         p = self.pool
         return p.k[self.pidx], p.v[self.pidx], p.kscale[self.pidx], p.vscale[self.pidx]
@@ -297,47 +271,44 @@ class FullAttn:
     @staticmethod
     def _quant(x: torch.Tensor, out_q: torch.Tensor,
                out_s: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """[nkv, hd] bf16 -> (int8, per-head scale), one fused launch into caller buffers.
+        """[nkv, hd] bf16 -> (int8, 逐头 scale)，一次融合 launch 写进调用方缓冲区。
 
-        The arithmetic is the int8 KV cache contract and is not a tuning choice: the
-        ``1e-5`` floor and the ``127`` divisor are an agreement with the kernel that reads
-        the cache back, so ``kv_quant`` reproduces the torch chain ``abs -> amax ->
-        clamp_min -> div -> round -> clamp_ -> to`` exactly, and this method is a thinner
-        spelling of that chain rather than a different one.
+        这套算术是 int8 KV 缓存的契约，不是调优选择：``1e-5`` 的下限和 ``127`` 的除数
+        是与回读缓存的内核之间的约定，所以 ``kv_quant`` 精确复现 torch 链
+        ``abs -> amax -> clamp_min -> div -> round -> clamp_ -> to``，本方法只是那条
+        链更薄的一种写法，而不是另一种。
 
-        What changed is the launch count and the allocation. The chain is six or seven
-        launches per call and allocates five tensors; this is one launch into buffers the
-        layer owns. Called twice per full-attention layer over 8 layers, that is roughly
-        100 of the decode step's launches and removes the per-step allocation churn.
+        变的是 launch 次数和分配。那条链每次调用六到七次 launch、分配五个张量；这里
+        是往层自己持有的缓冲区里发一次 launch。每个全注意力层调两次、共 8 层，那是
+        解码步里约 100 次 launch，还顺带消灭了每步的分配抖动。
 
         Args:
-            x: One token's K or V, ``[nkv, hd]``, in the compute dtype.
-            out_q: int8 destination, ``[nkv, hd]``, written in place.
-            out_s: fp32 scale destination, ``[nkv]``, written in place.
+            x: 一个 token 的 K 或 V，``[nkv, hd]``，计算 dtype。
+            out_q: int8 目标，``[nkv, hd]``，就地写入。
+            out_s: fp32 scale 目标，``[nkv]``，就地写入。
 
         Returns:
-            ``(out_q, out_s)``: int8 codes in ``[-127, 127]`` and the positive fp32 scale
-            per head that the kernel multiplies back.
+            ``(out_q, out_s)``：``[-127, 127]`` 的 int8 码，以及内核会乘回去的逐头
+            正 fp32 scale。
         """
         return bops.kv_quant(x, out_q, out_s), out_s
 
     def __call__(self, x: torch.Tensor, pos1, cos_tbl, sin_tbl, mask_idx,
                  rope_delta=None) -> torch.Tensor:
-        """Single-token decode step for one row.
+        """针对一行的单 token 解码步。
 
         Args:
-            x: The layer input for this token, ``[hidden]``.
-            pos1: 1-element long tensor with the token index. It addresses the KV
-                slot and the cache write, and the mask is ``> pos1``.
-            cos_tbl: RoPE cos table, indexed by position.
-            sin_tbl: RoPE sin table, indexed by position.
-            mask_idx: Device-side position counter used by the CPU fallback mask.
-            rope_delta: Optional mRoPE offset added to ``pos1`` for the rotation
-                only. Zero (``None``) for text, so the text path stays bit for
-                bit what it was before images existed.
+            x: 该 token 的层输入，``[hidden]``。
+            pos1: 只含一个元素的 long 张量，值是该 token 下标。它寻址 KV 槽位和
+                缓存写入，掩码条件是 ``> pos1``。
+            cos_tbl: RoPE 余弦表，按位置索引。
+            sin_tbl: RoPE 正弦表，按位置索引。
+            mask_idx: 设备侧位置计数器，CPU 回退掩码用。
+            rope_delta: 可选的 mRoPE 偏移，只加在旋转用的 ``pos1`` 上。纯文本时为
+                零（``None``），文本路径因此保持和图像功能出现之前逐位相同。
 
         Returns:
-            ``[hidden]`` the gated attention output after ``o_proj``.
+            ``[hidden]``，经 ``o_proj`` 之后的加门注意力输出。
         """
         qg, k, v = self.qkv(x)
         qg = qg.reshape(self.nh, 2 * self.hd)
@@ -346,10 +317,10 @@ class FullAttn:
         k = self.k_norm(k.reshape(self.nkv, self.hd))
         v = v.reshape(self.nkv, self.hd)
 
-        # ``pos1`` stays the *token index* everywhere else in this method (it is
-        # what addresses the KV slot); only the rotation reads the mRoPE position,
-        # which is ``token_index + rope_delta`` once a prompt has an image.  With
-        # no image ``rope_delta`` is 0 and the lookup is the old one, bit for bit.
+        # 在本方法其余地方 ``pos1`` 始终是*token 下标*（寻址 KV 槽位的就是它）；只有
+        # 旋转去读 mRoPE 位置，prompt 含图像之后那就是
+        # ``token_index + rope_delta``。没有图像时 ``rope_delta`` 为 0，查表和以前
+        # 逐位相同。
         idx = pos1 if rope_delta is None else pos1 + rope_delta
         cos = cos_tbl.index_select(0, idx)
         sin = sin_tbl.index_select(0, idx)
@@ -366,10 +337,9 @@ class FullAttn:
             self.kscale.index_copy_(1, pos1, sk.unsqueeze(1))
             self.vscale.index_copy_(1, pos1, sv.unsqueeze(1))
 
-        # One op call per path: dequant k/v, fold the scales, apply the causal
-        # mask, softmax, gate, PV. Which kernel answers is the backend's business;
-        # both entries are callable on every backend, so there is no availability
-        # fork and no eager twin to keep numerically in step.
+        # 每条路径一次算子调用：反量化 k/v、折叠 scale、施加因果掩码、softmax、加门、
+        # PV。由哪个内核应答是后端的事；两个入口在每个后端上都可调用，所以既没有
+        # 可用性分叉，也没有需要保持数值一致的即时执行孪生体。
         if self.pool is not None:
             kp, vp, kps, vps = self._pool_views()
             out = bops.attn_paged(q.contiguous(), gate.contiguous(), kp, vp, kps, vps,
@@ -386,23 +356,21 @@ class FullAttn:
     @staticmethod
     def _quant_rows(x: torch.Tensor, out_q: torch.Tensor,
                     out_s: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """[B, nkv, hd] bf16 -> (int8, per-(row, head) scale), row-wise == ``_quant``.
+        """[B, nkv, hd] bf16 -> (int8, 逐 (行, 头) scale)，逐行等价于 ``_quant``。
 
-        The row is the batch entry, so the ``[nkv, hd]`` axis pair becomes the flat row of
-        ``kv_quant``: reshaping to ``[B*nkv, hd]`` makes one row of the fused kernel exactly
-        one (row, head) pair, which is the reduction the reference performs with
-        ``amax(-1)``. The destinations are the layer's own buffers, viewed the same way, so
-        the batch path stays allocation-free and writes straight into the layouts the pool's
-        indexed write takes.
+        这里的行是批条目，所以 ``[nkv, hd]`` 那对轴变成 ``kv_quant`` 的扁平行：
+        reshape 成 ``[B*nkv, hd]`` 之后，融合内核的一行恰好是一个 (行, 头) 对，正是
+        参考实现用 ``amax(-1)`` 做的归约。目标缓冲区是层自己的，按同样方式取视图，
+        批处理路径因此不分配，并且直接写进池索引写入所取的布局。
 
         Args:
-            x: One token per batch row, ``[B, nkv, hd]``.
-            out_q: int8 destination, ``[B, nkv, hd]``, written in place.
-            out_s: fp32 destination, ``[B, nkv]``, written in place.
+            x: 每个批行一个 token，``[B, nkv, hd]``。
+            out_q: int8 目标，``[B, nkv, hd]``，就地写入。
+            out_s: fp32 目标，``[B, nkv]``，就地写入。
 
         Returns:
-            ``(out_q, out_s)``. Each row is quantised independently, so the result for row
-            ``b`` is bit-identical to :meth:`_quant` on that row alone.
+            ``(out_q, out_s)``。每行独立量化，所以第 ``b`` 行的结果与单独对那一行调
+            :meth:`_quant` 逐位相同。
         """
         B = x.shape[0]
         flat = out_q.view(B * x.shape[1], x.shape[2])
@@ -411,37 +379,32 @@ class FullAttn:
         return out_q, out_s
 
     def batch(self, x: torch.Tensor, positions: torch.Tensor, ctx) -> torch.Tensor:
-        """``x`` [B, hidden] -> [B, hidden]: batched projections, per-row attention.
+        """``x`` [B, hidden] -> [B, hidden]：批处理投影，逐行注意力。
 
-        Two of the three stages here are batched: the projections (one weight read
-        for all rows, ``models/qwen35/batch.py``) and -- on a backend that serves
-        batched paged attention natively -- the attention itself, so the whole
-        bucket is one launch instead of B.  Each row still resolves positions
-        through its own ``pos2slot`` row and stops at its own ``context_lens[b]``,
-        and the kernels are numerically identical to the single-row ones.  On a
-        backend without the batched entry this calls the single-token entry once
-        per row on row slices; both paths must stay bit-identical per row.
+        这里三个阶段里有两个是批处理的：投影（所有行共用一次权重读取，见
+        ``models/qwen35/batch.py``），以及——在后端原生提供批处理分页注意力时——
+        注意力本身，于是整个 bucket 只 launch 一次而不是 B 次。每一行仍通过自己的
+        ``pos2slot`` 行解析位置、在自己那行的 ``context_lens[b]`` 处停下，内核的
+        数值与单行版本完全相同。后端没有批处理入口时，它对行切片逐行调用单 token
+        入口；两条路径必须逐行逐位一致。
 
-        ``ctx`` may carry a 5th entry: the per-row ``rope_delta`` ``[B]`` long
-        (mRoPE text offset of a request that has an image).  It only moves the
-        cos/sin lookup; ``positions`` keeps addressing the KV slot.
+        ``ctx`` 可以带第 5 项：逐行的 ``rope_delta``，长度 ``[B]``（带图像的请求的
+        mRoPE 文本偏移）。它只移动 cos/sin 查找；``positions`` 继续寻址 KV 槽位。
 
         Args:
-            x: Decode-row inputs, ``[B, hidden]``.
-            positions: Current token index per row, ``[B]`` long.
-            ctx: ``(cos_tbl, sin_tbl, mask_idx[, context_lens[, rope_delta]])``.
-                ``context_lens`` is ``[B]`` int32 and selects the batched entry;
-                ``rope_delta`` is ``[B]`` long and moves only the rotation.
+            x: 解码行输入，``[B, hidden]``。
+            positions: 每行的当前 token 下标，长度 ``[B]``。
+            ctx: ``(cos_tbl, sin_tbl, mask_idx[, context_lens[, rope_delta]])``。
+                ``context_lens`` 是 ``[B]`` 的 int32，用来选择批处理入口；
+                ``rope_delta`` 是 ``[B]`` 的 long，只移动旋转。
 
         Returns:
-            ``[B, hidden]`` gated attention output after the batched ``o_proj``.
+            ``[B, hidden]``，经批处理 ``o_proj`` 之后的加门注意力输出。
 
         Raises:
-            RuntimeError: No paged pool is attached. The batched path reads the
-                pool's slot maps, so the caller must attach a pool before enabling
-                batching or stay on single-stream decode. This is a configuration
-                error, not a missing-kernel one: every backend answers both
-                attention entries.
+            RuntimeError: 没有挂分页池。批处理路径要读池的槽位表，所以调用方必须
+                在打开批处理之前挂好池，否则就留在单流解码。这是配置错误，不是缺
+                内核：每个后端都应答两个注意力入口。
         """
         cos_tbl, sin_tbl, mask_idx = ctx[0], ctx[1], ctx[2]
         ctx_lens = ctx[3] if len(ctx) > 3 else None
@@ -456,7 +419,7 @@ class FullAttn:
         k = self.k_norm(k.reshape(B, self.nkv, self.hd))
         v = v.reshape(B, self.nkv, self.hd)
 
-        # [B, 1, rot]: the singleton is the token axis the block kernels expect.
+        # [B, 1, rot]：那个单元素维是块内核期望的 token 轴。
         rope_pos = positions if rope_delta is None else positions + rope_delta[:B]
         cos = cos_tbl.index_select(0, rope_pos)
         sin = sin_tbl.index_select(0, rope_pos)
@@ -464,8 +427,8 @@ class FullAttn:
 
         kp, vp, kps, vps = self._pool_views()
         if ctx_lens is not None and _CAPS.batch_attn:
-            # One launch for the whole bucket: quantise every row, write every
-            # row's K/V through its own slot, then one paged-attention pass.
+            # 整个 bucket 一次 launch：量化每一行、把每行的 K/V 写进各自槽位，然后
+            # 一趟分页注意力。
             qk, sk = self._quant_rows(k, self.k_i8[:B], self.k_s[:B])
             qv, sv = self._quant_rows(v, self.v_i8[:B], self.v_s[:B])
             slots = self.pool.pos2slot[:B].gather(1, positions.view(B, 1)).squeeze(1)
@@ -485,27 +448,25 @@ class FullAttn:
                                 self.pool.pos2slot[b], self.attn_out[b], pos_b,
                                 self.max_seq, self.rep, self.scale,
                                 self.part_acc[b], self.part_ml[b])
-        # Only the first ``B`` rows of the capacity-sized buffer were written; the
-        # slice is what keeps the projection's K at nh*hd.
+        # 按容量定尺寸的缓冲区只写了前 ``B`` 行；切片让投影的 K 维保持为 nh*hd。
         return batch_proj(self.o_proj, self.attn_out[:B].reshape(B, -1))
 
     @staticmethod
     def _quant_seq(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """[C, nkv, hd] bf16 -> (int8, per-(token, head) scale).
+        """[C, nkv, hd] bf16 -> (int8, 逐 (token, 头) scale)。
 
-        Unlike the decode and batch paths this one allocates: ``C`` is the prefill chunk
-        length, so a per-layer buffer would have to be sized for the longest chunk the engine
-        will ever take and would sit resident for the whole run. Prefill is compute-bound and
-        runs once per request rather than once per token, so the one launch saved is the win
-        worth having here and the allocation is not worth removing.
+        和解码、批处理路径不同，这一条会分配：``C`` 是预填充分块长度，逐层常驻缓冲区
+        就得按引擎可能接受的最长分块定尺寸，而且整轮运行都占着。预填充是计算受限的，
+        且每请求跑一次而不是每 token 一次，所以这里值得要的是省下的那一次 launch，
+        分配倒不值得消掉。
 
         Args:
-            x: Several tokens' K or V, ``[C, nkv, hd]``, in the compute dtype.
+            x: 若干 token 的 K 或 V，``[C, nkv, hd]``，计算 dtype。
 
         Returns:
-            ``(q, s)`` with int8 codes ``[C, nkv, hd]`` and fp32 scales ``[C, nkv]``. Same
-            per-token reduction as :meth:`_quant`, so a prefill chunk and a per-token write
-            quantise identically.
+            ``(q, s)``：``[C, nkv, hd]`` 的 int8 码和 ``[C, nkv]`` 的 fp32 scale。
+            逐 token 归约与 :meth:`_quant` 相同，所以分块预填充和逐 token 写入的量化
+            结果一致。
         """
         C, nkv = x.shape[0], x.shape[1]
         rows = C * nkv
@@ -515,31 +476,30 @@ class FullAttn:
         return q, s
 
     def prefill_project(self, x: torch.Tensor):
-        """Projection half of prefill: ``[C, hidden]`` -> raw ``(qg, k, v)``.
+        """预填充的投影半边：``[C, hidden]`` -> 原始 ``(qg, k, v)``。
 
-        Split out so a group prefill can run one GEMM over the concatenated
-        prompts of several sequences and slice the result afterwards.
+        拆出来是为了让组预填充对若干个序列拼接后的 prompt 只跑一次 GEMM，事后再
+        切分结果。
 
         Args:
-            x: Prefill inputs, ``[C, hidden]``.
+            x: 预填充输入，``[C, hidden]``。
 
         Returns:
-            ``(qg, k, v)`` before the q/k norms and rope, i.e. the raw projection
-            the caller may concatenate and later hand to :meth:`prefill_attend`.
+            经过 q/k 归一化和 rope 之前的 ``(qg, k, v)``，也就是调用方可以拼接、
+            之后再交给 :meth:`prefill_attend` 的原始投影。
         """
         return self.qkv.prefill(x)
 
     def enable_multi_q(self, capacity: int, width: int) -> None:
-        """Buffers for the multi-query verify: one ``(row, token)`` query pair row.
+        """多查询校验的缓冲区：每个 (行, token) 查询对占一行。
 
         Args:
-            capacity: Decode rows.
-            width: Drafted tokens per row (``c``); a row and its ``c`` queries
-                become ``c`` entries of the leading dim.
+            capacity: 解码行数。
+            width: 每行草拟的 token 数（``c``）；一行及其 ``c`` 个查询变成首维上的
+                ``c`` 个条目。
 
         Returns:
-            Nothing. Buffers are allocated here and only here, because the
-            verify graph captures these addresses.
+            无。缓冲区只在这里分配，因为校验图捕获的就是这些地址。
         """
         self._mq_width = int(width)
         n = capacity * int(width)
@@ -551,27 +511,26 @@ class FullAttn:
 
     def verify_batch_multi(self, qg: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                            positions: torch.Tensor, ctx, rows: int) -> torch.Tensor:
-        """One multi-query attention call for the whole one-forward verify.
+        """整个一次前向校验只调一次的多查询注意力。
 
-        ``qg``/``k``/``v`` are the layer projection over ``rows*c`` tokens
-        (row-major), ``positions`` is ``[rows, c]``.  Every token's K/V is written
-        at its own slot (one indexed write for all ``rows*c`` tokens), then
-        ``attn_paged_multi_q`` serves all ``c`` queries of every row from one pass
-        over that row's history KV.  Returns the pre-``o_proj`` attention output
-        ``[rows*c, nh*hd]``; the caller runs the wide projection once.
+        ``qg``/``k``/``v`` 是对 ``rows*c`` 个 token 的层投影（行主序），``positions``
+        是 ``[rows, c]``。每个 token 的 K/V 写进各自槽位（``rows*c`` 个 token 一次
+        索引写入），然后 ``attn_paged_multi_q`` 用一趟遍历该行历史 KV 的扫描，服务
+        该行全部 ``c`` 个查询。返回 ``o_proj`` 之前的注意力输出
+        ``[rows*c, nh*hd]``；调用方只跑一次宽投影。
 
         Args:
-            qg: Packed query and gate, ``[rows*c, 2*nh*hd]``.
-            k: Keys, ``[rows*c, nkv*hd]``.
-            v: Values, ``[rows*c, nkv*hd]``.
-            positions: Token indices, ``[rows, c]`` long, row-major inside a row.
-            ctx: ``(cos_tbl, sin_tbl[, rope_delta_rows])``; a 5th entry is the
-                per-row mRoPE offset, applied to the rotation only.
-            rows: Row count ``b``; ``c`` is read from ``positions``.
+            qg: 打包的查询与门，``[rows*c, 2*nh*hd]``。
+            k: 键，``[rows*c, nkv*hd]``。
+            v: 值，``[rows*c, nkv*hd]``。
+            positions: token 下标，``[rows, c]`` 的 long，行内行主序。
+            ctx: ``(cos_tbl, sin_tbl[, rope_delta_rows])``；第 5 项是逐行 mRoPE
+                偏移，只作用在旋转上。
+            rows: 行数 ``b``；``c`` 从 ``positions`` 读。
 
         Returns:
-            ``[rows*c, nh*hd]`` gated attention output before ``o_proj``, so the
-            caller can run that weight read once for the whole verify batch.
+            ``[rows*c, nh*hd]``，``o_proj`` 之前的加门注意力输出，调用方因此可以对
+            整个校验批只做一次那笔权重读取。
         """
         cos_tbl, sin_tbl = ctx[0], ctx[1]
         b = rows
@@ -582,9 +541,8 @@ class FullAttn:
         q = self.q_norm(q)
         k = self.k_norm(k.view(b, c, self.nkv, self.hd))
         v = v.view(b, c, self.nkv, self.hd)
-        # The rotation's position is ``token index + rope_delta``; the KV slot and
-        # the per-row window stay at the token index. ``[b*c]`` rows so one launch covers
-        # the whole verify window.
+        # 旋转的位置是 ``token 下标 + rope_delta``；KV 槽位和逐行窗口仍停在 token
+        # 下标上。``[b*c]`` 行，一次 launch 就覆盖整个校验窗口。
         rope_pos = positions if len(ctx) < 5 else positions + ctx[4][:b, None]
         cos = cos_tbl.index_select(0, rope_pos.reshape(-1))
         sin = sin_tbl.index_select(0, rope_pos.reshape(-1))
@@ -593,9 +551,8 @@ class FullAttn:
         q = q.view(b, c, self.nh, self.hd)
         k = k.view(b, c, self.nkv, self.hd)
 
-        # Every verified token's K/V goes in, then the multi-query attention reads
-        # each row's history once for all c queries (the kernel masks query j at
-        # pos j, so one pass serves the whole speculative block).
+        # 每个校验 token 的 K/V 都写进去，然后多查询注意力为全部 c 个查询只读一次
+        # 每行的历史（内核会把查询 j 掩在位置 j，所以一趟就服务整个投机块）。
         kq, ks = self._quant_seq(k.reshape(n, self.nkv, self.hd))
         vq, vs = self._quant_seq(v.reshape(n, self.nkv, self.hd))
         slots = torch.stack([self.pool.pos2slot[i].index_select(0, positions[i])
@@ -615,29 +572,24 @@ class FullAttn:
 
     def verify_batch_step(self, qg: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                           positions: torch.Tensor, ctx) -> torch.Tensor:
-        """One verified token for ``B`` rows, from already-projected q/k/v.
+        """从已投影好的 q/k/v 出发，为 ``B`` 行处理一个校验 token。
 
-        Same attention as the decode step (the fused paged kernel, so the numbers
-        agree with greedy), one batched launch for the whole bucket: the verify
-        graph projects all ``B*c`` tokens once and then walks the ``c`` token
-        positions through this entry point.  ``ctx`` may carry the per-row
-        ``rope_delta`` as a 5th entry (mRoPE after an image; ``positions`` keeps
-        addressing the KV slot).
+        注意力和解码步相同（融合的分页内核，数字因此与贪心解码一致），整个 bucket
+        一次批处理 launch：校验图把 ``B*c`` 个 token 一次投影完，然后让 ``c`` 个
+        token 位置逐个走这个入口。``ctx`` 可以把逐行 ``rope_delta`` 作为第 5 项
+        带上（图像之后的 mRoPE；``positions`` 继续寻址 KV 槽位）。
 
         Args:
-            qg: Already-projected query and gate for the ``c`` tokens of each
-                row, ``[B*c, 2*nh*hd]``.
-            k: Projected keys, ``[B*c, nkv*hd]``.
-            v: Projected values, ``[B*c, nkv*hd]``.
-            positions: Token indices, ``[B, c]`` long; used both to place the KV
-                and, plus ``rope_delta``, to look up the rotation.
-            ctx: ``(cos_tbl, sin_tbl, mask_idx)``; a 5th entry is the per-row
-                mRoPE offset.
+            qg: 每行 ``c`` 个 token 的已投影查询与门，``[B*c, 2*nh*hd]``。
+            k: 已投影的键，``[B*c, nkv*hd]``。
+            v: 已投影的值，``[B*c, nkv*hd]``。
+            positions: token 下标，``[B, c]`` 的 long；既用来放 KV，也在加上
+                ``rope_delta`` 后用来查旋转。
+            ctx: ``(cos_tbl, sin_tbl, mask_idx)``；第 5 项是逐行 mRoPE 偏移。
 
         Returns:
-            ``[B, hidden]`` gated output after ``o_proj`` -- one row per verified
-            token, which the caller compares against the draft to accept or
-            reject.
+            ``[B, hidden]``，经 ``o_proj`` 之后的加门输出——每个校验 token 一行，
+            调用方拿它和草稿比较来决定接受还是拒绝。
         """
         cos_tbl, sin_tbl, mask_idx = ctx[0], ctx[1], ctx[2]
         b = qg.shape[0]
@@ -655,8 +607,8 @@ class FullAttn:
         kp, vp, kps, vps = self._pool_views()
         slots = self.pool.pos2slot[:b].gather(1, positions.view(b, 1)).squeeze(1)
         self.pool.write_rows(self.pidx, slots, qk, sk, qv, sv)
-        # ``attn_paged_batch`` takes a length, not a last index, so +1 turns the
-        # token position into a count. In place, because this is a captured path.
+        # ``attn_paged_batch`` 要的是长度而不是末下标，所以 +1 把 token 位置变成计数。
+        # 就地做，因为这是捕获路径。
         lens = positions.to(torch.int32).add_(1)
         bops.attn_paged_batch(q, gate, kp, vp, kps, vps,
                               self.pool.pos2slot[:b], lens,
@@ -667,40 +619,35 @@ class FullAttn:
     def prefill_attend(self, qg: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                        positions: torch.Tensor, ctx, tiles: list | None = None,
                        row: int | None = None, rope=None) -> torch.Tensor:
-        """Attention half of prefill: raw ``(qg, k, v)`` -> gated ``[C, nh*hd]``.
+        """预填充的注意力半边：原始 ``(qg, k, v)`` -> 加门后的 ``[C, nh*hd]``。
 
-        Writes the C tokens into ``row``'s KV slots and attends over that row's
-        own window.  ``o_proj`` is left to the caller, so a group prefill can run
-        it once over every sequence's output (it is a weight read).
+        把 C 个 token 写进 ``row`` 的 KV 槽位，并在该行自己的窗口上做注意力。
+        ``o_proj`` 留给调用方，组预填充因此可以对所有序列的输出只跑它一次（那是一笔
+        权重读取）。
 
-        ``rope`` is an optional explicit ``(cos, sin)`` pair of ``[C, rot]`` rows
-        (``ops.mrope.MRopeMapper``), used by a chunk that contains image tokens:
-        there the three position axes differ per token, so a single table lookup
-        cannot produce the rotation, and the causal/KV side still uses
-        ``positions``.  ``None`` keeps the 1-D table path unchanged.  When the
-        argument is ``None`` but ``ctx`` carries a 4th entry, that entry is the
-        rope pair: the prefill call chain (``Layer.prefill`` ->
-        ``prefill_state``) only forwards ``ctx``, and this is the same pass-through
-        style ``FullAttn.batch`` already uses for ``ctx_lens``.
+        ``rope`` 是可选的显式 ``(cos, sin)`` 对，形状 ``[C, rot]``
+        （``ops.mrope.MRopeMapper``），用于含图像 token 的分块：那里三根位置轴逐
+        token 不同，单次查表给不出旋转，而因果/KV 那一侧仍用 ``positions``。
+        ``None`` 时一维表路径保持不变。当参数为 ``None`` 但 ``ctx`` 带了第 4 项时，
+        那一项就是 rope 对：预填充调用链（``Layer.prefill`` -> ``prefill_state``）
+        只转发 ``ctx``，而 ``FullAttn.batch`` 对 ``ctx_lens`` 用的也是这种透传方式。
 
         Args:
-            qg: Packed query and gate, ``[C, 2*nh*hd]``.
-            k: Keys, ``[C, nkv*hd]``.
-            v: Values, ``[C, nkv*hd]``.
-            positions: Absolute token indices of the chunk, ``[C]`` long; they
-                address both the KV slots and, without explicit ``rope``, the
-                rotation table.
-            ctx: ``(cos_tbl, sin_tbl, mask_idx[, rope])``.
-            tiles: ``(q0, q1, p0, kend)`` query tiles from ``Qwen35.prefill``.
-                ``None`` treats the whole chunk as one tile, correct but with the
-                wasted upper-triangle work described in :meth:`prefill`.
-            row: Slot-map row to write. Defaults to the staging row.
-            rope: Explicit ``(cos, sin)`` of ``[C, rot]`` for a chunk holding
-                image tokens, where a single table lookup cannot produce the
-                three-axis rotation.
+            qg: 打包的查询与门，``[C, 2*nh*hd]``。
+            k: 键，``[C, nkv*hd]``。
+            v: 值，``[C, nkv*hd]``。
+            positions: 该分块的绝对 token 下标，长度 ``[C]``；它们既寻址 KV 槽位，
+                在没有显式 ``rope`` 时也用来查旋转表。
+            ctx: ``(cos_tbl, sin_tbl, mask_idx[, rope])``。
+            tiles: 来自 ``Qwen35.prefill`` 的 ``(q0, q1, p0, kend)`` 查询块。
+                ``None`` 把整个分块当成一块，结果正确，但会浪费 :meth:`prefill`
+                里说的上三角工作量。
+            row: 要写的槽位表行。默认是暂存行。
+            rope: 含图像 token 的分块要用的显式 ``(cos, sin)``，``[C, rot]``；
+                这种分块单次查表给不出三轴旋转。
 
         Returns:
-            ``[C, nh*hd]`` gated attention output, before ``o_proj``.
+            ``[C, nh*hd]``，``o_proj`` 之前的加门注意力输出。
         """
         if row is None:
             row = self.prefill_row
@@ -708,8 +655,7 @@ class FullAttn:
         if rope is None and len(ctx) > 3:
             rope = ctx[3]
         C = qg.shape[0]
-        # The tile list is authoritative for the key range when present: its
-        # bounds already account for a prefix the caller sliced off the front.
+        # 有 tiles 时 key 范围以它为准：它的边界已经把调用方从前面切掉的前缀算进去了。
         if tiles is None:
             p0, p1 = int(positions[0]), int(positions[-1]) + 1
         else:
@@ -724,8 +670,8 @@ class FullAttn:
             cos = cos_tbl.index_select(0, positions)
             sin = sin_tbl.index_select(0, positions)
         else:
-            # The mRoPE pair arrives already gathered and fp32-shaped as [C, rot]; the
-            # kernel narrows it per element, which is what the chain's ``.to(dtype)`` did.
+            # mRoPE 的对到达时已经 gather 好、是 [C, rot] 的 fp32；内核逐元素收窄它，
+            # 也就是原来链里 ``.to(dtype)`` 干的事。
             cos = rope[0].to(cos_tbl.dtype)
             sin = rope[1].to(sin_tbl.dtype)
         q, k = self.rope(q, k, cos, sin)
@@ -733,10 +679,9 @@ class FullAttn:
         qk, sk = self._quant_seq(k)
         qv, sv = self._quant_seq(v)
         if self.pool is not None:
-            # Paged: scatter the C new tokens into the pool, then read back a dense
-            # view for the attention itself. Prefill is compute-bound, so the
-            # materialised view costs little and keeps this path identical to the
-            # dense one (the reference paged implementation does the same).
+            # 分页时：把 C 个新 token 散写进池，再为注意力本身读回一个稠密视图。预填充
+            # 是计算受限的，实体化那个视图代价不大，还能让这条路径与稠密版保持同一份
+            # 实现（参考实现的分页版也这么做）。
             slots = self.pool.slots_for(positions, row)
             self.pool.write_range(self.pidx, slots, qk, sk, qv, sv)
             kk, vv, kkp, vvp = self.pool.gather(self.pidx, p1, row=row)
@@ -745,21 +690,18 @@ class FullAttn:
             self.vcache[:, p0:p1] = qv.transpose(0, 1)
             self.kscale[:, p0:p1] = sk.transpose(0, 1)
             self.vscale[:, p0:p1] = sv.transpose(0, 1)
-            # [nkv, S, hd] int8: only the prefix up to p1 is addressed by this
-            # chunk, so the tail is never touched and needs no zeroing.
+            # [nkv, S, hd] 的 int8：这次分块只寻址到 p1 为止的前缀，尾部永远碰不到，
+            # 不需要清零。
             kk = self.kcache[:, :p1]
             vv = self.vcache[:, :p1]
             kkp = self.kscale[:, :p1]
             vvp = self.vscale[:, :p1]
 
-        # The two attention matmuls run on fp16 operands for the same reason the
-        # projections do: this part has packed fp16 math and no packed bf16 math,
-        # so the same einsum is ~2-3x faster (the accumulators stay fp32 on both
-        # sides).  The rest of the block keeps bf16, which is what the KV cache
-        # quantiser and the gates are written against.  The widening is done *per
-        # key block*, not once for the whole prefix: widening the prefix once costs
-        # 4 KB per token of context (1.07 GB at 256k) and that buffer has to be
-        # live for the whole layer call, which is what a long prompt cannot afford.
+        # 两个注意力矩阵乘都用 fp16 操作数，原因和投影一样：这颗芯片有 packed fp16
+        # 计算、没有 packed bf16 计算，同一个 einsum 快约 2-3x（两边累加器都仍是
+        # fp32）。块里其余部分保持 bf16，KV 量化器和门都是照它写的。加宽是*按 key
+        # 块*做的，不是对整段前缀做一次：整段加宽每个上下文 token 要 4 KB（256k 时
+        # 1.07 GB），而且那份缓冲区得在整个层调用期间活着，长 prompt 负担不起。
         if tiles is None:
             tiles = [(0, C, p0, p1)]
         KB = PREFILL_ATTN_KB
@@ -769,24 +711,23 @@ class FullAttn:
             qe = q[q0:q1].reshape(nq, self.nkv, self.rep, self.hd).permute(1, 2, 0, 3)
             qf = qe.to(WF)
             qpos = positions[q0:q1]
-            # Online softmax over key blocks: acc is the unnormalised output, m the
-            # running max and l the running denominator, all [nkv, rep, nq, .]
+            # 在 key 块上做 online softmax：acc 是未归一化输出，m 是运行最大值，l 是
+            # 运行分母，全部形状 [nkv, rep, nq, .]
             acc = m = l = None
             for k0 in range(0, kend, KB):
                 k1 = min(k0 + KB, kend)
                 kb16 = kk[:, k0:k1].to(WF)
                 scores = torch.einsum("ghcd,gsd->ghcs", qf, kb16).float()
-                # One fused scale instead of two multiplies, and the causal mask in
-                # place: the score block is the largest tensor in the layer, so every
-                # extra pass over it is worth avoiding.  `tiles` carries absolute
-                # positions, so the mask and the cache slice line up directly.
+                # 用一次融合缩放代替两次乘法，并就地施加因果掩码：score 块是层里最大的
+                # 张量，多遍历它一遍都值得避免。`tiles` 带的是绝对位置，掩码和缓存
+                # 切片因此直接对齐。
                 scores *= (kkp[:, k0:k1] * self.scale)[:, None, None, :]
                 scores.masked_fill_(
                     (mask_idx[None, k0:k1] > qpos[:, None])[None, None, :, :], NEG_INF)
                 bmax = scores.amax(-1, keepdim=True)
                 if acc is None:
-                    # The first block always contains key 0, which every query can
-                    # see, so bmax is finite here and no -inf arithmetic can leak in.
+                    # 第一个块总是包含 key 0，每个查询都看得到它，所以这里 bmax 是
+                    # 有限值，不会有 -inf 运算漏进来。
                     m = bmax
                     p = (scores - m).exp()
                     l = p.sum(-1, keepdim=True)
@@ -797,13 +738,13 @@ class FullAttn:
                     l = l * alpha + p.sum(-1, keepdim=True)
                     acc *= alpha
                     m = mnew
-                # Fold the per-token V scale into the weights (as the untiled
-                # version does) so the einsum runs on raw int8-widened V.
+                # 把逐 token 的 V scale 折进权重（不分块的版本也这么做），einsum 就在
+                # 原始 int8 加宽后的 V 上跑。
                 pw = (p * vvp[:, None, None, k0:k1]).to(WF)
                 pv = torch.einsum("ghcs,gsd->ghcd", pw, vv[:, k0:k1].to(WF))
                 acc = pv if acc is None else acc + pv
-            # acc/l is the normalised tile output in (nkv, rep, nq, hd); the
-            # permute restores (nq, nh, hd) before the gate is applied.
+            # acc/l 是 (nkv, rep, nq, hd) 下归一化后的切块输出；permute 在加门之前把
+            # 它恢复成 (nq, nh, hd)。
             out[q0:q1] = (acc / l).permute(2, 0, 1, 3).reshape(nq, self.nh, self.hd).to(D)
         out = out * gate.sigmoid()
         return out.reshape(C, -1)
@@ -811,30 +752,27 @@ class FullAttn:
     def prefill(self, x: torch.Tensor, positions: torch.Tensor, ctx,
                 tiles: list | None = None, row: int | None = None,
                 rope=None) -> torch.Tensor:
-        """``x`` [C, hidden] -> [C, hidden]; writes C tokens into the KV cache.
+        """``x`` [C, hidden] -> [C, hidden]；把 C 个 token 写进 KV 缓存。
 
-        With ``tiles`` (``(q0, q1, kend)`` triples from ``Qwen35.prefill``) the
-        attention runs query-tile by query-tile over a key range that stops at the
-        tile's own end.  That is not just an L2 trick: the untiled version builds a
-        full ``[nkv, rep, C, p1]`` score block and masks off the upper triangle, so
-        half of its matmul and softmax work at pos=0 (a quarter at pos=2048) is
-        thrown away.  Tiling cuts the score/softmax/PV traffic by the same fraction
-        and makes the block small enough to stay in cache.  ``row`` selects the
-        slot-map row (default: the staging row); the batched drafter passes each
-        sequence's own row.  ``rope`` is the optional explicit 3-D ``(cos, sin)``
-        for a chunk with image tokens (see :meth:`prefill_attend`).
+        给了 ``tiles``（来自 ``Qwen35.prefill`` 的 ``(q0, q1, kend)`` 三元组）时，
+        注意力逐查询块跑，key 范围只到该块自己的末尾为止。这不只是 L2 层面的技巧：
+        不分块的版本会构造完整的 ``[nkv, rep, C, p1]`` score 块再掩掉上三角，于是
+        pos=0 时一半（pos=2048 时四分之一）的矩阵乘和 softmax 计算被白白扔掉。分块
+        把 score/softmax/PV 的流量按同样比例砍掉，块还小到能留在缓存里。``row`` 选择
+        槽位表行（默认暂存行）；批处理草稿器传各序列自己的行。``rope`` 是含图像 token
+        的分块要用的可选显式三维 ``(cos, sin)``（见 :meth:`prefill_attend`）。
 
         Args:
-            x: Prefill inputs, ``[C, hidden]``.
-            positions: Absolute token indices of the chunk, ``[C]`` long.
-            ctx: ``(cos_tbl, sin_tbl, mask_idx[, rope])``.
-            tiles: ``(q0, q1, p0, kend)`` query tiles, from ``Qwen35.prefill``.
-            row: Slot-map row to write; ``None`` uses the staging row.
-            rope: Explicit 3-D ``(cos, sin)`` for a chunk containing image tokens.
+            x: 预填充输入，``[C, hidden]``。
+            positions: 该分块的绝对 token 下标，长度 ``[C]``。
+            ctx: ``(cos_tbl, sin_tbl, mask_idx[, rope])``。
+            tiles: 来自 ``Qwen35.prefill`` 的 ``(q0, q1, p0, kend)`` 查询块。
+            row: 要写的槽位表行；``None`` 用暂存行。
+            rope: 含图像 token 的分块要用的显式三维 ``(cos, sin)``。
 
         Returns:
-            ``[C, hidden]`` layer output after ``o_proj``, in the same order as
-            ``x`` so the residual add lines up.
+            ``[C, hidden]``，经 ``o_proj`` 之后的层输出，顺序与 ``x`` 一致，残差
+            相加才能对齐。
         """
         proj = self.prefill_project(x)
         out = self.prefill_attend(*proj, positions, ctx, tiles,
@@ -843,32 +781,28 @@ class FullAttn:
 
     def verify(self, x: torch.Tensor, positions, cos_tbl, sin_tbl, mask_idx,
                rope_delta=None) -> torch.Tensor:
-        """``x`` [C, hidden] -> [C, hidden] for C drafted tokens at ``positions``.
+        """``x`` [C, hidden] -> [C, hidden]，处理 ``positions`` 处的 C 个草稿 token。
 
-        The projections are batched; each token then runs through the same fused
-        attention as the decode step, writing its own KV slot. Rollback is free
-        here: the cache is position-indexed, so rewinding is just the position
-        counter.  ``rope_delta`` (optional, 0-d or ``[1]`` long) is the request's
-        mRoPE offset: ``positions`` keeps addressing KV slots, the rotation reads
-        ``positions + rope_delta``.
+        投影是批处理的；之后每个 token 都走与解码步相同的融合注意力，写自己的 KV
+        槽位。这里的回滚是免费的：缓存按位置索引，倒回就是移动位置计数器。
+        ``rope_delta``（可选，0 维或长度 ``[1]``）是该请求的 mRoPE 偏移：
+        ``positions`` 继续寻址 KV 槽位，旋转读的是 ``positions + rope_delta``。
 
-        Rolling back by the position counter only works because a rejected draft
-        leaves nothing behind: the next prefill overwrites those slots. That is
-        why the loop writes each token's KV before attending -- a rejected token
-        is never read again.
+        靠位置计数器回滚之所以成立，是因为被拒的草稿什么都不留：下一次预填充会覆盖
+        那些槽位。这也是循环在注意之前先写每个 token 的 KV 的原因——被拒的 token 不会
+        再被读到。
 
         Args:
-            x: The drafted tokens' inputs, ``[C, hidden]``.
-            positions: Token indices of the drafted tokens, ``[C]`` long.
-            cos_tbl: RoPE cos table.
-            sin_tbl: RoPE sin table.
-            mask_idx: Device-side position counter for the mask.
-            rope_delta: Optional mRoPE offset, 0-d or ``[1]`` long; moves only the
-                rotation.
+            x: 草稿 token 的输入，``[C, hidden]``。
+            positions: 草稿 token 的 token 下标，长度 ``[C]``。
+            cos_tbl: RoPE 余弦表。
+            sin_tbl: RoPE 正弦表。
+            mask_idx: 设备侧位置计数器，供掩码使用。
+            rope_delta: 可选的 mRoPE 偏移，0 维或长度 ``[1]``；只移动旋转。
 
         Returns:
-            ``[C, hidden]`` layer output, one row per drafted token, which the
-            sampler compares against the draft to accept the longest prefix.
+            ``[C, hidden]`` 层输出，每个草稿 token 一行，采样器拿它和草稿比较，接受
+            最长的前缀。
         """
         C = x.shape[0]
         qg, k, v = self.qkv.prefill(x)
@@ -911,16 +845,15 @@ class FullAttn:
         return self.o_proj.prefill(out.reshape(C, -1))
 
     def reset(self) -> None:
-        """Clear the dense KV cache between requests.
+        """在请求之间清空稠密 KV 缓存。
 
         Returns:
-            Nothing. Zeroing is not needed for correctness of the next prefill --
-            positions are overwritten before they are read -- but a stale int8
-            scale from a previous request would be dequantised by any path that
-            reads past the current length, so the buffers start neutral.
+            无。清零对下一次预填充的正确性并非必需——位置在读取前就被覆写了——但上一个
+            请求残留的 int8 scale 会被任何读过当前长度的路径反量化，所以缓冲区从干净
+            状态开始。
 
-        Only the dense cache is cleared: with a pool attached the session owns
-        the slots, and zeroing here would wipe a prefix another sequence shares.
+        只清稠密缓存：挂上池之后槽位归会话所有，在这里清零会抹掉别的序列共享的
+        前缀。
         """
         if self.pool is not None:
             return

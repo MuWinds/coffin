@@ -1,4 +1,14 @@
-"""Command-line entry point for the OpenAI-compatible HTTP adapter."""
+"""OpenAI 兼容 HTTP 适配器的命令行入口。
+
+Module: ``coffin.entrypoints.cli``。只负责解析开关、等常驻引擎就绪、把 HTTP
+层挂起来；模型和 KV 都在引擎进程里，不在本进程。
+
+Constraints:
+    * 启动时轮询 ``ping``：HTTP 层可能先于引擎起来，读不到引擎信息就没法
+      向 ``/v1/models`` 报告模型 id。
+    * 引擎是单流的，没有取消通道；``--default-max-tokens`` /
+      ``--max-decode-seconds`` 的默认值就是为这种情况兜底的。
+"""
 
 from __future__ import annotations
 
@@ -12,7 +22,15 @@ from entrypoints.openai.client import EngineClient
 
 
 def main() -> None:
-    """Wait for the resident engine, configure the HTTP adapter and serve."""
+    """等常驻引擎可用，配置好 HTTP 适配器后开始服务。
+
+    先轮询 ``ping`` 拿到引擎信息（模型 id、checkpoint 路径、是否有视觉能力），
+    这些是 ``/v1/models`` 和 ``/health`` 的唯一数据来源。
+
+    Raises:
+        SystemExit: 连续三次 ping 都失败。此时报错退出比带着空配置起 HTTP
+            服务好——后者只会把每个请求都变成 500。
+    """
     ap = argparse.ArgumentParser(description="OpenAI-compatible HTTP API in front of "
                                      "the resident engine")
     ap.add_argument("--sock", default=_app.SOCK,

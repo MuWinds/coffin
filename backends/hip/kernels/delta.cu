@@ -1,30 +1,25 @@
 // @file delta.cu
-// @brief Gated DeltaNet decode step (the 24 linear-attention layers of Qwen3.5).
+// @brief Gated DeltaNet 的解码步（Qwen3.5 的 24 个线性注意力层）。
 //
-// Module: coffin/kernels. Consumes the fp32 q/k/v/beta/g that ``linear_attn.cu``
-// produces and updates the recurrent state in place; the batched version is in
-// ``batch.cu``.
+// Module: coffin/kernels。消费 ``linear_attn.cu`` 产出的 fp32 q/k/v/beta/g，并原地更新
+// 循环状态；批处理版本在 ``batch.cu``。
 //
-// The recurrence per token is
+// 每个 token 的循环是
 //     st = st * exp(g)[:, None, None]
 //     kv = (st * k[:, :, None]).sum(-2)
 //     st = st + k[:, :, None] * ((v - kv) * beta)[:, None, :]
 //     out = (st * q[:, :, None]).sum(-2)
-// As a chain of torch ops that is ~140 us per layer, i.e. 3.4 ms/token over 24
-// layers and about a tenth of the whole decode step. Every thread owns one column
-// j of the [dk, dv] state, and a column is only ever read and written by its own
-// thread, so no cross-thread communication is needed and the whole recurrence
-// collapses into a single kernel.
+// 用一串 torch 算子写，折合每层约 140 us，即 24 层下来 3.4 ms/token，占整个解码步的
+// 十分之一左右。每个线程独占 [dk, dv] 状态的第 j 列，而一列只由它自己的线程读写，因此
+// 不需要任何跨线程通信，整个循环塌缩成一个内核。
 //
 // Constraints:
-//   * ``dk`` must be a multiple of DELTA_SPLIT (4): the per-column partial is
-//     combined with three ``__shfl_xor`` steps inside a warp, so a different dk
-//     layout would silently change the fp32 sum order.
-//   * The state is updated in place; the caller must snapshot it with the KV
-//     before prefix reuse, or a later restore pairs shared keys with a state that
-//     has moved on.
-//   * Inputs are fp32 and contiguous: the prologue has already normalised and
-//     scaled q/k, so this kernel does no per-element fix-up.
+//   * ``dk`` 必须是 DELTA_SPLIT（4）的整数倍：每列的部分和要在 warp 内用三次
+//     ``__shfl_xor`` 合并，换一种 dk 布局会悄悄改变 fp32 的求和顺序。
+//   * 状态是原地更新的；前缀复用之前调用方必须把它和 KV 一起打快照，否则之后的一次恢复
+//     会把共享的 key 配上一个已经往前走了的状态。
+//   * 输入是 fp32 且连续存放：prologue 已经把 q/k 归一化和缩放好了，所以本内核不做任何
+//     逐元素修补。
 
 #include "hip_ops.h"
 
@@ -33,31 +28,26 @@
 
 namespace {
 
-//: dk slices per state column. The per-column partial is combined with
-//: ``__shfl_xor`` steps inside the warp, so this must stay a power of two and
-//: ``dk % DELTA_SPLIT == 0`` must hold or the state layout breaks.
+//: 每个状态列由多少个 dk 切片分担。每列的部分和要在 warp 内用 ``__shfl_xor`` 合并，
+//: 所以这里必须保持 2 的幂，且 ``dk % DELTA_SPLIT == 0`` 必须成立，否则状态布局就坏了。
 #define DELTA_SPLIT 4
 
-// @brief One block per (head, tile of value columns); DELTA_SPLIT threads share
-//        each column.
+// @brief 每个（头，value 列的一块）一个 block；每列由 DELTA_SPLIT 个线程分担。
 //
-// Each of the DELTA_SPLIT threads owns one slice of the dk loop and the
-// per-column partials are combined with two shuffles inside the warp.
+// 这 DELTA_SPLIT 个线程各拥有 dk 循环的一段，每列的部分和在 warp 内用两次 shuffle 合并。
 //
-// The earlier shape -- one thread per column, blockDim = dv = 128 -- launched 32
-// blocks for 64 CUs (half the card idle) and gave every thread a 2x128-iteration
-// serial walk with only two warps per CU to hide L2 latency. It measured
-// 2294 us/step on the int8 decode profile, 15.6% of the step; splitting dk four
-// ways cuts the serial chain to dk/4 and the block count up.
+// 早先的形状是「每列一个线程，blockDim = dv = 128」：64 个 CU 只启动了 32 个 block（半张
+// 卡空转），而且每个线程要走一遍 2x128 次迭代的串行循环，每 CU 只有两个 warp 去掩盖 L2
+// 延迟。实测在 int8 解码 profile 上 2294 us/步，占该步的 15.6%；把 dk 切成四份后串行链
+// 缩短到 dk/4，block 数也上去了。
 //
-// k and q are staged in shared memory because every thread needs all dk of them.
-// The first pass deliberately does not write e^g*S back: k^T(e^g S) = e^g(k^T S),
-// so the decay is applied again in the second pass, which removes one
-// read-modify-write of the 2 MB state per layer per token.
+// k 和 q 被暂存进共享内存，因为每个线程都需要它们的全部 dk。第一遍刻意不把 e^g*S 写回：
+// k^T(e^g S) = e^g(k^T S)，衰减留到第二遍再施加一次，于是省掉了每层每 token 对 2 MB
+// 状态的一次读-改-写。
 //
-// @param st  [heads, dk, dv] fp32 recurrent state, updated in place.
-// @param out [heads, dv] fp32; written by the lane that owns dk slice 0, so the
-//            four lanes of a column do not race.
+// @param st  [heads, dk, dv] fp32 循环状态，原地更新。
+// @param out [heads, dv] fp32；由拥有 dk 切片 0 的 lane 写出，这样一列上的四个 lane 不会
+//            互相竞争。
 __global__ void delta_kernel(const float* __restrict__ q, const float* __restrict__ k,
                              const float* __restrict__ v, const float* __restrict__ beta,
                              const float* __restrict__ g, float* __restrict__ st,
@@ -65,8 +55,8 @@ __global__ void delta_kernel(const float* __restrict__ q, const float* __restric
     const int head = blockIdx.x;
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
-    const int ii = lane & (DELTA_SPLIT - 1);              // dk slice
-    const int jj = lane >> 2;                             // column within the warp
+    const int ii = lane & (DELTA_SPLIT - 1);              // dk 切片
+    const int jj = lane >> 2;                             // warp 内的列
     const int cols_per_block = (blockDim.x >> 5) * (32 / DELTA_SPLIT);
     const int j = blockIdx.y * cols_per_block + warp * (32 / DELTA_SPLIT) + jj;
 
@@ -84,7 +74,7 @@ __global__ void delta_kernel(const float* __restrict__ q, const float* __restric
     }
     __syncthreads();
 
-    if (j >= dv) return;                                  // whole 4-lane group exits together
+    if (j >= dv) return;                                  // 整个 4-lane 组一起退出
     float* column = st + (size_t)head * dk * dv + j;
     const float value = v[(size_t)head * dv + j];
 
@@ -111,18 +101,17 @@ __global__ void delta_kernel(const float* __restrict__ q, const float* __restric
 
 }  // namespace
 
-// @brief One gated-delta-rule decode step: advances the recurrent state in place.
+// @brief 一步 gated delta 规则的解码：原地推进循环状态。
 //
-// @param q,k [heads, dk] fp32, already L2-normalised by ``delta_prologue`` (q
-//            additionally scaled), so this kernel applies no per-element fix-up.
-// @param v [heads, dv] fp32.
-// @param beta,g [heads] fp32 rate and decay.
-// @param st [heads, dk, dv] fp32 state, updated in place -- the caller owns the
-//           snapshot discipline that prefix reuse depends on.
-// @return ``out``, [heads, dv] fp32, returned for call chaining.
-// @throws c10::Error (TORCH_CHECK) when a non-beta/g input is non-contiguous, the
-//         head counts disagree with the state, or ``dk`` is not a multiple of
-//         DELTA_SPLIT (the four-lane shuffle cannot split it).
+// @param q,k [heads, dk] fp32，已由 ``delta_prologue`` 做过 L2 归一化（q 还额外缩放
+//            过），所以本内核不做任何逐元素修补。
+// @param v [heads, dv] fp32。
+// @param beta,g [heads] fp32 的写入速率与衰减。
+// @param st [heads, dk, dv] fp32 状态，原地更新——前缀复用所依赖的快照纪律由调用方
+//           负责。
+// @return ``out``，[heads, dv] fp32，返回以便链式调用。
+// @throws c10::Error（TORCH_CHECK）：非 beta/g 的输入不连续、头数与状态对不上，或 ``dk``
+//         不是 DELTA_SPLIT 的整数倍（四 lane 的 shuffle 切不开它）。
 torch::Tensor delta_step(torch::Tensor q, torch::Tensor k, torch::Tensor v,
                          torch::Tensor beta, torch::Tensor g,
                          torch::Tensor st, torch::Tensor out) {

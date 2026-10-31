@@ -1,40 +1,33 @@
-"""The gfx906 (Hygon DCU) backend: the contract adapter over this package's kernels.
+"""gfx906（Hygon DCU）后端：架在本包内核之上的一层契约适配器。
 
-S1 of the platform migration. The kernels and their host shim now live inside this
-package (``backends/hip/kernels/`` and ``backends/hip/shim.py``); this module is
-the *contract* adapter that makes them look like one of the platform backends, and
-it is the only place in ``coffin`` allowed to know the arch string, the ROCm
-environment variables and the split-K width.
+平台迁移的 S1 阶段。内核和它们的主机侧 shim 现在都在本包内
+（``backends/hip/kernels/`` 和 ``backends/hip/shim.py``）；本模块是*契约*适配器，
+让它们看起来像平台后端之一，也是 ``coffin`` 里唯一允许知道 arch 字符串、ROCm 环境
+变量和 split-K 宽度的位置。
 
-All four of the shim's ``gemv*`` families collapse to the three ``linear*`` entries
-here: ``R``/``U`` (rows per block, K-unroll), the wide-M kernels and the ``_dbg``
-A/B entry points are kernel tiling detail, so they become an internal choice keyed
-by shape instead of arguments in the contract.
+shim 的四个 ``gemv*`` 家族在这里全部收敛成三个 ``linear*`` 条目：``R``/``U``（每块
+行数、K-unroll）、wide-M 内核以及 ``_dbg`` A/B 入口都是内核切块细节，所以它们变成
+按形状索引的内部选择，而不是契约里的参数。
 
-Module: ``coffin/backends/hip``. Imports ``coffin.backends.protocol``,
-``coffin.backends.reference`` (to fill ops with no kernel) and, *lazily*,
-``coffin.backends.hip.shim`` -- lazily so importing this package on a host without
-a ROCm toolchain does not set the build environment variables or import
-``torch.utils.cpp_extension``.
+Module: ``coffin/backends/hip``。import ``coffin.backends.protocol``、
+``coffin.backends.reference``（用来补没有内核的算子）以及*惰性*的
+``coffin.backends.hip.shim``——惰性是为了在没有 ROCm 工具链的主机上 import 本包时
+不去设置构建环境变量、也不 import ``torch.utils.cpp_extension``。
 
 Constraints:
-    * Importing the shim has module-level side effects: it sets
-      ``PYTORCH_ROCM_ARCH`` and ``TORCH_EXTENSIONS_DIR`` and imports the CUDA/HIP
-      extension loader, which reads them at import time. It is therefore done
-      inside :func:`_hip`, never at module scope: a CPU-only box that merely asks
-      the registry to enumerate backends must not be reconfigured by the attempt,
-      and a process that selected a CoreX card must not inherit a gfx906 arch.
-    * The extension is built on first :func:`ops()` call (or first :func:`usable`
-      call), not at import: a broken toolchain must degrade to the eager path
-      instead of taking the process down, and the failure has to be memoised so it
-      costs one attempt per process.
-    * ``ATTN_SPLIT`` here must equal ``ATTN_SPLIT`` in ``kernels/attn.cu``: this
-      side owns the split-K partial buffers, so a mismatch corrupts attention
-      rather than failing a shape check. It moves to ``backends/hip/tuning.py``
-      in S3 together with the buffer sizing.
-    * Every entry keeps the eager path reachable: an op with no kernel returns
-      ``None`` and :func:`ops` fills it from the reference backend, so a partially
-      built extension still runs the model.
+    * import shim 有模块级副作用：它设置 ``PYTORCH_ROCM_ARCH`` 和
+      ``TORCH_EXTENSIONS_DIR``，并 import CUDA/HIP 扩展加载器，后者在 import 时读这两个
+      变量。因此这一步只在 :func:`_hip` 里做，绝不在模块作用域做：一台只是让 registry
+      枚举后端的纯 CPU 机器不能因此被改写配置，一个已经选中 CoreX 卡的进程也不能继承
+      gfx906 的 arch。
+    * 扩展在首次调用 :func:`ops()`（或首次 :func:`usable`）时才编译，不在 import 时
+      编译：坏掉的工具链必须退化成即时执行路径而不是把进程带崩，且失败要记忆化，让每个
+      进程只付一次尝试的代价。
+    * 这里的 ``ATTN_SPLIT`` 必须等于 ``kernels/attn.cu`` 里的 ``ATTN_SPLIT``：split-K
+      部分和缓冲区由这一侧持有，不匹配会让注意力结果坏掉而不是悄悄失败一个形状检查。
+      S3 阶段它会连同缓冲区尺寸计算一起搬进 ``backends/hip/tuning.py``。
+    * 每个条目都保留即时执行路径可达：没有内核的算子返回 ``None``，由 :func:`ops`
+      从参考后端补齐，所以只编译了一部分的扩展也能跑模型。
 """
 
 from __future__ import annotations
@@ -49,109 +42,97 @@ from backends import reference
 from backends.protocol import Caps, Ops, OpFn, make_device
 from int8_weights import QWeight
 
-#: Backend identifier, i.e. what ``COFFIN_BACKEND=hip`` selects.
+#: 后端标识符，即 ``COFFIN_BACKEND=hip`` 选中的那个。
 NAME = "hip"
 
-#: Module-level alias, so this module satisfies :class:`~coffin.backends.protocol.Backend`.
+#: 模块级别名，让本模块满足 :class:`~coffin.backends.protocol.Backend`。
 name = NAME
 
-#: Split-K width of ``kernels/attn.cu``. This is a kernel ABI: the caller allocates
-#: ``part_acc``/``part_ml`` from it and the kernel indexes them with the same
-#: width. It moves to ``backends/hip/tuning.py`` in S3.
+#: ``kernels/attn.cu`` 的 split-K 宽度。这是内核 ABI：调用方据此分配
+#: ``part_acc``/``part_ml``，内核用同样的宽度去索引它们。S3 阶段会搬进
+#: ``backends/hip/tuning.py``。
 ATTN_SPLIT = 8
 
-#: Arch this backend's kernels are compiled for. Read from the driver at selection
-#: time (:func:`caps`) and used as the fallback when the driver does not report
-#: one, so the build flags never have to hardcode it at a call site.
+#: 本后端内核编译所针对的 arch。选择时从驱动读取（:func:`caps`），驱动没报时用它兜底，
+#: 这样构建标志不必在任何调用点写死。
 DEFAULT_ARCH = "gfx906"
 
-#: Row-block / K-unroll pairs the GEMV kernel instantiates. These are kernel tiling
-#: parameters, not contract: they stay inside this module and are indexed by shape
-#: in :data:`_TUNING`.
+#: GEMV 内核实例化的「行块 / K-unroll」组合。这些是内核切块参数而不是契约：只留在本模块
+#: 内，由 :data:`_TUNING` 按形状索引。
 _GEMV_CFGS: tuple[tuple[int, int], ...] = ((1, 1), (2, 1), (1, 2), (2, 2), (1, 4), (4, 1))
 
-#: The static default for a shape nobody has tuned yet. ``(1, 2)`` is what the
-#: contract's old ``gemv`` default was, and it is within a few percent of the
-#: per-shape optimum on the model's real shapes.
+#: 还没人调优过的形状所用的静态默认值。``(1, 2)`` 是契约里旧 ``gemv`` 的默认值，
+#: 在模型的真实形状上与逐个形状的最优值相差几个百分点。
 _DEFAULT_CFG = (1, 2)
 
-#: Shape-keyed kernel choice, filled by :func:`_cfg`. Keyed by ``(N, K, is_int8)``
-#: rather than by weight tensor identity so two layers with the same geometry share
-#: one entry. It is a backend-internal cache: the model must never read or pass it.
+#: 按形状键控的内核选择，由 :func:`_cfg` 填充。键是 ``(N, K, is_int8)`` 而不是权重张量
+#: 本身，好让几何相同的两个层共用一个条目。这是后端内部缓存：模型绝不能读它或传它。
 _TUNING: dict[tuple[int, int, bool], tuple[int, int]] = {}
 
 
 def _hip() -> Any:
-    """Import this backend's kernel shim on first use.
+    """首次使用时 import 本后端的内核 shim。
 
-    The shim lives beside this file (``backends/hip/shim.py``) rather than at the
-    package root, so importing it is a private act of this backend. It sets
-    ``PYTORCH_ROCM_ARCH`` / ``TORCH_EXTENSIONS_DIR`` at import, which is a
-    process-wide side effect that must not happen just because something imported
-    the backend package: on a CoreX host that would point the extension loader at
-    a gfx906 arch.
+    shim 放在本文件旁边（``backends/hip/shim.py``）而不是包根目录，所以 import 它是本
+    后端的私事。它在 import 时设置 ``PYTORCH_ROCM_ARCH`` / ``TORCH_EXTENSIONS_DIR``，
+    那是一个进程级副作用，不能仅仅因为有人 import 了后端包就发生：在 CoreX 主机上那会
+    把扩展加载器指向 gfx906 的 arch。
 
     Returns:
-        The shim module.
+        shim 模块。
 
     Raises:
-        ImportError: The shim or the torch extension loader is missing. The caller
-            treats that as "no kernels", which is a supported state.
+        ImportError: shim 或 torch 扩展加载器缺失。调用方把这当作「没有内核」处理，
+            那是一种受支持的状态。
     """
     from backends.hip import shim
     return shim
 
 
 def _is_rocm_build() -> bool:
-    """Report whether this torch build links a ROCm/HIP runtime at all.
+    """报告本次 torch 构建是否至少链接了 ROCm/HIP 运行时。
 
-    ``torch.cuda.is_available()`` is not a vendor test. Several non-NVIDIA
-    accelerators expose themselves through the *CUDA* namespace because they
-    implement that API: the Iluvatar CoreX stack is one -- its own engine sets
-    ``device="cuda"`` unconditionally -- and a Moore Threads or Hygon card is
-    another. Probing on the namespace alone would let this backend claim a
-    foreign card, report itself usable, and then either fail inside the first
-    kernel launch or, worse, compile for ``--offload-arch=gfx906`` and run.
+    ``torch.cuda.is_available()`` 不是厂商判定。好几家非 NVIDIA 加速卡通过 *CUDA*
+    命名空间暴露自己，因为它们实现了那套 API：Iluvatar CoreX 是其中之一——它自己的
+    引擎无条件设 ``device="cuda"``——Moore Threads 或 Hygon 的卡也是。只按命名空间
+    探测，会让本后端认领一张别人的卡、报告自己可用，然后在第一次内核启动里失败，或者
+    更糟：用 ``--offload-arch=gfx906`` 编译完照样跑起来。
 
-    ``torch.version.hip`` is the marker that separates the two: it is set to the
-    HIP version on every ROCm build and is ``None`` on a CUDA build and on every
-    CUDA-compatible vendor build this engine is aimed at. ``gcnArchName`` in
-    ``get_device_properties`` is the second, device-side marker used by
-    :func:`_arch`.
+    ``torch.version.hip`` 是区分两者的标记：每个 ROCm 构建上它被设为 HIP 版本，而在
+    CUDA 构建以及本引擎瞄准的所有 CUDA 兼容厂商构建上它是 ``None``。
+    ``get_device_properties`` 里的 ``gcnArchName`` 是第二个、设备侧的标记，由
+    :func:`_arch` 使用。
 
     Returns:
-        ``True`` when the torch build itself is a HIP build.
+        torch 构建本身就是 HIP 构建时为 ``True``。
     """
     return getattr(torch.version, "hip", None) is not None
 
 
 def probe() -> bool:
-    """Report whether a ROCm/HIP device is visible to torch.
+    """报告 torch 是否看得到 ROCm/HIP 设备。
 
-    Only reads the driver: no kernel import, no build, no device reset. This runs
-    on every host during auto-detect, including a CPU-only one.
+    只读驱动：不 import 内核、不编译、不重置设备。自动探测期间它会在每台主机上运行，
+    包括纯 CPU 主机。
 
-    Both halves matter: a HIP build with no device attached is ``False``, and a
-    CUDA-compatible card from another vendor is ``False`` too (see
-    :func:`_is_rocm_build`). Auto-detect then falls through to that vendor's
-    backend, or to the reference.
+    两半都算数：没有插设备的 HIP 构建是 ``False``，别家的 CUDA 兼容卡也是 ``False``
+    （见 :func:`_is_rocm_build`）。自动探测随后会落到那家厂商的后端，或者参考实现。
 
     Returns:
-        ``True`` only when the build is a HIP build *and* a device is present.
+        仅当既是 HIP 构建*又*有设备存在时为 ``True``。
     """
     try:
         return _is_rocm_build() and bool(torch.cuda.is_available())
-    except Exception:                             # pragma: no cover - driver error
+    except Exception:                             # pragma: no cover - 驱动报错
         return False
 
 
 def _build_error() -> str | None:
-    """Return the memoised kernel-build failure, attempting the build once.
+    """返回记忆化的内核编译失败原因，并尝试编译一次。
 
     Returns:
-        ``"<ExceptionType>: <message>"`` from the failed build, or ``None`` when
-        the extension is loaded. The attempt is memoised inside the shim, so
-        calling this again costs nothing.
+        编译失败时的 ``"<ExceptionType>: <message>"``；扩展已加载时为 ``None``。这次
+        尝试在 shim 里做了记忆化，所以再次调用不花钱。
     """
     try:
         module = _hip()
@@ -163,22 +144,20 @@ def _build_error() -> str | None:
 
 
 def usable() -> bool:
-    """Report whether the kernels are built or cached, so the table can run native.
+    """报告内核是否已编译或已缓存，这张表因此可以原生执行。
 
     Returns:
-        ``False`` when there is no device or the extension failed to build; the
-        registry then falls through to the next candidate, so a host with the
-        driver but no working toolchain still serves the model through the
-        reference backend.
+        没有设备或扩展编译失败时为 ``False``；registry 随后会继续尝试下一个候选，于是
+        一个驱动在、工具链却不可用的主机依然能通过参考后端服务模型。
     """
     return probe() and _build_error() is None
 
 
 def reason() -> str:
-    """Explain why :func:`usable` is ``False``, for the selection error text.
+    """解释 :func:`usable` 为什么是 ``False``，供选择错误的文案使用。
 
     Returns:
-        ``""`` when usable, otherwise the device state or the build exception.
+        可用时为 ``""``，否则是设备状态或编译抛出的异常。
     """
     if not probe():
         return "no ROCm/HIP device visible (torch.cuda.is_available() is False)"
@@ -188,56 +167,51 @@ def reason() -> str:
 
 @functools.lru_cache(maxsize=1)
 def _device_name() -> str:
-    """Read the device name once; it is used in the banner and to pick the arch.
+    """只读一次设备名；横幅要用它，挑选 arch 也要用它。
 
     Returns:
-        ``torch.cuda.get_device_name(0)``, or ``""`` when there is no device. The
-        call initialises the HIP runtime, so it is memoised and only reached once
-        :func:`probe` has already said a device exists.
+        ``torch.cuda.get_device_name(0)``，没有设备时为 ``""``。这次调用会初始化 HIP
+        运行时，所以做了记忆化，并且只有在 :func:`probe` 已经说过有设备之后才会到达。
     """
     if not probe():
         return ""
     try:
         return str(torch.cuda.get_device_name(0))
-    except Exception:                             # pragma: no cover - driver error
+    except Exception:                             # pragma: no cover - 驱动报错
         return ""
 
 
 @functools.lru_cache(maxsize=1)
 def _arch() -> str:
-    """Report the target ISA, read from the driver rather than hardcoded.
+    """报告目标 ISA，从驱动读取而不是写死。
 
-    ``gcnArchName`` is a ROCm-only field, which is why it doubles as the second
-    half of the vendor test: reaching this function with a non-ROCm card under
-    the ``cuda`` namespace means :func:`probe` already said no, and this returns
-    ``""`` rather than inventing ``gfx906`` and compiling for it.
+    ``gcnArchName`` 是 ROCm 独有的字段，所以它同时充当厂商判定的第二半：如果一张非
+    ROCm 的卡走 ``cuda`` 命名空间到了这个函数，说明 :func:`probe` 已经说过不行了，
+    这里返回 ``""``，而不是虚构一个 ``gfx906`` 再照着编译。
 
     Returns:
-        ``get_device_properties(0).gcnArchName`` (``"gfx906"`` on the DCU) with
-        the ``:sramecc``-style suffix stripped, or :data:`DEFAULT_ARCH` when the
-        driver is ROCm but reports no arch. Build flags are derived from this
-        value, so a different part needs a different string, not a second build
-        path.
+        ``get_device_properties(0).gcnArchName``（DCU 上是 ``"gfx906"``），去掉
+        ``:sramecc`` 之类的后缀；驱动是 ROCm 却没报 arch 时返回 :data:`DEFAULT_ARCH`。
+        构建标志由这个值推导，所以换一颗芯片要换的是字符串，而不是加第二条编译路径。
     """
     if not probe():
         return ""
     try:
         props = torch.cuda.get_device_properties(0)
         arch = getattr(props, "gcnArchName", "") or ""
-    except Exception:                             # pragma: no cover - driver error
+    except Exception:                             # pragma: no cover - 驱动报错
         arch = ""
     return str(arch).split(":")[0] or DEFAULT_ARCH
 
 
 @functools.lru_cache(maxsize=1)
 def caps() -> Caps:
-    """Return this backend's capability record, probing the device once.
+    """返回本后端的能力记录，只探测设备一次。
 
     Returns:
-        A record with ``device="cuda"`` (torch's ROCm backend keeps that name),
-        fp16 projection weights because gfx906 has packed fp16 math only, graph
-        capture and load-time autotune both enabled, and ``recurrent_state=True``
-        because snapshot/restore is plain ``copy_`` on this backend.
+        一条记录：``device="cuda"``（torch 的 ROCm 后端保留了这个名字）、fp16 投影
+        权重（因为 gfx906 只有 packed fp16 数学）、图捕获与加载时 autotune 均开启、
+        ``recurrent_state=True``（本后端的快照/恢复就是普通的 ``copy_``）。
     """
     natives = frozenset(Ops.NAMES) if usable() else frozenset()
     return Caps(
@@ -248,10 +222,9 @@ def caps() -> Caps:
         arch=_arch(),
         native=natives,
         act_dtype=torch.bfloat16,
-        # fp16, not bf16: this part has packed fp16 math and no packed bf16 math, so
-        # the prefill GEMM reaches 13-20 TFLOP/s on fp16 weights against
-        # 2.3 TFLOP/s on bf16. Activations stay bf16 because the int8 KV cache and
-        # every fused kernel are written against it.
+        # 用 fp16 而不是 bf16：这颗芯片有 packed fp16 数学而没有 packed bf16 数学，所以
+        # 预填充 GEMM 在 fp16 权重上达到 13-20 TFLOP/s，bf16 上只有 2.3 TFLOP/s。激活
+        # 保持 bf16，因为 int8 KV 缓存和每个融合内核都是照着它写的。
         weight_dtype=torch.float16,
         graph=True,
         autotune=True,
@@ -264,31 +237,29 @@ def caps() -> Caps:
 
 @functools.lru_cache(maxsize=1)
 def _resolve_device() -> torch.device:
-    """Return the device every allocation for this backend goes on.
+    """返回本后端所有分配应该落到的设备。
 
     Returns:
-        ``torch.device("cuda", 0)``. Model code uses this instead of the
-        ``device="cuda"`` literal.
+        ``torch.device("cuda", 0)``。模型代码用它替代 ``device="cuda"`` 字面量。
     """
     return make_device(caps())
 
 
 def __getattr__(name: str) -> Any:
-    """Resolve the lazily-computed module attributes of the :class:`Backend` protocol.
+    """解析 :class:`Backend` 协议里那些惰性计算的模块属性。
 
-    ``device`` cannot be a module-level constant: building the capability record
-    reads the device name, which initialises the HIP runtime, and importing this
-    module on a CPU-only host must not do that. Python only calls this hook for
-    names the module does not define, so the normal attribute path is unaffected.
+    ``device`` 不能做成模块级常量：构建能力记录要读设备名，那会初始化 HIP 运行时，而在
+    纯 CPU 主机上 import 本模块绝不能做这件事。Python 只对模块没定义的名字调用这个钩子，
+    所以正常属性访问路径不受影响。
 
     Args:
-        name: Attribute being looked up.
+        name: 正在查找的属性名。
 
     Returns:
-        The resolved attribute.
+        解析出的属性值。
 
     Raises:
-        AttributeError: The name is not one of the lazily-resolved attributes.
+        AttributeError: 该名字不是惰性解析的属性之一。
     """
     if name == "device":
         return _resolve_device()
@@ -296,18 +267,17 @@ def __getattr__(name: str) -> Any:
 
 
 def _cfg(w: torch.Tensor | QWeight) -> tuple[int, int]:
-    """Return the ``(rows_per_block, k_unroll)`` this shape should use.
+    """返回这个形状该用的 ``(rows_per_block, k_unroll)``。
 
-    The choice is the backend's private business: it is cached by shape, never
-    passed by a caller and never stored in the model family. :data:`_TUNING` is
-    filled by the load-time sweep (S3) when ``caps().autotune`` is on; until then
-    every shape takes :data:`_DEFAULT_CFG`.
+    选哪个是后端的私事：按形状缓存，绝不由调用方传入，也绝不存进模型族。加载时的扫描
+    （S3）在 ``caps().autotune`` 开启时填充 :data:`_TUNING`；在那之前每个形状都取
+    :data:`_DEFAULT_CFG`。
 
     Args:
-        w: The projection weight, plain or int8.
+        w: 投影权重，普通张量或 int8 权重。
 
     Returns:
-        The ``(R, U)`` pair to pass to the kernel.
+        要传给内核的 ``(R, U)`` 组合。
     """
     n, k = (w.n, w.k) if isinstance(w, QWeight) else w.shape
     return _TUNING.get((n, k, isinstance(w, QWeight)), _DEFAULT_CFG)
@@ -315,21 +285,18 @@ def _cfg(w: torch.Tensor | QWeight) -> tuple[int, int]:
 
 def _split_k(part_acc: torch.Tensor | None, part_ml: torch.Tensor | None,
              nh: int, hd: int, like: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return the split-K scratch, allocating it when the caller did not.
+    """返回 split-K 中间缓冲区，调用方没给时就地分配。
 
     Args:
-        part_acc: Caller-owned accumulator, ``[nh, ATTN_SPLIT, hd]`` fp32, or
-            ``None``.
-        part_ml: Caller-owned running max/denominator, ``[nh, ATTN_SPLIT, 2]``
-            fp32, or ``None``.
-        nh: Query heads.
-        hd: Head dim.
-        like: A tensor whose device the allocation follows.
+        part_acc: 调用方持有的累加器，``[nh, ATTN_SPLIT, hd]`` fp32；或 ``None``。
+        part_ml: 调用方持有的滑动最大值/分母，``[nh, ATTN_SPLIT, 2]`` fp32；或 ``None``。
+        nh: 查询头数。
+        hd: 头维。
+        like: 一个张量，分配跟随它的设备。
 
     Returns:
-        ``(part_acc, part_ml)``. Allocating here is correct but not
-        graph-capturable, which is why the model's capture path always passes its
-        own buffers.
+        ``(part_acc, part_ml)``。在这里分配结果正确但不可被图捕获，所以模型的捕获路径
+        总是传自己的缓冲区。
     """
     if part_acc is None:
         part_acc = torch.zeros(nh, ATTN_SPLIT, hd, dtype=torch.float32,
@@ -343,18 +310,18 @@ def _split_k(part_acc: torch.Tensor | None, part_ml: torch.Tensor | None,
 def _split_k_batch(part_acc: torch.Tensor | None, part_ml: torch.Tensor | None,
                    rows: int, nh: int, hd: int,
                    like: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-row variant of :func:`_split_k` for the batched attention entries.
+    """:func:`_split_k` 的按行版本，供批处理注意力条目使用。
 
     Args:
-        part_acc: Caller-owned ``[rows, nh, ATTN_SPLIT, hd]`` fp32, or ``None``.
-        part_ml: Caller-owned ``[rows, nh, ATTN_SPLIT, 2]`` fp32, or ``None``.
-        rows: Leading row count of the buffers.
-        nh: Query heads.
-        hd: Head dim.
-        like: A tensor whose device the allocation follows.
+        part_acc: 调用方持有的 ``[rows, nh, ATTN_SPLIT, hd]`` fp32；或 ``None``。
+        part_ml: 调用方持有的 ``[rows, nh, ATTN_SPLIT, 2]`` fp32；或 ``None``。
+        rows: 缓冲区的行数。
+        nh: 查询头数。
+        hd: 头维。
+        like: 一个张量，分配跟随它的设备。
 
     Returns:
-        ``(part_acc, part_ml)``, allocated when absent.
+        ``(part_acc, part_ml)``，缺席时新分配。
     """
     if part_acc is None:
         part_acc = torch.zeros(rows, nh, ATTN_SPLIT, hd, dtype=torch.float32,
@@ -365,27 +332,25 @@ def _split_k_batch(part_acc: torch.Tensor | None, part_ml: torch.Tensor | None,
     return part_acc, part_ml
 
 
-# Projections
+# 投影
 
 
 def linear(w: torch.Tensor | QWeight, x: torch.Tensor) -> torch.Tensor:
-    """Decode-time weight read: one or a few activation rows against ``w``.
+    """解码时的权重读取：一行或少数几行激活对 ``w`` 做乘。
 
-    Routes to the int8 kernel for a ``QWeight`` and the fp16/bf16 kernel for a
-    plain tensor; a 2-D activation delegates to :func:`linear_m`, because the
-    single-row kernel is compiled for one vector only.
+    ``QWeight`` 走 int8 内核，普通张量走 fp16/bf16 内核；二维激活转交
+    :func:`linear_m`，因为单行内核只为单个向量编译。
 
     Args:
-        w: ``[N, K]`` row-major weight, plain tensor or ``QWeight``.
-        x: Activations, ``[K]`` or ``[C, K]``.
+        w: ``[N, K]`` 行主序权重，普通张量或 ``QWeight``。
+        x: 激活，``[K]`` 或 ``[C, K]``。
 
     Returns:
-        ``[N]`` or ``[C, N]`` in ``x``'s dtype.
+        ``[N]`` 或 ``[C, N]``，dtype 跟 ``x`` 走。
 
     Raises:
-        RuntimeError: The extension is unavailable and this entry was reached
-            directly. Through :func:`ops` it is filled by the reference instead,
-            so this only happens if a caller reached past the table.
+        RuntimeError: 扩展不可用却直接调用到了这个条目。经由 :func:`ops` 时会由参考
+            实现替代，所以只有在调用方绕过表直接取用时才会发生。
     """
     if x.dim() != 1:
         return linear_m(w, x)
@@ -397,22 +362,21 @@ def linear(w: torch.Tensor | QWeight, x: torch.Tensor) -> torch.Tensor:
 
 
 def linear_m(w: torch.Tensor | QWeight, x: torch.Tensor) -> torch.Tensor:
-    """Small-M batch projection: one weight pass for every row of ``x``.
+    """小 M 的批投影：一次权重读取服务 ``x`` 的每一行。
 
-    Picks between the small-M kernel (``M`` in 2/4/8), the wide-M kernel for
-    ``M`` in 16/24/32, and the prefill GEMM otherwise. All three are numerically
-    equivalent to calling :func:`linear` per row, so the choice is invisible to
-    the caller -- which is the reason one contract name covers them.
+    在三种实现之间选：小 M 内核（``M`` 为 2/4/8）、``M`` 为 16/24/32 时的 wide-M 内核，
+    其余情况走预填充 GEMM。三者数值上都等价于逐行调用 :func:`linear`，所以这个选择对
+    调用方不可见——也正是同一个契约名能覆盖它们的原因。
 
     Args:
-        w: ``[N, K]`` row-major weight, plain tensor or ``QWeight``.
-        x: Activations, ``[M, K]``.
+        w: ``[N, K]`` 行主序权重，普通张量或 ``QWeight``。
+        x: 激活，``[M, K]``。
 
     Returns:
-        ``[M, N]`` in ``x``'s dtype.
+        ``[M, N]``，dtype 跟 ``x`` 走。
 
     Raises:
-        RuntimeError: The extension is unavailable.
+        RuntimeError: 扩展不可用。
     """
     module = _hip()
     m = x.shape[0]
@@ -430,41 +394,40 @@ def linear_m(w: torch.Tensor | QWeight, x: torch.Tensor) -> torch.Tensor:
 
 
 def linear_prefill(w: torch.Tensor | QWeight, x: torch.Tensor) -> torch.Tensor:
-    """Prefill-chunk projection (large M), where a GEMM beats streaming the weight.
+    """预填充分块的投影（大 M），此处 GEMM 胜过流式读权重。
 
     Args:
-        w: ``[N, K]`` row-major weight, plain tensor or ``QWeight``.
-        x: Activations, ``[C, K]``.
+        w: ``[N, K]`` 行主序权重，普通张量或 ``QWeight``。
+        x: 激活，``[C, K]``。
 
     Returns:
-        ``[C, N]`` in ``x``'s dtype. An int8 weight is dequantised to
-        :attr:`Caps.weight_dtype` for the call: prefill is compute-bound, so one
-        materialisation is cheaper than many dequantising kernel launches.
+        ``[C, N]``，dtype 跟 ``x`` 走。int8 权重会为这次调用反量化到
+        :attr:`Caps.weight_dtype`：预填充是算力受限的，实体化一次比多次反量化的内核
+        启动更便宜。
     """
     weight_dtype = caps().weight_dtype
     dense = w.dequant(weight_dtype) if isinstance(w, QWeight) else w.to(weight_dtype)
     return F.linear(x.to(weight_dtype), dense).to(x.dtype)
 
 
-# Normalisation
+# 归一化
 
 
 def rms_norm(x: torch.Tensor, w: torch.Tensor, stride: int = 0,
              eps: float = 1e-6) -> torch.Tensor:
-    """Zero-centred RMSNorm over the last axis of ``[M, N]``, via the fused kernel.
+    """对 ``[M, N]`` 最后一轴做零中心 RMSNorm，走融合内核。
 
     Args:
-        x: Rows to normalise, ``[M, N]``; may be a column slice, in which case the
-            rows are pitched wider than ``N``.
-        w: Gain, ``[N]``, already carrying the ``1 + w`` offset.
-        stride: Element pitch between rows; ``0`` reads it from ``x``.
-        eps: Variance floor.
+        x: 待归一化的行，``[M, N]``；可以是列切片，此时行的实际间距比 ``N`` 宽。
+        w: 增益，``[N]``，已经带着 ``1 + w`` 的偏移。
+        stride: 行与行之间的元素间距；``0`` 表示从 ``x`` 里读。
+        eps: 方差下限。
 
     Returns:
-        Normalised rows, same shape and dtype as ``x``.
+        归一化后的行，形状与 dtype 同 ``x``。
 
     Raises:
-        RuntimeError: The extension is unavailable.
+        RuntimeError: 扩展不可用。
     """
     module = _hip()
     stride = x.stride(0) if stride == 0 else stride
@@ -473,26 +436,25 @@ def rms_norm(x: torch.Tensor, w: torch.Tensor, stride: int = 0,
 
 def rms_norm_gated(x: torch.Tensor, w: torch.Tensor, gate: torch.Tensor,
                    eps: float = 1e-6) -> torch.Tensor:
-    """RMSNorm (per head) scaled by ``silu(gate)``, via the fused kernel.
+    """按头做的 RMSNorm，再乘 ``silu(gate)``，走融合内核。
 
     Args:
-        x: Activations, ``[..., dv]``.
-        w: Per-head gain, ``[dv]``: not the flattened width, because the norm is
-            per head.
-        gate: Gate tensor shaped like ``x``.
-        eps: Variance floor.
+        x: 激活，``[..., dv]``。
+        w: 每头的增益，``[dv]``：不是展平后的宽度，因为归一化是按头做的。
+        gate: 形状与 ``x`` 相同的门控张量。
+        eps: 方差下限。
 
     Returns:
-        Same shape and dtype as ``x``.
+        形状与 dtype 同 ``x``。
 
     Raises:
-        RuntimeError: The extension is unavailable.
+        RuntimeError: 扩展不可用。
     """
     module = _hip()
     return module.rms_norm_gated(x, w, gate, eps)
 
 
-# Attention
+# 注意力
 
 
 def attn_decode(q: torch.Tensor, gate: torch.Tensor, kcache: torch.Tensor,
@@ -500,30 +462,29 @@ def attn_decode(q: torch.Tensor, gate: torch.Tensor, kcache: torch.Tensor,
                 out: torch.Tensor, pos: torch.Tensor, rep: int, scale: float,
                 part_acc: torch.Tensor | None = None,
                 part_ml: torch.Tensor | None = None) -> torch.Tensor:
-    """One decode token over the dense int8 KV cache, via the fused split-K kernel.
+    """一个解码 token 在稠密 int8 KV 缓存上的注意力，走融合的 split-K 内核。
 
     Args:
-        q: Query, ``[nh, hd]``, already rotated and scaled by the caller.
-        gate: Output gate, ``[nh, hd]``; the kernel applies ``sigmoid``.
-        kcache: int8 keys, ``[nkv, max_seq, hd]``.
-        vcache: int8 values, ``[nkv, max_seq, hd]``.
-        kscale: fp32 K scale, ``[nkv, max_seq]``.
-        vscale: fp32 V scale, ``[nkv, max_seq]``.
-        out: Output buffer, ``[nh, hd]``, written in place.
-        pos: 1-element long tensor; the token index and the causal bound. The
-            kernel masks past it rather than shrinking the loop, which is what
-            keeps the captured shape static.
-        rep: Query heads per KV head.
-        scale: ``hd ** -0.5``.
-        part_acc: Split-K accumulator, ``[nh, ATTN_SPLIT, hd]`` fp32. ``None``
-            allocates, which is correct but not graph-capturable.
-        part_ml: Split-K running max/denominator, ``[nh, ATTN_SPLIT, 2]`` fp32.
+        q: 查询，``[nh, hd]``，调用方已完成旋转和缩放。
+        gate: 输出门控，``[nh, hd]``；``sigmoid`` 由内核施加。
+        kcache: int8 key，``[nkv, max_seq, hd]``。
+        vcache: int8 value，``[nkv, max_seq, hd]``。
+        kscale: fp32 的 K scale，``[nkv, max_seq]``。
+        vscale: fp32 的 V scale，``[nkv, max_seq]``。
+        out: 输出缓冲区，``[nh, hd]``，原地写。
+        pos: 单元素 long 张量；既是 token 索引也是因果边界。内核把越过它的条目掩掉
+            而不是缩短循环，捕获下来的形状因此保持静态。
+        rep: 每个 KV 头对应的查询头数。
+        scale: ``hd ** -0.5``。
+        part_acc: split-K 累加器，``[nh, ATTN_SPLIT, hd]`` fp32。传 ``None`` 会分配，
+            结果正确但不可被图捕获。
+        part_ml: split-K 的滑动最大值/分母，``[nh, ATTN_SPLIT, 2]`` fp32。
 
     Returns:
-        ``out``, for call chaining.
+        ``out``，便于链式调用。
 
     Raises:
-        RuntimeError: The extension is unavailable.
+        RuntimeError: 扩展不可用。
     """
     module = _hip()
     pa, pm = _split_k(part_acc, part_ml, q.shape[0], q.shape[1], q)
@@ -537,29 +498,29 @@ def attn_paged(q: torch.Tensor, gate: torch.Tensor, kpool: torch.Tensor,
                max_pos: int, rep: int, scale: float,
                part_acc: torch.Tensor | None = None,
                part_ml: torch.Tensor | None = None) -> torch.Tensor:
-    """One decode token over a layer's paged int8 pool.
+    """一个解码 token 在某层分页 int8 池上的注意力。
 
     Args:
-        q: Query, ``[nh, hd]``.
-        gate: Output gate, ``[nh, hd]``.
-        kpool: This layer's int8 K pool, ``[nslots, nkv, hd]``.
-        vpool: This layer's int8 V pool, ``[nslots, nkv, hd]``.
-        kscale: fp32 K scale, ``[nslots, nkv]``.
-        vscale: fp32 V scale, ``[nslots, nkv]``.
-        pos2slot: This row's slot map; only the first ``pos + 1`` entries are read.
-        out: Output buffer, ``[nh, hd]``, written in place.
-        pos: 1-element long tensor; the token index and the causal bound.
-        max_pos: Window length, i.e. the row stride of the slot map.
-        rep: Query heads per KV head.
-        scale: ``hd ** -0.5``.
-        part_acc: Split-K accumulator, ``[nh, ATTN_SPLIT, hd]`` fp32.
-        part_ml: Split-K running max/denominator, ``[nh, ATTN_SPLIT, 2]`` fp32.
+        q: 查询，``[nh, hd]``。
+        gate: 输出门控，``[nh, hd]``。
+        kpool: 本层的 int8 K 池，``[nslots, nkv, hd]``。
+        vpool: 本层的 int8 V 池，``[nslots, nkv, hd]``。
+        kscale: fp32 的 K scale，``[nslots, nkv]``。
+        vscale: fp32 的 V scale，``[nslots, nkv]``。
+        pos2slot: 本行的槽位表；只读它的前 ``pos + 1`` 项。
+        out: 输出缓冲区，``[nh, hd]``，原地写。
+        pos: 单元素 long 张量；既是 token 索引也是因果边界。
+        max_pos: 窗口长度，即槽位表的行距。
+        rep: 每个 KV 头对应的查询头数。
+        scale: ``hd ** -0.5``。
+        part_acc: split-K 累加器，``[nh, ATTN_SPLIT, hd]`` fp32。
+        part_ml: split-K 的滑动最大值/分母，``[nh, ATTN_SPLIT, 2]`` fp32。
 
     Returns:
-        ``out``, for call chaining.
+        ``out``，便于链式调用。
 
     Raises:
-        RuntimeError: The extension is unavailable.
+        RuntimeError: 扩展不可用。
     """
     module = _hip()
     pa, pm = _split_k(part_acc, part_ml, q.shape[0], q.shape[1], q)
@@ -574,29 +535,29 @@ def attn_paged_batch(q: torch.Tensor, gate: torch.Tensor, kpool: torch.Tensor,
                      out: torch.Tensor, max_seq: int, rep: int, scale: float,
                      part_acc: torch.Tensor | None = None,
                      part_ml: torch.Tensor | None = None) -> torch.Tensor:
-    """One decode token for a bucket of rows, one launch for the whole bucket.
+    """一个批桶里所有行各解一个 token，整个桶只启动一次。
 
     Args:
-        q: Queries, ``[B, nh, hd]``.
-        gate: Output gates, ``[B, nh, hd]``.
-        kpool: This layer's int8 K pool, ``[nslots, nkv, hd]``.
-        vpool: This layer's int8 V pool, ``[nslots, nkv, hd]``.
-        kscale: fp32 K scale, ``[nslots, nkv]``.
-        vscale: fp32 V scale, ``[nslots, nkv]``.
-        slots: Per-row slot maps, ``[B, max_seq]``.
-        context_lens: Per-row key count, ``[B]`` int32.
-        out: Output buffer, ``[B, nh, hd]``, written in place.
-        max_seq: Window length, i.e. the row stride of ``slots``.
-        rep: Query heads per KV head.
-        scale: ``hd ** -0.5``.
-        part_acc: Split-K accumulator, ``[B, nh, ATTN_SPLIT, hd]`` fp32.
-        part_ml: Split-K running max/denominator, ``[B, nh, ATTN_SPLIT, 2]`` fp32.
+        q: 查询，``[B, nh, hd]``。
+        gate: 输出门控，``[B, nh, hd]``。
+        kpool: 本层的 int8 K 池，``[nslots, nkv, hd]``。
+        vpool: 本层的 int8 V 池，``[nslots, nkv, hd]``。
+        kscale: fp32 的 K scale，``[nslots, nkv]``。
+        vscale: fp32 的 V scale，``[nslots, nkv]``。
+        slots: 每行的槽位表，``[B, max_seq]``。
+        context_lens: 每行的 key 数，``[B]`` int32。
+        out: 输出缓冲区，``[B, nh, hd]``，原地写。
+        max_seq: 窗口长度，即 ``slots`` 的行距。
+        rep: 每个 KV 头对应的查询头数。
+        scale: ``hd ** -0.5``。
+        part_acc: split-K 累加器，``[B, nh, ATTN_SPLIT, hd]`` fp32。
+        part_ml: split-K 的滑动最大值/分母，``[B, nh, ATTN_SPLIT, 2]`` fp32。
 
     Returns:
-        ``out``, for call chaining.
+        ``out``，便于链式调用。
 
     Raises:
-        RuntimeError: The extension is unavailable.
+        RuntimeError: 扩展不可用。
     """
     module = _hip()
     rows, nh, hd = q.shape[0], q.shape[1], q.shape[2]
@@ -613,31 +574,31 @@ def attn_paged_multi_q(q: torch.Tensor, gate: torch.Tensor, kpool: torch.Tensor,
                        part_ml: torch.Tensor | None = None,
                        block_mask: torch.Tensor | None = None,
                        mask_block: int = 64) -> torch.Tensor:
-    """Speculative verify: ``c`` draft queries per row share one pass over the history KV.
+    """投机校验：每行的 ``c`` 个草稿查询共享对历史 KV 的一次遍历。
 
     Args:
-        q: Draft queries, ``[B, c, nh, hd]``.
-        gate: Output gates, same shape.
-        kpool: This layer's int8 K pool, ``[nslots, nkv, hd]``.
-        vpool: This layer's int8 V pool, ``[nslots, nkv, hd]``.
-        kscale: fp32 K scale, ``[nslots, nkv]``.
-        vscale: fp32 V scale, ``[nslots, nkv]``.
-        slots: Per-row slot maps, ``[B, max_seq]``.
-        ctx_lens: Per-row history length, ``[B]`` int32.
-        out: Output buffer, ``[B, c, nh, hd]``, written in place.
-        max_seq: Window length, i.e. the row stride of ``slots``.
-        rep: Query heads per KV head.
-        scale: ``hd ** -0.5``.
-        part_acc: Split-K accumulator, ``[B*c, nh, ATTN_SPLIT, hd]`` fp32.
-        part_ml: Split-K running max/denominator, ``[B*c, nh, ATTN_SPLIT, 2]`` fp32.
-        block_mask: Optional uint8 ``[B, n_blocks]`` keep-mask (1 = keep).
-        mask_block: Block size the mask is expressed in.
+        q: 草稿查询，``[B, c, nh, hd]``。
+        gate: 输出门控，形状同上。
+        kpool: 本层的 int8 K 池，``[nslots, nkv, hd]``。
+        vpool: 本层的 int8 V 池，``[nslots, nkv, hd]``。
+        kscale: fp32 的 K scale，``[nslots, nkv]``。
+        vscale: fp32 的 V scale，``[nslots, nkv]``。
+        slots: 每行的槽位表，``[B, max_seq]``。
+        ctx_lens: 每行的历史长度，``[B]`` int32。
+        out: 输出缓冲区，``[B, c, nh, hd]``，原地写。
+        max_seq: 窗口长度，即 ``slots`` 的行距。
+        rep: 每个 KV 头对应的查询头数。
+        scale: ``hd ** -0.5``。
+        part_acc: split-K 累加器，``[B*c, nh, ATTN_SPLIT, hd]`` fp32。
+        part_ml: split-K 的滑动最大值/分母，``[B*c, nh, ATTN_SPLIT, 2]`` fp32。
+        block_mask: 可选的 uint8 ``[B, n_blocks]`` 保留掩码（1 表示保留）。
+        mask_block: 掩码所表达的块大小。
 
     Returns:
-        ``out``, for call chaining.
+        ``out``，便于链式调用。
 
     Raises:
-        RuntimeError: The extension is unavailable.
+        RuntimeError: 扩展不可用。
     """
     module = _hip()
     rows, nh, hd = q.shape[0] * q.shape[1], q.shape[2], q.shape[3]
@@ -647,61 +608,61 @@ def attn_paged_multi_q(q: torch.Tensor, gate: torch.Tensor, kpool: torch.Tensor,
                                      block_mask, mask_block)
 
 
-# Gated DeltaNet
+# 线性注意力（Gated DeltaNet）
 
 
 def conv1d_silu(conv_w: torch.Tensor, x: torch.Tensor, conv_state: torch.Tensor,
                 out: torch.Tensor) -> torch.Tensor:
-    """Depthwise causal conv (kernel 4) + SiLU for one token, shifting ``conv_state``.
+    """单 token 的深度因果卷积（卷积核 4）+ SiLU，并平移 ``conv_state``。
 
     Args:
-        conv_w: Per-channel taps, ``[C, 4]`` fp32.
-        x: This token's projection, ``[C]``.
-        conv_state: Previous ``3`` tokens, ``[C, 3]`` fp32; shifted in place.
-        out: Output buffer, ``[C]`` fp32, written in place.
+        conv_w: 每通道的抽头系数，``[C, 4]`` fp32。
+        x: 本 token 的投影，``[C]``。
+        conv_state: 前 ``3`` 个 token，``[C, 3]`` fp32；原地平移。
+        out: 输出缓冲区，``[C]`` fp32，原地写。
 
     Returns:
-        ``out``, for call chaining.
+        ``out``，便于链式调用。
 
     Raises:
-        RuntimeError: The extension is unavailable.
+        RuntimeError: 扩展不可用。
     """
     return _hip().conv1d_silu(conv_w, x, conv_state, out)
 
 
 def conv1d_silu_seq(conv_w: torch.Tensor, x: torch.Tensor,
                     conv_state: torch.Tensor) -> torch.Tensor:
-    """The same conv over a prefill chunk, carrying ``conv_state`` across chunks.
+    """同样的卷积跑在预填充分块上，并跨块携带 ``conv_state``。
 
     Args:
-        conv_w: Per-channel taps, ``[C, 4]`` fp32.
-        x: Chunk projections, ``[T, C]``.
-        conv_state: Previous ``3`` tokens, ``[C, 3]`` fp32; shifted in place.
+        conv_w: 每通道的抽头系数，``[C, 4]`` fp32。
+        x: 分块的投影，``[T, C]``。
+        conv_state: 前 ``3`` 个 token，``[C, 3]`` fp32；原地平移。
 
     Returns:
-        ``[T, C]`` fp32 conv+SiLU output.
+        ``[T, C]`` fp32 的卷积 + SiLU 输出。
 
     Raises:
-        RuntimeError: The extension is unavailable.
+        RuntimeError: 扩展不可用。
     """
     return _hip().conv1d_silu_seq(conv_w, x, conv_state)
 
 
 def conv1d_silu_batch(conv_w: torch.Tensor, x: torch.Tensor,
                       conv_state: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
-    """Batched depthwise causal conv + SiLU, one row per batch entry.
+    """批处理的深度因果卷积 + SiLU，每个批条目一行。
 
     Args:
-        conv_w: Per-channel taps, ``[C, 4]`` fp32.
-        x: One token per row, ``[B, C]``.
-        conv_state: Per-row windows, ``[B, C, 3]`` fp32; shifted in place.
-        out: Output buffer, ``[B, C]`` fp32, written in place.
+        conv_w: 每通道的抽头系数，``[C, 4]`` fp32。
+        x: 每行一个 token，``[B, C]``。
+        conv_state: 每行的窗口，``[B, C, 3]`` fp32；原地平移。
+        out: 输出缓冲区，``[B, C]`` fp32，原地写。
 
     Returns:
-        ``out``, for call chaining.
+        ``out``，便于链式调用。
 
     Raises:
-        RuntimeError: The extension is unavailable.
+        RuntimeError: 扩展不可用。
     """
     return _hip().conv1d_silu_batch(conv_w, x, conv_state, out)
 
@@ -712,29 +673,29 @@ def delta_prologue(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                    q_out: torch.Tensor, k_out: torch.Tensor, v_out: torch.Tensor,
                    beta: torch.Tensor, g: torch.Tensor,
                    qscale: float, rep: int) -> None:
-    """Fused q/k norm, head expand and beta/g build for one token.
+    """单 token 的 q/k 归一化、头扩展与 beta/g 构建，融合在一个内核里。
 
     Args:
-        q: Query per key head, ``[num_k, dk]``.
-        k: Key per key head, ``[num_k, dk]``.
-        v: Value per value head, ``[num_v, dv]``.
-        b: Beta logits, ``[num_v]``.
-        a: Decay logits, ``[num_v]``.
-        neg_expA: ``-exp(A_log)``, ``[num_v]`` fp32.
-        dt_bias: Decay bias, ``[num_v]`` fp32.
-        q_out: Output query, ``[num_v, dk]`` fp32.
-        k_out: Output key, ``[num_v, dk]`` fp32.
-        v_out: Output value, ``[num_v, dv]`` fp32.
-        beta: Output write strength, ``[num_v]`` fp32.
-        g: Output log decay ``<= 0``, ``[num_v]`` fp32.
-        qscale: ``dk ** -0.5``.
-        rep: Value heads per key head.
+        q: 每个 key 头的查询，``[num_k, dk]``。
+        k: 每个 key 头的 key，``[num_k, dk]``。
+        v: 每个 value 头的 value，``[num_v, dv]``。
+        b: beta 的 logits，``[num_v]``。
+        a: 衰减的 logits，``[num_v]``。
+        neg_expA: ``-exp(A_log)``，``[num_v]`` fp32。
+        dt_bias: 衰减偏置，``[num_v]`` fp32。
+        q_out: 输出查询，``[num_v, dk]`` fp32。
+        k_out: 输出 key，``[num_v, dk]`` fp32。
+        v_out: 输出 value，``[num_v, dv]`` fp32。
+        beta: 输出的写入强度，``[num_v]`` fp32。
+        g: 输出的对数衰减 ``<= 0``，``[num_v]`` fp32。
+        qscale: ``dk ** -0.5``。
+        rep: 每个 key 头对应的 value 头数。
 
     Returns:
-        Nothing. Every output buffer is written in place.
+        无。每个输出缓冲区都是原地写入。
 
     Raises:
-        RuntimeError: The extension is unavailable.
+        RuntimeError: 扩展不可用。
     """
     _hip().delta_prologue(q, k, v, b, a, neg_expA, dt_bias, q_out, k_out, v_out,
                           beta, g, qscale, rep)
@@ -746,29 +707,29 @@ def delta_prologue_batch(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                          q_out: torch.Tensor, k_out: torch.Tensor,
                          v_out: torch.Tensor, beta: torch.Tensor,
                          g: torch.Tensor, qscale: float, rep: int) -> None:
-    """Batched :func:`delta_prologue`, a leading row dim on every argument.
+    """批处理的 :func:`delta_prologue`，每个参数都多一个前导行维。
 
     Args:
-        q: Query per key head, ``[B, num_k, dk]``.
-        k: Key per key head, ``[B, num_k, dk]``.
-        v: Value per value head, ``[B, num_v, dv]``.
-        b: Beta logits, ``[B, num_v]``.
-        a: Decay logits, ``[B, num_v]``.
-        neg_expA: ``-exp(A_log)``, ``[num_v]``, shared by every row.
-        dt_bias: Decay bias, ``[num_v]``, shared by every row.
-        q_out: Output query, ``[B, num_v, dk]`` fp32.
-        k_out: Output key, ``[B, num_v, dk]`` fp32.
-        v_out: Output value, ``[B, num_v, dv]`` fp32.
-        beta: Output write strength, ``[B, num_v]`` fp32.
-        g: Output log decay ``<= 0``, ``[B, num_v]`` fp32.
-        qscale: ``dk ** -0.5``.
-        rep: Value heads per key head.
+        q: 每个 key 头的查询，``[B, num_k, dk]``。
+        k: 每个 key 头的 key，``[B, num_k, dk]``。
+        v: 每个 value 头的 value，``[B, num_v, dv]``。
+        b: beta 的 logits，``[B, num_v]``。
+        a: 衰减的 logits，``[B, num_v]``。
+        neg_expA: ``-exp(A_log)``，``[num_v]``，所有行共享。
+        dt_bias: 衰减偏置，``[num_v]``，所有行共享。
+        q_out: 输出查询，``[B, num_v, dk]`` fp32。
+        k_out: 输出 key，``[B, num_v, dk]`` fp32。
+        v_out: 输出 value，``[B, num_v, dv]`` fp32。
+        beta: 输出的写入强度，``[B, num_v]`` fp32。
+        g: 输出的对数衰减 ``<= 0``，``[B, num_v]`` fp32。
+        qscale: ``dk ** -0.5``。
+        rep: 每个 key 头对应的 value 头数。
 
     Returns:
-        Nothing. Buffers are written in place.
+        无。缓冲区都是原地写入。
 
     Raises:
-        RuntimeError: The extension is unavailable.
+        RuntimeError: 扩展不可用。
     """
     _hip().delta_prologue_batch(q, k, v, b, a, neg_expA, dt_bias, q_out, k_out,
                                 v_out, beta, g, qscale, rep)
@@ -779,27 +740,27 @@ def delta_prep_seq(qkv: torch.Tensor, b: torch.Tensor, a: torch.Tensor,
                    q_out: torch.Tensor, k_out: torch.Tensor, v_out: torch.Tensor,
                    beta: torch.Tensor, g: torch.Tensor,
                    qscale: float, rep: int) -> None:
-    """Prefill head prep, writing the head-major layout the chunked scan reads.
+    """预填充的头准备，写出分块扫描直接读取的头主序布局。
 
     Args:
-        qkv: Conv output, ``[T, conv_dim]`` fp32.
-        b: Beta logits, ``[T, num_v]``.
-        a: Decay logits, ``[T, num_v]``.
-        neg_expA: ``-exp(A_log)``, ``[num_v]`` fp32.
-        dt_bias: Decay bias, ``[num_v]`` fp32.
-        q_out: Output query, ``[num_v, T, dk]`` fp32.
-        k_out: Output key, ``[num_v, T, dk]`` fp32.
-        v_out: Output value, ``[num_v, T, dv]`` fp32.
-        beta: Output write strength, ``[num_v, T]`` fp32.
-        g: Output log decay ``<= 0``, ``[num_v, T]`` fp32.
-        qscale: ``dk ** -0.5``.
-        rep: Value heads per key head.
+        qkv: 卷积输出，``[T, conv_dim]`` fp32。
+        b: beta 的 logits，``[T, num_v]``。
+        a: 衰减的 logits，``[T, num_v]``。
+        neg_expA: ``-exp(A_log)``，``[num_v]`` fp32。
+        dt_bias: 衰减偏置，``[num_v]`` fp32。
+        q_out: 输出查询，``[num_v, T, dk]`` fp32。
+        k_out: 输出 key，``[num_v, T, dk]`` fp32。
+        v_out: 输出 value，``[num_v, T, dv]`` fp32。
+        beta: 输出的写入强度，``[num_v, T]`` fp32。
+        g: 输出的对数衰减 ``<= 0``，``[num_v, T]`` fp32。
+        qscale: ``dk ** -0.5``。
+        rep: 每个 key 头对应的 value 头数。
 
     Returns:
-        Nothing. Every output buffer is written in place.
+        无。每个输出缓冲区都是原地写入。
 
     Raises:
-        RuntimeError: The extension is unavailable.
+        RuntimeError: 扩展不可用。
     """
     _hip().delta_prep_seq(qkv, b, a, neg_expA, dt_bias, q_out, k_out, v_out,
                           beta, g, qscale, rep)
@@ -807,22 +768,22 @@ def delta_prep_seq(qkv: torch.Tensor, b: torch.Tensor, a: torch.Tensor,
 
 def delta(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, beta: torch.Tensor,
           g: torch.Tensor, st: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
-    """One gated delta decode step, updating ``st`` in place.
+    """一步 gated delta 解码，原地更新 ``st``。
 
     Args:
-        q: Normalised query, ``[num_v, dk]`` fp32.
-        k: Normalised key, ``[num_v, dk]`` fp32.
-        v: Value, ``[num_v, dv]`` fp32.
-        beta: Write strength, ``[num_v]`` fp32.
-        g: Log decay ``<= 0``, ``[num_v]`` fp32.
-        st: Recurrent state ``[num_v, dk, dv]`` fp32, updated in place.
-        out: Output buffer ``[num_v, dv]`` fp32, written in place.
+        q: 归一化后的查询，``[num_v, dk]`` fp32。
+        k: 归一化后的 key，``[num_v, dk]`` fp32。
+        v: value，``[num_v, dv]`` fp32。
+        beta: 写入强度，``[num_v]`` fp32。
+        g: 对数衰减 ``<= 0``，``[num_v]`` fp32。
+        st: 循环状态 ``[num_v, dk, dv]`` fp32，原地更新。
+        out: 输出缓冲区 ``[num_v, dv]`` fp32，原地写。
 
     Returns:
-        ``out``, for call chaining.
+        ``out``，便于链式调用。
 
     Raises:
-        RuntimeError: The extension is unavailable.
+        RuntimeError: 扩展不可用。
     """
     return _hip().delta(q, k, v, beta, g, st, out)
 
@@ -830,29 +791,28 @@ def delta(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, beta: torch.Tensor,
 def delta_batch(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                 beta: torch.Tensor, g: torch.Tensor, st: torch.Tensor,
                 out: torch.Tensor) -> torch.Tensor:
-    """Batched gated delta step, one state row per batch entry.
+    """批处理的 gated delta 步，每个批条目一行状态。
 
     Args:
-        q: Normalised query, ``[B, num_v, dk]`` fp32.
-        k: Normalised key, ``[B, num_v, dk]`` fp32.
-        v: Value, ``[B, num_v, dv]`` fp32.
-        beta: Write strength, ``[B, num_v]`` fp32.
-        g: Log decay ``<= 0``, ``[B, num_v]`` fp32.
-        st: Recurrent state ``[B, num_v, dk, dv]`` fp32, updated in place.
-        out: Output buffer ``[B, num_v, dv]`` fp32, written in place.
+        q: 归一化后的查询，``[B, num_v, dk]`` fp32。
+        k: 归一化后的 key，``[B, num_v, dk]`` fp32。
+        v: value，``[B, num_v, dv]`` fp32。
+        beta: 写入强度，``[B, num_v]`` fp32。
+        g: 对数衰减 ``<= 0``，``[B, num_v]`` fp32。
+        st: 循环状态 ``[B, num_v, dk, dv]`` fp32，原地更新。
+        out: 输出缓冲区 ``[B, num_v, dv]`` fp32，原地写。
 
     Returns:
-        ``out``, for call chaining.
+        ``out``，便于链式调用。
 
     Raises:
-        RuntimeError: The extension is unavailable.
+        RuntimeError: 扩展不可用。
     """
     return _hip().delta_batch(q, k, v, beta, g, st, out)
 
 
-#: The 17 names this backend serves with a kernel. ``_NATIVE`` is what
-#: :func:`caps` reports; it is spelled out so a missing kernel shows up as a
-#: shorter ``native=N/17`` in the banner instead of silently degrading.
+#: 本后端用内核提供的 17 个名字。``_NATIVE`` 就是 :func:`caps` 报告的内容；这里逐个
+#: 写出来，好让缺失的内核在横幅里表现为更短的 ``native=N/17``，而不是悄悄降级。
 _NATIVE: dict[str, OpFn] = {
     "linear": linear,
     "linear_m": linear_m,
@@ -873,39 +833,36 @@ _NATIVE: dict[str, OpFn] = {
     "delta_batch": delta_batch,
 }
 
-#: Table with every kernel this backend has; the resolver fills anything absent.
+#: 本后端已有的全部内核组成的表；解析器会补齐缺席的部分。
 _OPS = Ops.from_mapping(_NATIVE)
 
 
 @functools.lru_cache(maxsize=1)
 def ops() -> Ops:
-    """Return this backend's total op table, with the extension loaded.
+    """返回本后端的完整算子表，并确保扩展已加载。
 
-    The kernels are built (or attached to a cached build) on the first call, and
-    the result is memoised: the failure memo lives in the shim, so a broken
-    toolchain costs one attempt per process. Entries without a kernel are filled
-    from the reference backend, which is what keeps the table total.
+    首次调用时编译内核（或挂到已缓存的构建上），结果被记忆化：失败的记忆留在 shim
+    里，所以坏掉的工具链每个进程只花一次尝试。没有内核的条目由参考后端补齐，整张表
+    因此保持完整。
 
     Returns:
-        A table with all 17 entries callable: this backend's kernels where they
-        exist, the reference implementation for the rest. With no device, or with
-        a failed build, the table is all reference, so a diagnostic caller can
-        still inspect it; :func:`usable` is what stops such a table from ever
-        reaching a request.
+        17 个条目全部可调用的表：有内核的地方是本后端的实现，其余是参考实现。没有
+        设备或编译失败时，整张表都是参考实现，诊断调用方仍能检查它；:func:`usable`
+        才是拦着这张表进入请求的东西。
     """
-    # ``probe()`` first, so a host with no device never reaches ``_build_error`` and
-    # never imports the shim that sets the build environment variables.
+    # 先看 ``probe()``，这样没有设备的主机永远到不了 ``_build_error``，也就永远不会
+    # import 那个会设置构建环境变量的 shim。
     if not probe() or _build_error() is not None:
         return reference.fill(Ops(), caps())
     return reference.fill(_OPS, caps())
 
 
 def reason_table() -> str:
-    """Return the native/fallback split, for a diagnostic dump.
+    """返回原生/回退的划分，供诊断转储使用。
 
     Returns:
-        One line naming which ops run native and which fall back to the
-        reference, e.g. for ``test_backends`` to assert the split.
+        一行，点名哪些算子走原生、哪些回退到参考实现，例如供 ``test_backends`` 断言
+        这个划分。
     """
     table = _OPS
     return (f"native={', '.join(table.implemented())}; "

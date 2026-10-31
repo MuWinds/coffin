@@ -1,21 +1,19 @@
-"""The tied embedding matrix: input row gather and shared ``lm_head`` projection.
+"""绑定嵌入矩阵：输入行 gather 与共用的 ``lm_head`` 投影。
 
-One weight serves two very different roles -- a row gather per token id, and the
-final projection, which is the single largest weight read of a decode step -- so
-the gather dequantises only the rows it touches while the projection goes
-through :class:`ops.gemv.GEMV`.
+同一个权重承担两个完全不同的角色——按 token id 取一行，以及最终投影，后者
+是一次解码步骤里最大的一笔权重读取——所以 gather 只反量化它碰到的行，投影
+则走 :class:`ops.gemv.GEMV`。
 
-Module: ``coffin/ops``. Sits on ``ops/gemv``; used by ``models/qwen35/model.py``
-for both the embedding lookup and the logits projection.
+Module: ``coffin/ops``。建立在 ``ops/gemv`` 之上；``models/qwen35/model.py``
+用它同时做嵌入查表和 logits 投影。
 
 Constraints:
-    * The gather must return bf16 (``D``) regardless of how the weight is stored:
-      the KV cache and every kernel are written against bf16.
-    * The int8 path dequantises per row with the row's own scale -- a whole-matrix
-      dequantise would cost a full pass over the largest weight in the model.
-    * Gather and projection are separate entry points on purpose; keeping the
-      projection's kernel selection off the gather path is what makes the gather
-      cheap.
+    * 不管权重怎么存，gather 都必须返回 bf16（``D``）：KV 缓存和每个内核都是
+      照 bf16 写的。
+    * int8 路径按行用该行自己的 scale 反量化——整矩阵反量化要完整读一遍模型里
+      最大的权重。
+    * gather 和投影刻意是两个入口；把投影的内核选择从 gather 路径上摘掉，
+      正是 gather 便宜的原因。
 """
 
 from __future__ import annotations
@@ -28,22 +26,20 @@ from ops.gemv import GEMV
 
 
 class TiedEmbedding:
-    """The tied input-embedding / lm_head matrix, held as bf16 or int8.
+    """绑定的输入嵌入 / lm_head 矩阵，以 bf16 或 int8 持有。
 
-    One weight serves two very different roles: a row gather per token id, and the
-    final projection. Quantised, the gather dequantises only the rows it touches
-    (a few thousand elements) while the projection reads the whole matrix -- the
-    single largest weight read of a decode step -- so the two get separate paths.
+    同一个权重承担两个完全不同的角色：按 token id 取一行，以及最终投影。
+    量化之后，gather 只反量化碰到的那些行（几千个元素），而投影要读整个矩阵
+    ——一次解码步骤里最大的一笔权重读取——所以两者分属不同路径。
     """
 
     def __init__(self, w, bench: bool = True) -> None:
-        """Wrap the shared weight and build its projection path.
+        """包住共享权重并建好它的投影路径。
 
         Args:
-            w: The embedding matrix, either a plain tensor or an
-                :class:`int8_weights.QWeight`.
-            bench: Forwarded to :class:`GEMV`; ``False`` skips the per-shape
-                autotune, which is what makes structural tests cheap.
+            w: 嵌入矩阵，普通张量或 :class:`int8_weights.QWeight`。
+            bench: 透传给 :class:`GEMV`；``False`` 跳过逐形状的自动调优，
+                结构测试之所以便宜靠的就是它。
         """
         self.q = w if isinstance(w, QWeight) else None
         self.gemv = GEMV(w, bench)
@@ -51,27 +47,25 @@ class TiedEmbedding:
 
     @property
     def shape(self) -> tuple[int, int]:
-        """Weight shape, readable whichever storage form is live.
+        """权重形状，无论当前是哪种存储形式都可读。
 
         Returns:
-            ``(vocab, hidden)``; the int8 branch reports the logical shape of the
-            dequantised matrix, not the packed buffer's.
+            ``(vocab, hidden)``；int8 分支报的是反量化后矩阵的逻辑形状，不是
+            packed 缓冲区的形状。
         """
         return (self.q.n, self.q.k) if self.q is not None else tuple(self.w.shape)
 
     def lookup(self, ids: torch.Tensor) -> torch.Tensor:
-        """Gather ``[T]`` token ids into their ``[T, hidden]`` bf16 embeddings.
+        """把 ``[T]`` 个 token id 取成对应的 ``[T, hidden]`` bf16 嵌入。
 
-        The int8 branch dequantises only the selected rows: a prefill of 2k tokens
-        touches a few thousand rows of a ``[vocab, hidden]`` matrix, so a
-        whole-matrix dequantise would dominate the step.
+        int8 分支只反量化选中的行：2k token 的预填充只碰到 ``[vocab, hidden]``
+        矩阵里几千行，整矩阵反量化会主导这一步的耗时。
 
         Args:
-            ids: Token ids, ``[T]``, already validated against the vocabulary by
-                the caller.
+            ids: token id，``[T]``，调用方已校验过词表范围。
 
         Returns:
-            ``[T, hidden]`` bf16 activations.
+            ``[T, hidden]`` 的 bf16 激活。
         """
         if self.q is None:
             return self.w.index_select(0, ids).to(D)
@@ -79,24 +73,24 @@ class TiedEmbedding:
         return (rows.float() * scale[:, None]).to(D)
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        """Project one activation row against the tied matrix (decode path).
+        """拿一行激活对绑定矩阵做投影（解码路径）。
 
         Args:
-            x: Activations, ``[hidden]`` or ``[C, hidden]``.
+            x: 激活，``[hidden]`` 或 ``[C, hidden]``。
 
         Returns:
-            Logits, ``[vocab]`` or ``[C, vocab]``.
+            logits，``[vocab]`` 或 ``[C, vocab]``。
         """
         return self.gemv(x)
 
     def prefill(self, x: torch.Tensor) -> torch.Tensor:
-        """Project many activation rows against the tied matrix (prefill path).
+        """拿多行激活对绑定矩阵做投影（预填充路径）。
 
         Args:
-            x: Activations, ``[C, hidden]``.
+            x: 激活，``[C, hidden]``。
 
         Returns:
-            Logits, ``[C, vocab]``; see :meth:`ops.gemv.GEMV.prefill` for why the
-            small-``C`` case takes a different kernel.
+            logits，``[C, vocab]``；小 ``C`` 的情形为什么换一个内核见
+            :meth:`ops.gemv.GEMV.prefill`。
         """
         return self.gemv.prefill(x)

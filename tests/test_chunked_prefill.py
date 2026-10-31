@@ -1,35 +1,30 @@
-"""Chunked prefill, preemption and eager batched decode, on the CPU.
+"""在 CPU 上验证分块预填充、抢占与 eager 批处理解码。
 
-Module: ``coffin/tests``. Drives ``llm_engine`` / ``scheduler`` /
-``model_runner`` / ``block_manager`` against a recording fake model over a real
-paged pool, so the whole scheduling surface runs with no DCU and no checkpoint.
+Module: ``coffin/tests``。用一台会记账的假模型驱动 ``llm_engine`` /
+``scheduler`` / ``model_runner`` / ``block_manager``，底下挂真实分页池，
+于是整套调度面不用 DCU、不用 checkpoint 就能跑。
 
 Constraints:
-    * The fake model owns its "KV" as a list of tokens per row and refuses to
-      write at a position other than the next free one. That is what makes the
-      equivalence claims exact rather than approximate: a chunked prefill that
-      resumed from the wrong position, or reset the row's carried state, cannot
-      produce the prompt as its row state afterwards.
-    * The pool is real, so block refcounts, eviction and preemption are measured
-      on real allocations. ``num_free`` returning to its starting value is the
-      leak check for every test that allocates.
-    * ``graph=False`` throughout. A captured graph cannot be recorded on this
-      host, and the eager path is the one the SCOW deployment runs, so the tests
-      must not need capture to pass.
-    * Timing is never asserted; ``prefill_s`` is only checked for being present.
+    * 假模型的「KV」就是每行一个 token 列表，并且拒绝写到「下一个空位」以外
+      的位置。等价性结论因此是精确的而不是近似的：从错误位置续上的分块预填充，
+      或者把该行携带状态重置掉的分块预填充，事后都不可能把 prompt 还原成
+      行状态。
+    * 池是真的，块引用计数、淘汰、抢占都量在真实分配上。每个会分配的测试都用
+      ``num_free`` 是否回到初值查泄漏。
+    * 全程 ``graph=False``。这台主机记不了捕获图，而 SCOW 部署跑的正是 eager
+      路径，所以测试不能依赖捕获才能通过。
+    * 从不断言耗时；``prefill_s`` 只检查字段在不在。
 
-What has to hold:
+必须守住的不变量：
 
-1. one prefill call and N chunked calls produce the same row state and the same
-   next-token logits;
-2. a chunk boundary that lands inside the model's carried state does not reset
-   it -- the carried state after chunk k is exactly the prompt prefix;
-3. a prefix hit still works when the suffix takes several chunks;
-4. preemption mid-prefill, mid-decode and with a radix prefix all restore
-   without losing or duplicating an emitted token;
-5. the token budget really bounds a step's prefill work, and a short request is
-   not blocked behind a long prompt;
-6. a pool too small to make progress raises instead of spinning.
+1. 一次预填充调用与 N 次分块调用产出的行状态、下一个 token 的 logits 相同；
+2. 落在携带状态内部的分块边界不得重置它——第 k 块之后的状态恰好是 prompt
+   前缀；
+3. 后缀跨多块时分，前缀命中仍然生效；
+4. 预填充中途、解码中途、以及带基数前缀时被抢占，恢复后都不能丢或重复已输出
+   的 token；
+5. token 预算真的卡住单步预填充量，短请求不会被长 prompt 挡在后面；
+6. 池小到推不动时抛错，而不是原地空转。
 
     python -m unittest discover -s tests -p "test_chunked_prefill.py" -v
 """
@@ -38,7 +33,9 @@ from __future__ import annotations
 
 import unittest
 
-import support  # noqa: F401  (sys.path setup only; no checkpoint is loaded)
+# support 只为把顶层包加进 sys.path，本文件不加载 checkpoint，所以导入后不使用
+# 它，F401 是预期内的。
+import support  # noqa: F401
 
 import torch
 
@@ -54,21 +51,19 @@ VOCAB = 32
 
 
 class FakePrefillModel:
-    """A paged model whose "KV" is the token stream written into each row.
+    """一台分页模型，它的「KV」就是写进每一行的 token 流。
 
-    Every entry point records into ``rows`` and checks that it was asked to
-    write at the position the row is actually at, which is the whole contract a
-    chunked prefill has to satisfy. Logits are derived from the row's full token
-    list, so two runs agree exactly when they wrote the same stream.
+    每个入口都把写入记到 ``rows`` 里，并核对被要求写入的位置是否正是该行真正的
+    当前位置——这正是分块预填充必须满足的全部契约。logits 由该行的完整 token
+    列表算出，因此两次运行只要写入了同一串 token 就一定对得上。
     """
 
     def __init__(self, num_blocks: int = 48, block_size: int = BLOCK) -> None:
-        """Allocate the pool and the single-row defaults.
+        """分配池和单行默认状态。
 
         Args:
-            num_blocks: Physical blocks; small on purpose so preemption and
-                eviction are reachable.
-            block_size: Tokens per block.
+            num_blocks: 物理块数；故意给小，让抢占和淘汰够得着。
+            block_size: 每块的 token 数。
         """
         self.max_seq = MAX_SEQ
         self.num_blocks = num_blocks
@@ -88,24 +83,24 @@ class FakePrefillModel:
         self.scratch: list[int] = []
         self.mm_calls: list[object] = []
 
-    # lifecycle
+    # 生命周期
     def enable_paging(self, num_blocks: int, block_size: int):
-        """Attach the paged pool.
+        """挂上分页池。
 
         Args:
-            num_blocks: Pool size.
-            block_size: Tokens per block.
+            num_blocks: 池大小。
+            block_size: 每块的 token 数。
 
         Returns:
-            The pool, which the block manager then wraps.
+            池本身，块管理器随后会包住它。
         """
         return self.pool
 
     def enable_batching(self, capacity: int) -> None:
-        """Give the model one row per batch entry, plus the staging row.
+        """让模型每个批条目一行，外加一行暂存行。
 
         Args:
-            capacity: Rows including the staging row.
+            capacity: 行数，含暂存行。
         """
         self.batch_capacity = capacity
         self.decode_capacity = capacity - 1
@@ -113,74 +108,73 @@ class FakePrefillModel:
         self.pos = torch.zeros(capacity, dtype=torch.long)
         self.pos1 = self.pos[self.prefill_row:self.prefill_row + 1]
         self.rows = [[] for _ in range(capacity)]
-        # The real model grows the slot map to the row count here; without it a
-        # row above 0 has no map to write through.
+        # 真模型在这里把槽位表扩到行数这么多行；少了这一步，0 号以上的行没有
+        # 可写入的槽位表。
         self.pool.set_rows(capacity)
         for row in range(capacity):
             self.scratch.append(self.pool.alloc())
             self.pool.assign(self.scratch[-1], 0, row)
 
     def reset(self) -> None:
-        """Rewind every row to the empty context."""
+        """把所有行倒回空上下文。"""
         self.pos.zero_()
         self.rows = [[] for _ in range(self.batch_capacity)]
 
-    # carried state
     def snapshot_linear_states(self, row: int = 0) -> dict:
-        """Snapshot one row's carried state.
+        """给一行的携带状态打快照。
 
         Args:
-            row: Row to snapshot.
+            row: 要打快照的行。
 
         Returns:
-            The row's written token stream, which is its whole state here.
+            该行写入的 token 流，它在这里就是全部状态。
         """
         return {"tokens": tuple(self.rows[row])}
 
     def restore_linear_states(self, states, row: int = 0) -> None:
-        """Install a snapshot into ``row``.
+        """把一份快照装进 ``row``。
 
         Args:
-            states: Value from :meth:`snapshot_linear_states`.
-            row: Row to overwrite.
+            states: :meth:`snapshot_linear_states` 的返回值。
+            row: 要被覆盖的行。
         """
         self.rows[row] = list(states["tokens"])
 
     def zero_linear_states(self, row: int) -> None:
-        """Clear one row's carried state.
+        """清空一行的携带状态。
 
         Args:
-            row: Row to clear.
+            row: 要清空的行。
         """
         self.rows[row] = []
 
     def move_linear_states(self, src_row: int, dst_row: int) -> None:
-        """Copy one row's state onto another.
+        """把一行的状态拷到另一行。
 
         Args:
-            src_row: Source row.
-            dst_row: Destination row.
+            src_row: 源行。
+            dst_row: 目标行。
         """
         if src_row != dst_row:
             self.rows[dst_row] = list(self.rows[src_row])
 
-    # forward
+    # 前向入口
     def prefill(self, tokens, chunk: int = 2048, spec_row=None, mm=None):
-        """Write a token run into the staging row.
+        """把一段 token 写进暂存行。
 
         Args:
-            tokens: Tokens to write, starting at the row's current position.
-            chunk: GEMM tile; unused here apart from being recorded.
-            spec_row: Batched-spec drafter row; unused.
-            mm: The request's image payload, recorded so a test can prove it
-                reaches every chunk rather than only the first.
+            tokens: 要写入的 token，从该行当前位置起写。
+            chunk: GEMM 切块大小；这里除了记下来没有别的用途。
+            spec_row: 批处理投机用的草稿行；未使用。
+            mm: 请求的图像载荷，记录下来供测试证明它到达了每一块，而不只是
+                第一块。
 
         Returns:
-            ``[VOCAB]`` logits derived from the row's whole stream.
+            由该行整条 token 流算出的 ``[VOCAB]`` logits。
 
         Raises:
-            AssertionError: The run does not start where the row actually is.
-                That is the chunked-prefill bug this fake exists to catch.
+            AssertionError: 写入起点与该行实际位置不一致。这正是这个假模型要
+                抓的分块预填充 bug。
         """
         row = self.prefill_row
         start = int(self.pos[row])
@@ -193,13 +187,13 @@ class FakePrefillModel:
         return self._logits(self.rows[row])
 
     def set_rows(self, tokens, positions, slot_rows=None, row_indices=None) -> None:
-        """Stage one decode step: token and position per row.
+        """摆好一步解码的输入：每行一个 token 和一个位置。
 
         Args:
-            tokens: One token per row.
-            positions: Absolute position of that token per row.
-            slot_rows: Block table per row; mapped through the pool.
-            row_indices: Row for each entry.
+            tokens: 每行一个 token。
+            positions: 该 token 在对应行上的绝对位置。
+            slot_rows: 每行的块表；经池做映射。
+            row_indices: 每个条目所属的行。
         """
         rows = list(range(len(tokens))) if row_indices is None else list(row_indices)
         for row, tok, pos in zip(rows, tokens, positions):
@@ -210,16 +204,16 @@ class FakePrefillModel:
                 self.pool.assign_table(list(blocks), 0, row)
 
     def decode_batch_eager(self, rows: int, bucket: int, pad_rows=()):
-        """Run a batched decode step eagerly and return every row's logits.
+        """以 eager 方式跑一步批处理解码，返回每一行的 logits。
 
         Args:
-            rows: High-water mark of the live rows.
-            bucket: Width of the forward.
-            pad_rows: Holes below ``rows``.
+            rows: 活跃行的高水位。
+            bucket: 前向的宽度。
+            pad_rows: ``rows`` 之下的空洞。
 
         Returns:
-            ``[bucket, VOCAB]`` logits. Sentinel rows get a zero row, exactly like
-            the real model's discarded padding.
+            ``[bucket, VOCAB]`` logits。哨兵行拿到全零行，和真模型丢弃填充行
+            的做法一致。
         """
         assert self.batch_capacity > 1, "decode_batch_eager() before enable_batching()"
         pad = set(int(r) for r in pad_rows) | set(range(rows, bucket))
@@ -232,26 +226,23 @@ class FakePrefillModel:
         return out
 
     def capture_batch(self, buckets) -> None:
-        """Refuse capture: this host cannot record a graph, and the engine is
-        configured for the eager path anyway.
+        """拒绝捕获：这台主机记不了图，引擎本来也配成 eager 路径。
 
         Raises:
-            AssertionError: Always. A test that reaches capture is testing the
-                wrong configuration.
+            AssertionError: 无条件抛出。跑到捕获的测试说明配置选错了。
         """
         raise AssertionError("capture_batch() called with graph off")
 
     def prefill_group(self, seqs, snapshot_interval=None):
-        """Prefill several prompts in one call, one row each.
+        """一次调用预填充多个 prompt，每条序列一行。
 
         Args:
-            seqs: Sequences to prefill; each already has a row and a block table.
-            snapshot_interval: Boundaries to snapshot; unused here.
+            seqs: 要预填充的序列；每条都已经有行和块表。
+            snapshot_interval: 打快照的边界；未使用。
 
         Returns:
-            ``(logits_list, snaps_list)``: one ``[VOCAB]`` tensor and one
-            position-keyed snapshot dict per sequence, matching the real model's
-            grouped-prefill contract.
+            ``(logits_list, snaps_list)``：每条序列一个 ``[VOCAB]`` 张量和一个
+            以位置为键的快照字典，与真模型的分组预填充契约一致。
         """
         logits, snaps = [], []
         for seq in seqs:
@@ -265,17 +256,16 @@ class FakePrefillModel:
         return logits, snaps
 
     def logits(self, token: int) -> torch.Tensor:
-        """Single-stream eager decode: write one token, return the next logits.
+        """单流 eager 解码：写一个 token，返回下一步的 logits。
 
-        The prefix-cache and non-batched engines call this instead of
-        ``decode_step``; there is no graph to replay on this host, so it is also
-        the path the eager batched engine picks.
+        前缀缓存引擎和非批处理引擎走这里而不是 ``decode_step``；这台主机没有
+        可重放的图，所以 eager 批处理引擎也同样落到这条路径。
 
         Args:
-            token: Token to write on the staging row.
+            token: 要写在暂存行上的 token。
 
         Returns:
-            ``[VOCAB]`` logits for the row's stream after the write.
+            写入之后该行 token 流对应的 ``[VOCAB]`` logits。
         """
         row = self.prefill_row
         start = int(self.pos[row])
@@ -286,25 +276,24 @@ class FakePrefillModel:
         return self._logits(self.rows[row])
 
     def decode_step(self, token: int) -> torch.Tensor:
-        """Captured-decode entry; identical to :meth:`logits` without capture.
+        """捕获解码的入口；没有捕获时与 :meth:`logits` 完全一致。
 
         Args:
-            token: Token to write on the staging row.
+            token: 要写在暂存行上的 token。
 
         Returns:
-            ``[VOCAB]`` logits for the row's stream after the write.
+            写入之后该行 token 流对应的 ``[VOCAB]`` logits。
         """
         return self.logits(token)
 
     def _logits(self, tokens: list[int]) -> torch.Tensor:
-        """Logits from a row's token stream, deterministic and injective enough
-        for an equality claim.
+        """由一行的 token 流算出 logits，确定且足够单射，可以拿来做等式断言。
 
         Args:
-            tokens: The row's whole stream.
+            tokens: 该行的整条 token 流。
 
         Returns:
-            ``[VOCAB]`` fp32 logits: a hash of the stream spread over the vocab.
+            ``[VOCAB]`` 的 fp32 logits：整条流的哈希打散到词表上。
         """
         seed = 0
         for i, tok in enumerate(tokens):
@@ -318,21 +307,20 @@ class FakePrefillModel:
 def make_engine(num_blocks: int = 48, *, max_num_seqs: int = 2,
                 prefill_quantum: int = 16, max_num_batched_tokens: int = 64,
                 snapshots: int = 4, prefix_cache: bool = True) -> tuple[LLMEngine, FakePrefillModel]:
-    """Build an engine over a fake model with the graph off.
+    """在图关闭的前提下，用假模型搭一台引擎。
 
     Args:
-        num_blocks: Pool size; small enough that preemption is reachable.
-        max_num_seqs: Rows the engine may admit at once. The default is 2 because
-            chunked prefill is a batched-engine feature: the single-stream engine
-            prefills a prompt in one call through its prefix cache, so a budget
-            cannot bound it.
-        prefill_quantum: Tokens one request may prefill per step.
-        max_num_batched_tokens: Step token budget, decode included.
-        snapshots: Recurrent-state snapshot budget.
-        prefix_cache: Attach the radix tree.
+        num_blocks: 池大小；小到抢占够得着。
+        max_num_seqs: 引擎一次可以准入的行数。默认 2 是因为分块预填充是批处理
+            引擎的能力：单流引擎经前缀缓存一次就把 prompt 预填充完，预算根本
+            卡不住它。
+        prefill_quantum: 单个请求每步可预填充的 token 数。
+        max_num_batched_tokens: 单步 token 预算，含解码。
+        snapshots: 循环状态快照预算。
+        prefix_cache: 是否挂上基数树。
 
     Returns:
-        ``(engine, model)``, built and ready to step.
+        ``(engine, model)``，已构建好，可以直接 step。
     """
     model = FakePrefillModel(num_blocks=num_blocks)
     cfg = EngineConfig(model_dir="unused", max_seq=MAX_SEQ, bench=False,
@@ -349,15 +337,15 @@ def make_engine(num_blocks: int = 48, *, max_num_seqs: int = 2,
 
 
 def drain(engine: LLMEngine, seqs: list[Sequence], limit: int = 400) -> None:
-    """Step the engine until every sequence finishes.
+    """反复 step 引擎，直到所有序列结束。
 
     Args:
-        engine: Engine to drive.
-        seqs: Sequences that must all finish.
-        limit: Step cap, so a livelock fails the test instead of hanging it.
+        engine: 要驱动的引擎。
+        seqs: 必须全部结束的序列。
+        limit: 步数上限，让活锁表现为测试失败而不是把测试挂死。
 
     Raises:
-        AssertionError: The sequences did not finish within ``limit`` steps.
+        AssertionError: 序列没有在 ``limit`` 步内结束。
     """
     for _ in range(limit):
         if all(s.is_finished for s in seqs):
@@ -368,10 +356,10 @@ def drain(engine: LLMEngine, seqs: list[Sequence], limit: int = 400) -> None:
 
 
 class ChunkedPrefillTest(unittest.TestCase):
-    """A prompt advanced in pieces must equal the same prompt in one call."""
+    """分块推进的 prompt 必须等于一次调用写进去的同一个 prompt。"""
 
     def test_chunked_prefill_equals_one_shot(self) -> None:
-        """The row state and the next-token logits must not depend on how the prompt was cut, which is the whole correctness claim."""
+        """行状态和下一个 token 的 logits 不能取决于 prompt 被切成几段——这就是全部正确性主张。"""
         prompt = [100 + i for i in range(40)]
         one, _ = make_engine(prefill_quantum=64, max_num_batched_tokens=128)
         row_a = one.add_request(prompt, SamplingParams(max_tokens=1, temperature=0.0))
@@ -382,8 +370,8 @@ class ChunkedPrefillTest(unittest.TestCase):
         row_b = many.add_request(prompt, SamplingParams(max_tokens=1, temperature=0.0))
         drain(many, [row_b])
         piecewise = many_model.rows[row_b.row]
-        # The one request this engine serves owns every write, so a chunk count
-        # above one proves the prompt was split rather than prefilled whole.
+        # 这台引擎只服务一个请求，每次写入都归它，所以块数大于 1 就证明 prompt
+        # 是被切开写的，而不是整段预填充。
         chunks = len(many_model.writes)
 
         self.assertEqual(piecewise, whole, "chunked prefill wrote a different stream")
@@ -392,7 +380,7 @@ class ChunkedPrefillTest(unittest.TestCase):
                          "the row must hold the prompt as written")
 
     def test_grouped_prefill_serves_several_short_prompts_at_once(self) -> None:
-        """Two prompts that each fit the whole budget must share one forward: that single weight read is the only thing grouping buys, so a regression to per-prompt forwards would be invisible except here."""
+        """两个各自装得进预算的 prompt 必须共用一次前向：分组唯一换来的就是这一次权重读取，退化成逐 prompt 前向的话别处看不出来，只能靠这里。"""
         engine, model = make_engine(num_blocks=48, max_num_seqs=3,
                                     prefill_quantum=64,
                                     max_num_batched_tokens=96)
@@ -401,8 +389,8 @@ class ChunkedPrefillTest(unittest.TestCase):
         seqs = [engine.add_request(p, SamplingParams(max_tokens=4, temperature=0.0))
                 for p in prompts]
         engine.step()
-        # One grouped forward covers both prompts, so both are past the prompt
-        # after a single step; per-prompt prefills would need two steps.
+        # 一次分组前向覆盖两个 prompt，所以一步之后两者都已越过 prompt 段；
+        # 逐 prompt 预填充则要两步。
         for seq in seqs:
             self.assertIs(seq.status, SequenceStatus.RUNNING,
                           "the prompt did not finish in the grouped forward")
@@ -413,7 +401,7 @@ class ChunkedPrefillTest(unittest.TestCase):
         self.assertTrue(all(s.num_completion_tokens >= 1 for s in seqs),
                         "a prompt in the group produced no token")
     def test_state_is_carried_across_a_chunk_boundary(self) -> None:
-        """A chunk that stops mid-prompt must hand the next one the state, not a reset row: that is what a 50 MB copy per request would have bought."""
+        """停在 prompt 中间的分块必须把状态交给下一块，而不是交出一行被重置的行：否则每个请求都要多付一次 50 MB 拷贝。"""
         engine, model = make_engine(prefill_quantum=8, max_num_batched_tokens=64)
         prompt = [200 + i for i in range(40)]
         seq = engine.add_request(prompt, SamplingParams(max_tokens=1, temperature=0.0))
@@ -430,7 +418,7 @@ class ChunkedPrefillTest(unittest.TestCase):
         self.assertGreater(len(set(seen)), 1, "the prompt was not prefilled in pieces")
 
     def test_token_budget_bounds_one_step(self) -> None:
-        """The budget is a real limit: a step must not prefill more tokens than it allows."""
+        """预算是硬上限：一步写入的 token 不得超过它允许的量。"""
         engine, model = make_engine(prefill_quantum=8, max_num_batched_tokens=16)
         seq = engine.add_request([300 + i for i in range(64)],
                                  SamplingParams(max_tokens=1, temperature=0.0))
@@ -440,7 +428,7 @@ class ChunkedPrefillTest(unittest.TestCase):
         self.assertEqual(seq.status, SequenceStatus.PREFILLING)
 
     def test_prefix_hit_survives_chunking(self) -> None:
-        """Reuse must compose with chunking: the second request adopts the prefix and prefills only its own tail, in pieces."""
+        """前缀复用必须与分块共存：第二个请求接上前缀，只分块预填充自己那截尾巴。"""
         engine, model = make_engine(prefill_quantum=8, max_num_batched_tokens=64)
         prefix = [400 + i for i in range(24)]
         engine.clear_prefix_cache()
@@ -460,7 +448,7 @@ class ChunkedPrefillTest(unittest.TestCase):
                         "the warm run did not resume at the matched boundary")
 
     def test_image_payload_reaches_every_chunk(self) -> None:
-        """An image prompt sliced across chunks must hand the model the same payload each time: spans are absolute, so a chunk inside the image still has to inject it."""
+        """被切成多块的图像 prompt 每次都得把同一份载荷交给模型：图像 span 是绝对区间，落在图像内部的那一块照样要注入。"""
         engine, model = make_engine(prefill_quantum=8, max_num_batched_tokens=64)
         payload = object()
         seq = engine.add_request([700 + i for i in range(32)],
@@ -474,10 +462,10 @@ class ChunkedPrefillTest(unittest.TestCase):
 
 
 class PreemptionTest(unittest.TestCase):
-    """Recompute preemption must give the pool back and restore correctly."""
+    """重算式抢占必须把块还给池，并且恢复得正确。"""
 
     def test_preempt_mid_prefill_resumes_and_finishes(self) -> None:
-        """A preempted prompt restarts from the radix checkpoint, keeps its tokens and still produces output."""
+        """被抢占的 prompt 从基数树检查点重来，token 不丢，最后仍能产出结果。"""
         engine, model = make_engine(num_blocks=19, max_num_seqs=2,
                                     prefill_quantum=8, max_num_batched_tokens=16)
         long_prompt = [800 + i for i in range(32)]
@@ -494,7 +482,7 @@ class PreemptionTest(unittest.TestCase):
         self.assertTrue(all(w[1] >= 0 for w in model.writes))
 
     def test_preempt_mid_decode_keeps_emitted_tokens(self) -> None:
-        """A request evicted while generating must not repeat or lose a token: the emitted prefix is part of the request, not of the recomputed state."""
+        """生成中被淘汰的请求不能重复或丢失 token：已输出的前缀属于请求，不属于被重算的状态。"""
         engine, model = make_engine(num_blocks=19, max_num_seqs=2,
                                     prefill_quantum=8, max_num_batched_tokens=16)
         prompts = [[800 + i for i in range(32)], [900 + i for i in range(32)]]
@@ -510,7 +498,7 @@ class PreemptionTest(unittest.TestCase):
                              "recompute lost or duplicated generated tokens")
 
     def test_pool_survives_preemption_without_leaking(self) -> None:
-        """Every referenced block must be accounted for -- the tree's cached prefixes and the model's scratch rows -- and no refcount may go negative, which would free a block someone still reads."""
+        """每个被引用的块都得有主——基数树里缓存的前缀和模型的暂存行——并且引用计数不能变成负数，那会把别人还在读的块释放掉。"""
         engine, model = make_engine(num_blocks=19, max_num_seqs=2,
                                     prefill_quantum=8, max_num_batched_tokens=16)
         seqs = [engine.add_request([800 + i for i in range(32)],
@@ -528,9 +516,8 @@ class PreemptionTest(unittest.TestCase):
                 cached.update(child.blocks)
                 stack.append(child)
         held = {b for b, n in enumerate(pool.refcount) if n > 0}
-        # A finished sequence's blocks are meant to survive in the tree -- that is
-        # the prefix cache. What must not happen is a reference nothing owns: a
-        # block held with no tree edge and no scratch row is a leak.
+        # 已结束序列的块本来就该留在树里，那就是前缀缓存。不能出现的是没人拥有的
+        # 引用：一个块被占着，却既没有树边也没有暂存行认领它，那就是泄漏。
         stray = held - cached - set(model.scratch)
         self.assertFalse(stray, f"blocks referenced by nothing: {sorted(stray)}")
         self.assertTrue(all(n >= 0 for n in pool.refcount),
@@ -539,9 +526,9 @@ class PreemptionTest(unittest.TestCase):
                          "nothing was cached, so the leak check proved nothing")
 
     def test_unsatisfiable_pool_raises_instead_of_hanging(self) -> None:
-        """A pool smaller than one request's table must fail loudly: spinning is worse than an error naming the flag to raise."""
-        # Three scratch blocks plus the two rows' staging blocks leave too little
-        # for a 120-token prompt at block 8, and no completion can ever free any.
+        """池比单个请求的块表还小时必须大声报错：原地空转比一个点明该调哪个开关的错误更糟。"""
+        # 三个暂存块加两行的暂存块之后，块大小 8 装不下 120 个 token 的 prompt，
+        # 而且没有任何完成能释放出块来。
         engine, _ = make_engine(num_blocks=8, max_num_seqs=1,
                                 prefill_quantum=8, max_num_batched_tokens=16)
         seq = engine.add_request([i for i in range(120)],
@@ -552,7 +539,7 @@ class PreemptionTest(unittest.TestCase):
         self.assertFalse(seq.is_finished)
 
     def test_short_request_is_not_blocked_by_a_long_prompt(self) -> None:
-        """Chunked prefill exists so a long prompt cannot stall the queue: the short request must start and finish while the long one is still prefilling."""
+        """分块预填充存在的理由就是长 prompt 不能堵住队列：长的那条还在预填充时，短的必须能开始并跑完。"""
         engine, model = make_engine(num_blocks=64, max_num_seqs=2,
                                     prefill_quantum=8, max_num_batched_tokens=16)
         long_prompt = [i % 40 for i in range(160)]
@@ -570,17 +557,17 @@ class PreemptionTest(unittest.TestCase):
                         "the short request waited for the whole long prompt")
         self.assertFalse(long_seq.is_finished,
                          "the long prompt should still be prefilling")
-        # The long prompt must have advanced while the short one ran, not started
-        # only after it retired: that is the head-of-line block being gone.
+        # 长 prompt 必须在短请求运行期间就往前走，而不是等短的跑完才启动：那才是
+        # 队头阻塞消失的样子。
         self.assertGreater(long_seq.prefill_cursor, 0)
         self.assertLess(long_seq.prefill_cursor, len(long_prompt))
 
 
 class EagerBatchDecodeTest(unittest.TestCase):
-    """Batched decode must run with capture off -- the SCOW configuration."""
+    """批处理解码必须在关闭捕获的前提下跑——SCOW 的配置。"""
 
     def test_batched_decode_runs_without_capture(self) -> None:
-        """Two concurrent requests must both decode through the eager batched entry while the model never captures a graph."""
+        """两个并发请求都得走 eager 批处理入口解码，同时模型一次图都不捕获。"""
         engine, model = make_engine(num_blocks=48, max_num_seqs=4,
                                     prefill_quantum=16, max_num_batched_tokens=96)
         seqs = [engine.add_request([i for i in range(12)],
@@ -593,7 +580,7 @@ class EagerBatchDecodeTest(unittest.TestCase):
         self.assertFalse(engine.runner.graph, "the eager path must be selected")
 
     def test_batched_tokens_match_a_solo_run(self) -> None:
-        """A row must sample what a lone request samples: the eager batch changes the row count, never the numbers."""
+        """同一行采样出的 token 必须和单独跑一个请求时一样：eager 批只改行数，不改数值。"""
         prompt = [55 + i for i in range(16)]
         solo_engine, solo_model = make_engine(num_blocks=48, max_num_seqs=2,
                                               prefill_quantum=32,
@@ -612,17 +599,17 @@ class EagerBatchDecodeTest(unittest.TestCase):
         drain(batch_engine, [a, b])
         self.assertEqual(a.token_ids, solo.token_ids,
                          "the batched row produced a different token stream")
-        # The batched engine must really have allocated a second row, or the run
-        # proves nothing about the batching path it is meant to exercise.
+        # 批处理引擎必须真的分配了第二行，否则这次运行说明不了它要覆盖的批处理
+        # 路径。
         self.assertGreaterEqual(len(batch_model.rows), 2)
         del solo_model
 
 
 class StatusModelTest(unittest.TestCase):
-    """The new statuses must describe the lifecycle the scheduler relies on."""
+    """新状态必须如实描述调度器所依赖的生命周期。"""
 
     def test_non_chunked_engine_still_serves_one_request(self) -> None:
-        """The single-stream path predates chunking; whatever the new statuses do, one request must still prefill once and then decode to completion."""
+        """单流路径比分块更早存在；不管新状态怎么变，一个请求仍然要一次预填充完，然后解码到底。"""
         model = FakePrefillModel(num_blocks=32)
         cfg = EngineConfig(model_dir="unused", max_seq=MAX_SEQ, bench=False,
                            quant=False, graph=False, prefix_cache=False,
@@ -642,7 +629,7 @@ class StatusModelTest(unittest.TestCase):
                          "the single-stream loop lost or duplicated a token")
 
     def test_sequence_starts_waiting_and_prefills_before_running(self) -> None:
-        """``RUNNING`` means decodable, so a request still writing its prompt must be ``PREFILLING``."""
+        """``RUNNING`` 意味着可以解码，所以还在写 prompt 的请求必须是 ``PREFILLING``。"""
         engine, _ = make_engine(num_blocks=32, max_num_seqs=2,
                                 prefill_quantum=8, max_num_batched_tokens=16)
         seq = engine.add_request([i for i in range(40)],
@@ -655,7 +642,7 @@ class StatusModelTest(unittest.TestCase):
         self.assertIs(seq.status, SequenceStatus.FINISHED)
 
     def test_preempted_sequence_keeps_its_tokens(self) -> None:
-        """The whole point of recompute: the request survives eviction, only its cache bookkeeping is reset."""
+        """重算的全部意义：请求在淘汰中活下来，被重置的只是它的缓存记账。"""
         seq = Sequence([1, 2, 3, 4])
         seq.append_token(9)
         seq.block_table = [3, 4]

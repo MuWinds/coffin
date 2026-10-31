@@ -85,11 +85,11 @@ OSError: ./libnccl.so.2: undefined symbol: ixdrvDeviceGetAttribute, version CUDA
 - **`weight_dtype` 选 bf16**：实测 prefill GEMM 在 bf16 与 fp16 上**同为 32.6 TFLOP/s**
   （与 gfx906 完全不同——那边 bf16 只有 fp16 的 1/7），所以没有理由为算力选 fp16。
 - **graph 要按算子表判断**：cuBLAS 在这张卡上不能被 capture（`CUBLAS_STATUS_ALLOC_FAILED`），
-  自写 kernel 可以。所以 `caps.graph` 不是"平台属性"而是"这一层算子是否全自写"。
+  自写内核可以。所以 `caps.graph` 不是"平台属性"而是"这一层算子是否全自写"。
 
 ---
 
 ## 4. 结论
 
-这轮 torch/驱动兼容性调查已经完成，原先的一次性 survey launcher 已删除。
+这轮 torch/驱动兼容性调查已经完成，原先那次性的调查启动脚本已删除。
 后续如需重新评估，应按当前环境重新设计探针，不复用旧的固定路径和版本假设。

@@ -1,25 +1,22 @@
 // @file norm.cu
-// @brief Fused RMSNorm and gated RMSNorm.
+// @brief 融合的 RMSNorm 与带门控的 RMSNorm。
 //
-// Module: coffin/kernels. Layer-norm entry points bound by ``hip_ops.py``; called
-// from the model blocks, never from ``ops/``.
+// Module: coffin/kernels。由 ``hip_ops.py`` 绑定的层归一化入口；从模型层调用，绝不从
+// ``ops/`` 调用。
 //
-// Why fused: ``F.rms_norm`` on this stack decomposes into a reduce (mean of
-// squares) plus separate rsqrt / mul kernels, and the engine calls it 105 times
-// per decode step (in_ln, post_ln, q_norm, k_norm, the final norm and the gated
-// linear-attn norm), which is ~2.6 ms of the step. One block per row fuses the
-// whole thing: sum of squares, rsqrt and the weight multiply in a single pass.
+// 为什么融合：这套栈上的 ``F.rms_norm`` 会拆成一个归约（平方均值）加若干次独立的 rsqrt
+// / mul 内核，而引擎每个解码步要调它 105 次（in_ln、post_ln、q_norm、k_norm、最终
+// 归一化和带门控的线性注意力归一化），折合约占该步的 2.6 ms。每行一个 block 把整件事
+// 融在一起：平方和、rsqrt、乘权重一次走完。
 //
 // Constraints:
-//   * A row is one block, so the norm width must fit the block limit; the thread
-//     count is chosen from N by ``rms_threads`` rather than fixed.
-//   * ``x`` rows are strided: q_norm runs on a ``[nh, hd]`` slice of a wider
-//     buffer, so the row pitch is a parameter and must not be assumed equal to N.
-//   * bf16 in and out, with the mean and rsqrt accumulated in fp32; computing the
-//     sum in bf16 would lose the small-magnitude terms.
-//   * The reduction is a warp shuffle plus one cross-warp combine (two
-//     ``__syncthreads()``), not a shared tree: these kernels often run as a single
-//     block, where the sync chain was the dominant cost.
+//   * 一行一个 block，所以归一化宽度必须放得进 block 限制；线程数不写死，由 N 经
+//     ``rms_threads`` 选出。
+//   * ``x`` 的行是带间距的：q_norm 跑在更宽缓冲区的一个 ``[nh, hd]`` 切片上，所以行距是
+//     参数，不能假定它等于 N。
+//   * 进出都是 bf16，均值和 rsqrt 在 fp32 里累加；用 bf16 求和在量级小的项上会丢精度。
+//   * 归约是 warp shuffle 加一次跨 warp 合并（两次 ``__syncthreads()``），不是共享内存
+//     归约树：这些内核经常只跑一个 block，那种情况下同步链就是主要开销。
 
 #include "hip_ops.h"
 
@@ -35,7 +32,7 @@ __device__ __forceinline__ float bf16f(unsigned short h) {
 
 __device__ __forceinline__ unsigned short fbf16(float f) {
     unsigned u = __float_as_uint(f);
-    u += 0x7fffu + ((u >> 16) & 1u);   // round to nearest even
+    u += 0x7fffu + ((u >> 16) & 1u);   // 就近舍入到偶数（round to nearest even）
     return (unsigned short)(u >> 16);
 }
 
@@ -45,11 +42,10 @@ __device__ __forceinline__ float warp_sum(float v) {
     return v;
 }
 
-// Warp reduction then one combine across warps: two __syncthreads() instead of
-// the eight a 256-wide shared tree needs.  These kernels often run on a *single*
-// block (the hidden-size norms are one row in decode), so the sync chain was the
-// dominant cost -- 78 calls at 11 us each is 6% of an int8 decode step.  ``red``
-// must hold at least 32 floats and is clobbered.
+// 先做 warp 内归约，再做一次跨 warp 合并：两次 __syncthreads()，而不是 256 宽共享内存
+// 归约树需要的八次。这些内核经常跑在*单个* block 上（解码时隐含维度那几个归一化就是
+// 一行），同步链因此成了主要开销——78 次调用每次 11 us，占一个 int8 解码步的 6%。
+// ``red`` 至少要能放 32 个 float，且会被覆盖。
 __device__ __forceinline__ float block_sum(float v, float* red) {
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
@@ -66,19 +62,19 @@ __device__ __forceinline__ float block_sum(float v, float* red) {
     return red[0];
 }
 
-// Rows are one block wide; 256 threads only pays off at large N, and the gated
-// norm is [32, 128] (half the threads idle) while q_norm/k_norm are [nh, 256].
-// Rounding up to a warp keeps ``block_sum``'s cross-warp combine well defined.
+// 一行就是一个 block 的宽度；256 线程只有在大 N 时才划算，而带门控的归一化是
+// [32, 128]（一半线程空转），q_norm/k_norm 则是 [nh, 256]。向上取整到 warp 的整数倍，
+// 是为了让 ``block_sum`` 的跨 warp 合并有良好定义。
 __host__ int rms_threads(int N) {
     return N < 256 ? ((N + 31) / 32) * 32 : 256;
 }
 
-// @brief y = x * rsqrt(mean(x^2) + eps) * w, one block per row.
+// @brief y = x * rsqrt(mean(x^2) + eps) * w，每行一个 block。
 //
-// @param x [M, N] bf16 with row pitch ``stride`` (a slice of a wider buffer).
-// @param w [N] bf16 weight.
-// @param y [M, N] densely packed bf16 output.
-// @param eps Added inside the rsqrt, before the reciprocal square root.
+// @param x [M, N] bf16，行距为 ``stride``（更宽缓冲区的一个切片）。
+// @param w [N] bf16 权重。
+// @param y [M, N] 紧密排布的 bf16 输出。
+// @param eps 在平方根倒数之前加进 rsqrt 内部。
 __global__ void rms_norm_kernel(const unsigned short* __restrict__ x,
                                 const unsigned short* __restrict__ w,
                                 unsigned short* __restrict__ y,
@@ -98,11 +94,11 @@ __global__ void rms_norm_kernel(const unsigned short* __restrict__ x,
         yr[i] = fbf16(bf16f(xr[i]) * inv * bf16f(w[i]));
 }
 
-// @brief y = rms(x) * w * silu(gate), all rows densely packed.
+// @brief y = rms(x) * w * silu(gate)，所有行紧密排布。
 //
-// @param x,w,gate [M, N] bf16 contiguous; the SiLU is applied to the gate after
-//        the normalised weight multiply, so the gate does not affect the norm.
-// @param y [M, N] bf16 output.
+// @param x,w,gate [M, N] bf16 连续存放；SiLU 加在归一化乘权重之后，所以 gate 不影响
+//        归一化。
+// @param y [M, N] bf16 输出。
 __global__ void rms_norm_gated_kernel(const unsigned short* __restrict__ x,
                                       const unsigned short* __restrict__ w,
                                       const unsigned short* __restrict__ gate,
@@ -129,14 +125,14 @@ __global__ void rms_norm_gated_kernel(const unsigned short* __restrict__ x,
 
 }  // namespace
 
-// @brief Fused RMSNorm over strided rows: y = x * rsqrt(mean(x^2) + eps) * w.
+// @brief 带行间距的融合 RMSNorm：y = x * rsqrt(mean(x^2) + eps) * w。
 //
-// @param x [M, N] bf16, read-only.
-// @param w [N] bf16 weight.
-// @param stride Row pitch of ``x``; pass N for a packed tensor and the wider pitch
-//        when normalising a slice (q_norm / k_norm).
-// @param eps Added before the rsqrt; the checkpoint's epsilon, not a tuning knob.
-// @return [M, N] bf16, freshly allocated and densely packed.
+// @param x [M, N] bf16，只读。
+// @param w [N] bf16 权重。
+// @param stride ``x`` 的行距；紧密张量传 N，归一化切片（q_norm / k_norm）时传更宽的
+//        间距。
+// @param eps 在 rsqrt 之前加上；它是 checkpoint 的 epsilon，不是调优旋钮。
+// @return [M, N] bf16，新分配且紧密排布。
 torch::Tensor rms_norm(torch::Tensor x, torch::Tensor w, int64_t stride, double eps) {
     const int M = x.size(0), N = x.size(1);
     auto y = torch::empty({M, N}, x.options());
@@ -150,11 +146,11 @@ torch::Tensor rms_norm(torch::Tensor x, torch::Tensor w, int64_t stride, double 
     return y;
 }
 
-// @brief Gated RMSNorm: y = rms(x) * w * silu(gate).
+// @brief 带门控的 RMSNorm：y = rms(x) * w * silu(gate)。
 //
-// @param x,w,gate [M, N] bf16, every row densely packed (no stride parameter;
-//        the gated norm is only ever called on a contiguous tensor).
-// @return [M, N] bf16, freshly allocated.
+// @param x,w,gate [M, N] bf16，每一行都紧密排布（没有 stride 参数；带门控的归一化只在
+//        连续张量上被调用）。
+// @return [M, N] bf16，新分配。
 torch::Tensor rms_norm_gated(torch::Tensor x, torch::Tensor w, torch::Tensor gate,
                              double eps) {
     const int M = x.size(0), N = x.size(1);

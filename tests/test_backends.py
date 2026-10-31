@@ -1,31 +1,26 @@
-"""Conformance and selection tests for the platform backend layer.
+"""平台后端层的一致性测试与选择测试。
 
-Two things are guarded here, and both have to hold on a host with no accelerator:
+这里守两件事，且都要在没有任何加速卡的主机上成立：
 
-* the *selection* is deterministic and legible -- ``COFFIN_BACKEND`` wins, an
-  unknown or unusable name fails loudly instead of silently degrading, and the
-  pure-torch reference is always the last candidate;
-* the *reference backend implements all 23 ops*, because it is the safety net the
-  rest of the engine relies on once the ``hip_ops.available()`` branches are
-  deleted. A ``None`` entry here would be a hole that only shows up as a crash
-  mid-request on an unsupported platform.
+* 选择是确定的、可读的：``COFFIN_BACKEND`` 优先，未知或不可用的名字直接报错而
+  不是悄悄降级，纯 torch 的参考实现永远是最后一个候选；
+* 参考后端实现了全部 23 个算子，因为 ``hip_ops.available()`` 分支删掉之后，引擎
+  其余部分就靠它兜底。这里留一个 ``None``，就是一个只会在不支持的平台上以请求
+  中途崩溃的形式出现的洞。
 
-Module: ``coffin/tests``. Imports ``support`` (for the ``sys.path`` setup),
-``backends`` and ``int8_weights``; never loads a checkpoint and never requires a
-DCU, so it runs in the CPU-only CI step as well as in the container.
+Module: ``coffin/tests``。导入 ``support``（用于 ``sys.path`` 设置）、``backends``
+与 ``int8_weights``；不加载 checkpoint、不要求 DCU，所以纯 CPU 的 CI 步骤和容器
+里都能跑。
 
 Constraints:
-    * Oracles are written out independently from the backend code under test (the
-      delta recurrence, the bf16 widening of the int8 KV cache, the depthwise
-      convolution). Reusing a backend helper as the reference would only prove the
-      helper agrees with itself.
-    * Tolerances are dtype-driven, not per-op guesses: fp32 comparisons are exact
-      to a few ulp, bf16 comparisons allow the bf16 quantum (~0.8% of the max
-      magnitude). A tighter bound on a bf16 result would re-litigate the dtype.
-    * The environment-variable paths run in a subprocess. Mutating ``os.environ``
-      in-process would leak into the already-selected backend table, which is
-      memoised for the process's life by design; a subprocess is also the only way
-      to assert "importing this package does not build a kernel".
+    * 对照实现与被测后端代码分开写（delta 递推、int8 KV 缓存的 bf16 扩宽、深度
+      卷积）。拿后端自己的辅助函数当参照，只能证明这个辅助函数和自己一致。
+    * 容差按 dtype 定，不是逐算子拍脑袋：fp32 比较精确到几个 ulp，bf16 比较放行
+      bf16 的量化步长（约最大幅值的 0.8%）。对 bf16 结果卡更紧的界等于重新质疑
+      这个 dtype。
+    * 走环境变量的路径在子进程里跑。进程内改 ``os.environ`` 会漏进已经选好的
+      后端表，那张表按设计在进程生命周期内被缓存；子进程也是断言「导入这个包
+      不会编译内核」的唯一办法。
 """
 
 from __future__ import annotations
@@ -37,7 +32,9 @@ import sys
 import unittest
 from pathlib import Path
 
-import support  # noqa: F401  (sets MKL_THREADING_LAYER and puts coffin/ on sys.path)
+# 这条 import 有副作用：它设好 MKL_THREADING_LAYER 并把 coffin/ 放进 sys.path，
+# 后面所有 import 都依赖它已经生效，所以不能删也不能挪。
+import support  # noqa: F401
 
 import torch
 import torch.nn.functional as F
@@ -48,35 +45,35 @@ import backends.reference
 from backends.protocol import Caps, Ops, make_device
 from int8_weights import QWeight
 
-#: ``coffin/`` itself, for the subprocess runs that need the same import root.
+#: ``coffin/`` 自身。子进程要以同一个导入根启动。
 ENGINE_DIR = Path(__file__).resolve().parent.parent
 
-#: Relative tolerance for a bf16 result: the dtype's own quantum, not an error
-#: budget. Anything looser would hide a genuinely wrong reduction order.
+#: bf16 结果的相对容差：这是 dtype 自己的量化步长，不是错误预算。放宽到超过它，
+#: 就会掩盖真正错的归约顺序。
 BF16_TOL = 2e-2
 
-#: Relative tolerance for an fp32 result, i.e. a few ulp of a reordered sum.
+#: fp32 结果的相对容差，即重排求和后的几个 ulp。
 FP32_TOL = 1e-5
 
 
 def _rel(got: torch.Tensor, ref: torch.Tensor) -> float:
-    """Max absolute difference normalised by the reference's magnitude.
+    """以参照幅值归一化后的最大绝对差。
 
-    A relative metric reads the same at every layer depth; an absolute bound would
-    have to be re-tuned per shape, which is how a tolerance ends up meaningless.
+    相对指标在任何层深下读到的数都一样；绝对界得按形状重新调，那正是容差变得
+    毫无意义的由来。
     """
     return ((got.float() - ref.float()).abs().max() / ref.float().abs().max().clamp_min(1e-12)).item()
 
 
 def _run_py(code: str, env: dict | None = None) -> subprocess.CompletedProcess:
-    """Run a snippet in a fresh interpreter rooted at ``coffin/``.
+    """在 ``coffin/`` 为根目录的新解释器里跑一段代码。
 
     Args:
-        code: Python source to execute.
-        env: Extra environment entries merged over the current one.
+        code: 要执行的 Python 源码。
+        env: 覆盖在当前环境之上的环境变量条目。
 
     Returns:
-        The completed process, with stdout/stderr captured as text.
+        执行完的进程，stdout/stderr 已按文本捕获。
     """
     full = dict(os.environ)
     full.pop("COFFIN_BACKEND", None)
@@ -87,10 +84,10 @@ def _run_py(code: str, env: dict | None = None) -> subprocess.CompletedProcess:
 
 
 class OpTableTest(unittest.TestCase):
-    """``Ops`` is the contract: 23 names, frozen order, and no silently dropped entry."""
+    """``Ops`` 就是契约：23 个名字、固定顺序、不许有被悄悄丢掉的条目。"""
 
     def test_names_are_the_contract_ops(self):
-        """A rename or a dropped name is a contract break for every call site, so the tuple is pinned literally."""
+        """改名或漏名对每个调用点都是契约破坏，所以元组按字面钉死。"""
         self.assertEqual(Ops.NAMES, (
             "linear", "linear_m", "linear_prefill",
             "rms_norm", "add_rms_norm", "rms_norm_gated", "kv_quant", "silu_mul",
@@ -104,34 +101,34 @@ class OpTableTest(unittest.TestCase):
         self.assertEqual(len(Ops.NAMES), 23)
 
     def test_names_match_the_dataclass_fields_in_order(self):
-        """The tuple is hand-maintained, so it can drift from the dataclass; this is the drift alarm."""
+        """这条元组是手工维护的，可能与 dataclass 漂移；这里就是漂移报警器。"""
         from dataclasses import fields
 
         self.assertEqual(tuple(f.name for f in fields(Ops)), Ops.NAMES)
 
     def test_default_table_is_all_none(self):
-        """``None`` is how a native backend says "no kernel", so the empty table must be exactly that."""
+        """``None`` 是原生后端表示「没有内核」的方式，空表必须恰好是那个样子。"""
         table = Ops()
         self.assertEqual(table.as_dict(), {name: None for name in Ops.NAMES})
         self.assertEqual(table.implemented(), ())
         self.assertEqual(table.missing(), Ops.NAMES)
 
     def test_from_mapping_rejects_unknown_names(self):
-        """A typo must not yield a table that silently lacks the op; that looks identical to "platform has no kernel"."""
+        """拼错一个名字不能换来一张悄悄缺了该算子的表；那和「平台没有这个内核」看起来一模一样。"""
         with self.assertRaises(ValueError):
             Ops.from_mapping({"gemv": lambda: None})
         with self.assertRaises(ValueError):
             Ops.from_mapping({"linear": lambda: None, "Linear": lambda: None})
 
     def test_post_init_rejects_a_non_callable_entry(self):
-        """Registering a tensor or a string would fail at the first decode step, for one shape only."""
+        """登记张量或字符串会在第一次 decode 步才炸，而且只在某一个形状上炸。"""
         with self.assertRaises(TypeError):
             Ops(linear=1)  # type: ignore[arg-type]
         with self.assertRaises(TypeError):
             Ops(rms_norm="not a function")  # type: ignore[arg-type]
 
     def test_from_mapping_is_partial_and_round_trips(self):
-        """A native backend lists only its kernels; the rest must come back as ``None`` for the resolver to fill."""
+        """原生后端只列自己写了的内核；其余必须回成 ``None``，留给解析器补齐。"""
         fn = lambda *_a, **_k: None
         table = Ops.from_mapping({"linear": fn})
         self.assertIs(table.linear, fn)
@@ -140,34 +137,34 @@ class OpTableTest(unittest.TestCase):
 
 
 class CapsTest(unittest.TestCase):
-    """Capability records carry only facts model code branches on, and they must be resolvable to a device."""
+    """能力记录只装模型代码真正据以分支的事实，而且必须能解析成设备。"""
 
     def test_make_device_resolves_cpu_without_an_index(self):
-        """``torch.device("cpu", 0)`` is not portable across torch versions, so the CPU path must drop the index."""
+        """``torch.device("cpu", 0)`` 在各 torch 版本间不可移植，所以 CPU 路径必须丢掉索引。"""
         self.assertEqual(make_device(Caps(name="x", device="cpu", device_index=3)),
                          torch.device("cpu"))
 
     def test_make_device_resolves_an_indexed_accelerator(self):
-        """Every accelerator allocation must land on ``<type>:<index>``; a bare type string would follow whichever device is current."""
+        """加速卡上的每次分配都必须落在 ``<type>:<index>``；只给类型字符串会跟着当前设备走。"""
         self.assertEqual(make_device(Caps(name="x", device="cuda", device_index=1)),
                          torch.device("cuda", 1))
         self.assertEqual(make_device(Caps(name="x", device="xpu", device_index=0)),
                          torch.device("xpu", 0))
 
     def test_make_device_rejects_an_unknown_type(self):
-        """A typo in a backend's caps must fail at selection, not at the first allocation inside the model builder."""
+        """后端 caps 里的拼写错误必须在选择时失败，而不是拖到模型构建器里第一次分配。"""
         with self.assertRaises((RuntimeError, ValueError)):
             make_device(Caps(name="x", device="not-a-device"))
 
     def test_native_is_a_subset_of_the_contract(self):
-        """The banner prints ``len(native)/len(Ops.NAMES)``, so a name outside the contract would make that ratio a lie."""
+        """banner 打印 ``len(native)/len(Ops.NAMES)``，所以契约外的名字会让这个比值说谎。"""
         for candidate in backends.candidates():
             caps = candidate.backend.caps()
             self.assertTrue(caps.native <= set(Ops.NAMES),
                             f"{caps.name}: {sorted(caps.native - set(Ops.NAMES))}")
 
     def test_reference_caps_describe_the_eager_path(self):
-        """The reference must never claim graph capture or autotune: model code would allocate capture buffers that never exist."""
+        """参考实现绝不能声称支持图捕获或自动调优：模型代码会去分配根本不存在的捕获缓冲区。"""
         caps = backends.reference.caps()
         self.assertEqual(caps.name, "reference")
         self.assertEqual(caps.device, "cpu")
@@ -180,14 +177,13 @@ class CapsTest(unittest.TestCase):
 
 
 class RegistryTest(unittest.TestCase):
-    """Selection order and failure text: an explicit pin never falls through, and no failure is silent."""
+    """选择顺序与失败文案：显式钉住的后端绝不穿透，任何失败都不许无声。"""
 
     def test_available_names_include_every_discovered_vendor(self):
-        """Adding a platform is dropping in a file, so the accepted names must come from discovery.
+        """新增平台只是丢一个文件进去，所以可选名字必须来自发现过程。
 
-        Pinning a literal tuple here would reintroduce exactly the central list the
-        vendor directory exists to remove: a new vendor file would be selectable in
-        production but rejected by this test.
+        在这里钉一个字面量元组，等于把厂商目录本来要拆掉的那张中央清单又装回去：
+        新的厂商文件在生产里可选，却会被这个测试拒绝。
         """
         names = backends.available_names()
         self.assertIn("hip", names)
@@ -200,14 +196,14 @@ class RegistryTest(unittest.TestCase):
                           f"{module_name} is a discovered vendor but not selectable")
 
     def test_reference_is_always_selectable(self):
-        """It is the guaranteed last candidate; if this ever fails, no host can run the engine."""
+        """它是兜底的最后一个候选；这条一旦失败，任何主机都跑不了引擎。"""
         self.assertIs(backends.select("reference"), backends.reference)
         self.assertTrue(backends.reference.probe())
         self.assertTrue(backends.reference.usable())
         self.assertEqual(backends.reference.reason(), "")
 
     def test_explicit_unknown_name_fails_with_the_known_names(self):
-        """A typo must not auto-detect: that would hide a deployment mistake behind a 10x slower backend."""
+        """拼错名字不许落到自动探测：那会把部署失误藏在慢 10 倍的后端后面。"""
         with self.assertRaises(RuntimeError) as ctx:
             backends.select("no-such-backend")
         msg = str(ctx.exception)
@@ -216,7 +212,7 @@ class RegistryTest(unittest.TestCase):
             self.assertIn(name, msg)
 
     def test_explicit_unusable_backend_fails_instead_of_falling_back(self):
-        """Pinning a backend means pinning it; silently running something else is the bug this test exists for."""
+        """钉住一个后端就是钉住它；悄悄换成别的跑，正是这个测试要拦的 bug。"""
         if backends.hip.usable():
             self.skipTest("this host has working HIP kernels; the unusable path needs a host without them")
         with self.assertRaises(RuntimeError) as ctx:
@@ -226,11 +222,10 @@ class RegistryTest(unittest.TestCase):
         self.assertIn("reference", msg)
 
     def test_every_discovered_placeholder_is_registered_and_explains_itself(self):
-        """A vendor file that resolves by name is the whole point of the directory.
+        """能按名字解析出来的厂商文件，正是这个目录存在的意义。
 
-        A placeholder must still answer ``reason()``, because "unknown backend" on real
-        hardware the operator just plugged in sends them looking for a deployment
-        mistake instead of an unimplemented integration.
+        占位实现仍要回答 ``reason()``：运维刚插上的真实硬件上回一句「未知后端」，
+        会让他们去查部署失误，而不是去查「这个集成还没做」。
         """
         for module_name in backends.discovery.modules():
             vendor = module_name.rsplit(".", 1)[-1]
@@ -243,41 +238,39 @@ class RegistryTest(unittest.TestCase):
                                 f"{vendor} is unusable but explains nothing")
 
     def test_hip_probe_rejects_a_cuda_namespace_that_is_not_rocm(self):
-        """A ROCm build marker is required: the namespace alone cannot identify this card.
+        """需要 ROCm 构建标记：光看命名空间认不出这张卡。
 
-        Several domestic accelerators implement the CUDA API (Iluvatar's CoreX is the
-        documented case: its own engine selects the ``cuda`` device outright), so
-        answering "yes" for any visible CUDA device would let this backend claim a card
-        it cannot run and then compile for an ISA that card lacks.
+        好几家国产加速卡实现了 CUDA API（Iluvatar 的 CoreX 是有记录的案例：它自己的
+        引擎直接选 ``cuda`` 设备），所以对任何可见的 CUDA 设备都答「可用」，会让这个
+        后端认领一张它跑不了的卡，然后为该卡并不支持的 ISA 编译。
 
-        Note what this test does *not* assert: that the marker is sufficient. It is not
-        known whether CoreX sets it too, which is exactly why backend detection is
-        ordered by claim strength -- the Iluvatar vendor matches the device name and
-        outranks a namespace-level match regardless.
+        这个测试*不*断言什么也值得写明：它不断言该标记充分。CoreX 是否也设置它尚无
+        定论，这正是后端探测按认领强度排序的原因——Iluvatar 厂商按设备名匹配，无论
+        如何都压过命名空间级的匹配。
         """
         if getattr(torch.version, "hip", None) is None:
             self.assertFalse(
                 backends.hip.probe(),
                 "probe() claimed a non-ROCm host: the build has no HIP marker, so any "
                 "visible device belongs to another vendor")
-            # The arch is the second half of the vendor test: no ROCm, no ISA. An
-            # invented default here is what turns a wrong claim into a bad build.
+            # ISA 是厂商判定的另一半：没有 ROCm 就没有 ISA。在这里编一个默认值，
+            # 正是把错误的认领变成坏构建的那一步。
             self.assertEqual(backends.hip.caps().arch, "")
 
     def test_backend_is_memoised(self):
-        """Selecting twice would rebuild kernels or let two subsystems disagree about the device."""
+        """选两次会重新编译内核，或者让两个子系统对设备各执一词。"""
         self.assertIs(backends.backend(), backends.backend())
         self.assertIs(backends.backend().ops(), backends.backend().ops())
 
     def test_status_line_carries_name_device_native_graph_autotune(self):
-        """The banner is the only place a silent reference fallback is visible; a missing field makes it undiagnosable."""
+        """banner 是静默回退到参考实现唯一能被看见的地方；缺一个字段就变得无法诊断。"""
         line = backends.status()
         for token in ("backend=", "device=", "native=", "graph=", "autotune="):
             self.assertIn(token, line)
         self.assertIn(f"native={len(backends.caps().native)}/{len(Ops.NAMES)}", line)
 
     def test_describe_all_covers_every_candidate(self):
-        """A diagnostic dump that silently omits a backend is how "why did it pick that one" becomes unanswerable."""
+        """诊断转储悄悄漏掉一个后端，「为什么选了那个」就再也说不清了。"""
         lines = backends.describe_all()
         names = backends.available_names()
         self.assertEqual(len(lines), len(names))
@@ -286,10 +279,10 @@ class RegistryTest(unittest.TestCase):
 
 
 class ReferenceTotalityTest(unittest.TestCase):
-    """The reference backend must answer all 23 names: it is the only safety net left after migration."""
+    """参考后端必须答满 23 个名字：迁移完成后它是唯一的兜底。"""
 
     def test_reference_table_has_no_gaps(self):
-        """A ``None`` here would reach model code on every unsupported platform, mid-request."""
+        """这里留一个 ``None``，会在每个不支持的平台上以请求中途的形式撞进模型代码。"""
         table = backends.reference.ops()
         self.assertEqual(table.missing(), ())
         self.assertEqual(table.implemented(), Ops.NAMES)
@@ -297,11 +290,10 @@ class ReferenceTotalityTest(unittest.TestCase):
             self.assertTrue(callable(getattr(table, name)), name)
 
     def test_every_vendor_table_resolves_to_reference_for_every_op(self):
-        """A placeholder must answer all 23 names today: the model has no fallback branch left.
+        """占位实现今天就得答满 23 个名字：模型那边已经没有回退分支了。
 
-        This is the invariant that lets a vendor start with one kernel: the partial
-        table it returns is completed from the reference, so the model runs unchanged
-        from the first day the hardware arrives.
+        这条不变量让厂商可以从一个内核起步：它返回的部分表由参考实现补齐，硬件到位
+        的第一天模型就能原样跑起来。
         """
         ref = backends.reference.ops()
         w = torch.randn(4, 3)
@@ -312,12 +304,12 @@ class ReferenceTotalityTest(unittest.TestCase):
             self.assertEqual(table.missing(), (), f"{backend.name} has gaps")
             for name in Ops.NAMES:
                 self.assertTrue(callable(getattr(table, name)), f"{backend.name}.{name}")
-            # Spot-check that the filler really is the reference implementation.
+            # 抽查补齐的确实是参考实现。
             self.assertTrue(torch.allclose(table.linear(w, x), ref.linear(w, x)),
                             f"{backend.name}.linear is not the reference op")
 
     def test_fill_keeps_native_entries_and_completes_the_rest(self):
-        """The resolver is the single place "no kernel here" becomes "run the spec"; a bug in it is a bug everywhere."""
+        """解析器是「此处没有内核」变成「跑参考实现」的唯一一处；它坏了就处处都坏。"""
         marker = lambda *_a, **_k: "native"
         partial = Ops.from_mapping({"rms_norm": marker})
         filled = backends.reference.fill(partial, backends.reference.caps())
@@ -326,7 +318,7 @@ class ReferenceTotalityTest(unittest.TestCase):
         self.assertEqual(set(filled.implemented()), set(Ops.NAMES))
 
     def test_hip_table_is_total_when_the_kernels_are_usable(self):
-        """On the DCU every entry must resolve: the HIP table is the migration's reference implementation in production."""
+        """在 DCU 上每个条目都必须解析出来：HIP 表就是迁移之后生产上的参考实现。"""
         if not backends.hip.usable():
             self.skipTest("needs the HIP extension")
         table = backends.hip.ops()
@@ -336,24 +328,22 @@ class ReferenceTotalityTest(unittest.TestCase):
 
 
 class NativeRegistrationTest(unittest.TestCase):
-    """A backend's ``_NATIVE`` dict must list every op it has written an adapter for.
+    """后端的 ``_NATIVE`` 字典必须列出它为每个算子写的适配器。
 
-    This guards a failure mode that is invisible in every other check. ``_NATIVE`` is a
-    hand-maintained dict of name -> adapter, and an op missing from it is filled from the
-    *reference backend* by ``reference.fill``. So an adapter, a header declaration, a
-    binding, a protocol field and a reference implementation can all land, the whole tree
-    can be green, and the op still never executes a kernel on this backend -- it runs the
-    torch spec while reporting success. A performance measurement taken in that state reads
-    as a clean zero improvement, which is indistinguishable from "the fusion did not pay".
+    这里守的失效模式在其他任何检查里都看不见。``_NATIVE`` 是手工维护的
+    name -> adapter 字典，从它里面漏掉的算子会被 ``reference.fill`` 用*参考实现*
+    补上。于是适配器、头文件声明、绑定、协议字段、参考实现可以全都落地，整棵树
+    也是绿的，那个算子却始终没在这个后端上跑过内核——它跑着 torch 参考实现，同时
+    报告成功。在这种状态下测出来的性能会读成一个干净的零提升，与「融合没赚到」
+    无法区分。
 
-    The check is about the adapter, not the kernel symbol: a kernel is bound under its own
-    extension-level name (``gemv_kn``, ``silu_mul``) which need not match the op name, so
-    the question is only whether the module defines an adapter for an op and then leaves it
-    unregistered.
+    检查针对适配器而不是内核符号：内核以自己的扩展层名字绑定（``gemv_kn``、
+    ``silu_mul``），不必与算子名一致，所以这里只问一件事：模块为一个算子定义了
+    适配器，却把它漏在注册之外。
     """
 
     def test_every_op_with_an_adapter_is_registered_native(self):
-        """An op the backend defines a callable adapter for must be in ``_NATIVE``."""
+        """后端为某个算子定义了可调用的适配器，它就必须出现在 ``_NATIVE`` 里。"""
         from backends import corex
 
         missing = sorted(name for name in Ops.NAMES
@@ -365,25 +355,23 @@ class NativeRegistrationTest(unittest.TestCase):
             f"card: {missing}"))
 
     def test_decode_op_set_is_a_subset_of_native(self):
-        """``_DECODE_OPS`` gates ``caps.graph``; a name in it with no kernel could capture cuBLAS."""
+        """``_DECODE_OPS`` 把守 ``caps.graph``；里面混进一个没有内核的名字，就可能捕获到 cuBLAS。"""
         from backends.corex import _DECODE_OPS, NATIVE
 
         self.assertEqual(sorted(_DECODE_OPS - set(NATIVE)), [])
 
     def test_every_native_op_is_bound_in_the_extension(self):
-        """A kernel defined in a ``.cu`` file is unreachable until ``bindings.cpp`` registers it.
+        """写在 ``.cu`` 文件里的内核，在 ``bindings.cpp`` 注册之前都取不到。
 
-        This is the second half of the same trap as the ``_NATIVE`` guard above, and it bit
-        once already: ``delta_normed`` had a declaration, a definition, a protocol field, a
-        reference implementation, an adapter and a ``_NATIVE`` entry, and the decode step
-        still died with ``AttributeError`` on the card because the pybind ``m.def`` line was
-        missing. Neither the reference fill nor the local suite can see that: the reference
-        answers on a CPU host, and the binding is only read when the extension is imported.
+        这是上面 ``_NATIVE`` 那条守卫同一个陷阱的另一半，而且已经咬过一次：
+        ``delta_normed`` 有声明、有定义、有协议字段、有参考实现、有适配器、也有
+        ``_NATIVE`` 条目，可在卡上 decode 仍然死在 ``AttributeError``，因为 pybind 的
+        ``m.def`` 那行没写。参考补齐和本地测试套件都看不见这一点：参考实现在 CPU
+        主机上就能作答，而绑定只有导入扩展时才被读取。
 
-        The check is a source scan because the extension cannot be imported without a
-        toolchain. It is approximate by nature -- it proves a name appears in a ``m.def``
-        call, not that the signature matches -- but it makes the omission impossible to leave
-        in the tree, which is the failure that actually happened.
+        之所以做源码扫描，是因为没有工具链就导不进这个扩展。它天然是近似的——只证明
+        某个名字出现在一次 ``m.def`` 调用里，不证明签名对得上——但它让这个遗漏无法
+        留在树里，而真正发生过的正是这个遗漏。
         """
         import re
 
@@ -394,10 +382,9 @@ class NativeRegistrationTest(unittest.TestCase):
             self.skipTest("corex bindings not present")
         bound = set(re.findall(r'm\.def\(\s*"([a-z0-9_]+)"', bound_path.read_text(encoding="utf-8")))
 
-        # A backend-level op name is served by an extension entry of the same name for every
-        # op added by the fusion work; an op whose kernel is bound under a different name
-        # (``linear`` -> ``gemv_kn``) is out of this check's scope by design, so it only
-        # asserts about names that the extension also declares in its header.
+        # 融合工作新增的算子，后端层算子名都由同名的扩展条目提供；内核以别的名字绑定
+        # 的算子（``linear`` -> ``gemv_kn``）按设计不在本检查范围内，所以这里只对扩展
+        # 头文件里也有声明的名字下断言。
         header_path = corex.kernels.KERNEL_DIR / "corex_ops.h"
         declared = set(re.findall(r"^(?:torch::Tensor|void)\s+([a-z0-9_]+)\s*\(",
                                   header_path.read_text(encoding="utf-8"),
@@ -410,46 +397,44 @@ class NativeRegistrationTest(unittest.TestCase):
 
 
 class VendorExtensionTest(unittest.TestCase):
-    """Adding a platform must be dropping in one file, with nothing else edited.
+    """新增平台必须只是丢一个文件进去，别的都不用改。
 
-    This is the property the whole layer is judged on: the first two vendors were
-    reached by editing a central list in three places, which is exactly what makes a
-    platform layer rot as vendors accumulate.
+    整个层就是按这条性质来评判的：最早两个厂商是靠改三处中央清单接进来的，而平台层
+    随厂商增多而腐化，走的正是这条路。
     """
 
     def test_a_vendor_file_is_a_complete_backend(self):
-        """The declarative path must produce a working backend from data alone.
+        """声明式路径必须只凭数据造出一个能用的后端。
 
-        Builds one in a temporary directory under the repo and points discovery at it,
-        so the test exercises the real discovery code rather than a stub. If this ever
-        needs a registry edit to pass, the layer has regressed to a central list.
+        在仓库下的临时目录里造一个并把发现过程指过去，这样测的是真实的发现代码而不是
+        桩。哪天这条要改注册表才能通过，就说明这个层退回成了中央清单。
 
-        The vendor under test is discovered rather than named: naming one pinned this
-        test to ``iluvatar``, which stopped being a declaration once that platform got
-        real kernels and became a hand-written backend. A property about "any vendor
-        file" should not break when a vendor graduates.
+        被测厂商是发现出来的，不是写死的：写死会把这条测试钉到 ``iluvatar`` 上，而那个
+        平台拿到真内核、变成手写后端之后，就不再是声明了。「任意厂商文件」这种性质不
+        应该因为某个厂商毕业而失效。
         """
         module_names = backends.discovery.modules()
         self.assertTrue(module_names, "no vendor declarations found to test with")
         spec, backend = backends.discovery.load(module_names[0])
         self.assertIsInstance(spec, backends.VendorSpec)
         self.assertIsInstance(backend, backends.SpecBackend)
-        # A declaration is a full backend: every protocol member, no glue code.
+        # 声明就是完整的后端：协议成员齐全，没有胶水代码。
         for member in ("probe", "usable", "reason", "ops", "caps", "device"):
             self.assertTrue(hasattr(backend, member), member)
         self.assertEqual(backend.ops().missing(), ())
         self.assertIn(backend.name, backends.available_names())
 
     def test_detection_yields_a_claim_strength_not_a_boolean(self):
-        """Claim strength is what lets a shared namespace be resolved correctly.
+        """认领强度是让共享命名空间能被正确解析的东西。
 
-        Iluvatar answers through the CUDA namespace like the Hygon DCU, so both can see a\ndevice. A name match must outrank a namespace-only match, or the ROCm backend\nsteals an Iluvatar card.
+        Iluvatar 和 Hygon DCU 一样通过 CUDA 命名空间作答，所以两者都能看见设备。按名字
+        匹配必须压过只按命名空间匹配，否则 ROCm 后端会抢走 Iluvatar 的卡。
         """
         self.assertGreater(backends.vendor.CLAIM_NAME, backends.vendor.CLAIM_NAMESPACE)
         self.assertGreater(backends.vendor.CLAIM_NAMESPACE, backends.vendor.CLAIM_NONE)
 
     def test_candidate_ranking_prefers_the_strongest_claim(self):
-        """Ordering must be total and claim-driven, never filesystem order."""
+        """排序必须是全序且由认领驱动，绝不能落到文件系统顺序。"""
         strong = backends.registry.Candidate("a", backends.reference, claim=2, priority=90)
         weak = backends.registry.Candidate("b", backends.reference, claim=1, priority=10)
         self.assertLess(strong.rank(), weak.rank(),
@@ -460,10 +445,10 @@ class VendorExtensionTest(unittest.TestCase):
                         "an exact tie must still order deterministically, by name")
 
     def test_a_broken_vendor_file_is_reported_not_silently_dropped(self):
-        """A vendor that fails to import must surface in the diagnostic dump.
+        """导入失败的厂商必须出现在诊断转储里。
 
-        The failure this guards: someone adds a platform, its module raises on import,
-        and the only symptom is ``COFFIN_BACKEND=<name>`` saying "unknown backend".
+        这里守的失效：有人加了一个平台，它的模块一导入就抛，而唯一的症状是
+        ``COFFIN_BACKEND=<name>`` 回一句「未知后端」。
         """
         lines = backends.describe_all()
         joined = "\n".join(lines)
@@ -472,7 +457,7 @@ class VendorExtensionTest(unittest.TestCase):
             self.assertIn(vendor, joined, f"{vendor} missing from describe_all")
 
     def test_spec_rejects_a_declaration_that_cannot_work(self):
-        """Validation runs at discovery, not at the first request on unowned hardware."""
+        """校验在发现时跑，不拖到没主硬件上的第一个请求。"""
         good = dict(name="x", detection=backends.Detection(namespace="cuda"))
         backends.VendorSpec(**good).validate()
         with self.assertRaises(ValueError):
@@ -486,23 +471,23 @@ class VendorExtensionTest(unittest.TestCase):
 
 
 class ReferenceOracleTest(unittest.TestCase):
-    """Every reference op must reproduce the maths written out independently in this file.
+    """每个参考算子都必须复现本文件独立写出的那份数学。
 
-    These are the numbers a new platform has to match (PLATFORMS.md §6), which is
-    why the oracle is a second implementation rather than a call into the backend.
+    这些数字是新平台必须对齐的（PLATFORMS.md §6），所以对照实现是第二份实现，而不是
+    调回后端。
     """
 
     def setUp(self):
-        """Fix the seed per test, so a failure reproduces from the test name alone."""
+        """每个测试固定种子，让失败仅凭测试名就能复现。"""
         torch.manual_seed(1234)
         self.ops = backends.reference.ops()
 
     def _linear_case(self, n=8, k=6):
-        """A weight and activations at fp32, the widest dtype the oracles can compare exactly."""
+        """权重与激活取 fp32，这是对照实现能精确比较的最宽 dtype。"""
         return torch.randn(n, k), torch.randn(k)
 
     def test_linear_single_row_and_batch_agree_with_a_matmul(self):
-        """``linear`` is the decode hot path and the only projection the model calls; a transposed weight is plausible and wrong."""
+        """``linear`` 是解码热路径，也是模型唯一调用的投影；权重转置很像是对的，但答案错。"""
         w, x = self._linear_case()
         self.assertLess(_rel(self.ops.linear(w, x), x @ w.t()), FP32_TOL)
         X = torch.randn(5, w.shape[1])
@@ -510,11 +495,11 @@ class ReferenceOracleTest(unittest.TestCase):
         self.assertLess(_rel(self.ops.linear_prefill(w, X), X @ w.t()), FP32_TOL)
 
     def test_linear_dispatches_on_int8_storage_not_on_an_op_name(self):
-        """``QWeight`` is model-side storage; if the int8 branch lived at the call site, a tensor-passing platform would break it."""
+        """``QWeight`` 是模型侧的存储；int8 分支若留在调用点，按张量传参的平台就会坏掉。"""
         w, x = self._linear_case()
         q = QWeight.quantize(w)
-        # Dequantise in fp32: ``QWeight.dequant`` defaults to bf16, and comparing
-        # against that would measure bf16 rounding rather than the int8 dispatch.
+        # 在 fp32 下反量化：``QWeight.dequant`` 默认 bf16，拿它比较量到的是 bf16 舍入
+        # 而不是 int8 分派。
         dense = q.dequant(torch.float32)
         self.assertLess(_rel(self.ops.linear(q, x), x @ dense.t()), FP32_TOL)
         X = torch.randn(3, w.shape[1])
@@ -522,7 +507,7 @@ class ReferenceOracleTest(unittest.TestCase):
         self.assertLess(_rel(self.ops.linear_prefill(q, X), X @ dense.t()), FP32_TOL)
 
     def test_rms_norm_matches_the_definition_and_honours_a_row_pitch(self):
-        """The model feeds column slices of a fused buffer, so a variant that assumes contiguous rows would corrupt q_norm."""
+        """模型喂进的是融合缓冲区的列切片，所以假定行连续的变体会把 q_norm 写坏。"""
         x = torch.randn(6, 16)
         g = torch.randn(16)
         ref = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6) * g
@@ -535,7 +520,7 @@ class ReferenceOracleTest(unittest.TestCase):
                         FP32_TOL)
 
     def test_rms_norm_gated_applies_silu_after_the_head_norm(self):
-        """Order matters: ``silu(norm(x) * w)`` and ``norm(x) * w * silu(gate)`` differ, and only the second is in the checkpoint."""
+        """顺序有讲究：``silu(norm(x) * w)`` 与 ``norm(x) * w * silu(gate)`` 结果不同，checkpoint 里的是后者。"""
         x = torch.randn(4, 16)
         g = torch.randn(16)
         gate = torch.randn(4, 16)
@@ -543,7 +528,7 @@ class ReferenceOracleTest(unittest.TestCase):
         self.assertLess(_rel(self.ops.rms_norm_gated(x, g, gate, 1e-6), ref), FP32_TOL)
 
     def _attn_inputs(self, nh=4, nkv=2, hd=8, window=6):
-        """A dense int8 cache window plus one query, all fp32 so the comparison is exact."""
+        """一段稠密的 int8 缓存窗口加一条查询，全用 fp32，比较才能精确。"""
         rep = nh // nkv
         kcache = torch.randint(-127, 127, (nkv, window, hd), dtype=torch.int8)
         vcache = torch.randint(-127, 127, (nkv, window, hd), dtype=torch.int8)
@@ -553,7 +538,7 @@ class ReferenceOracleTest(unittest.TestCase):
                 kscale, vscale, rep, hd ** -0.5)
 
     def _attn_ref(self, q, gate, k, v, ks, vs, rep, scale, keep=None):
-        """Causal gated attention written from the definition: widen, scale, mask, softmax, PV, gating."""
+        """按定义直写的因果带门注意力：扩宽、缩放、掩码、softmax、PV、门控。"""
         nh, hd = q.shape
         nkv = k.shape[0]
         qe = q.reshape(nkv, rep, hd)
@@ -566,7 +551,7 @@ class ReferenceOracleTest(unittest.TestCase):
         return out.reshape(nh, hd) * gate.sigmoid()
 
     def test_attn_decode_matches_the_reference_arithmetic(self):
-        """Attention is where a scale folded twice or a mask off by one stays plausible but answers wrongly."""
+        """注意力这里，缩放折了两次或掩码偏了一位，都还是看着合理但答案错。"""
         q, gate, kc, vc, ks, vs, rep, scale = self._attn_inputs()
         out = torch.zeros_like(q)
         self.ops.attn_decode(q, gate, kc, vc, ks, vs, out, torch.tensor([3]), rep, scale)
@@ -574,7 +559,7 @@ class ReferenceOracleTest(unittest.TestCase):
         self.assertLess(_rel(out, ref), FP32_TOL)
 
     def test_attn_decode_masks_past_the_position(self):
-        """The causal bound is ``pos``, not the cache length: reading the whole window silently leaks future tokens."""
+        """因果界是 ``pos``，不是缓存长度：整窗读完会悄悄泄漏未来的 token。"""
         q, gate, kc, vc, ks, vs, rep, scale = self._attn_inputs()
         short = torch.zeros_like(q)
         long = torch.zeros_like(q)
@@ -583,7 +568,7 @@ class ReferenceOracleTest(unittest.TestCase):
         self.assertGreater((short - long).abs().max().item(), 0.0)
 
     def test_attn_paged_equals_decode_on_an_identity_slot_map(self):
-        """The paged path must be the same attention; if the two disagree, batch and single-stream decode answer differently."""
+        """分页路径必须是同一个注意力；两者不一致，批处理与单流解码就会给出不同答案。"""
         q, gate, kc, vc, ks, vs, rep, scale = self._attn_inputs()
         window = kc.shape[1]
         pool_k = torch.zeros(12, kc.shape[0], kc.shape[2], dtype=torch.int8)
@@ -603,7 +588,7 @@ class ReferenceOracleTest(unittest.TestCase):
         self.assertLess(_rel(paged, dense), FP32_TOL)
 
     def test_attn_paged_batch_equals_per_row_paged(self):
-        """Each row of the batch kernel must equal the single-row kernel on that row; otherwise a bucket changes its answers."""
+        """批内核的每一行都必须等于单行内核算那一行；否则换一个桶就换一套答案。"""
         nh, nkv, hd = 4, 2, 8
         rep = nh // nkv
         window, rows = 6, 3
@@ -626,7 +611,7 @@ class ReferenceOracleTest(unittest.TestCase):
             self.assertLess(_rel(got[b], one), FP32_TOL)
 
     def test_attn_paged_batch_uses_each_rows_own_length(self):
-        """A shared launch must not let one row's context length change another row's answer; mixed buckets are the norm."""
+        """一次共享 launch 不能让某行的上下文长度改动另一行的答案；混合桶才是常态。"""
         nh, nkv, hd = 2, 2, 8
         rep = nh // nkv
         window = 6
@@ -642,8 +627,8 @@ class ReferenceOracleTest(unittest.TestCase):
         self.ops.attn_paged_batch(q, gate, pool_k, pool_v, ps, pv, slots,
                                   torch.tensor([1, 5], dtype=torch.int32), mixed,
                                   window, rep, hd ** -0.5)
-        # Row 0's context is one key both times, so its output may not move when
-        # row 1's context shrinks from five keys to one.
+        # 第 0 行的上下文两次都只有一个 key，所以第 1 行的上下文从五个 key 缩到
+        # 一个时，它的输出不许动。
         self.ops.attn_paged_batch(q, gate, pool_k, pool_v, ps, pv, slots,
                                   torch.tensor([1, 1], dtype=torch.int32), alone,
                                   window, rep, hd ** -0.5)
@@ -651,7 +636,7 @@ class ReferenceOracleTest(unittest.TestCase):
         self.assertGreater((mixed[1] - alone[1]).abs().max().item(), 0.0)
 
     def test_attn_paged_multi_q_equals_decoding_each_draft_alone(self):
-        """Verify accepts a draft only if its single-token decode agrees; a shared pass must be bit-identical per query."""
+        """校验只有在单 token 解码也同意时才接受草稿；一次共享的 pass 必须按查询逐位一致。"""
         nh, nkv, hd = 4, 2, 8
         rep = nh // nkv
         rows, ctx, c, window = 2, 3, 3, 8
@@ -675,7 +660,7 @@ class ReferenceOracleTest(unittest.TestCase):
                 self.assertLess(_rel(got[b, j], one), FP32_TOL)
 
     def test_attn_paged_multi_q_block_mask_excludes_blocks(self):
-        """A kept-block mask must drop the excluded keys entirely; masking the score after the softmax would not."""
+        """保留块掩码必须把被排除的 key 彻底丢掉；在 softmax 之后再掩分数做不到这一点。"""
         nh, nkv, hd = 2, 2, 8
         rows, ctx, c, window = 1, 1, 2, 8
         pool_k = torch.randint(-127, 127, (12, nkv, hd), dtype=torch.int8)
@@ -686,8 +671,8 @@ class ReferenceOracleTest(unittest.TestCase):
         q = torch.randn(rows, c, nh, hd)
         gate = torch.randn(rows, c, nh, hd)
         got = torch.zeros(rows, c, nh, hd)
-        # block size 2, keep only the first block: query 0 sees keys 0..1 of a
-        # 2-key context, which is exactly the unmasked case.
+        # 块大小 2，只保留第一个块：查询 0 看到的是 2 个 key 的上下文里的 0..1，
+        # 恰好就是不加掩码的情形。
         mask = torch.tensor([[1, 0, 0, 0]], dtype=torch.uint8)
         self.ops.attn_paged_multi_q(q, gate, pool_k, pool_v, ps, pv, slots,
                                     torch.tensor([ctx], dtype=torch.int32), got,
@@ -704,7 +689,7 @@ class ReferenceOracleTest(unittest.TestCase):
             self.assertLess(_rel(got[0, j], ref), FP32_TOL)
 
     def test_conv1d_silu_shifts_its_window_and_matches_the_definition(self):
-        """The window shift is the mixer's short-term memory: a wrong slice silently loses the previous three tokens."""
+        """窗口平移是混合器的短期记忆：切片偏了会悄悄丢掉前三个 token。"""
         channels, kernel = 8, 4
         conv_w = torch.randn(channels, kernel)
         state = torch.randn(channels, kernel - 1)
@@ -717,7 +702,7 @@ class ReferenceOracleTest(unittest.TestCase):
         self.assertEqual(_rel(state, win[:, 1:]), 0.0)
 
     def test_conv1d_silu_seq_equals_step_by_step(self):
-        """A chunked prefill must not restart the 3-token history at a chunk edge; that is the whole point of the state."""
+        """分块预填充不能在块的边界上重启那 3 个 token 的历史；状态存在的意义正是这个。"""
         channels, kernel = 8, 4
         conv_w = torch.randn(channels, kernel)
         x = torch.randn(9, channels)
@@ -731,7 +716,7 @@ class ReferenceOracleTest(unittest.TestCase):
         self.assertEqual(_rel(seq_state, step_state), 0.0)
 
     def test_conv1d_silu_batch_equals_per_row(self):
-        """A bucket must not mix rows' conv windows; that would swap tokens between sequences."""
+        """批处理不能把各行的卷积窗口混在一起；那会在序列之间交换 token。"""
         channels, kernel, rows = 8, 4, 3
         conv_w = torch.randn(channels, kernel)
         x = torch.randn(rows, channels)
@@ -746,7 +731,7 @@ class ReferenceOracleTest(unittest.TestCase):
         self.assertEqual(_rel(batch_state, per_state), 0.0)
 
     def _prologue_ref(self, q, k, v, b, a, neg_expA, dt_bias, qscale, rep):
-        """Head prep from the definition: L2 norm, head expansion, sigmoid and softplus gates."""
+        """按定义直写的头部准备：L2 归一化、头扩宽、sigmoid 与 softplus 门。"""
         qe = q.repeat_interleave(rep, dim=-2)
         ke = k.repeat_interleave(rep, dim=-2)
         qn = qe * torch.rsqrt((qe * qe).sum(-1, keepdim=True) + 1e-6) * qscale
@@ -754,7 +739,7 @@ class ReferenceOracleTest(unittest.TestCase):
         return qn, kn, b.sigmoid(), neg_expA * F.softplus(a + dt_bias)
 
     def test_delta_prologue_matches_the_definition(self):
-        """Sixteen small elementwise ops were fused into this; a wrong softplus or head expansion breaks the recurrence quietly."""
+        """十六个小逐元素算子融合进了这一个；softplus 或头扩宽写错，递推会悄悄坏掉。"""
         nv, nk, dk, dv, rep = 4, 2, 8, 8, 2
         q, k = torch.randn(nk, dk), torch.randn(nk, dk)
         v, b, a = torch.randn(nv, dv), torch.randn(nv), torch.randn(nv)
@@ -772,7 +757,7 @@ class ReferenceOracleTest(unittest.TestCase):
         self.assertLessEqual(go.max().item(), 0.0)
 
     def test_delta_prologue_batch_equals_per_row(self):
-        """Batched prologue shares ``neg_expA``/``dt_bias`` across rows; a per-row read of the 1-D tensors would alias."""
+        """批处理头部准备把 ``neg_expA``/``dt_bias`` 在各行间共享；逐行读取这两个一维张量会混叠。"""
         nv, nk, dk, dv, rep, rows = 4, 2, 8, 8, 2, 3
         q, k = torch.randn(rows, nk, dk), torch.randn(rows, nk, dk)
         v, b, a = torch.randn(rows, nv, dv), torch.randn(rows, nv), torch.randn(rows, nv)
@@ -792,7 +777,7 @@ class ReferenceOracleTest(unittest.TestCase):
             self.assertLess(_rel(go[i], gn), FP32_TOL)
 
     def test_delta_prep_seq_matches_the_definition_and_the_head_major_layout(self):
-        """The layout is the contract: the chunked scan reads ``[H, T, d]`` directly, so a transposed output feeds it garbage."""
+        """布局就是契约：分块扫描直接读 ``[H, T, d]``，输出转置了喂进去就是垃圾。"""
         nv, nk, dk, dv, rep, T = 4, 2, 8, 8, 2, 5
         conv_dim = 2 * nk * dk + nv * dv
         qkv, b, a = torch.randn(T, conv_dim), torch.randn(T, nv), torch.randn(T, nv)
@@ -812,7 +797,7 @@ class ReferenceOracleTest(unittest.TestCase):
         self.assertLess(_rel(gt, gn.permute(1, 0)), FP32_TOL)
 
     def test_delta_matches_the_gated_delta_update(self):
-        """The recurrence is the only cross-token memory in 24 of 32 layers: decay, write, then read, in that order."""
+        """递推是 32 层里那 24 层唯一的跨 token 记忆：先衰减、再写、再读，顺序如此。"""
         nv, dk, dv = 4, 8, 8
         q, k, v = torch.randn(nv, dk), torch.randn(nv, dk), torch.randn(nv, dv)
         beta, g = torch.rand(nv), -torch.rand(nv)
@@ -829,7 +814,7 @@ class ReferenceOracleTest(unittest.TestCase):
         self.assertLess(_rel(got_st, ref_st), FP32_TOL)
 
     def test_delta_batch_equals_per_row_and_keeps_rows_independent(self):
-        """Rows must not share state: a batched step that broadcast its update would make bucket members influence each other."""
+        """各行不许共享状态：批处理步把更新广播出去，桶内成员就会互相影响。"""
         nv, dk, dv, rows = 4, 8, 8, 3
         q, k = torch.randn(rows, nv, dk), torch.randn(rows, nv, dk)
         v = torch.randn(rows, nv, dv)
@@ -846,26 +831,25 @@ class ReferenceOracleTest(unittest.TestCase):
 
 
 class DependencyDirectionTest(unittest.TestCase):
-    """``backends/`` may not import the engine layers it serves; one-way imports are what keeps the layer testable alone."""
+    """``backends/`` 不许导入它所服务的引擎层；单向导入才能让这一层单独可测。"""
 
-    #: Packages ``backends/`` must never import: they sit above it in the graph.
+    #: ``backends/`` 绝不能导入的包：它们在依赖图里位于这一层之上。
     FORBIDDEN = ("ops", "models", "engine", "serving", "cache", "entrypoints",
                  "engine_api")
 
-    #: One documented exception, with the step that removes it. S0 keeps the host
-    #: shim and the kernels where they are and adapts them as a backend; S1 moves
-    #: them to ``backends/hip/``, at which point this entry must be deleted rather
-    #: than grown. ``hip_ops`` is a *leaf* shim (it imports only torch), so the
-    #: temporary dependence does not invert the graph.
+    #: 唯一一处有记录的例外，连同移除它的步骤。S0 把主机侧 shim 与内核留在原处并把
+    #: 它们适配成一个后端；S1 把它们移到 ``backends/hip/``，那时这条必须删除而不是
+    #: 增长。``hip_ops`` 是*叶子* shim（只导入 torch），所以这份临时依赖不会把依赖图
+    #: 反转。
     S0_ALLOWLIST = {"backends/hip/__init__.py": ("hip_ops",)}
 
     def _backend_files(self):
-        """Every Python file in the backend package, so a new submodule is covered automatically."""
+        """后端包里的每个 Python 文件，新的子模块自动被覆盖。"""
         root = ENGINE_DIR / "backends"
         return sorted(p for p in root.rglob("*.py"))
 
     def test_no_backend_module_imports_an_engine_layer(self):
-        """An import here would invert the dependency graph and make the backend untestable without a checkpoint."""
+        """这里出现一条导入就会反转依赖图，并让后端脱离 checkpoint 就无法测试。"""
         offenders = []
         for path in self._backend_files():
             rel = path.relative_to(ENGINE_DIR).as_posix()
@@ -888,12 +872,12 @@ class DependencyDirectionTest(unittest.TestCase):
                          "backends/ must not import engine layers:\n" + "\n".join(offenders))
 
     def test_the_s0_allowlist_stays_minimal(self):
-        """A growing allowlist is how a dependency gate turns into decoration; this pins it to one entry."""
+        """反正则表越加越长，是依赖门禁沦为摆设的典型路径；这里把它钉在一条。"""
         self.assertEqual(set(self.S0_ALLOWLIST), {"backends/hip/__init__.py"})
         self.assertEqual(self.S0_ALLOWLIST["backends/hip/__init__.py"], ("hip_ops",))
 
     def test_package_imports_without_an_accelerator_or_a_build(self):
-        """Importing the package is what a CPU-only box does; a build attempt there would rewrite the environment and fail."""
+        """导入这个包就是纯 CPU 机器会做的事；在那里尝试构建会改写环境并失败。"""
         probe = ("import sys, backends\n"
                  "assert backends.caps().name == 'reference', backends.caps().name\n"
                  "assert 'hip_ops' not in sys.modules, 'imported the HIP shim'\n"
@@ -903,14 +887,14 @@ class DependencyDirectionTest(unittest.TestCase):
         self.assertIn("backend=reference", done.stdout)
 
     def test_env_var_selects_and_pins_the_backend(self):
-        """``COFFIN_BACKEND`` is the A/B and troubleshooting knob; it has to work before anything else imports the package."""
+        """``COFFIN_BACKEND`` 是做 A/B 与排障的开关；它必须在别的代码导入这个包之前就生效。"""
         ok = _run_py("import backends; print(backends.caps().name)",
                      env={"COFFIN_BACKEND": "reference"})
         self.assertEqual(ok.returncode, 0, ok.stderr)
         self.assertEqual(ok.stdout.strip(), "reference")
 
     def test_env_var_with_an_unknown_name_fails_loudly(self):
-        """A typo must abort at import, not select a slower backend and look like a performance regression."""
+        """拼错的名字必须在导入时就中止，而不是选一个更慢的后端、看起来像性能回退。"""
         bad = _run_py("import backends", env={"COFFIN_BACKEND": "nonsense"})
         self.assertNotEqual(bad.returncode, 0)
         self.assertIn("nonsense", bad.stderr)
@@ -918,14 +902,14 @@ class DependencyDirectionTest(unittest.TestCase):
 
 
 class CorexPackTest(unittest.TestCase):
-    """The int8 -> bf16 weight conversion, which every int8 prefill call pays for."""
+    """int8 -> bf16 的权重量化转换，每次 int8 预填充调用都要付这个代价。"""
 
     def _packed(self):
-        """Build a small packed int8 weight with realistic scales.
+        """造一个小尺寸、scale 接近真实的打包 int8 权重。
 
         Returns:
-            A ``KnQWeight`` whose ``[K, N]`` matrix is contiguous int8 and whose scale is
-            1-D fp32, which is the pair the constructor validates.
+            一个 ``KnQWeight``，其 ``[K, N]`` 矩阵是连续的 int8，scale 是一维 fp32，
+            正是构造函数校验的那一对。
         """
         from backends.corex.pack import KnQWeight
 
@@ -935,14 +919,13 @@ class CorexPackTest(unittest.TestCase):
         return KnQWeight(wt, scale)
 
     def test_dequant_kn_is_bit_identical_to_the_wide_fp32_spelling(self):
-        """The fast spelling must not move a single weight.
+        """快的写法不许挪动任何一个权重。
 
-        The conversion used to build a ``[K, N]`` fp32 temporary and narrow it, which cost
-        174.8 ms per prefill request on the card. Casting to the output dtype first and
-        scaling in place is 1.70x faster because ``mul_`` takes its dtype from the
-        destination, so it still multiplies in fp32 and rounds once -- same arithmetic,
-        no temporary. A bf16 *scale* would instead cost 1 ULP on every weight, which is
-        why the scale stays fp32 here and this test is bit-exact rather than approximate.
+        原先的转换会先造一个 ``[K, N]`` 的 fp32 临时张量再窄化，在卡上每次预填充请求
+        花 174.8 ms。先转成输出 dtype 再原地缩放快 1.70x，因为 ``mul_`` 的 dtype 取自
+        目标张量，它仍在 fp32 下相乘、只舍入一次——同样的算术，没有临时张量。换成 bf16
+        的 *scale* 反而会让每个权重差 1 ULP，这就是这里 scale 保持 fp32、这条测试要求
+        逐位精确而不是近似的原因。
         """
         q = self._packed()
         got = q.dequant_kn(torch.bfloat16).wt
@@ -952,7 +935,7 @@ class CorexPackTest(unittest.TestCase):
                         "acceptable if it is bit-identical")
 
     def test_dequant_kn_keeps_the_kn_layout(self):
-        """The result feeds ``matmul(lhs, wt)``, so a transposed or non-contiguous matrix multiplies silently wrong."""
+        """结果直接喂给 ``matmul(lhs, wt)``；转置了或者不连续，乘法就会悄悄算错。"""
         q = self._packed()
         out = q.dequant_kn(torch.bfloat16)
         self.assertEqual((out.k, out.n), (q.k, q.n))
@@ -961,35 +944,32 @@ class CorexPackTest(unittest.TestCase):
         self.assertEqual(out.wt.dtype, torch.bfloat16)
 
     def test_dequant_kn_rejects_an_integer_destination(self):
-        """Scaling into an integer destination wraps instead of raising, which reads as a corrupt checkpoint later."""
+        """往整型目标里缩放会回绕而不是抛错，事后读起来像一个损坏的 checkpoint。"""
         q = self._packed()
         with self.assertRaises(TypeError):
             q.dequant_kn(torch.int8)
 
 
 class Int8BatchKernelTest(unittest.TestCase):
-    """The int8 batched projection must be a kernel, not a loop that looks like one.
+    """int8 批量投影必须是内核，不是看起来像内核的循环。
 
-    The failure this guards is silent in both directions. Without a batched entry,
-    ``linear_m`` loops the single-row GEMV, which is *correct* -- so no functional test can
-    see it -- and reads the whole weight once per row, which makes every speculative verify
-    cost ``c`` plain steps. That is the measured reason suffix decoding could not break even
-    on this card (../../PERF_COREX.md section 14), and it would return the moment somebody reverts
-    the dispatch to the loop.
+    这里守的失效在两个方向上都不出声。没有批量入口时，``linear_m`` 会循环调用单行
+    GEMV，而那是*正确*的——功能测试看不见——但它每读一行就把整份权重读一遍，让每次
+    投机校验都要多付 ``c`` 个普通步。这就是实测到投机后缀解码在这张卡上打不平的原
+    因（../../PERF_COREX.md 第 14 节），而只要有人把分派改回循环，它立刻会回来。
 
-    A card is needed to *call* the kernel, so these checks are structural: they pin the pieces
-    that must all exist together, because each of them has been the missing one at some point
-    in this port (../../PERF_COREX.md 12.5).
+    调内核需要卡，所以这些检查是结构性的：钉住必须同时存在的那几块，因为它们各自都
+    在这个移植过程中当过缺失的那一块（../../PERF_COREX.md 12.5）。
     """
 
     def _sources(self) -> dict:
-        """Read the kernel-side sources this contract spans.
+        """读出这份契约牵涉到的内核侧源码。
 
         Returns:
-            ``{file name: text}`` for the header, the binding and the GEMV kernels.
+            ``{文件名: 文本}``，覆盖头文件、绑定和 GEMV 内核。
 
         Raises:
-            unittest.SkipTest: The sources are absent, i.e. a tree without the backend.
+            unittest.SkipTest: 源码缺失，即一棵没有该后端的树。
         """
         from backends import corex
 
@@ -1000,7 +980,7 @@ class Int8BatchKernelTest(unittest.TestCase):
         return {n: (kernel_dir / n).read_text(encoding="utf-8") for n in wanted}
 
     def test_the_batched_int8_entry_exists_in_header_binding_and_kernel(self):
-        """Declaration, registration and definition are three edits that all have to land."""
+        """声明、注册、定义是三处改动，必须全部落地。"""
         src = self._sources()
         self.assertIn("gemv_kn_i8_m", src["corex_ops.h"],
                       "the batched int8 entry is not declared in corex_ops.h")
@@ -1013,13 +993,11 @@ class Int8BatchKernelTest(unittest.TestCase):
                       "launch")
 
     def test_the_batched_int8_kernel_accumulates_m_rows_per_weight_load(self):
-        """The kernel only pays if M chains stay live across one weight read.
+        """只有 M 条累加链在一次权重读取期间一直活着，这个内核才划算。
 
-        Checked in the source because that property is a compiler outcome no unit test
-        can observe without a card: the row loop has to be template-instantiated and
-        fully unrolled over M, with the weight load hoisted outside it. A runtime ``for``
-        over rows would keep the kernel shape and read the weight M times, which is
-        exactly the bug this kernel exists to remove.
+        在源码里查，是因为这是编译器的产物，没有卡时任何单元测试都观察不到：行循环必须
+        按 M 做模板实例化并完全展开，权重读取要提到循环外。用运行时的 ``for`` 遍历行，
+        内核形状不变、权重却要读 M 次，那正是这个内核要消除的 bug。
         """
         src = self._sources()["gemv.cu"]
         start = src.index("gemv_kn_i8_m_kernel")
@@ -1034,7 +1012,7 @@ class Int8BatchKernelTest(unittest.TestCase):
                       "re-read the weight")
 
     def test_linear_m_routes_int8_to_the_batched_kernel_not_a_row_loop(self):
-        """The dispatch is the piece a correct-but-slow revert would silently change."""
+        """分派正是「正确但更慢」的回退会悄悄改掉的那一块。"""
         import inspect
 
         from backends import corex

@@ -1,32 +1,25 @@
-"""Single-box entry point: load one checkpoint, generate greedily, print it.
+"""单机入口：加载一个 checkpoint，贪心生成，打印结果。
 
-This is the debugging front door for one request on one card -- no server, no
-scheduler, no paged cache. It exists to answer "does this build still produce
-text, and how fast", which is the check to run after a kernel change; the
-serving path is ``entrypoints/cli/runtime.py`` and is what any real deployment
-uses.
+这是一张卡上一个请求的调试前门——没有服务端、没有调度器、没有分页缓存。它存在的
+目的是回答「这次构建还能不能产出文本、有多快」，那是改完内核之后要跑的检查；服务
+路径是 ``entrypoints/cli/runtime.py``，任何真实部署用的都是它。
 
     python run_chat.py --raw "The capital of France is" -n 32
     python run_chat.py --chat "introduce yourself" -n 64
     python run_chat.py --bench -n 128
 
-Module: ``coffin/run_chat.py``. Top of the import graph, a sibling of
-the runtime CLI: it imports ``engine_api`` (the model-facing surface) and reads
-the
-tokenizer from the checkpoint directory, and no engine module imports it back.
-Model selection is delegated to ``create_model``, so this script never names a
-model family -- the checkpoint's ``config.json`` decides.
+Module: ``coffin/run_chat.py``。导入图的最顶层，与运行时 CLI 平级：它 import
+``engine_api``（面向模型的表层接口），从 checkpoint 目录读分词器，没有任何引擎
+模块反向导入它。模型选择交给 ``create_model``，所以这个脚本从不点名模型族——
+由 checkpoint 的 ``config.json`` 决定。
 
 Constraints:
-    * Decoding is greedy, ``argmax`` with no sampler. That is what makes the
-      same prompt reproducible run to run, which is the point of a smoke test;
-      ``--bench`` numbers are compared against earlier runs and a sampler would
-      make them meaningless.
-    * ``--bench`` and ``--no-graph`` change the measured path itself, not just
-      the output: the decode loop either replays the captured graph or calls
-      ``logits`` eagerly, and those are different costs.
-    * Nothing here is thread-safe or re-entrant. One process, one model, one
-      request at a time; concurrency is the runtime service's job.
+    * 解码是贪心的，``argmax`` 不带采样器。同一个 prompt 因此每次运行都可复现，
+      那正是冒烟测试的意义；``--bench`` 的数字要和早先的运行比较，带采样器就没法比。
+    * ``--bench`` 和 ``--no-graph`` 改变的是被测量的路径本身，不只是输出：解码
+      循环要么重放捕获图，要么即时调用 ``logits``，两种成本不同。
+    * 这里没有任何东西是线程安全或可重入的。一个进程、一个模型、一次一个请求；
+      并发是运行时服务的职责。
 """
 
 from __future__ import annotations
@@ -41,30 +34,27 @@ from tokenizers import Tokenizer
 
 from engine_api import Model, create_model, describe
 
-#: Deployment default; any checkpoint registered in engine_api works.
+#: 部署默认值；engine_api 里注册过的 checkpoint 都能用。
 MODEL = os.environ.get("ENGINE_MODEL", "/root/private_data/models/Qwen3.5-4B")
 
 
 def build_prompt(tok: Tokenizer, args) -> list[int]:
-    """Turn the CLI's ``--raw``/``--chat``/``--system`` into prompt token ids.
+    """把 CLI 的 ``--raw``/``--chat``/``--system`` 变成 prompt token id。
 
-    The tags are encoded with the tokenizer rather than copied as literals,
-    because ``<|im_start|>``/``<|im_end|>`` are single special tokens in this
-    vocabulary and string concatenation would tokenize them as ordinary text.
+    标签是用分词器编码的，不是当字面量拼进去：``<|im_start|>``/``<|im_end|>`` 在这个
+    词表里是单个特殊 token，字符串拼接会把它们当成普通文本切分。
 
     Args:
-        tok: The checkpoint's tokenizer.
-        args: Parsed CLI arguments; ``raw`` bypasses the template, ``chat`` and
-            ``system`` fill it.
+        tok: checkpoint 的分词器。
+        args: 解析后的 CLI 参数；``raw`` 绕过模板，``chat`` 和 ``system`` 填充模板。
 
     Returns:
-        The prompt ids, ending in the open ``assistant`` turn so generation
-        continues the assistant reply rather than starting a new message.
+        prompt 的 id，末尾是打开的 ``assistant`` 回合，生成因此是接着 assistant
+        回复往下写，而不是新起一条消息。
 
     Raises:
-        AttributeError: Neither ``raw`` nor ``chat`` was given; the resulting
-            ``None`` fails on concatenation. A missing prompt is a CLI mistake,
-            so failing here beats sending the model an empty one.
+        AttributeError: ``raw`` 和 ``chat`` 都没给；得到的 ``None`` 会在拼接时失败。
+            缺 prompt 是 CLI 用法错误，在这里失败胜过给模型送一个空 prompt。
     """
     if args.raw:
         return tok.encode(args.raw).ids
@@ -81,27 +71,25 @@ def build_prompt(tok: Tokenizer, args) -> list[int]:
 @torch.inference_mode()
 def generate(model: Model, tok: Tokenizer, prompt: list[int], n: int, eos: int,
              graph: bool = True) -> tuple[list[int], float, float]:
-    """Prefill ``prompt`` and decode greedily for at most ``n`` tokens.
+    """预填充 ``prompt``，然后贪心解码最多 ``n`` 个 token。
 
-    Two decode paths, and the choice is made per call: ``decode_step`` only
-    exists once a graph has been captured, so the first call captures it and
-    every token after that replays it. With ``graph=False`` each step calls
-    ``logits`` eagerly -- slower, but it exercises the code the capture hides,
-    which is why ``--no-graph`` exists as a diagnostic.
+    两条解码路径，每次调用时决定：``decode_step`` 只在图捕获之后才存在，所以第一次
+    调用会捕获它，其后的每个 token 都重放它。``graph=False`` 时每一步都即时调用
+    ``logits``——更慢，但会跑到捕获所掩盖的那段代码，这也是 ``--no-graph`` 作为诊断
+    开关存在的理由。
 
     Args:
-        model: A loaded model; its state is consumed and left dirty.
-        tok: Tokenizer for the checkpoint, kept for callers that decode with it.
-        prompt: Prompt ids to prefill.
-        n: Maximum number of tokens to generate, ``eos`` included.
-        eos: Stop id; generation ends without emitting it.
-        graph: Use the captured decode graph when the model can provide one.
+        model: 已加载的模型；它的状态会被消费并留在脏状态。
+        tok: 该 checkpoint 的分词器，留给要用它解码的调用方。
+        prompt: 要预填充的 prompt id。
+        n: 最多生成多少个 token，含 ``eos``。
+        eos: 停止 id；生成在它之前结束，不会把它吐出来。
+        graph: 模型能提供捕获图时就用它。
 
     Returns:
-        ``(tokens, prefill_s, decode_s)``: the generated ids with the stop token
-        excluded, and the two wall-clock times reported separately because a
-        prefill-bound change and a decode-bound change look identical in a
-        combined number.
+        ``(tokens, prefill_s, decode_s)``：生成的 id（不含停止 token），以及两个
+        分开上报的墙钟时间——预填充受限的改动和解码受限的改动在合并数字里看起来
+        一模一样。
     """
     model.reset()
     if graph and not model.graph_ready:
@@ -110,7 +98,7 @@ def generate(model: Model, tok: Tokenizer, prompt: list[int], n: int, eos: int,
     step = model.decode_step if (graph and model.graph_ready) else model.logits
 
     t0 = time.time()
-    logits = model.prefill(prompt)       # batched GEMMs over the whole prompt
+    logits = model.prefill(prompt)       # 对整个 prompt 做批处理 GEMM
     t_prefill = time.time() - t0
 
     out: list[int] = []
@@ -126,14 +114,14 @@ def generate(model: Model, tok: Tokenizer, prompt: list[int], n: int, eos: int,
 
 
 def main() -> None:
-    """Parse the CLI, load the checkpoint and print either a reply or timings.
+    """解析 CLI、加载 checkpoint，然后打印回复或者计时。
 
-    ``--bench`` runs a fixed prompt and reports throughput instead of the text,
-    so successive builds are compared on the same input.
+    ``--bench`` 跑一个固定 prompt 并报告吞吐而不是文本，连续的构建因此是在同一份
+    输入上比较。
 
     Raises:
-        OSError: The checkpoint directory is missing its ``tokenizer.json`` or
-            weights; point ``--model`` at a complete checkpoint.
+        OSError: checkpoint 目录缺 ``tokenizer.json`` 或权重；把 ``--model`` 指向一个
+            完整的 checkpoint。
     """
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=MODEL)
@@ -151,10 +139,9 @@ def main() -> None:
 
     tok = Tokenizer.from_file(str(Path(args.model) / "tokenizer.json"))
 
-    # ``<|im_end|>`` of this checkpoint. Unlike the server, which derives the
-    # stop set from the tokenizer, this smoke test hard-codes the one id it
-    # needs: a wrong value here shows up as a reply that runs past its turn,
-    # which is exactly the regression to notice.
+    # 这个 checkpoint 的 ``<|im_end|>``。服务端会从分词器推导停止集合，这个冒烟测试
+    # 则把它需要的那个 id 写死：这里写错的表现是回复越过自己的回合还在继续，而那
+    # 正是该被注意到的回归。
     eos = 248044
 
     print("loading weights ...", flush=True)
@@ -165,8 +152,8 @@ def main() -> None:
     graph = not args.no_graph
 
     if args.bench:
-        # Fixed prompt on purpose: the token count is part of the reported
-        # tok/s, so a varying prompt would make successive runs incomparable.
+        # 故意用固定 prompt：token 数是上报 tok/s 的一部分，prompt 一变，连续几次
+        # 运行就没法比较了。
         prompt = tok.encode("The quick brown fox").ids
         out, tp, dt = generate(model, tok, prompt, args.max_new, eos, graph)
         print(f"prefill: {len(prompt)} tokens in {tp*1000:.0f}ms ({len(prompt)/tp:.0f} tok/s)")

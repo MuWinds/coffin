@@ -1,43 +1,38 @@
-"""Qwen3.5-4B vision tower: the 24-layer ViT that turns pixels into LLM tokens.
+"""Qwen3.5-4B 的视觉塔：把像素变成 LLM token 的 24 层 ViT。
 
-Module: ``coffin/models/qwen35``. Leaf of the model family: it imports ``torch``,
-``int8_weights`` and ``backends`` (for the device and the weight dtype, which are
-platform facts), and is built by ``models.qwen35.model`` out of
-``weights.load_weights`` tensors. It must not import ``ops``, ``engine_api`` or the
-text-side modules, so ``tests/test_vision.py`` can build a tiny tower with no
-checkpoint and no engine around it.
+Module: ``coffin/models/qwen35``。模型族的叶子：只 import ``torch``、
+``int8_weights`` 和 ``backends``（设备与权重 dtype 都是平台事实），由
+``models.qwen35.model`` 用 ``weights.load_weights`` 的张量建起来。它不许 import
+``ops``、``engine_api`` 或文本侧的模块，这样 ``tests/test_vision.py`` 才能在没有
+checkpoint、没有引擎的情况下建一座小塔。
 
-Shape flow (``N = Σ t*h*w`` patch tokens, ``n_img = N / 4`` LLM tokens)::
+形状流转（``N = Σ t*h*w`` 个 patch token，``n_img = N / 4`` 个 LLM token）::
 
-    pixel_values [N, 1536]        processor output, rows in merge-block order
+    pixel_values [N, 1536]        processor 输出，行按 merge 块顺序排列
       -> patch_embed              F.linear (= Conv3d k=s=(2,16,16))   -> [N, 1024]
-      -> + pos_embed resample     48x48 learned table -> per-image (h,w) grid
-      -> 24 x block               LN -> attn(axial rope, per-image) -> LN -> MLP
-      -> merger                   LN(1024) -> 4-in-1 view(4096) -> fc1 -> GELU
-                                  (exact) -> fc2                       -> [N/4, 2560]
+      -> + pos_embed resample     48x48 学到的表 -> 每图的 (h,w) 网格
+      -> 24 x block               LN -> attn(轴向 rope, 每图) -> LN -> MLP
+      -> merger                   LN(1024) -> 4 合 1 视图(4096) -> fc1 -> GELU
+                                  (精确) -> fc2                        -> [N/4, 2560]
 
 Constraints:
-    * Compute is fp16 on a part with packed fp16 math and no packed bf16 math
-      (13-20 TFLOP/s vs 2.3-7 for the same GEMM, the same reason the text
-      projections load at ``caps.weight_dtype``), and the tower is compute-bound.
-      A part whose caps report bf16 weights computes in bf16 here too: the rule is
-      the caps value, not a vendor name.
-    * The fp32 islands must stay fp32 -- the pos-embed tap sum, the rotary
-      angle, the attention softmax. They are the ones HF has too, because a
-      bf16/fp16 tap sum is 1e-2 wrong (``.tmp_dsh/vision/reference_spec.md``
-      §14.3).
-    * Token order is merge-block order everywhere except inside the attention:
-      the processor emits ``pixel_values`` rows that way, and both the pos-embed
-      permute and the merger's 4-in-1 view depend on it. A row-major stream here
-      silently produces a plausible but wrong image.
-    * Attention is per-frame, per-image and non-causal; segments are isolated by
-      slicing, never by a mask, because the tower has no mask input and an
-      ``[N, N]`` additive mask would be its largest tensor.
-    * Never dequantise the whole int8 tower at once: one GEMM at a time keeps
-      the peak transient at a single fp16 matrix (33 MB for the merger's fc1).
+    * 计算用 fp16，因为这颗芯片有 packed fp16 计算、没有 packed bf16 计算
+      （同一个 GEMM 13-20 TFLOP/s 对 2.3-7，文本投影按 ``caps.weight_dtype`` 加载
+      也是这个原因），而视觉塔是计算受限的。caps 报告 bf16 权重的芯片，这里也用
+      bf16 算：规则是 caps 的值，不是厂商名。
+    * fp32 孤岛必须保持 fp32——pos-embed 的抽头求和、旋转角、注意力 softmax。这些
+      也是 HF 保留 fp32 的地方，因为 bf16/fp16 的抽头求和会错 1e-2
+      （``.tmp_dsh/vision/reference_spec.md`` §14.3）。
+    * 除注意力内部之外，token 顺序处处是 merge 块顺序：processor 就是这么发
+      ``pixel_values`` 的，pos-embed 的 permute 和 merger 的 4 合 1 视图都依赖它。
+      在这里改成行主序，会悄悄产出一张看似合理、实际错误的图。
+    * 注意力逐帧、逐图、非因果；各段靠切片隔离，绝不用掩码，因为视觉塔没有掩码
+      输入，而 ``[N, N]`` 的加性掩码会变成它最大的张量。
+    * 绝不要一次性反量化整个 int8 塔：一次一个 GEMM 把峰值临时量压在一个 fp16 矩阵上
+      （merger 的 fc1 是 33 MB）。
 
-Measured against ``transformers`` 4.57.6 ``Qwen3VLVisionModel`` on the real
-checkpoint (canonical acceptance, DCU, one image per size)::
+在真实 checkpoint 上与 ``transformers`` 4.57.6 的 ``Qwen3VLVisionModel`` 实测对比
+（canonical 验收、DCU、每个尺寸一张图）::
 
     size   engine(fp32)  engine(fp16)  engine(fp16)     time   tower-only
            vs HF(fp32)   vs HF(fp32)   vs HF(bf16)              peak
@@ -45,27 +40,22 @@ checkpoint (canonical acceptance, DCU, one image per size)::
     512^2      1.2e-5       1.3e-2       7.9e-2        129 ms   ~0.71 GiB
     1024^2     1.4e-5       1.4e-2       9.0e-2        756 ms   ~0.85 GiB
 
-The first column is the correctness gate: formula error is O(1), so 1e-5 sits a
-million times below anything a wrong merge order, rope layout or LN placement
-could hide.  The second is fp16's intrinsic cost, and it matches HF's *own* fp16
-run against its fp32 run (1.4e-2) -- the dtype, not the implementation.  The
-third is a smoke column only: bf16 rounds ~8e-3 per layer and this tower stacks
-24 layers of activations reaching 1e3, so a bf16 oracle is 1e-1 from fp32 by
-itself and cannot gate anything at 1e-3.
+第一列是正确性门禁：公式误差是 O(1) 量级，所以 1e-5 比任何错误的 merge 顺序、rope
+布局或 LN 位置所能藏身的高度还低一百万倍。第二列是 fp16 的内在代价，它和 HF *自己*
+的 fp16 对 fp32 的差异一致（1.4e-2）——那是 dtype 的代价，不是实现的。第三列只是
+冒烟列：bf16 每层约舍入 8e-3，而这座塔叠了 24 层、激活到达 1e3 量级，bf16 判据本身
+离 fp32 就有 1e-1，管不了 1e-3 级别的门禁。
 
-1024^2 is 756 ms against a 450 ms target.  The tower sustains 5.7 TFLOP/s there
-(44% of this part's M=256 packed-fp16 ceiling) and the rate is flat from 512^2
-to 1024^2, so the gap is per-op efficiency in the attention's ``score -> fp32
-softmax -> PV`` round trip rather than launch count: at n=4096 attention is
-38.5% of the 4.28 TFLOP forward and needs 6.4 G exp() calls.
-``.tmp_dsh/vision2/budget.py`` prints that budget; the levers are fp16 softmax,
-a larger ``Q_TILE``, and a fused attention kernel.
+1024^2 是 756 ms，目标是 450 ms。塔在那里维持 5.7 TFLOP/s（本芯片 M=256 的
+packed-fp16 峰值的 44%），而且从 512^2 到 1024^2 速率是平的，所以差距出在注意力
+``score -> fp32 softmax -> PV`` 往返里逐算子的效率上，而不是 launch 次数：n=4096 时
+注意力占 4.28 TFLOP 前向的 38.5%，需要 6.4 G 次 exp() 调用。
+``.tmp_dsh/vision2/budget.py`` 会打印这份预算；可动的杠杆是 fp16 softmax、更大的
+``Q_TILE``，以及融合的注意力内核。
 
-The int8 mode is for the memory-constrained case only: the tower is
-compute-bound, so ``vision_quant`` buys 0.315 GiB instead of 0.621 GiB of
-resident weights and pays for it in both error and time (W8A16 on top of a tower
-already 1.4e-2 from fp32 -- measure with ``probe_parity.py --int8`` rather than
-assuming it is free).
+int8 模式只用于显存吃紧的情形：塔是计算受限的，所以 ``vision_quant`` 用 0.315 GiB
+换下 0.621 GiB 的常驻权重，代价同时落在误差和时间上（本来离 fp32 就 1.4e-2 的塔上
+再叠 W8A16——用 ``probe_parity.py --int8`` 实测，别假设它是免费的）。
 """
 
 from __future__ import annotations
@@ -80,70 +70,66 @@ from backends import caps as _caps
 from backends import device as _device
 from int8_weights import QWeight
 
-#: Checkpoint prefix of every tensor this module reads.
+#: 本模块读取的每个张量的 checkpoint 前缀。
 VISUAL_PREFIX = "model.visual."
 
-#: Query-tile width of the vision attention.  The score tile ``[heads, Q_TILE,
-#: n]`` is the largest activation of the whole tower -- at 1 MP (n = 4096) the
-#: untiled block is 0.5 GiB fp16 and 1 GiB once softmax lifts it to fp32, which
-#: is why tiling is a hard requirement rather than a tuning knob.  256 keeps the
-#: transient at 33 MB fp16 + 67 MB fp32 per tile (peak well inside 0.4 GiB) at
-#: 16 tiles x 2 matmuls per image per layer, i.e. ~750 launches for 24 layers.
+#: 视觉注意力的查询切块宽度。score 切块 ``[heads, Q_TILE, n]`` 是整座塔最大的
+#: 激活——1 MP（n = 4096）时不分块的块是 0.5 GiB fp16，softmax 把它抬到 fp32 后
+#: 是 1 GiB，所以切块是硬性要求而不是调优旋钮。取 256 时每块临时量是 33 MB fp16
+#: 加 67 MB fp32（峰值稳在 0.4 GiB 以内），每图每层 16 块、2 次矩阵乘，24 层合计
+#: 约 750 次 launch。
 Q_TILE = int(os.environ.get("VISION_Q_TILE", "256"))
 
-#: Token tile for the rotary application, which is done in fp32 like HF.  Keeps
-#: its temporaries at ~4 MB instead of ``N*heads*head_dim*4`` (16 MB at 1 MP).
+#: 施加旋转时的 token 切块宽度，和 HF 一样在 fp32 里做。它把临时量控制在约 4 MB，
+#: 而不是 ``N*heads*head_dim*4``（1 MP 时 16 MB）。
 _ROPE_TILE = 1024
 
-#: Rows per chunk when dequantising an int8 weight.  ``QWeight.dequant`` makes an
-#: fp32 copy of the whole matrix (67 MB for a 4096x4096); chunking bounds that
-#: transient at 8 MB so the fp16 result (33 MB) stays the peak.
+#: 反量化 int8 权重时每个分块的行数。``QWeight.dequant`` 会为整个矩阵做一份 fp32
+#: 拷贝（4096x4096 时 67 MB）；分块把这个临时量压到 8 MB，峰值因此仍落在 fp16
+#: 结果（33 MB）上。
 _DEQUANT_ROWS = 512
 
 
 def is_vision_quantizable(key: str, w: torch.Tensor) -> bool:
-    """Select the tower's GEMM weights, the only ones int8 helps.
+    """挑出视觉塔的 GEMM 权重，那是 int8 唯一帮得上忙的部分。
 
-    ``pos_embed.weight`` is a row-gather table read by index (not a GEMM) and
-    ``patch_embed.proj.weight`` is a 5-D conv kernel; both stay fp16.  Quantising
-    them would put a dequantise on the gather / first-layer path for a 7.8 MB win,
-    so the rule is "2-D ``.weight``, not the gather table".
+    ``pos_embed.weight`` 是按索引读的行 gather 表（不是 GEMM），
+    ``patch_embed.proj.weight`` 是 5 维卷积核；两者都保持 fp16。量化它们等于为了
+    省 7.8 MB 而在 gather / 第一层路径上塞进一次反量化，所以规则是「二维
+    ``.weight``，且不是 gather 表」。
 
-    In numbers: 24 blocks x 4 matmuls + the merger's 2 = 98 of the 297 tensors
-    are quantised, which is 329.25 M of the tower's 333.51 M parameters.  Resident
-    that is 0.307 GiB int8 + 0.008 GiB of fp16 1-D/norm/gather leftovers, i.e.
-    **0.315 GiB against fp16's 0.621 GiB**.
+    算个数：24 个块 × 4 个矩阵乘 + merger 的 2 个 = 297 个张量里量化 98 个，占视觉塔
+    333.51 M 参数中的 329.25 M。常驻是 0.307 GiB 的 int8 加 0.008 GiB 的 fp16
+    一维/归一化/gather 残留，也就是**0.315 GiB 对 fp16 的 0.621 GiB**。
 
     Args:
-        key: Checkpoint name of the tensor, used to exclude the gather table.
-        w: The loaded tensor; only its rank is inspected.
+        key: 张量在 checkpoint 里的名字，用来排除 gather 表。
+        w: 已加载的张量；只看它的秩。
 
     Returns:
-        ``True`` when the caller should keep this weight as int8. The decision
-        is policy, not measurement: an unmoved call site here means the tower
-        loads twice its needed resident bytes.
+        调用方应把这个权重存成 int8 时为 ``True``。这个决定是策略而非实测：这里漏改
+        一个调用点，视觉塔就要多占一倍常驻字节。
     """
     return w.dim() == 2 and key.endswith(".weight") and "pos_embed" not in key
 
 
-#: 2-D matmuls per block: ``attn.qkv``, ``attn.proj``, ``mlp.linear_fc1``,
-#: ``mlp.linear_fc2``.  The biases and both LayerNorms are 1-D; the merger adds
-#: ``linear_fc1`` + ``linear_fc2``.  24*4 + 2 = 98 quantisable weights.
+#: 每个块的二维矩阵乘：``attn.qkv``、``attn.proj``、``mlp.linear_fc1``、
+#: ``mlp.linear_fc2``。各 bias 和两个 LayerNorm 都是一维；merger 再加
+#: ``linear_fc1`` + ``linear_fc2``。24*4 + 2 = 98 个可量化权重。
 GEMMS_PER_BLOCK = 4
 
 
 def _cfg_get(cfg, key, default=None):
-    """Read one field from either the raw ``config.json`` dict or a config object.
+    """从原始 ``config.json`` 字典或配置对象里读一个字段。
 
     Args:
-        cfg: A ``dict`` from ``config.json`` or an object with attributes; both
-            shapes reach this module, depending on who builds the tower.
-        key: Field name.
-        default: Value when the field is absent, which is the normal case for
-            every key the checkpoint does not spell out.
+        cfg: 来自 ``config.json`` 的 ``dict``，或带属性的对象；两种形态都会到达本
+            模块，取决于谁构建视觉塔。
+        key: 字段名。
+        default: 字段缺失时的值，对 checkpoint 没写明的每个键来说这都是常态。
 
     Returns:
-        The field value, or ``default``.
+        字段值，或者 ``default``。
     """
     if isinstance(cfg, dict):
         return cfg.get(key, default)
@@ -151,41 +137,38 @@ def _cfg_get(cfg, key, default=None):
 
 
 class _VisionConfig:
-    """``config.json:vision_config`` with the defaults transformers fills in.
+    """``config.json:vision_config``，外加 transformers 会填的默认值。
 
-    The checkpoint has no ``rope_parameters`` for the vision tower; transformers
-    4.57.6 fills ``{rope_type: "axial", rope_theta: 10000.0}`` from
-    ``Qwen3_5VisionConfig.default_rope_type`` / ``RotaryEmbeddingConfigMixin``.
-    The defaults below are that fill, so a checkpoint that omits a field lands on
-    the values HF would have used rather than on an invented geometry.
+    checkpoint 里没有视觉塔的 ``rope_parameters``；transformers 4.57.6 会从
+    ``Qwen3_5VisionConfig.default_rope_type`` / ``RotaryEmbeddingConfigMixin``
+    填入 ``{rope_type: "axial", rope_theta: 10000.0}``。下面的默认值就是那份填充，
+    所以省略了某个字段的 checkpoint 落到的仍是 HF 会用的值，而不是一套自创的几何。
 
-    Raises at construction time for any checkpoint geometry the tower cannot
-    express -- those are configuration errors, and failing here names the field
-    instead of surfacing as a wrong image several layers later.
+    构造时对任何视觉塔表达不了的 checkpoint 几何直接抛出——那些是配置错误，在这里
+    失败能点名字段，而不是几层之后冒出一张错误的图。
     """
 
     def __init__(self, cfg) -> None:
-        """Normalise one ``vision_config`` into the tower's fixed vocabulary.
+        """把一份 ``vision_config`` 归一化到视觉塔固定的词表里。
 
         Args:
-            cfg: ``config.json:vision_config`` as a dict or an object.
+            cfg: ``config.json:vision_config``，字典或对象。
 
         Raises:
-            ValueError: The checkpoint asks for deepstack visual indexes, a
-                non-axial rope, an unsupported activation, or a pos-embed table
-                that is not a perfect square. Each is a checkpoint this engine
-                does not implement; reject it at load rather than decode.
+            ValueError: checkpoint 要求 deepstack 视觉索引、非轴向 rope、不支持的
+                激活函数，或 pos-embed 表不是完全平方数。每一种都是本引擎没实现的
+                checkpoint；在加载时拒绝，而不是等到解码。
         """
         def g(key, default=None):
-            """Read one config field through ``_cfg_get``, keeping the call sites short.
+            """经 ``_cfg_get`` 读一个配置字段，让调用点保持简短。
 
             Args:
-                key: Field name in ``vision_config``.
-                default: Value when the checkpoint omits the field, i.e. the
-                    transformers fill for that key.
+                key: ``vision_config`` 里的字段名。
+                default: checkpoint 省略该字段时的值，也就是 transformers 为该键
+                    填的默认值。
 
             Returns:
-                The field value, or ``default``.
+                字段值，或者 ``default``。
             """
             return _cfg_get(cfg, key, default)
 
@@ -217,7 +200,7 @@ class _VisionConfig:
 
         side = math.isqrt(self.num_position_embeddings)
         if side * side != self.num_position_embeddings:
-            # Silently rounding would mis-lay the whole pos-embed table (spec §14.6).
+            # 悄悄取整会把整张 pos-embed 表摆错位置（spec §14.6）。
             raise ValueError(
                 f"num_position_embeddings={self.num_position_embeddings} is not a "
                 "perfect square; the learned pos-embed grid is unknown")
@@ -226,17 +209,17 @@ class _VisionConfig:
 
     @property
     def patch_dim(self) -> int:
-        """Width of one ``pixel_values`` row: ``C * tps * p * p`` (1536 here).
+        """一行 ``pixel_values`` 的宽度：``C * tps * p * p``（这里是 1536）。
 
         Returns:
-            The flattened patch width the processor emits, which ``forward``
-            validates the input against before any GEMM runs.
+            processor 发出的展平 patch 宽度；``forward`` 在任何 GEMM 跑起来之前
+            用它校验输入。
         """
         return self.in_channels * self.temporal_patch_size * self.patch_size ** 2
 
 
 class _Block:
-    """One ViT block's tensors: two LayerNorms, a packed attention, an MLP."""
+    """One ViT block's 张量：两个 LayerNorm、一组打包注意力、一个 MLP。"""
 
     __slots__ = ("norm1_w", "norm1_b", "norm2_w", "norm2_b",
                  "qkv_w", "qkv_b", "proj_w", "proj_b",
@@ -244,52 +227,46 @@ class _Block:
 
 
 class VisionTower:
-    """The checkpoint's ``model.visual.*`` tensors as a runnable fp16 tower.
+    """把 checkpoint 的 ``model.visual.*`` 张量变成一座可运行的 fp16 视觉塔。
 
-    ``sd`` may key the tensors either with the ``model.visual.`` prefix (what
-    :func:`models.qwen35.weights.load_weights` returns) or stripped; both are
-    accepted.  With ``quant=True`` -- or when ``sd`` already holds
-    :class:`~int8_weights.QWeight` matrices, which is what a ``vision_quant``
-    load produces -- the GEMM weights are int8 + per-row fp32 scale and are
-    dequantised one GEMM at a time.
+    ``sd`` 既可以用 ``model.visual.`` 前缀给键（即
+    :func:`models.qwen35.weights.load_weights` 返回的形式），也可以去掉前缀；两种
+    都接受。``quant=True`` 时——或者 ``sd`` 本身就持有
+    :class:`~int8_weights.QWeight` 矩阵（``vision_quant`` 加载出来的正是这样）——
+    GEMM 权重是 int8 加逐行 fp32 scale，一次反量化一个 GEMM。
 
-    ``dtype`` is what :meth:`forward` returns (the model casts it to bf16 for the
-    text side anyway).  The tower itself computes in fp16 on CUDA whatever
-    ``dtype`` says, for the packed-math reason in the module docstring; on CPU
-    (the numeric tests) it computes in ``dtype`` so fp32 works.  Pass
-    ``compute_dtype=`` to override that rule explicitly.
+    ``dtype`` 是 :meth:`forward` 返回的类型（模型反正会把文本侧转成 bf16）。
+    在 CUDA 上，视觉塔自身不管 ``dtype`` 说什么都按 fp16 算，理由是模块 docstring
+    里的 packed 数学；在 CPU 上（数值测试）它按 ``dtype`` 算，fp32 才能跑。传
+    ``compute_dtype=`` 可以显式覆盖这条规则。
     """
 
     def __init__(self, sd: dict, cfg, dtype: torch.dtype = torch.float16,
                  device=None, quant: bool = False,
                  compute_dtype: torch.dtype | None = None) -> None:
-        """Bind one checkpoint to ``device`` and pick the compute dtype.
+        """把一个 checkpoint 绑到 ``device`` 上并选定计算 dtype。
 
         Args:
-            sd: ``model.visual.*`` tensors, keyed with or without the
-                ``model.visual.`` prefix. A ``vision_quant`` load already holds
-                :class:`~int8_weights.QWeight` matrices, which turns on the int8
-                path by presence rather than by flag.
-            cfg: ``config.json:vision_config`` as a dict or an object.
-            dtype: What :meth:`forward` returns. The model casts it to bf16 for
-                the text side, so this is a boundary dtype, not a compute one.
-            device: Target device, string or ``torch.device``. ``None`` uses the
-                selected backend's device, which is what the model passes on
-                every path except the CPU numeric tests.
-            quant: Force int8 GEMM weights even when ``sd`` is all fp16. Costs
-                the 1.4e-2 fp16 error plus W8A16 on top, so it is for the
-                memory-constrained case only.
-            compute_dtype: Override the default rule, which is fp16 where the part
-                has packed fp16 math (the ``caps.weight_dtype`` the text
-                projections already follow) and ``dtype`` otherwise, so the fp32
-                numeric tests can run.
+            sd: ``model.visual.*`` 张量，键带或不带 ``model.visual.`` 前缀均可。
+                ``vision_quant`` 加载的结果已经持有
+                :class:`~int8_weights.QWeight` 矩阵，于是 int8 路径靠「存在」而不是
+                「标志」被打开。
+            cfg: ``config.json:vision_config``，字典或对象。
+            dtype: :meth:`forward` 返回的类型。模型会把它转成 bf16 给文本侧，所以
+                这是边界 dtype，不是计算 dtype。
+            device: 目标设备，字符串或 ``torch.device``。``None`` 用当前选中后端的
+                设备，除 CPU 数值测试之外模型每条路径都这么传。
+            quant: 即使 ``sd`` 全是 fp16 也强制 int8 GEMM 权重。要付 1.4e-2 的 fp16
+                误差再加 W8A16 的代价，所以只用于显存吃紧的情形。
+            compute_dtype: 覆盖默认规则——芯片有 packed fp16 计算时默认 fp16
+                （即文本投影已经遵循的 ``caps.weight_dtype``），否则用 ``dtype``，
+                fp32 数值测试才能跑。
 
         Raises:
-            KeyError: The state dict is missing tensors the forward pass reads;
-                the error names the count and the first four so a partial
-                download is obvious.
-            ValueError: ``cfg`` describes a tower this engine does not implement
-                (see :class:`_VisionConfig`).
+            KeyError: state dict 缺少前向要读的张量；报错会点出缺失数量和前四个，
+                一次不完整的下载一眼就能看出来。
+            ValueError: ``cfg`` 描述的视觉塔本引擎没实现（见
+                :class:`_VisionConfig`）。
         """
         self.cfg = _VisionConfig(cfg)
         c = self.cfg
@@ -310,17 +287,17 @@ class VisionTower:
                     for k, v in sd.items()}
         self._check_keys()
 
-        # patch embed: the checkpoint's Conv3d k=s=(2,16,16) is exactly a GEMM
-        # over 1536 inputs once the kernel is reshaped, so no conv runs here.
+        # patch embed：checkpoint 的 Conv3d k=s=(2,16,16) 把卷积核 reshape 之后就是
+        # 对 1536 个输入的 GEMM，所以这里不跑卷积。
         self.patch_w = self._tensor("patch_embed.proj.weight").reshape(
             c.hidden_size, c.patch_dim)
         self.patch_b = self._tensor("patch_embed.proj.bias")
 
-        # Learned pos-embed table: a row-gather read by index, never quantised.
+        # 学到的 pos-embed 表：按索引读的行 gather，永不量化。
         self.pos_embed = self._tensor("pos_embed.weight")
 
-        # Axial rope: head_dim//4 = 16 frequencies per axis, base 10000. Kept
-        # fp32 because the angle is one of the fp32 islands.
+        # 轴向 rope：每轴 head_dim//4 = 16 个频率，底数 10000。保持 fp32，因为角度是
+        # fp32 孤岛之一。
         spatial_dim = c.head_dim // 2
         self.inv_freq = 1.0 / (
             c.rope_theta ** (torch.arange(0, spatial_dim, 2, dtype=torch.float32,
@@ -344,7 +321,7 @@ class VisionTower:
             blk.fc2_b = self._tensor(p + "mlp.linear_fc2.bias")
             self.blocks.append(blk)
 
-        # Merger applies LayerNorm(1024) *before* the 2x2 shuffle, not after.
+        # Merger 在 2x2 重排*之前*做 LayerNorm(1024)，而不是之后。
         self.merger_norm_w = self._tensor("merger.norm.weight")
         self.merger_norm_b = self._tensor("merger.norm.bias")
         self.merger_fc1_w = self._tensor("merger.linear_fc1.weight", quantizable=True)
@@ -353,26 +330,23 @@ class VisionTower:
         self.merger_fc2_b = self._tensor("merger.linear_fc2.bias")
         self.merge_dim = c.hidden_size * c.merge_unit
 
-        # (h,w)-keyed resampling/rope tables: they depend on the patch grid only,
-        # never on the pixels, so a server pays for each new image size once
-        # (spec §14.4).
+        # 以 (h,w) 为键的重采样/rope 表：它们只依赖 patch 网格，和像素无关，所以
+        # 服务端每遇到一个新图像尺寸只付一次代价（spec §14.4）。
         self._pos_cache: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
         self._hw_cache: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
         self._rope_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
         del self._sd
 
     def _check_keys(self) -> None:
-        """Reject a state dict that does not hold every tensor the forward reads.
+        """拒绝缺少前向所需任何张量的 state dict。
 
-        Checked up front because the alternative is an ``AttributeError`` from a
-        ``_Block.__slots__`` field half-way through the first image, after the
-        weights are already resident. The error names the count and the first
-        four missing keys, which is enough to tell a partial download from a
-        wrong checkpoint.
+        提前检查，因为替代方案是在第一张图跑到一半、权重已经常驻之后，从
+        ``_Block.__slots__`` 的某个字段上炸出 ``AttributeError``。报错会点出缺失
+        数量和前四个缺失键，足以分辨是下载不全还是拿错了 checkpoint。
 
         Raises:
-            KeyError: Any required key is absent. Re-load the tower; a partial
-                state dict cannot be patched at run time.
+            KeyError: 任何必需的键缺失。重新加载视觉塔；残缺的 state dict 没法在
+                运行时打补丁。
         """
         c = self.cfg
         want = {"patch_embed.proj.weight", "patch_embed.proj.bias", "pos_embed.weight",
@@ -392,20 +366,20 @@ class VisionTower:
                 f"vision state dict is missing {len(missing)} tensors, first: {missing[:4]}")
 
     def _tensor(self, key: str, quantizable: bool = False):
-        """Move one tensor to ``device`` in the compute dtype, or keep it int8.
+        """把一个张量按计算 dtype 搬到 ``device``，或者保持 int8。
 
-        1-D tensors (LayerNorm weights, biases) stay in the compute dtype: they
-        are consumed elementwise by ``F.layer_norm`` / added to a fp16 output, so
-        a dequantise would add a launch per block to save 0.3 MB in total.
+        一维张量（LayerNorm 权重、bias）保持计算 dtype：它们被 ``F.layer_norm``
+        逐元素消费、或者加到一个 fp16 输出上，反量化只会为了总共省 0.3 MB 而每块
+        多一次 launch。
 
         Args:
-            key: State-dict key with the ``model.visual.`` prefix already stripped.
-            quantizable: Allow int8 when :attr:`quant` is on. Only the GEMM
-                weights carry this flag; see :func:`is_vision_quantizable`.
+            key: 已经去掉 ``model.visual.`` 前缀的 state dict 键。
+            quantizable: :attr:`quant` 打开时允许 int8。只有 GEMM 权重带这个
+                标志；见 :func:`is_vision_quantizable`。
 
         Returns:
-            The tensor on ``device``, either in the compute dtype or as a
-            :class:`~int8_weights.QWeight` that ``_linear`` dequantises per call.
+            位于 ``device`` 上的张量，或是计算 dtype，或是 ``_linear`` 每次调用
+            反量化的 :class:`~int8_weights.QWeight`。
         """
         t = self._sd[key]
         if isinstance(t, QWeight):
@@ -418,18 +392,17 @@ class VisionTower:
         return t
 
     def _dequant(self, q: QWeight) -> torch.Tensor:
-        """Expand one int8 matrix to the compute dtype, in row chunks.
+        """按行分块，把一个 int8 矩阵展开成计算 dtype。
 
-        Chunking is what keeps the peak transient at one chunk plus the fp16
-        result instead of a whole fp32 copy (see ``_DEQUANT_ROWS``); the row
-        slices are contiguous, so the extra loop costs no gather.
+        分块把峰值临时量压到一个分块加 fp16 结果，而不是整份 fp32 拷贝（见
+        ``_DEQUANT_ROWS``）；行切片是连续的，多出来的循环不产生 gather。
 
         Args:
-            q: int8 weight, ``[n, k]`` with a per-row fp32 scale.
+            q: int8 权重，``[n, k]``，带逐行 fp32 scale。
 
         Returns:
-            The dense ``[n, k]`` matrix in the compute dtype, ready for
-            ``F.linear``. Caller-owned; freed on the next GEMM.
+            计算 dtype 的稠密 ``[n, k]`` 矩阵，可直接给 ``F.linear``。归调用方所有；
+            下一个 GEMM 时释放。
         """
         if q.n <= _DEQUANT_ROWS:
             return q.dequant(self.compute_dtype)
@@ -441,53 +414,51 @@ class VisionTower:
         return out
 
     def _linear(self, x: torch.Tensor, w, b) -> torch.Tensor:
-        """``F.linear`` that accepts either a dense weight or an int8 ``QWeight``.
+        """``F.linear``，既接受稠密权重，也接受 int8 ``QWeight``。
 
         Args:
-            x: Activations, ``[N, in]``.
-            w: Dense weight, or a :class:`~int8_weights.QWeight` dequantised
-                just for this call.
-            b: Bias in the compute dtype, or ``None``.
+            x: 激活，``[N, in]``。
+            w: 稠密权重，或只为这一次调用反量化的
+                :class:`~int8_weights.QWeight`。
+            b: 计算 dtype 的 bias，或 ``None``。
 
         Returns:
-            ``[N, out]`` in the activation dtype.
+            ``[N, out]``，dtype 与激活一致。
         """
         if isinstance(w, QWeight):
             w = self._dequant(w)
         return F.linear(x, w, b)
 
     def _ln(self, x: torch.Tensor, w, b) -> torch.Tensor:
-        """LayerNorm with the checkpoint's ``layer_norm_eps`` and HF's biased variance.
+        """用 checkpoint 的 ``layer_norm_eps`` 和 HF 的有偏方差做 LayerNorm。
 
         Args:
-            x: Activations, ``[N, hidden]``.
-            w: Gain, ``[hidden]``.
-            b: Bias, ``[hidden]``.
+            x: 激活，``[N, hidden]``。
+            w: 增益，``[hidden]``。
+            b: bias，``[hidden]``。
 
         Returns:
-            ``[N, hidden]`` normalised in place-free fashion.
+            ``[N, hidden]``，归一化后新分配的结果。
         """
         return F.layer_norm(x, (x.shape[-1],), w, b, self.cfg.layer_norm_eps)
 
     def _pos_taps(self, h: int, w: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """``(h*w, 4)`` gather indices and fp32 weights, in row-major patch order.
+        """行主序 patch 顺序下的 ``(h*w, 4)`` gather 下标和 fp32 权重。
 
-        Reproduces ``Qwen3VLVisionModel.fast_pos_embed_interpolate``: the table is
-        a ``side x side`` grid resampled with ``torch.linspace(0, side-1, size)``
-        (align_corners=True) and a 2-tap hat kernel per axis.  The merge-block
-        permute is applied to the *result* (see :meth:`_pos_offsets`), which is
-        the same thing HF's ``view/permute/flatten`` does and keeps the tap
-        tables identical for every image of a given size.
+        复现 ``Qwen3VLVisionModel.fast_pos_embed_interpolate``：表是 ``side x side``
+        的网格，用 ``torch.linspace(0, side-1, size)``（align_corners=True）重采样，
+        每根轴一个 2 抽头的帽形核。merge 块的 permute 施加在*结果*上（见
+        :meth:`_pos_offsets`），和 HF 的 ``view/permute/flatten`` 做的是同一件事，
+        给定尺寸的每张图因此共用同一套抽头表。
 
         Args:
-            h: Patch-grid rows of one image.
-            w: Patch-grid columns of one image.
+            h: 一张图的 patch 网格行数。
+            w: 一张图的 patch 网格列数。
 
         Returns:
-            ``(idx, wt)`` for the row-major grid: four table offsets per patch
-            in ``idx`` and their fp32 bilinear weights in ``wt``, which sum to 1.
-            Both are cached per ``(h, w)`` because they depend on the grid only,
-            never on the pixels.
+            行主序网格的 ``(idx, wt)``：``idx`` 里每个 patch 四个表偏移，``wt`` 里
+            是对应的 fp32 双线性权重，和为 1。两者都按 ``(h, w)`` 缓存，因为它们
+            只依赖网格，与像素无关。
         """
         hit = self._pos_cache.get((h, w))
         if hit is not None:
@@ -495,7 +466,7 @@ class VisionTower:
         side = self.cfg.num_grid_per_side
         hs = torch.linspace(0, side - 1, h, device=self.device, dtype=torch.float32)
         ws = torch.linspace(0, side - 1, w, device=self.device, dtype=torch.float32)
-        h0 = hs.to(torch.int64)                       # >= 0, so trunc == floor
+        h0 = hs.to(torch.int64)                       # >= 0，所以截断即下取整
         w0 = ws.to(torch.int64)
         h1 = (h0 + 1).clamp(max=side - 1)
         w1 = (w0 + 1).clamp(max=side - 1)
@@ -519,26 +490,23 @@ class VisionTower:
         return idx, wt
 
     def _pos_offsets(self, gt: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-        """Per-token learned pos-embed, summed in fp32 (spec §14.3), in token order.
+        """逐 token 的学到 pos-embed，在 fp32 里求和（spec §14.3），按 token 顺序。
 
-        The accumulator stays fp32 for the whole tap sum because a fp16/bf16 tap
-        sum is 1e-2 wrong: four table rows with bilinear weights are added and
-        then permuted, and the rounding of the intermediate sum cannot be undone
-        by casting the result later.
+        整个抽头求和过程的累加器都保持 fp32，因为 fp16/bf16 的抽头求和会错 1e-2：
+        带双线性权重的四行表被相加再 permute，中间和的舍入没法靠事后转换结果挽回。
 
         Args:
-            gt: ``grid_thw``, ``[n_img, 3]`` rows of ``(t, h, w)`` patch counts.
-            dtype: Dtype to return, normally the compute dtype of ``x``.
+            gt: ``grid_thw``，``[n_img, 3]`` 行，每行是 ``(t, h, w)`` 的 patch 数。
+            dtype: 返回的 dtype，通常是 ``x`` 的计算 dtype。
 
         Returns:
-            ``[N, hidden]`` positional embedding, already permuted into
-            merge-block order and repeated over frames, so it adds to the patch
-            embeddings row for row.
+            ``[N, hidden]`` 位置嵌入，已经 permute 成 merge 块顺序并按帧重复，
+            因此可以逐行加到 patch 嵌入上。
 
         Raises:
-            ValueError: A grid side is not a multiple of ``spatial_merge_size``.
-                The 2x2 merge would leave a partial block whose rows the merger
-                cannot fold, so the caller must resize the image, not the grid.
+            ValueError: 某个网格边不是 ``spatial_merge_size`` 的倍数。2x2 合并会留下
+                一个不完整的块，merger 折不了它的行，所以调用方要改图像尺寸，
+                不是改网格。
         """
         c = self.cfg
         m, hidden = c.spatial_merge_size, c.hidden_size
@@ -553,9 +521,9 @@ class VisionTower:
                 gathered = self.pos_embed.index_select(0, idx[:, k]).to(torch.float32)
                 acc.addcmul_(gathered, wt[:, k:k + 1])
                 del gathered
-            # Row-major (h, w) -> merge-block order (block_row, block_col,
-            # in_row, in_col). This is the order pixel_values already use, so
-            # skipping the permute misaligns every patch from here on.
+            # 行主序 (h, w) -> merge 块顺序 (block_row, block_col, in_row, in_col)。
+            # 这正是 pixel_values 已经在用的顺序，跳过 permute 会让此后每个 patch
+            # 都错位。
             acc = (acc.view(h // m, m, w // m, m, hidden)
                    .permute(0, 2, 1, 3, 4).reshape(h * w, hidden))
             if t > 1:
@@ -565,14 +533,14 @@ class VisionTower:
         return out.to(dtype)
 
     def _hw_positions(self, h: int, w: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Patch-grid (row, col) of every token, in merge-block order.
+        """每个 token 的 patch 网格 (行, 列)，按 merge 块顺序。
 
         Args:
-            h: Patch-grid rows of one image.
-            w: Patch-grid columns of one image.
+            h: 一张图的 patch 网格行数。
+            w: 一张图的 patch 网格列数。
 
         Returns:
-            ``(rows, cols)`` as int64 ``[h*w]`` in merge-block order. The rope
+            merge 块顺序下的 ``(rows, cols)``，int64 ``[h*w]``。rope
             angles are derived from these, so they must use the same order as
             the token stream; cached per ``(h, w)``.
         """
@@ -594,20 +562,19 @@ class VisionTower:
         return rows, cols
 
     def _rope(self, gt: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """fp32 cos/sin ``[N, head_dim]`` for the whole batch, in token order.
+        """整个批的 fp32 cos/sin ``[N, head_dim]``，按 token 顺序。
 
-        Layout is ``[cos_h | cos_w | cos_h | cos_w]`` (16 frequencies each): with
-        ``rotate_half`` pairing ``i`` with ``i + head_dim/2`` that is 32
-        independent 2D rotations, H for the first 16 and W for the next 16.
+        布局是 ``[cos_h | cos_w | cos_h | cos_w]``（各 16 个频率）：配合把 ``i`` 与
+        ``i + head_dim/2`` 配对的 ``rotate_half``，就是 32 个独立的二维旋转，前 16 个
+        用 H、后 16 个用 W。
 
         Args:
-            gt: ``grid_thw``, ``[n_img, 3]``. The whole tensor keys the cache,
-                so two requests with the same images share one table.
+            gt: ``grid_thw``，``[n_img, 3]``。整个张量作为缓存键，所以图像相同的
+                两次请求共用一张表。
 
         Returns:
-            ``(cos, sin)``, each fp32 ``[N, head_dim]``, already repeated over
-            frames and concatenated across images in ``gt`` row order. fp32
-            because the angle is one of the fp32 islands HF also keeps.
+            ``(cos, sin)``，各自 fp32 ``[N, head_dim]``，已按帧重复、并跨图像按
+            ``gt`` 的行序拼接。用 fp32 是因为角度也是 HF 保留的 fp32 孤岛之一。
         """
         key = tuple(int(v) for v in gt.reshape(-1).tolist())
         hit = self._rope_cache.get(key)
@@ -635,43 +602,42 @@ class VisionTower:
 
     @staticmethod
     def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-        """Swap the two halves of the last dim with a sign flip on the first.
+        """交换最后一维的前后两半，并给前半变号。
 
-        Interleaved rope (``-x2, x1``) instead of HF's ``rotate_half`` variant
-        would still produce unit-norm rotations, so nothing downstream would
-        raise -- the image would just be wrong. This is HF's split-half form.
+        用交错式 rope（``-x2, x1``）替代 HF 的 ``rotate_half`` 变体，得到的仍是
+        单位模旋转，下游什么都不会报错——图只是错的。这里是 HF 的分半形式。
 
         Args:
-            x: fp32 tensor whose last dim is ``head_dim``.
+            x: 最后一维是 ``head_dim`` 的 fp32 张量。
 
         Returns:
-            Same shape, rotated half.
+            同形状，半区完成旋转。
         """
         half = x.shape[-1] // 2
         return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
 
     def _apply_rope(self, q: torch.Tensor, k: torch.Tensor,
                     cos: torch.Tensor, sin: torch.Tensor):
-        """Rotate q/k in fp32 then cast back -- HF's ``apply_rotary_pos_emb_vision``.
+        """在 fp32 里旋转 q/k 再转回去——即 HF 的 ``apply_rotary_pos_emb_vision``。
 
-        Tiled over tokens so the fp32 copies stay ~4 MB instead of N*heads*64*4.
+        按 token 切块，fp32 拷贝因此维持在约 4 MB，而不是 N*heads*64*4。
 
         Args:
-            q: Queries, ``[N, heads, head_dim]`` in token order.
-            k: Keys, same shape.
-            cos: fp32 ``[N, head_dim]`` from :meth:`_rope`.
-            sin: fp32 ``[N, head_dim]`` from :meth:`_rope`.
+            q: 查询，``[N, heads, head_dim]``，按 token 顺序。
+            k: 键，同形状。
+            cos: 来自 :meth:`_rope` 的 fp32 ``[N, head_dim]``。
+            sin: 来自 :meth:`_rope` 的 fp32 ``[N, head_dim]``。
 
         Returns:
-            ``(q_out, k_out)`` with the input shapes and dtypes restored. The
-            buffers are preallocated so the tile loop never grows the peak.
+            ``(q_out, k_out)``，形状与 dtype 恢复为输入。缓冲区是预分配的，切块
+            循环因此不会推高峰值。
         """
         q_dtype, k_dtype = q.dtype, k.dtype
         q_out = torch.empty_like(q)
         k_out = torch.empty_like(k)
         for i0 in range(0, q.shape[0], _ROPE_TILE):
             i1 = min(i0 + _ROPE_TILE, q.shape[0])
-            # [tile, 1, head_dim]: the singleton broadcasts over heads.
+            # [tile, 1, head_dim]：那个单元素维在头上广播。
             c = cos[i0:i1].unsqueeze(1)
             s = sin[i0:i1].unsqueeze(1)
             qf = q[i0:i1].to(torch.float32)
@@ -683,17 +649,16 @@ class VisionTower:
         return q_out, k_out
 
     def _segments(self, gt: torch.Tensor) -> list[tuple[int, int]]:
-        """``[start, end)`` of every attention segment: one per frame, per image.
+        """每个注意力段的 ``[start, end)``：每图每帧一段。
 
-        Frames attend within themselves only, so a 2-frame image produces two
-        segments, not one. Sliding these wrong lets one frame see another, which
-        no numeric test would flag as an error.
+        帧只在自己内部做注意力，所以 2 帧的图像产生两段而不是一段。这些段滑错位会
+        让一帧看到另一帧，而没有任何数值测试会把它标成错误。
 
         Args:
-            gt: ``grid_thw``, ``[n_img, 3]``.
+            gt: ``grid_thw``，``[n_img, 3]``。
 
         Returns:
-            Half-open ``(start, end)`` pairs covering ``[0, N)`` in order.
+            按顺序覆盖 ``[0, N)`` 的半开 ``(start, end)`` 区间。
         """
         segs: list[tuple[int, int]] = []
         off = 0
@@ -705,44 +670,42 @@ class VisionTower:
         return segs
 
     def cu_seqlens(self, gt: torch.Tensor) -> torch.Tensor:
-        """``int32`` cumulative segment lengths (``[0, ..., N]``), FA-varlen style.
+        """``int32`` 的累积段长（``[0, ..., N]``），FA-varlen 风格。
 
         Args:
-            gt: ``grid_thw``, ``[n_img, 3]``.
+            gt: ``grid_thw``，``[n_img, 3]``。
 
         Returns:
-            ``[n_seg + 1]`` int32 offsets on ``device``. int32 because that is
-            what a varlen attention kernel takes; the tower itself slices with
-            :meth:`_segments` and only reports this shape for parity checks.
+            ``device`` 上 ``[n_seg + 1]`` 个 int32 偏移。用 int32 是因为 varlen
+            注意力内核就要这个；视觉塔自己用 :meth:`_segments` 切片，这个形状只用在
+            对比检查里上报。
         """
         bounds = [0] + [e for _s, e in self._segments(gt)]
         return torch.tensor(bounds, dtype=torch.int32, device=self.device)
 
     def _attn(self, blk: _Block, x: torch.Tensor, segs: list[tuple[int, int]],
               cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        """Packed non-causal attention, one query-tile of scores at a time.
+        """打包的非因果注意力，一次处理一个查询切块的 score。
 
-        Segments are isolated by slicing, not by a mask (the tower has no mask
-        input; a ``[N, N]`` additive mask would also be the biggest tensor in the
-        tower).  Softmax runs in fp32 and is cast back to the compute dtype before
-        the ``p @ v``, exactly like HF's eager path, so a query tile reproduces the
-        full-score-block result to within fp32 summation order.
+        各段靠切片隔离，不用掩码（视觉塔没有掩码输入；一张 ``[N, N]`` 的加性掩码
+        也会成为塔里最大的张量）。Softmax 在 fp32 里跑，并在 ``p @ v`` 之前转回
+        计算 dtype，和 HF 的 eager 路径完全一致，所以一个查询切块复现出的结果与
+        完整 score 块相比，只差 fp32 求和次序。
 
-        The softmax is ``torch.softmax(..., dtype=fp32)`` rather than a hand-rolled
-        max/exp/div: one fused kernel instead of three passes over a fp32 copy of
-        the tile, and it is literatim what HF's ``eager_attention_forward`` does.
+        softmax 用 ``torch.softmax(..., dtype=fp32)`` 而不是手写 max/exp/div：
+        一个融合内核替代对切块 fp32 拷贝的三趟遍历，而且它逐字就是 HF
+        ``eager_attention_forward`` 做的事。
 
         Args:
-            blk: The block whose ``qkv`` / ``proj`` weights this pass uses.
-            x: Pre-norm activations, ``[N, hidden]``.
-            segs: Segments from :meth:`_segments`.
-            cos: fp32 ``[N, head_dim]`` rope table.
-            sin: fp32 ``[N, head_dim]`` rope table.
+            blk: 这一趟用其 ``qkv`` / ``proj`` 权重的块。
+            x: pre-norm 激活，``[N, hidden]``。
+            segs: 来自 :meth:`_segments` 的段。
+            cos: fp32 ``[N, head_dim]`` rope 表。
+            sin: fp32 ``[N, head_dim]`` rope 表。
 
         Returns:
-            ``[N, hidden]`` attention output, ready to add to the residual. Tiles
-            cover each segment separately, so the output is exact per segment
-            while the score block never materialises whole.
+            ``[N, hidden]`` 注意力输出，可直接加进残差。切块逐段覆盖，所以输出在
+            每段内是精确的，同时 score 块从不整体实体化。
         """
         c = self.cfg
         n = x.shape[0]
@@ -751,14 +714,14 @@ class VisionTower:
         q, k, v = qkv.view(n, 3, heads, hd).permute(1, 0, 2, 3).unbind(0)
         del qkv
         q, k = self._apply_rope(q, k, cos, sin)
-        # [heads, n, hd]: batch the heads so each tile matmul is one GEMM.
+        # [heads, n, hd]：把头并成一批，每个切块的矩阵乘因此是一次 GEMM。
         q = q.transpose(0, 1).contiguous()
         k = k.transpose(0, 1).contiguous()
         v = v.transpose(0, 1).contiguous()
         out = torch.empty_like(q)
         tile = max(1, min(Q_TILE, n))
         for s, e in segs:
-            # [heads, hd, seg]: transposed once per segment, not per tile.
+            # [heads, hd, seg]：每段转置一次，而不是每个切块一次。
             kt = k[:, s:e].transpose(-1, -2).contiguous()
             vs = v[:, s:e]
             for q0 in range(s, e, tile):
@@ -769,36 +732,34 @@ class VisionTower:
                 del scores, p
             del kt, vs
         del q, k, v
-        # (heads, n, hd) -> (n, heads*hd): the head dim has to come back *inside*
-        # the feature dim before proj, or the projection reads a permuted vector.
+        # (heads, n, hd) -> (n, heads*hd)：head 维必须在 proj 之前回到特征维*内部*，
+        # 否则投影读到的是一个被重排过的向量。
         return self._linear(out.transpose(0, 1).reshape(n, heads * hd),
                             blk.proj_w, blk.proj_b)
 
     @torch.no_grad()
     def forward(self, pixel_values: torch.Tensor,
                 grid_thw: torch.Tensor) -> torch.Tensor:
-        """``pixel_values [N, 1536]`` + ``grid_thw [n_img, 3]`` -> ``[N/4, 2560]``.
+        """``pixel_values [N, 1536]`` 加 ``grid_thw [n_img, 3]`` -> ``[N/4, 2560]``。
 
-        The output row order is the prompt's ``<|image_pad|>`` order: images in
-        ``grid_thw`` row order, each one row-major over its *merged* grid, which
-        is what ``masked_scatter`` (and the engine's span overwrite) expects.
+        输出行序就是 prompt 里 ``<|image_pad|>`` 的顺序：图像按 ``grid_thw`` 的行序
+        排列，每张在其*合并后*的网格上按行主序展开，这正是 ``masked_scatter``（以及
+        引擎的区间覆写）期待的布局。
 
         Args:
-            pixel_values: Processor output, ``[N, 1536]``, rows in merge-block
-                order. The width must be ``patch_dim``.
-            grid_thw: ``[n_img, 3]`` rows of ``(t, h, w)`` patch counts.
+            pixel_values: processor 输出，``[N, 1536]``，行按 merge 块顺序。宽度必须
+                等于 ``patch_dim``。
+            grid_thw: ``[n_img, 3]`` 行，每行是 ``(t, h, w)`` 的 patch 数。
 
         Returns:
-            ``[N / 4, 2560]`` image embeddings in the tower's output dtype.
-            ``N / 4`` because the merger folds each 2x2 patch block into one
-            row; the callers replace the prompt's image-pad rows with these, so
-            a count mismatch is an immediate shape error at scatter time.
+            ``[N / 4, 2560]`` 的图像嵌入，dtype 是视觉塔的输出 dtype。``N / 4`` 是
+            因为 merger 把每个 2x2 patch 块折成一行；调用方用这些行替换 prompt 里的
+            图像填充行，所以数量对不上会在 scatter 时立刻触发形状错误。
 
         Raises:
-            ValueError: ``grid_thw`` is not ``[n, 3]``, the row count disagrees
-                with the grid, or the row width is not ``patch_dim``. All three
-                are processor/engine mismatches; the caller should reject the
-                request rather than feed a misaligned image to GEMMs.
+            ValueError: ``grid_thw`` 不是 ``[n, 3]``、行数与网格不符，或行宽不等于
+                ``patch_dim``。三种都是 processor 与引擎不匹配；调用方应当拒绝该请求，
+                而不是把一份错位的图像喂给 GEMM。
         """
         c = self.cfg
         gt = torch.as_tensor(grid_thw, dtype=torch.long, device=self.device)
@@ -817,9 +778,9 @@ class VisionTower:
         cos, sin = self._rope(gt)
         segs = self._segments(gt)
 
-        # Both GELUs are deliberately different: the blocks use the checkpoint's
-        # ``gelu_pytorch_tanh`` approximation, the merger uses HF's exact erf
-        # ``nn.GELU``. Swapping them costs ~1e-3 and no shape check would catch it.
+        # 两个 GELU 刻意不同：各块用 checkpoint 的 ``gelu_pytorch_tanh`` 近似，merger
+        # 用 HF 精确的 erf ``nn.GELU``。对调会带来约 1e-3 的差异，而且没有任何形状
+        # 检查能发现。
         for blk in self.blocks:
             x = x + self._attn(blk, self._ln(x, blk.norm1_w, blk.norm1_b), segs, cos, sin)
             h = self._ln(x, blk.norm2_w, blk.norm2_b)
@@ -830,41 +791,39 @@ class VisionTower:
 
         y = self._ln(x, self.merger_norm_w, self.merger_norm_b)
         del x
-        # 2x2 merge-block -> one row: the halving of the token count the prompt's
-        # image-pad span already accounts for.
+        # 2x2 的 merge 块 -> 一行：token 数减半，prompt 里图像填充区间已经按这个算过。
         y = y.reshape(-1, self.merge_dim)
         y = self._linear(y, self.merger_fc1_w, self.merger_fc1_b)
-        # Default ``F.gelu`` is the exact erf form nn.GELU uses; passing
-        # approximate="tanh" here would be the block activation, not the merger's.
+        # 默认的 ``F.gelu`` 就是 nn.GELU 用的精确 erf 形式；这里传
+        # approximate="tanh" 用的就是各块的激活，而不是 merger 的。
         y = F.gelu(y)
         y = self._linear(y, self.merger_fc2_w, self.merger_fc2_b)
         return y.to(self.dtype)
 
     def __call__(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
-        """Alias of :meth:`forward` so the tower reads like a module in the model.
+        """:meth:`forward` 的别名，让视觉塔在模型里读起来像一个模块。
 
         Args:
-            pixel_values: ``[N, 1536]`` processor output.
-            grid_thw: ``[n_img, 3]`` patch grids.
+            pixel_values: ``[N, 1536]`` 的 processor 输出。
+            grid_thw: ``[n_img, 3]`` 的 patch 网格。
 
         Returns:
-            ``[N / 4, 2560]`` image embeddings, same as :meth:`forward`.
+            ``[N / 4, 2560]`` 图像嵌入，与 :meth:`forward` 相同。
         """
         return self.forward(pixel_values, grid_thw)
 
     def num_params(self) -> int:
-        """Count the tower's parameters from the config, without touching storage.
+        """只按配置数视觉塔的参数，不碰存储。
 
-        Exists because the fp16 and int8 modes hold the same parameter count but
-        different bytes; a log line that quotes parameters must not have to walk
-        (and so materialise) ``QWeight`` matrices.
+        它存在的理由是 fp16 和 int8 两种模式参数量相同、字节数不同；一行引用参数的
+        日志不该被迫遍历（从而实体化）``QWeight`` 矩阵。
 
         Returns:
-            Total parameter count of the architecture the config describes.
+            配置所描述架构的参数总数。
         """
         c = self.cfg
-        n = c.hidden_size * c.patch_dim + c.hidden_size                    # patch embed
-        n += c.num_position_embeddings * c.hidden_size                     # pos embed
+        n = c.hidden_size * c.patch_dim + c.hidden_size                    # patch 嵌入
+        n += c.num_position_embeddings * c.hidden_size                     # 位置嵌入
         h, i = c.hidden_size, c.intermediate_size
         per_block = (3 * h * h + 3 * h) + (h * h + h) + (h * i + i) + (i * h + h) + 4 * h
         n += c.depth * per_block
@@ -873,12 +832,11 @@ class VisionTower:
         return n
 
     def nbytes(self) -> int:
-        """Resident bytes of the weights (int8 mode is ~half of fp16).
+        """权重的常驻字节数（int8 模式约为 fp16 的一半）。
 
         Returns:
-            Bytes actually held, so int8 counts 1 byte per weight plus the fp32
-            per-row scale -- the number the residency budget needs, not the
-            parameter count times an element size.
+            实际占用的字节：int8 按每个权重 1 字节再加上逐行 fp32 scale 计——常驻预算
+            要的是这个数，而不是参数量乘以一个元素大小。
         """
         total = 0
         tensors = [self.patch_w, self.patch_b, self.pos_embed,
@@ -893,12 +851,11 @@ class VisionTower:
         return total
 
     def summary(self) -> dict:
-        """Startup log payload: geometry, dtypes and resident weight size.
+        """启动日志的内容：几何、dtype 和常驻权重大小。
 
         Returns:
-            A JSON-friendly dict. ``q_tile`` is the effective tile and
-            ``q_tile_env`` the variable that overrides it, so a mismatched
-            ``VISION_Q_TILE`` in the deployment is visible in the log.
+            可直接 JSON 化的字典。``q_tile`` 是生效的切块宽度，``q_tile_env`` 是
+            覆盖它的环境变量，部署里 ``VISION_Q_TILE`` 配错在日志里一眼可见。
         """
         return {"params": self.num_params(), "weight_GiB": self.nbytes() / 1024 ** 3,
                 "quant": self.quant, "dtype": str(self.dtype),

@@ -1,22 +1,19 @@
-"""One transformer layer: a mixer (linear or full attention) plus the MLP.
+"""一个 transformer 层：一个 mixer（线性注意力或全注意力）加 MLP。
 
-Which mixer a layer gets comes from ``cfg["layer_types"]``; the checkpoint
-interleaves 24 linear-attention layers with 8 full-attention ones.
+层拿到哪种 mixer 由 ``cfg["layer_types"]`` 决定；checkpoint 把 24 层线性注意力和
+8 层全注意力交错排列。
 
-Module: ``coffin/models/qwen35``. Depends on ``ops`` (norm, gemv) and its
-siblings ``full_attn``, ``linear_attn`` and ``batch``; assembled into a stack by
-``model.py``.
+Module: ``coffin/models/qwen35``。依赖 ``ops``（归一化、gemv）和同级的
+``full_attn``、``linear_attn``、``batch``；由 ``model.py`` 组装成层栈。
 
 Constraints:
-    * The two mixer classes are interchangeable only through the methods below
-      (``prefill_project`` / ``prefill_state`` / ``verify`` / ``batch``), so a new
-      mixer has to implement the same surface; ``isinstance`` checks route the
-      linear-attention-only cases.
-    * Linear-attention layers carry recurrent state, full-attention layers carry
-      KV. Every entry point here must reach the right one, or a chunked prefill
-      silently advances only half the model.
-    * The layer type is read from the checkpoint's ``layer_types`` list, never
-      inferred from the layer index -- the interleaving is a model property.
+    * 两个 mixer 类只能通过下面这些方法互换（``prefill_project`` /
+      ``prefill_state`` / ``verify`` / ``batch``），所以新的 mixer 必须实现同一套
+      接口；``isinstance`` 判断负责把线性注意力专属的分支导过去。
+    * 线性注意力层携带循环状态，全注意力层携带 KV。这里的每个入口都必须摸到对的
+      那一个，否则分块预填充只会悄悄推进半个模型。
+    * 层类型从 checkpoint 的 ``layer_types`` 列表读取，绝不从层下标推断——
+      交错方式是模型属性。
 """
 
 from __future__ import annotations
@@ -32,108 +29,104 @@ from ops.norm import RMSNorm
 
 
 class MLP:
-    """SwiGLU feed-forward block: ``down(silu(gate) * up)``.
+    """SwiGLU 前馈块：``down(silu(gate) * up)``。
 
-    ``gate`` and ``up`` share one input, so they are built as a single fused
-    :class:`~ops.gemv.GEMVGroup` and split afterwards; one wide weight read beats
-    two narrow ones on every path (decode, prefill, batch).
+    ``gate`` 和 ``up`` 共享同一个输入，所以建成一个融合的
+    :class:`~ops.gemv.GEMVGroup` 再切分；在每条路径（解码、预填充、批处理）上，
+    一次宽权重读取都胜过两次窄的。
     """
 
     def __init__(self, sd: dict, p: str, bench: bool) -> None:
-        """Build the fused gate/up projection and the down projection.
+        """构建融合的 gate/up 投影和 down 投影。
 
         Args:
-            sd: Checkpoint state dict.
-            p: Parameter prefix of this MLP inside the state dict.
-            bench: Forwarded to the projections; ``False`` skips the autotune.
+            sd: checkpoint state dict。
+            p: 这个 MLP 在 state dict 里的参数前缀。
+            bench: 透传给投影；``False`` 跳过自动调优。
         """
         self.gate_up = _proj(sd, [f"{p}.gate_proj", f"{p}.up_proj"], bench)
         self.down = _proj(sd, [f"{p}.down_proj"], bench)
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply the block to one or a few rows (decode path).
+        """把块作用在一行或少数几行上（解码路径）。
 
-        ``silu(gate) * up`` is written as one op into ``up``'s own buffer rather than as
-        ``F.silu(gate) * up``. As two torch calls it is two launches and two fresh
-        ``[intermediate]`` temporaries per layer; the fused entry is one launch, reads each
-        operand once and writes back over ``up``, which nothing reads afterwards. There are
-        32 MLPs in a decode step and this card's launch floor is ~5.75 us, so the two
-        launches were costing more than the arithmetic. ``out`` may alias ``up`` by
-        contract, which is what makes the writeback legal rather than a trick.
+        ``silu(gate) * up`` 作为一个算子直接写进 ``up`` 自己的缓冲区，而不是写成
+        ``F.silu(gate) * up``。拆成两次 torch 调用就是两次 launch，每层还要两个
+        新的 ``[intermediate]`` 临时量；融合入口只 launch 一次，每个操作数只读
+        一次，并就地覆写 ``up``，那之后没有东西再读它。一次解码步骤有 32 个 MLP，
+        而这张卡的 launch 下限约 5.75 us，两次 launch 比算术本身还贵。按契约
+        ``out`` 可以与 ``up`` 别名，所以这次回写是合法的，不是取巧。
 
         Args:
-            x: Activations, ``[hidden]`` or ``[B, hidden]``, bf16.
+            x: 激活，``[hidden]`` 或 ``[B, hidden]``，bf16。
 
         Returns:
-            Same leading shape as ``x`` with the hidden width.
+            与 ``x`` 相同的前导形状，宽度为 hidden。
         """
         gate, up = self.gate_up(x)
         return self.down(bops.silu_mul(gate, up, up))
 
     def prefill(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply the block to a prefill chunk.
+        """把块作用在一个预填充分块上。
 
-        The same fused product as :meth:`__call__`. Prefill is compute-bound so the launch
-        is a smaller share of it, but this is the identical arithmetic on the identical
-        layout, and a second spelling would be a second thing to keep numerically in step.
+        和 :meth:`__call__` 是同一个融合乘积。预填充是计算受限的，launch 占比更小，
+        但这里算术和布局都完全相同，另写一种拼法只会多出一处需要保持数值一致的
+        地方。
 
         Args:
-            x: Activations, ``[C, hidden]``, bf16.
+            x: 激活，``[C, hidden]``，bf16。
 
         Returns:
-            ``[C, hidden]``.
+            ``[C, hidden]``。
         """
         gate, up = self.gate_up.prefill(x)
         return self.down.prefill(bops.silu_mul(gate, up, up))
 
     def batch(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply the block with the bit-exact batched GEMV path.
+        """用逐位精确的批处理 GEMV 路径作用这个块。
 
         Args:
-            x: Activations, ``[B, hidden]``, one row per decoding sequence.
+            x: 激活，``[B, hidden]``，每个解码序列一行。
 
         Returns:
-            ``[B, hidden]``, each row identical to the solo-decode result.
+            ``[B, hidden]``，每行与单条解码结果一致。
         """
         gate, up = batch_proj(self.gate_up, x)
         return batch_proj(self.down, bops.silu_mul(gate, up, up))
 
     def wide(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply the block at an arbitrary row count (the one-forward verify).
+        """在任意行数下作用这个块（一次前向校验）。
 
         Args:
-            x: Activations, ``[M, hidden]``; ``M`` is the verify width ``B*c``.
+            x: 激活，``[M, hidden]``；``M`` 是校验宽度 ``B*c``。
 
         Returns:
-            ``[M, hidden]``; rows need not be bit-identical to solo decode once a
-            wide kernel is in play.
+            ``[M, hidden]``；一旦用上宽内核，各行不必与单条解码逐位相同。
         """
         gate, up = wide_proj(self.gate_up, x)
         return wide_proj(self.down, bops.silu_mul(gate, up, up))
 
 
 class Layer:
-    """One decoder layer: pre-norm mixer, residual add, pre-norm MLP, residual add.
+    """一个解码层：pre-norm mixer、残差相加、pre-norm MLP、残差相加。
 
-    The mixer is chosen by the checkpoint's ``layer_types`` entry for this index:
-    ``linear_attention`` gets :class:`~models.qwen35.linear_attn.LinearAttn`,
-    anything else :class:`~models.qwen35.full_attn.FullAttn`.
+    mixer 由 checkpoint 里 ``layer_types`` 对应本下标的项决定：
+    ``linear_attention`` 拿 :class:`~models.qwen35.linear_attn.LinearAttn`，其余
+    一律 :class:`~models.qwen35.full_attn.FullAttn`。
     """
 
     def __init__(self, sd: dict, i: int, cfg: dict, bench: bool, max_seq: int,
                  paged: bool = False) -> None:
-        """Build the norms, the MLP and this layer's mixer.
+        """构建归一化、MLP 和本层的 mixer。
 
         Args:
-            sd: Checkpoint state dict.
-            i: Layer index, used both for the parameter prefix and to look up
-                ``layer_types[i]``.
-            cfg: Model config dict from ``config.json``.
-            bench: Forwarded to the projections; ``False`` skips the autotune.
-            max_seq: Longest sequence the engine will run, used to size the
-                full-attention mask and RoPE tables.
-            paged: Build the mixer against the paged KV pool instead of a
-                contiguous cache. Must match how the runner drives the model.
+            sd: checkpoint state dict。
+            i: 层下标，既用于拼参数前缀，也用于查 ``layer_types[i]``。
+            cfg: 来自 ``config.json`` 的模型配置字典。
+            bench: 透传给投影；``False`` 跳过自动调优。
+            max_seq: 引擎会跑的最长序列，用来定全注意力掩码和 RoPE 表的尺寸。
+            paged: 让 mixer 针对分页 KV 池构建，而不是连续缓存。必须和运行器
+                驱动模型的方式一致。
         """
         p = f"model.language_model.layers.{i}"
         self.type = cfg["layer_types"][i]
@@ -146,44 +139,42 @@ class Layer:
             self.mix = FullAttn(sd, f"{p}.self_attn", cfg, bench, max_seq, paged)
 
     def __call__(self, x: torch.Tensor, ctx) -> torch.Tensor:
-        """Run one decode step through the layer.
+        """让一个解码步穿过本层。
 
         Args:
-            x: Hidden state, ``[hidden]``.
-            ctx: Mixer inputs (cache slots, positions and the layer's own state);
-                forwarded to the mixer as positional arguments.
+            x: 隐含状态，``[hidden]``。
+            ctx: mixer 的输入（缓存槽位、位置以及本层自己的状态）；按位置参数
+                转交给 mixer。
 
         Returns:
-            ``[hidden]`` output state.
+            ``[hidden]`` 的输出状态。
         """
         h = self.mix(self.in_ln(x), *ctx)
-        # The residual add folds into the norm that consumes it: ``post_ln`` accumulates
-        # ``x += h`` in place and normalises the sum into ``h``, whose mixer value the add
-        # has just consumed. One launch instead of two, and no buffer to allocate -- the
-        # mixer output is dead the moment the sum reads it.
+        # 残差相加折进消费它的归一化：``post_ln`` 就地累加 ``x += h``，并把和归一化
+        # 写进 ``h``——相加刚刚就读走了 mixer 的输出，那个值随即失效。一次 launch
+        # 代替两次，也不用分配缓冲区。
         #
-        # Only this add folds here. The layer's *other* add, ``x + mlp(...)``, is consumed
-        # by the next layer's ``in_ln`` rather than by anything in this layer, so folding it
-        # needs a buffer carried across layers and belongs in ``model._forward``, not here.
+        # 只有这一处相加在这里折叠。本层的*另一处*相加 ``x + mlp(...)`` 由下一层的
+        # ``in_ln`` 消费，而不是本层任何东西，要折它就得有跨层携带的缓冲区，那属于
+        # ``model._forward``，不在这里。
         normed = self.post_ln.add_residual(x, h, h)
         return x + self.mlp(normed)
 
     def prefill(self, x: torch.Tensor, positions: torch.Tensor, ctx,
                 tiles: list | None = None) -> torch.Tensor:
-        """Run one prefill chunk through the layer, for a single sequence.
+        """让一个预填充分块穿过本层，只处理单个序列。
 
-        The input projection is hoisted out of :meth:`prefill_state` so the
-        stateful half can run per sequence while the GEMM stays one call.
+        输入投影被提到 :meth:`prefill_state` 外面，这样有状态的那一半可以逐序列
+        运行，而 GEMM 仍然只有一次调用。
 
         Args:
-            x: Chunk activations, ``[C, hidden]``.
-            positions: Absolute positions of the chunk, ``[C]``.
-            ctx: Mixer inputs for this chunk.
-            tiles: Pre-split query tiles, or ``None`` to let the mixer tile the
-                chunk itself.
+            x: 分块激活，``[C, hidden]``。
+            positions: 该分块的绝对位置，``[C]``。
+            ctx: 该分块对应的 mixer 输入。
+            tiles: 预先切好的查询块；``None`` 表示让 mixer 自己切分这个分块。
 
         Returns:
-            ``[C, hidden]`` output activations.
+            ``[C, hidden]`` 的输出激活。
         """
         proj = self.mix.prefill_project(self.in_ln(x))
         h = self.prefill_state(proj, positions, ctx, tiles, self.mix.prefill_row)
@@ -192,19 +183,18 @@ class Layer:
 
     def prefill_state(self, proj, positions: torch.Tensor, ctx,
                       tiles: list | None, row: int) -> torch.Tensor:
-        """Mixer half of a prefill chunk for one sequence on ``row``.
+        """在 ``row`` 上为单个序列执行预填充分块的 mixer 半边。
 
         Args:
-            proj: Raw projection output for this chunk, as returned by the
-                mixer's ``prefill_project``.
-            positions: Absolute positions of the chunk, ``[C]``.
-            ctx: Mixer inputs for this chunk.
-            tiles: Pre-split query tiles, or ``None``.
-            row: Recurrence/KV row this sequence owns in the batch layout; the
-                prefill scratch row is the last one.
+            proj: 该分块的原始投影输出，即 mixer 的 ``prefill_project`` 返回的
+                东西。
+            positions: 该分块的绝对位置，``[C]``。
+            ctx: 该分块对应的 mixer 输入。
+            tiles: 预先切好的查询块，或 ``None``。
+            row: 该序列在批布局里占用的递推/KV 行；预填充临时行是最后一行。
 
         Returns:
-            ``[C, hidden]`` pre-residual mixer output.
+            ``[C, hidden]``，加残差之前的 mixer 输出。
         """
         mix = self.mix
         if isinstance(mix, LinearAttn):
@@ -213,68 +203,66 @@ class Layer:
         pre = mix.prefill_attend(*proj, positions, ctx, tiles, row)
         return mix.o_proj.prefill(pre)
 
-    # group prefill: the projection is one GEMM over every sequence's tokens, the
-    # stateful half runs per sequence with its own positions / KV row / recurrence
-    # row, and the output projection is batched again over the concatenation.
+    # 组预填充：投影是对所有序列 token 的一次 GEMM，有状态的一半逐序列运行、各用
+    # 自己的位置 / KV 行 / 递推行，输出投影再对拼接结果做一次批处理。
     def prefill_group_project(self, x: torch.Tensor):
-        """Project a concatenation of several sequences' prefill chunks.
+        """对若干个序列预填充分块的拼接做投影。
 
         Args:
-            x: Activations for every sequence's chunk, ``[C_total, hidden]``.
+            x: 所有序列分块的激活，``[C_total, hidden]``。
 
         Returns:
-            ``(mixer, projection tuple)``: the mixer instance, so the per-sequence
-            calls below do not have to re-dispatch on the layer type, plus the
-            raw projection output.
+            ``(mixer, 投影元组)``：mixer 实例，好让下面的逐序列调用不必再按层
+            类型重新分派；外加原始投影输出。
         """
         mix = self.mix
         return mix, mix.prefill_project(self.in_ln(x))
 
     def prefill_group_state(self, mix, proj, positions: torch.Tensor, ctx,
                             tiles: list | None, row: int) -> torch.Tensor:
-        """Run one sequence's slice of the group projection.
+        """运行某个序列在组投影里的那一片。
 
         Args:
-            mix: Mixer returned by :meth:`prefill_group_project`.
-            proj: That sequence's slice of the group projection.
-            positions: Absolute positions of the slice, ``[C_i]``.
-            ctx: Mixer inputs for this slice.
-            tiles: Pre-split query tiles, or ``None``.
-            row: Row this sequence owns in the batch layout.
+            mix: :meth:`prefill_group_project` 返回的 mixer。
+            proj: 该序列在组投影里的切片。
+            positions: 该切片的绝对位置，``[C_i]``。
+            ctx: 该切片对应的 mixer 输入。
+            tiles: 预先切好的查询块，或 ``None``。
+            row: 该序列在批布局里占用的行。
 
         Returns:
-            ``[C_i, D]``, before the output projection. Kept pre-projection so
-            :meth:`prefill_group_out` can batch the GEMM over all sequences.
+            ``[C_i, D]``，位于输出投影之前。保持未投影状态，:meth:`prefill_group_out`
+            才能把所有序列的 GEMM 合成一次。
         """
         if isinstance(mix, LinearAttn):
             return mix.prefill_state(*proj, row=row)
         return mix.prefill_attend(*proj, positions, ctx, tiles, row)
 
     def prefill_group_out(self, mix, pre_out: torch.Tensor) -> torch.Tensor:
-        """Apply the output projection once over all sequences' mixer outputs.
+        """对所有序列的 mixer 输出一次性施加输出投影。
 
         Args:
-            mix: Mixer returned by :meth:`prefill_group_project`.
-            pre_out: Concatenated pre-projection outputs, ``[C_total, D]``.
+            mix: :meth:`prefill_group_project` 返回的 mixer。
+            pre_out: 未投影输出的拼接，``[C_total, D]``。
 
         Returns:
-            ``[C_total, hidden]``.
+            ``[C_total, hidden]``。
         """
         if isinstance(mix, LinearAttn):
             return mix.out_proj.prefill(pre_out)
         return mix.o_proj.prefill(pre_out)
 
     def verify(self, x: torch.Tensor, positions: torch.Tensor, ctx) -> torch.Tensor:
-        """Replay the layer for the ``c`` speculative tokens of one step.
+        """为一步里的 ``c`` 个投机 token 重放本层。
 
         Args:
-            x: Hidden states for the verify window, ``[c, hidden]``.
-            positions: Absolute positions of those tokens, ``[c]``.
-            ctx: Mixer inputs for the window; the linear-attention mixer gets no
-                positions because it carries its state instead.
+            x: 校验窗口的隐含状态，``[c, hidden]``。
+            positions: 那些 token 的绝对位置，``[c]``。
+            ctx: 窗口对应的 mixer 输入；线性注意力 mixer 不接收位置，因为它携带
+                的是自己的状态。
 
         Returns:
-            ``[c, hidden]`` output states.
+            ``[c, hidden]`` 的输出状态。
         """
         if self.type == "linear_attention":
             h = self.mix.verify(self.in_ln(x))
@@ -284,19 +272,18 @@ class Layer:
         return x + self.mlp.prefill(self.post_ln(x))
 
     def batch(self, x: torch.Tensor, positions: torch.Tensor, ctx) -> torch.Tensor:
-        """Run the layer for the static-batch decode step.
+        """为静态批解码步运行本层。
 
-        Projections run batched (one weight read for all rows); the stateful
-        mixers run the existing per-row kernels so every row keeps the exact
-        numbers of a solo decode.
+        投影走批处理（所有行共用一次权重读取）；有状态的 mixer 仍跑现有的逐行
+        内核，每一行因此保持单条解码的精确数字。
 
         Args:
-            x: One row per decoding sequence, ``[B, hidden]``.
-            positions: Each row's next absolute position, ``[B]``.
-            ctx: Mixer inputs for the batch.
+            x: 每个解码序列一行，``[B, hidden]``。
+            positions: 每行下一个绝对位置，``[B]``。
+            ctx: 该批对应的 mixer 输入。
 
         Returns:
-            ``[B, hidden]`` output states.
+            ``[B, hidden]`` 的输出状态。
         """
         if self.type == "linear_attention":
             h = self.mix.batch(self.in_ln(x))
@@ -306,5 +293,5 @@ class Layer:
         return x + self.mlp.batch(self.post_ln(x))
 
     def reset(self) -> None:
-        """Clear this layer's recurrent state so the model can take a new request."""
+        """清空本层的循环状态，让模型可以接新请求。"""
         self.mix.reset()

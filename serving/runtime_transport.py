@@ -1,17 +1,15 @@
-"""Unix-socket transport for the resident inference runtime.
+"""常驻推理运行时的 unix socket 传输层。
 
-Module: ``coffin.serving``. This module owns socket accept/read/write behavior;
-model lifecycle remains in ``runtime_service.Server``.
+Module: ``coffin.serving``。socket 的 accept/read/write 行为归本模块；模型生命周期
+仍在 ``runtime_service.Server`` 里。
 
 Constraints:
-    * The startup banner is the only place a silent backend fallback would be
-      visible, so it prints ``backends.status()`` verbatim instead of assembling
-      its own field list: the fields (``backend=``, ``device=``, ``native=``,
-      ``graph=``, ``autotune=``) are the ones an operator diagnoses with, and a
-      hand-built banner drifts from the backend the moment one gains a flag.
-    * Nothing here may touch the device: a transport that allocates or
-      synchronises cannot bind its socket on a host with no accelerator, and the
-      reference backend is exactly the case that has to work there.
+    * 启动横幅是后端静默回退唯一会被看见的地方，所以它原样打印
+      ``backends.status()``，而不是自己拼一份字段列表：``backend=``、``device=``、
+      ``native=``、``graph=``、``autotune=`` 这些字段就是运维诊断时看的东西，手工
+      拼出来的横幅会在后端新增开关的那一刻就开始漂移。
+    * 这里不许碰设备：会分配或同步的传输层在没有任何加速卡的主机上根本绑不了
+      socket，而参考后端恰恰就是必须在那样的机器上跑通的情况。
 """
 
 from __future__ import annotations
@@ -37,43 +35,40 @@ def serve(model_dir: str, max_seq: int, bench: bool, sock_path: str,
           image_max_pixels: int = 1048576, image_min_pixels: int = 65536,
           max_images: int = 4, max_image_bytes: int = 8388608,
           graph: bool = True, prefill_quantum: int = 2048) -> None:
-    """Build the server, bind the unix socket and serve until asked to stop.
+    """建好服务、绑定 unix socket，然后一直服务到被要求停止。
 
-    The argument list mirrors ``Server.__init__``; see it for the meaning of each
-    knob. Everything here is process lifetime, not per request.
+    参数表与 ``Server.__init__`` 一一对应，各开关的含义见那里。这里的一切都是
+    进程级的，不是按请求的。
 
     Args:
-        model_dir: Checkpoint directory.
-        max_seq: Context window, shared by prompt and output.
-        bench: Keep the legacy single-stream bench path available.
-        sock_path: Unix socket to bind; an existing file at that path is removed
-            first, so a stale socket from a killed run does not block startup.
-        spec_k: Drafts per speculative step, 0 to disable.
-        int8: Quantise the 2D weights.
-        prefix_cache: Enable the paged radix prefix cache.
-        block_size: KV block granularity in tokens.
-        snapshots: Recurrent-state snapshot budget.
-        snapshot_interval: Snapshot every N tokens, rounded to a block.
-        max_seconds: Wall-clock cap on one generation, 0 for none.
-        max_num_seqs: Rows in a batched decode step.
-        num_blocks: KV pool size, 0 to derive it from the window.
-        spec_batch: Speculate in the batched engine.
-        spec_sparse_k: Approximate batched verify, top-k historical blocks.
-        spec_min_ctx: Skip batched speculation below this cached length.
-        vision: Load the checkpoint's vision tower when it has one.
-        vision_int8: Keep the tower's 2D weights int8.
-        image_max_pixels: Largest image the processor serves.
-        image_min_pixels: Smallest image after the processor's upscale.
-        max_images: Images accepted in one request.
-        max_image_bytes: Decoded bytes allowed per image.
-        graph: Capture the decode step into a device graph. ``False`` runs the
-            eager step instead; it is the escape hatch for a backend whose graph
-            replay is not trusted yet, and it must reach the engine before the
-            graph is captured, which is why it travels as a constructor argument
-            rather than an environment variable.
-        prefill_quantum: Prompt tokens one request may prefill per step. The
-            scheduler uses it to interleave long prompts with short ones; 0 falls
-            back to the step's whole token budget.
+        model_dir: checkpoint 目录。
+        max_seq: 上下文窗口，prompt 和输出共享。
+        bench: 保留旧的单流 bench 路径可用。
+        sock_path: 要绑的 unix socket；该路径上已有的文件会先被删掉，一次被杀掉
+            的运行留下的陈旧 socket 因此不会挡住启动。
+        spec_k: 每个投机步的草稿数，0 表示关闭。
+        int8: 把二维权重量化。
+        prefix_cache: 启用分页基数前缀缓存。
+        block_size: KV 块的 token 粒度。
+        snapshots: 循环状态快照预算。
+        snapshot_interval: 每 N 个 token 打一次快照，取整到块。
+        max_seconds: 一次生成的墙钟上限，0 表示不限。
+        max_num_seqs: 批解码步里的行数。
+        num_blocks: KV 池大小，0 表示按窗口推算。
+        spec_batch: 在批处理引擎里投机。
+        spec_sparse_k: 近似的批验证，只用历史块里的 top-k。
+        spec_min_ctx: 缓存长度低于它就跳过批投机。
+        vision: checkpoint 有视觉塔时加载它。
+        vision_int8: 视觉塔的二维权重保持 int8。
+        image_max_pixels: 处理器服务的最大图像。
+        image_min_pixels: 处理器放大之后的最小图像。
+        max_images: 一个请求接受的图像数。
+        max_image_bytes: 单张图像允许的解码字节数。
+        graph: 把解码步 capture 成设备图。``False`` 改跑 eager 步；这是给
+            还不信任图回放的后端留的逃生口，而它必须在图 capture 之前就传到引擎，
+            所以它走构造参数，而不是环境变量。
+        prefill_quantum: 一个请求每步最多预填充多少 prompt token。调度器用它把长
+            prompt 和短 prompt 交错开；0 表示退回该步的全部 token 预算。
     """
     srv_model = Server(model_dir, max_seq, bench, spec_k, int8, prefix_cache, block_size,
                        snapshots, snapshot_interval, max_seconds, max_num_seqs,
@@ -109,9 +104,8 @@ def serve(model_dir: str, max_seq: int, bench: bool, sock_path: str,
     print(f"[serve] listening on {sock_path}", flush=True)
     srv_model.start()
 
-    # The accept timeout is how the loop notices ``_stop``: a blocking accept
-    # would keep the socket open after a ``stop`` request until a new client
-    # happened to connect.
+    # accept 超时是循环发现 ``_stop`` 的唯一办法：阻塞式 accept 会让 socket 在
+    # 收到 ``stop`` 之后继续开着，直到恰好有新的客户端连上来。
     srv.settimeout(0.5)
     while not srv_model._stop:
         try:
@@ -119,8 +113,8 @@ def serve(model_dir: str, max_seq: int, bench: bool, sock_path: str,
         except socket.timeout:
             continue
 
-        # One thread per connection: the engine thread batches whatever requests
-        # are in flight, so a slow SSE client no longer blocks the next request.
+        # 每条连接一个线程：引擎线程会把在途请求凑成批，慢的 SSE 客户端因此不再
+        # 挡住下一个请求。
         threading.Thread(target=_serve_connection, args=(srv_model, conn),
                          daemon=True).start()
     srv_model.stop()
@@ -130,16 +124,15 @@ def serve(model_dir: str, max_seq: int, bench: bool, sock_path: str,
 
 
 def _serve_connection(srv_model: "Server", conn: socket.socket) -> None:
-    """Serve one JSON-line request (or one SSE stream) on its own thread.
+    """在自己的线程上服务一个 JSON 行请求（或一条 SSE 流）。
 
-    The reply goes out as a single line, so the client's read-until-newline loop
-    terminates. A ``chat_stream`` op instead writes one line per stream event,
-    which the OpenAI entry point turns into SSE frames.
+    回复作为一整行发出去，客户端「读到换行」的循环因此才能结束。``chat_stream`
+    操作则每个流事件写一行，由 OpenAI 入口把它们变成 SSE 帧。
 
     Args:
-        srv_model: The shared server; every thread sees the same one.
-        conn: The accepted connection. It is closed here in every case, including
-            a malformed request, so a bad client cannot leak a descriptor.
+        srv_model: 共享的服务对象；所有线程看到的是同一个。
+        conn: 已接受的连接。无论哪种情况都在这里关掉，包括请求格式错误时，
+            所以坏客户端不会泄漏描述符。
     """
     try:
         buf = b""
@@ -151,7 +144,7 @@ def _serve_connection(srv_model: "Server", conn: socket.socket) -> None:
         req = json.loads(buf.decode() or "{}")
         t0 = time.time()
         if req.get("op") == "chat_stream":
-            # One reply line per token, so the client can forward them as SSE.
+            # 每个 token 一行回复，客户端才能把它们当作 SSE 转发出去。
             for line in srv_model.stream_chat(req):
                 conn.sendall((json.dumps(line, ensure_ascii=False) + "\n").encode())
             print(f"[serve] chat_stream -> {round((time.time() - t0) * 1000, 1)}ms",
@@ -164,9 +157,8 @@ def _serve_connection(srv_model: "Server", conn: socket.socket) -> None:
         if rep.get("stopping"):
             srv_model.stop()
     except Exception as exc:  # keep the server alive on a bad request
-        # An ``MMError`` that escaped a path which could not answer cleanly (a
-        # stream whose 200 is already committed) is still reported with its status
-        # so the HTTP shell can map it instead of calling everything a 500.
+        # 从无法干净答复的路径里逃出来的 ``MMError``（比如 200 已经发出去的流），
+        # 仍然带着自己的状态码上报，HTTP 外壳据此映射，而不是一律当成 500。
         rep = {"ok": False, "error": str(exc)}
         if isinstance(exc, MMError):
             rep["status"] = exc.status
@@ -180,22 +172,22 @@ def _serve_connection(srv_model: "Server", conn: socket.socket) -> None:
 
 
 def call(sock_path: str, req: dict) -> dict:
-    """Send one request to a running server and return its reply.
+    """向正在运行的服务发一个请求，返回它的回复。
 
-    The client half of the wire format: one JSON line out, one back.
+    线协议的客户端部分：发一行 JSON，收回一行。
 
     Args:
-        sock_path: The engine socket the server bound.
-        req: The request dict; ``op`` selects the handler.
+        sock_path: 服务绑定的引擎 socket。
+        req: 请求字典；``op`` 决定走哪个处理分支。
 
     Returns:
-        The decoded reply. It may carry ``ok: False``; this function does not
-        raise on a refusal, because the CLI prints the reply either way.
+        解码后的回复。它可能带 ``ok: False``；本函数不会因为被拒绝而抛异常，
+        因为命令行无论如何都要把回复打出来。
 
     Raises:
-        OSError: The server is not listening on ``sock_path``. Start it first;
-            a client-side retry cannot fix a missing server.
-        json.JSONDecodeError: The server closed without sending a full line.
+        OSError: 服务没在 ``sock_path`` 上监听。先把服务起起来；客户端重试
+            修不好一个不存在的服务。
+        json.JSONDecodeError: 服务在一整行还没发完时就关了连接。
     """
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.connect(sock_path)

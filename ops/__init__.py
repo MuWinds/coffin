@@ -1,30 +1,25 @@
-"""Device-side primitives, deliberately independent of any one checkpoint family.
+"""设备侧原语，刻意不绑定任何一套 checkpoint 族。
 
-A model family decides the shapes and the wiring; these modules decide how a
-projection, a norm, RoPE or the delta recurrence is *executed* on this part. Every
-one of them was benchmarked into its current form, so the measurement notes travel
-with the code they justify.
+模型族决定形状和接线；这些模块决定投影、归一化、RoPE 或 delta 递推在这颗
+芯片上*怎么执行*。每一个都是被基准测到当前形态的，所以实测记录跟着它所辩护
+的代码一起走。
 
-Module: ``coffin/ops``. Bottom of the dependency graph above ``backends``:
-``models/*`` and the engine import from here, never the reverse. Each module below
-is re-exported so callers can write ``from ops import GEMV`` instead of reaching
-into a submodule.
+Module: ``coffin/ops``。依赖图上位于 ``backends`` 之上的最底层：
+``models/*`` 和引擎从这里导入，反方向不允许。下面每个模块都再导出一次，
+调用方写 ``from ops import GEMV`` 即可，不必伸手进子模块。
 
 Constraints:
-    * May not import ``models/`` or anything above it in the graph; this layer has
-      to stay loadable, and unit-testable, without a checkpoint.
-    * The platform detail lives in ``backends``: no module here may name a device
-      API, a kernel source path, an arch string or a device literal. Anything that
-      differs between the DCU and the CoreX is reached through ``backends.ops``,
-      ``backends.caps()`` or ``ops.runtime``.
-    * Absolute imports (``from ops.gemv import GEMV``) because the entry points put
-      ``coffin/`` itself on ``sys.path``, making ``ops`` a top-level package next
-      to ``models`` and the ``cache`` package -- see
-      ``entrypoints/cli/runtime.py`` and ``run_chat.py``.
-    * Keep the measured TFLOP/s and GB/s figures in the module docstrings: they are
-      the only record of why the current kernel form won on the first part this
-      engine was tuned for, and they are what a new platform's numbers get compared
-      against.
+    * 不许 import ``models/`` 或图里更上层的东西；这一层必须能在没有
+      checkpoint 的情况下加载、单测。
+    * 平台细节存放在 ``backends``：这里任何模块都不许出现设备 API、内核源码
+      路径、arch 字符串或设备字面量。DCU 和 CoreX 之间不同的东西一律通过
+      ``backends.ops``、``backends.caps()`` 或 ``ops.runtime`` 取得。
+    * 用绝对导入（``from ops.gemv import GEMV``），因为入口脚本把 ``coffin/``
+      本身放进 ``sys.path``，``ops`` 于是成了和 ``models``、``cache`` 平级的
+      顶层包——见 ``entrypoints/cli/runtime.py`` 和 ``run_chat.py``。
+    * 模块 docstring 里测得的 TFLOP/s 和 GB/s 数字要保留：它们是当前内核形态
+      为什么胜出的唯一记录，针对的是本引擎最早调优的那颗芯片；新平台的数字
+      要拿来和它们对比。
 """
 
 from ops.delta import chunked_delta

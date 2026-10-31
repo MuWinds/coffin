@@ -1,8 +1,7 @@
-"""Parser and serializer for the Qwen3.5 tool-call wire format.
+"""Qwen3.5 工具调用线格式的解析与序列化。
 
-The format is the checkpoint's, not ours: the chat template teaches the model to
-answer a tool request with the body below, so the parser has to accept exactly
-that text and nothing more forgiving.
+格式是 checkpoint 定的，不是我们定的：对话模板教模型用下面这样的正文回答工具
+请求，所以解析器必须恰好接受这种文本，不能再宽容。
 
     <tool_call>
     <function=get_weather>
@@ -12,29 +11,27 @@ that text and nothing more forgiving.
     </function>
     </tool_call>
 
-One call may carry several ``<function=...>`` blocks and several
-``<parameter=...>`` blobs. Parameter values are raw text, not JSON: the format
-has no quoting, so ``0755`` and ``celsius`` arrive as strings, and a value that
-parses as a JSON literal has to be un-wrapped deliberately (see ``_coerce``).
-A JSON fallback (``{"name": ..., "arguments": {...}}`` inside ``<tool_call>``)
-is also accepted because some checkpoints emit it.
+一个调用可以带多个 ``<function=...>`` 块和多个 ``<parameter=...>`` 块。
+参数值是原始文本而不是 JSON：格式里没有引号概念，所以 ``0755`` 和 ``celsius``
+都会以字符串到达，而能被解析成 JSON 字面量的值必须刻意去壳（见 ``_coerce``）。
+``<tool_call>`` 里直接放 ``{"name": ..., "arguments": {...}}`` 的 JSON 兜底形式也
+接受，因为有 checkpoint 就是这么输出的。
 
-When thinking is on, the reasoning sits in ``<think>...</think>`` and may precede
-the call; ``split_thinking`` separates the two so the OpenAI shell can return
-``reasoning_content`` next to the answer.
+开着思考时，推理段在 ``<think>...</think>`` 里，且可能出现在调用之前；
+``split_thinking`` 把两者分开，OpenAI 外壳才能把 ``reasoning_content`` 和答案一起
+返回。
 
-Module: ``coffin/utils/tool_call.py``. Leaf of the import graph: standard library
-only, so ``serving/`` and ``tests/test_openai.py`` can both depend on it.
+Module: ``coffin/utils/tool_call.py``。依赖图的叶子：只用标准库，所以
+``serving/`` 和 ``tests/test_openai.py`` 都能依赖它。
 
 Constraints:
-    * The tags and the surrounding template are a checkpoint contract. Changing
-      the patterns without retraining the template silently stops every tool
-      call from being recognised -- the model output would still look right.
-    * Parsing never raises on malformed input: a truncated or half-written block
-      yields fewer calls, because this runs on a degraded generation and turning
-      that into a server error would kill the request.
-    * Parsing is pure: no I/O and no global state, so it is safe to call on a
-      streamed partial answer.
+    * 标签和配套的模板是 checkpoint 契约。不重新训练模板就改这些正则，会让
+      所有工具调用静默地识别不出来——模型输出看起来还是对的。
+    * 解析永远不为畸形输入抛异常：截断或只写了一半的块只是产出更少的调用，
+      因为这段代码跑在已经降级的生成结果上，把它变成服务端错误等于杀掉整个
+      请求。
+    * 解析是纯函数：不做 I/O 也没有全局状态，所以对流式返回的半截回答调用
+      是安全的。
 """
 
 from __future__ import annotations
@@ -54,12 +51,11 @@ _THINK = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 
 @dataclass
 class ToolCall:
-    """One parsed call, in the shape both the chat template and OpenAI expect.
+    """一个解析出来的调用，形状同时满足对话模板和 OpenAI 两边的要求。
 
-    ``to_openai_dict`` re-serialises ``arguments`` to a JSON *string*, because
-    the OpenAI wire format carries arguments as text; the chat template instead
-    iterates them as a dict. Both consumers read this same object, so the two
-    representations live in one place.
+    ``to_openai_dict`` 会把 ``arguments`` 重新序列化成 JSON *字符串*，因为 OpenAI
+    线格式用文本承载参数；对话模板则把它当字典遍历。两个消费方读的是同一个
+    对象，所以两种表示集中在这里维护。
     """
 
     name: str
@@ -68,52 +64,48 @@ class ToolCall:
     raw: str = ""
 
     def __post_init__(self) -> None:
-        """Mint an id when the wire format carried none.
+        """线格式没带 id 时在这里生成一个。
 
-        The OpenAI response contract requires every call to have an id, and the
-        Qwen template does not emit one, so the parser invents it here rather
-        than making each caller do so.
+        OpenAI 的响应契约要求每个调用都有 id，而 Qwen 模板不产出 id，所以由
+        解析器统一补上，省得每个调用方各写一遍。
         """
         if not self.id:
             self.id = "call_" + uuid.uuid4().hex[:24]
 
     def to_openai_dict(self) -> dict[str, Any]:
-        """Render as one entry of an OpenAI ``tool_calls`` array.
+        """渲染成 OpenAI ``tool_calls`` 数组里的一项。
 
         Returns:
-            ``{"id", "type": "function", "function": {"name", "arguments"}}``
-            with ``arguments`` JSON-encoded and non-ASCII kept readable, since
-            the client parses it back verbatim.
+            ``{"id", "type": "function", "function": {"name", "arguments"}}``，
+            其中 ``arguments`` 已 JSON 编码，非 ASCII 保持可读——客户端会原样
+            解析回去。
         """
         return {"id": self.id, "type": "function",
                 "function": {"name": self.name,
                              "arguments": json.dumps(self.arguments, ensure_ascii=False)}}
 
     def __repr__(self) -> str:
-        """One-line form for the agent loop's ``-> name(args)`` trace.
+        """给 agent 循环里 ``-> name(args)`` 那种追踪用的一行形式。
 
         Returns:
-            The name and arguments, with ``raw`` left out so a long tool-call
-            block does not flood the log.
+            名字和参数；``raw`` 被省略，免得一个长工具调用块把日志刷屏。
         """
         return f"ToolCall(name={self.name!r}, arguments={self.arguments!r})"
 
 
 def split_thinking(text: str) -> tuple[str, str]:
-    """Split reasoning from the answer, returning ``(thinking, answer)``.
+    """把推理段和答案分开，返回 ``(thinking, answer)``。
 
-    The template already emits the opening ``<think>`` in the prompt, so the
-    generated text usually carries only the closing ``</think>``; both shapes and
-    a truncated (unclosed) ``<think>`` are handled.
+    模板已经把开头的 ``<think>`` 发在 prompt 里了，所以生成文本通常只带闭合的
+    ``</think>``；两种形状以及被截断（未闭合）的 ``<think>`` 都处理。
 
     Args:
-        text: Raw generated text, after the prompt has been stripped from it.
+        text: 从 prompt 之后切出来的原始生成文本。
 
     Returns:
-        ``(thinking, answer)``, both stripped. ``thinking`` is ``""`` when the
-        model did not reason. For an unclosed ``<think>`` the answer is whatever
-        preceded the tag and the partial reasoning becomes ``thinking``, so a
-        truncated turn still yields usable text.
+        ``(thinking, answer)``，两者都已去空白。模型没有推理时 ``thinking``
+        是 ``""``。遇到未闭合的 ``<think>`` 时，标签之前的部分算答案，残缺的
+        推理段算 ``thinking``，被截断的一轮因此仍有可用文本。
     """
     if not text:
         return "", ""
@@ -130,30 +122,29 @@ def split_thinking(text: str) -> tuple[str, str]:
 
 
 def strip_thinking(text: str) -> str:
-    """The answer half of ``text``, for callers that discard the reasoning.
+    """``text`` 里属于答案的那一半，供丢弃推理段的调用方使用。
 
     Args:
-        text: Raw generated text; empty is accepted.
+        text: 原始生成文本；允许为空。
 
     Returns:
-        The answer with any thinking block removed, stripped.
+        去掉推理块并去过空白的答案。
     """
     return split_thinking(text)[1]
 
 
 def _coerce(value: str) -> Any:
-    """Unwrap values that are unambiguous JSON literals; keep the rest verbatim.
+    """把无歧义的 JSON 字面量去壳，其余原样保留。
 
-    Only ``true``/``false``/``null``, objects/arrays and numbers are converted, so
-    ``"Beijing"``, ``"0755"`` and ``"celsius"`` stay strings. The formats share no
-    type information, so guessing wider (dates, booleans spelled ``yes``) would
-    corrupt arguments the tool validates itself.
+    只转换 ``true``/``false``/``null``、对象/数组和数字，所以 ``"Beijing"``、
+    ``"0755"``、``"celsius"`` 仍是字符串。这个格式本身不携带类型信息，猜得再宽
+    一点（日期、写成 ``yes`` 的布尔）就会改坏工具自己去校验的参数。
 
     Args:
-        value: Raw text between one ``<parameter=...>`` pair.
+        value: 一对 ``<parameter=...>`` 之间的原始文本。
 
     Returns:
-        The decoded literal, or the stripped text when it is not one.
+        解码后的字面量；不是字面量时返回去过空白的原文。
     """
     s = value.strip()
     if s in ("true", "false", "null"):
@@ -167,19 +158,17 @@ def _coerce(value: str) -> Any:
 
 
 def _parse_block(block: str) -> list[ToolCall]:
-    """Parse the inside of one ``<tool_call>`` block, template form first.
+    """解析一个 ``<tool_call>`` 块的内部，先试模板形式。
 
-    The native form is tried first and wins outright: a block that contains
-    ``<function=...>`` never falls through to JSON, so a parameter whose value
-    happens to be JSON cannot be mistaken for a whole call.
+    原生形式先试且一试到底：含 ``<function=...>`` 的块绝不会再落到 JSON 分支，
+    取值恰好是 JSON 的参数因此不会被误认成整个调用。
 
     Args:
-        block: Text between the ``<tool_call>`` tags, tags excluded.
+        block: ``<tool_call>`` 标签之间的文本，不含标签本身。
 
     Returns:
-        Every call the block contains, in order; empty when neither form
-        matches, which leaves a malformed block as "no call" rather than an
-        error.
+        块里的全部调用，按顺序排列；两种形式都不匹配时为空——畸形的块被当成
+        「没有调用」，而不是一个错误。
     """
     calls: list[ToolCall] = []
     fns = list(_FN.finditer(block))
@@ -211,22 +200,20 @@ def _parse_block(block: str) -> list[ToolCall]:
 
 
 def parse_tool_calls(text: str) -> list[ToolCall]:
-    """Extract every tool call from a model response (empty list if none).
+    """从模型回复里取出所有工具调用，没有则返回空列表。
 
     Args:
-        text: Assistant text with the prompt already stripped; may still contain
-            the thinking block.
+        text: 已经去掉 prompt 的 assistant 文本；其中可能仍有推理块。
 
     Returns:
-        The calls in generation order. An unterminated ``<tool_call>`` -- the
-        usual shape when generation hits the token budget mid-call -- is parsed
-        from its partial body, which is what keeps a truncated answer usable.
+        按生成顺序排列的调用。未闭合的 ``<tool_call>``——生成到一半撞上 token
+        预算时的常见形状——按它残缺的正文解析，被截断的回答因此仍可用。
     """
     if not text:
         return []
     blocks = [m.group(1) for m in _TC.finditer(text)]
     if not blocks and _TC_OPEN in text:
-        blocks = [text.split(_TC_OPEN, 1)[1]]      # truncated generation
+        blocks = [text.split(_TC_OPEN, 1)[1]]      # 生成被截断
     calls: list[ToolCall] = []
     for b in blocks:
         calls.extend(_parse_block(b))
@@ -234,32 +221,29 @@ def parse_tool_calls(text: str) -> list[ToolCall]:
 
 
 def has_tool_call(text: str) -> bool:
-    """Whether ``text`` contains anything ``parse_tool_calls`` can turn into a call.
+    """``text`` 里有没有 ``parse_tool_calls`` 能变成调用的内容。
 
     Args:
-        text: Assistant text; may be empty.
+        text: assistant 文本；可以为空。
 
     Returns:
-        ``True`` when at least one call parsed, i.e. when the loop should run a
-        tool instead of treating the answer as final.
+        至少解析出一个调用时为 ``True``，也就是循环该去执行工具，而不是把
+        这个回答当成最终答案。
     """
     return bool(parse_tool_calls(text))
 
 
 def tool_result_message(call: ToolCall, result: Any, name: str | None = None) -> dict[str, str]:
-    """Build the chat message that feeds a tool result back to the model.
+    """构造把工具结果喂回模型的那条对话消息。
 
     Args:
-        call: The call being answered; it supplies the default ``name``.
-        result: The tool's return value. A string is passed through unchanged,
-            anything else is JSON-encoded, because the template renders
-            ``content`` verbatim.
-        name: Override for the ``name`` field, for a result produced by a
-            different tool than the one called.
+        call: 正在被回答的调用；它提供默认的 ``name``。
+        result: 工具的返回值。字符串原样传递，其余一律 JSON 编码，因为模板是
+            逐字渲染 ``content`` 的。
+        name: 覆盖 ``name`` 字段，用于结果并非由被调用的那个工具产生的情况。
 
     Returns:
-        A ``{"role": "tool", "name", "content"}`` message ready to append to the
-        history.
+        一条 ``{"role": "tool", "name", "content"}`` 消息，可以直接追加到历史里。
     """
     content = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
     return {"role": "tool", "name": name or call.name, "content": content}

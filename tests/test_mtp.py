@@ -1,24 +1,17 @@
-"""The MTP head is the speculative drafter: is its acceptance rate worth it?
+"""MTP 头充当投机草稿模型：它的接受率是否值回代价。
 
-Module: ``coffin/tests``. Reaches into ``model.mtp`` and the layer stack through
-``support.ModelTestCase``; it measures the drafter alone, without the verify
-path that ``test_spec.py`` exercises.
+Module: ``coffin/tests``。经 ``support.ModelTestCase`` 摸进 ``model.mtp`` 与层栈；
+只测草稿模型本身，不碰 ``test_spec.py`` 覆盖的校验路径。
 
 Constraints:
-    * The drafter is fed the main model's real hidden states, not its own: it is
-      trained on those, and feeding it its own output would measure drift rather
-      than prediction quality.
-    * The drafter's own KV cache is filled with the real tokens first, then
-      reset; leaving it populated would leak a prefix into the next test.
-    * Deeper drafts can never be accepted more often than shallower ones, which
-      is why the monotonicity check is an assertion and not a comparison against
-      a measured number.
-    * The 0.5 bar at k=1 is the business threshold: below roughly half the
-      speculative path costs more per step than the step it saves, so a drafter
-      under it is not worth keeping regardless of its exact rate.
-
-Port of ``diag/check_mtp.py`` (its GEMV/profile sections stay in that probe; this
-is the functional acceptance test, using the integrated ``model.mtp``).
+    * 草稿模型吃的是主模型的真实隐含状态，不是它自己的输出：它就是在这些状态上
+      训练的，喂自己的输出只会量到漂移，而不是预测质量。
+    * 草稿模型自己的 KV cache 先用真实 token 填满再清空；留着不清会把前缀泄漏到
+      下一个测试。
+    * 更深的草稿不可能比更浅的更容易被接受，所以单调性检查写成断言，而不是和某
+      个实测数字比大小。
+    * k=1 处的 0.5 门槛是业务阈值：低于大约一半时，投机路径每步的代价超过它省
+      下的那一步，草稿模型再准也不值得保留。
 """
 
 from __future__ import annotations
@@ -40,7 +33,7 @@ TEXT = ("The capital of France is Paris. The capital of Germany is Berlin. "
 
 @functools.lru_cache(maxsize=1)
 def _prompt_ids() -> list[int]:
-    """Tokenise the fixed prompt once; the acceptance sweep compares against these exact ids."""
+    """把固定 prompt 只分词一次；接受率扫描要和这串 id 逐位对齐。"""
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(str(support.MODEL_DIR))
     return tok.encode(TEXT)
@@ -48,19 +41,19 @@ def _prompt_ids() -> list[int]:
 
 @support.needs_model
 class MtpDrafterTest(support.ModelTestCase):
-    """The drafter's predictions must be good enough that speculating beats not speculating."""
+    """草稿模型的预测得足够准，投机才比不投机划算。"""
 
     QUANT = True
     MAX_SEQ = 1024
 
     def setUp(self) -> None:
-        """Cache the prompt ids and the shared RoPE/mask context the drafter expects."""
+        """预取 prompt id，并留住草稿模型需要的 RoPE 表与 mask 上下文。"""
         super().setUp()
         self.ids = _prompt_ids()
         self.ctx = (self.model.cos_tbl, self.model.sin_tbl, self.model.mask_idx)
 
     def _main_hidden(self, ids: list[int]) -> torch.Tensor:
-        """Hidden state after every prompt token (the drafter's ground truth)."""
+        """每个 prompt token 之后的主模型隐含状态，也就是草稿模型的对照真值。"""
         model = self.model
         toks = torch.tensor(ids, device="cuda")
         x = model.embed.lookup(toks)
@@ -70,13 +63,13 @@ class MtpDrafterTest(support.ModelTestCase):
         return x
 
     def test_chained_acceptance_by_depth(self):
-        """Per-depth acceptance rates must clear the k=1 bar and stay monotone, or the draft chain is wasted work."""
+        """各深度的接受率必须越过 k=1 门槛且保持单调，否则草稿链就是白做的功。"""
         model = self.model
         ids = self.ids
         assert len(ids) > K + 4, "prompt too short for the acceptance sweep"
         hidden = self._main_hidden(ids)
 
-        # Fill the drafter's own KV cache over the prompt with the real tokens.
+        # 用真实 token 把草稿模型自己的 KV cache 按整个 prompt 填满。
         model.mtp.reset()
         for j in range(len(ids) - 1):
             model.mtp.pos.fill_(j)
@@ -103,10 +96,8 @@ class MtpDrafterTest(support.ModelTestCase):
 
         self.assertGreater(tested, 10, "not enough positions to measure acceptance")
         rates = [accepted[k] / tested for k in range(1, K + 1)]
-        # Measured ~75% / 47% / 24% / 13% / 4% for k=1..5.
         self.assertGreater(rates[0], 0.5, f"k=1 acceptance {rates[0]:.1%}")
         self.assertGreater(rates[1], 0.2, f"k=2 acceptance {rates[1]:.1%}")
-        # Deeper drafts cannot be accepted more often than shallower ones.
         for shallow, deep in zip(rates, rates[1:]):
             self.assertGreaterEqual(shallow + 1e-9, deep,
                                     f"acceptance not monotone: {rates}")

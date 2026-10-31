@@ -1,31 +1,29 @@
-"""Vision tower: the engine's ``VisionTower`` against an inline HF reference.
+"""视觉塔：引擎的 ``VisionTower`` 对照内联的 HF 参考实现。
 
-Two tiers, so the numerics are checkable on any box:
+分两层，数值在任何机器上都能校验：
 
-* **CPU (always runs)** -- a ~150-line inline re-implementation of the HF 4.57.6
-  vision path (``fast_pos_embed_interpolate`` / ``rot_pos_emb`` / packed
-  per-image attention / merger), written here rather than imported so the
-  comparison is against the formulas and not against another copy of
-  ``.tmp_dsh``.  Random weights, fp32, tiny and real geometries, multiple images.
-* **DCU + checkpoint (skips otherwise)** -- the real ``model.visual.*`` weights
-  against ``transformers`` 4.57.6's ``Qwen3VLVisionModel`` (the M0 oracle), and
-  against the dumped ``oracle_512.pt`` fixture.  Gate: ``rel_err <= 2e-3``.
+* **CPU（总会执行）** —— 约 150 行的内联 HF 4.57.6 视觉路径复刻
+  （``fast_pos_embed_interpolate`` / ``rot_pos_emb`` / 按图像打包的注意力 /
+  merger）。写在这里而不是导入，是为了对着公式比，而不是对着 ``.tmp_dsh``
+  的另一份拷贝比。随机权重、fp32、微小与真实几何、多张图像。
+* **DCU + checkpoint（否则跳过）** —— 真实的 ``model.visual.*`` 权重对照
+  ``transformers`` 4.57.6 的 ``Qwen3VLVisionModel``（M0 对照实现），以及转储的
+  ``oracle_512.pt`` fixture。门限：``rel_err <= 2e-3``。
 
-Run either way::
+两种跑法都可以：
 
     PYTHONPATH=coffin python -m unittest coffin/tests/test_vision.py
-    # in the container, inside the engine dir:
+    # 在容器里、引擎目录内：
     python3 -m unittest tests.test_vision -v
 
-Module: ``coffin/tests``. Split by device: the tokeniser/processor and mRoPE
-checks run anywhere, the tower forward needs a DCU and the checkpoint and is
-skipped without them.
+Module: ``coffin/tests``。按设备分层：分词器/处理器与 mRoPE 的检查在任何机器
+上都能跑，塔的前向需要 DCU 和 checkpoint，缺了就跳过。
 
 Constraints:
-    * Tolerances are 1-ULP-class where the maths is exact and looser only across a
-      dtype change; widening one to make a case pass hides a real regression.
-    * The shared model fixture is closed between weight formats, because two
-      copies do not fit on the card at once.
+    * 数学上精确的地方容差按 1 ULP 量级给，只有跨 dtype 时才放宽；为了放行某个
+      用例去调宽容差，会把真实回归掩盖掉。
+    * 共享的模型 fixture 在不同权重格式之间要关闭重开，因为两份拷贝同时放不
+      进卡里。
 """
 
 from __future__ import annotations
@@ -41,19 +39,18 @@ import torch.nn.functional as F
 
 try:
     import support
-except ImportError:  # `python -m unittest coffin/tests/test_vision.py`
+except ImportError:  # 直接以 `python -m unittest coffin/tests/test_vision.py` 运行时
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
     import support
 
 
 def _vision_module():
-    """The engine's ``models.qwen35.vision``, without requiring the whole family.
+    """取引擎的 ``models.qwen35.vision``，同时不被迫拉起整个模型族。
 
-    ``import models.qwen35.vision`` runs the package ``__init__``, which imports
-    ``model.py`` -> ``safetensors``; on a dev box without the container's
-    dependency set that fails, so fall back to loading the file directly.  The
-    module under test is identical either way (its only import is
-    ``int8_weights``).
+    走 ``import models.qwen35.vision`` 会先执行包的 ``__init__``，它再导入
+    ``model.py`` -> ``safetensors``；开发机没有容器那套依赖时这一步就失败，
+    所以回退到直接按路径加载文件。两条路径拿到的被测模块是同一个（它唯一
+    的导入是 ``int8_weights``）。
     """
     try:
         from models.qwen35 import vision
@@ -72,20 +69,20 @@ V = _vision_module()
 VisionTower = V.VisionTower
 
 
-# inline reference: the formulas, not the engine
+# 内联参考实现：对着公式写，不照抄引擎
 def ref_pos_embed(table, h, w, merge, t=1):
-    """``fast_pos_embed_interpolate``: 48x48 (side=sqrt(n_pos)) -> per-image grid."""
+    """``fast_pos_embed_interpolate``：48x48（side=sqrt(n_pos)）重采样到每张图的网格。"""
     side = int(round(table.shape[0] ** 0.5))
     views = table.reshape(side, side, -1).permute(2, 0, 1).unsqueeze(0)
     up = F.interpolate(views, size=(h, w), mode="bilinear", align_corners=True)
-    flat = up[0].permute(1, 2, 0)                     # (h, w, hidden), row-major
+    flat = up[0].permute(1, 2, 0)                     # (h, w, hidden)，行主序
     blocks = flat.reshape(h // merge, merge, w // merge, merge, -1)
-    out = blocks.permute(0, 2, 1, 3, 4).reshape(h * w, -1)   # merge-block order
+    out = blocks.permute(0, 2, 1, 3, 4).reshape(h * w, -1)   # 按 merge 块排序
     return out.repeat(t, 1)
 
 
 def ref_hw(grid_thw, merge):
-    """``rot_pos_emb``'s ``pos_ids``: patch-grid (row, col) per token, merge-block order."""
+    """``rot_pos_emb`` 的 ``pos_ids``：每个 token 的 patch 网格 (row, col)，按 merge 块排序。"""
     rows, cols = [], []
     for t, h, w in grid_thw:
         mh, mw = h // merge, w // merge
@@ -99,7 +96,7 @@ def ref_hw(grid_thw, merge):
 
 
 def ref_rope(grid_thw, merge, head_dim, theta=10000.0):
-    """Axial rope cos/sin ``[N, head_dim]`` as ``[h | w | h | w]`` frequency blocks."""
+    """轴向 rope 的 cos/sin ``[N, head_dim]``，频段布局为 ``[h | w | h | w]``。"""
     spatial = head_dim // 2
     inv = 1.0 / (theta ** (torch.arange(0, spatial, 2, dtype=torch.float32) / spatial))
     rows, cols = ref_hw(grid_thw, merge)
@@ -117,13 +114,13 @@ def ref_rotate_half(x):
 
 
 def ref_attention(x, sd, prefix, cfg, grid_thw, cos, sin, merge):
-    """Packed non-causal attention as one dense block-diagonal-masked matmul."""
+    """把打包的非因果注意力写成一次稠密的块对角掩码矩阵乘。"""
     del merge
     heads, hd = cfg["num_heads"], cfg["hidden_size"] // cfg["num_heads"]
     n = x.shape[0]
     qkv = F.linear(x, sd[prefix + "qkv.weight"], sd[prefix + "qkv.bias"])
     q, k, v = qkv.reshape(n, 3, heads, hd).permute(1, 0, 2, 3).unbind(0)   # (n,heads,hd)
-    qf, kf = q.float(), k.float()                       # HF ropes in fp32
+    qf, kf = q.float(), k.float()                       # HF 的 rope 在 fp32 里算
     qf = qf * cos[:, None] + ref_rotate_half(qf) * sin[:, None]
     kf = kf * cos[:, None] + ref_rotate_half(kf) * sin[:, None]
     q, k = qf.to(q.dtype), kf.to(k.dtype)
@@ -131,13 +128,13 @@ def ref_attention(x, sd, prefix, cfg, grid_thw, cos, sin, merge):
     seg = torch.zeros(n)
     off = 0
     for t, h, w in grid_thw:
-        for _f in range(t):                             # one segment per frame
+        for _f in range(t):                             # 每帧一段，段间不能互相看见
             seg[off:off + h * w] = off
             off += h * w
     blocked = seg[:, None] != seg[None, :]
     scores = torch.matmul(q, k.transpose(-1, -2)) * (hd ** -0.5)
     scores = scores.masked_fill(blocked[None], float("-inf"))
-    p = torch.softmax(scores, dim=-1)                   # ok in fp32
+    p = torch.softmax(scores, dim=-1)                   # 掩码项是 -inf，fp32 下算得稳
     out = torch.matmul(p.to(q.dtype), v)                # (heads,n,hd)
     return F.linear(out.transpose(0, 1).reshape(n, heads * hd),
                     sd[prefix + "proj.weight"],
@@ -145,7 +142,7 @@ def ref_attention(x, sd, prefix, cfg, grid_thw, cos, sin, merge):
 
 
 def ref_forward(sd, cfg, pixel_values, grid_thw):
-    """Whole tower, HF shape-for-shape (``Qwen3VLVisionModel.forward``)."""
+    """整座塔逐形状对照 HF（``Qwen3VLVisionModel.forward``）。"""
     hidden = cfg["hidden_size"]
     heads = cfg["num_heads"]
     hd = hidden // heads
@@ -175,12 +172,17 @@ def ref_forward(sd, cfg, pixel_values, grid_thw):
     y = F.layer_norm(x, (hidden,), sd["merger.norm.weight"], sd["merger.norm.bias"], eps)
     y = y.reshape(-1, merge_dim)
     y = F.linear(y, sd["merger.linear_fc1.weight"], sd["merger.linear_fc1.bias"])
-    y = F.gelu(y)                                    # exact erf GELU
+    y = F.gelu(y)                                    # 精确 erf GELU，与块内的 tanh 近似不同
     return F.linear(y, sd["merger.linear_fc2.weight"], sd["merger.linear_fc2.bias"])
 
 
-# fixtures
+# fixture 构造
 def tiny_cfg(**over) -> dict:
+    """能跑通前向的最小配置，``over`` 用来单独放大某一维。
+
+    默认值都不大，是为了让 CPU 层的用例在几秒内跑完；要验证某条形状约束
+    时只覆盖对应的键，其余保持最小。
+    """
     cfg = {"depth": 2, "hidden_size": 64, "intermediate_size": 128, "num_heads": 4,
            "in_channels": 3, "patch_size": 2, "spatial_merge_size": 2,
            "temporal_patch_size": 2, "num_position_embeddings": 16,
@@ -191,6 +193,11 @@ def tiny_cfg(**over) -> dict:
 
 
 def random_sd(cfg, seed=0, dtype=torch.float32):
+    """按真实 checkpoint 的键名和形状造一份随机权重。
+
+    键名必须与 ``model.visual.*`` 去掉前缀后一致，加载路径才能原样走通；
+    ``mul_(0.2)`` 把激活压到个位数量级，误差界限才有意义。
+    """
     g = torch.Generator().manual_seed(seed)
     hidden = cfg["hidden_size"]
     inter = cfg["intermediate_size"]
@@ -238,30 +245,30 @@ def patch_dim(cfg) -> int:
 
 
 def rel_norm(got, ref) -> float:
-    """Relative Frobenius error -- the metric the oracle gate uses too."""
+    """相对 Frobenius 误差，对照实现的门限用的也是这个度量。"""
     return ((got - ref).norm() / ref.norm()).item()
 
 
-#: Tolerances for "same maths, different reduction order".  These random-weight
-#: towers produce activations of order 10, so a fp32 sum order difference over 24
-#: layers lands at ~1e-7 relative / ~2e-5 absolute.  What has to *fail* is a
-#: formula error (merge-block order, head order, rope layout = O(1)) or the wrong
-#: GELU (~1e-3 relative), so both bounds are ~100x above the rounding floor.
+#: 「数学相同、归约顺序不同」的容差。这些随机权重塔的激活在 10 量级，24 层
+#: 累加下来 fp32 的求和顺序差异是相对 ~1e-7、绝对 ~2e-5。真正必须让它失败的
+#: 是公式错误（merge 块顺序、头序、rope 布局都是 O(1)）或 GELU 用错
+#: （相对 ~1e-3），所以两个界都在舍入噪声之上约 100 倍。
 REL_TOL = 1e-5
 ABS_TOL = 5e-5
 
 
 def blocked_pixels(cfg, grid_thw):
-    """``pixel_values`` rows for ``grid_thw`` (content is irrelevant here)."""
+    """为 ``grid_thw`` 造形状对的 ``pixel_values``，内容在这里无关紧要。"""
     return torch.randn(int(torch.as_tensor(grid_thw).prod(-1).sum()), patch_dim(cfg))
 
 
-# CPU: the formulas
+# CPU 层：只验公式
 class PosEmbedTest(unittest.TestCase):
-    """The learned 2304=48x48 table resampling (the silent-failure #1)."""
+    """学到的 2304=48x48 位置表的双线性重采样，这是最容易静默出错的一处。"""
 
     def test_matches_bilinear_reference_on_real_side(self):
-        # Real geometry (side 48) with a narrow hidden so the test is cheap.
+        """侧边取真实的 48，否则重采样的缩放比例跟 checkpoint 对不上。"""
+        # 用窄的 hidden 保持开销低。
         cfg = tiny_cfg(hidden_size=8, num_heads=2, intermediate_size=16,
                        spatial_merge_size=2, num_position_embeddings=2304,
                        out_hidden_size=8, depth=0)
@@ -277,6 +284,7 @@ class PosEmbedTest(unittest.TestCase):
                             f"grid {grid}: pos-embed resampling disagrees")
 
     def test_multiple_images_and_frames(self):
+        """多图多帧时位置嵌入必须逐段拼接，不能复用上一张图的偏移。"""
         cfg = tiny_cfg(num_position_embeddings=16, hidden_size=8, num_heads=2,
                        intermediate_size=16, out_hidden_size=8, depth=0)
         tower = make_tower(cfg)
@@ -287,6 +295,7 @@ class PosEmbedTest(unittest.TestCase):
         self.assertLess((got - ref).abs().max().item(), 3e-5)
 
     def test_taps_are_cached_per_size(self):
+        """同一尺寸的插值结果必须命中缓存；解码时每帧都会问一次。"""
         tower = make_tower(tiny_cfg(num_position_embeddings=16))
         tower._pos_offsets(torch.tensor([[1, 4, 4]]), torch.float32)
         tower._pos_offsets(torch.tensor([[1, 4, 4]]), torch.float32)
@@ -294,9 +303,10 @@ class PosEmbedTest(unittest.TestCase):
 
 
 class RopeTest(unittest.TestCase):
-    """Axial rope: 16 frequencies, ``[h|w|h|w]`` layout, merge-block positions."""
+    """轴向 rope：16 个频率、``[h|w|h|w]`` 布局、按 merge 块排列的位置。"""
 
     def test_cos_sin_match_reference(self):
+        """频率表或拼接顺序错一格，注意力就会看到错误的相对位置。"""
         cfg = tiny_cfg()
         tower = make_tower(cfg)
         hd = cfg["hidden_size"] // cfg["num_heads"]
@@ -307,31 +317,35 @@ class RopeTest(unittest.TestCase):
             self.assertLess((sin - rsin).abs().max().item(), 1e-6)
 
     def test_merge_block_token_order(self):
+        """token 必须按 2x2 merge 块内先横后纵的顺序排，HF 的 ``pos_ids`` 就是这么排的。"""
         tower = make_tower(tiny_cfg())
         rows, cols = tower._hw_positions(4, 6)
-        # tokens 0..3 are the first 2x2 merge block: (0,0) (0,1) (1,0) (1,1)
+        # 前 4 个 token 是第一个 2x2 merge 块：(0,0) (0,1) (1,0) (1,1)
         self.assertEqual(rows[:4].tolist(), [0, 0, 1, 1])
         self.assertEqual(cols[:4].tolist(), [0, 1, 0, 1])
         self.assertEqual(rows[4:8].tolist(), [0, 0, 1, 1])
         self.assertEqual(cols[4:8].tolist(), [2, 3, 2, 3])
 
     def test_frequency_count(self):
+        """频率个数由 head_dim 推出来，少一对就会和 HF 的布局错位。"""
         tower = make_tower(tiny_cfg())
-        # head_dim 16 -> spatial_dim 8 -> 4 frequencies per axis
+        # head_dim 16 -> spatial_dim 8 -> 每轴 4 个频率
         self.assertEqual(tower.inv_freq.numel(), 4)
         self.assertAlmostEqual(float(tower.inv_freq[0]), 1.0, places=6)
 
 
 class PackedAttentionTest(unittest.TestCase):
-    """Query tiling must not change the result, and segments must stay isolated."""
+    """查询切块不能改变结果，各段之间必须互相隔离。"""
 
     def _tower(self, q_tile):
+        """造一座塔并把查询切块宽度顶到 ``q_tile``，只给切块相关的用例用。"""
         cfg = tiny_cfg()
         tower = make_tower(cfg)
         tower._q_tile_override = q_tile
         return tower
 
     def test_query_tiles_match_dense_mask(self):
+        """任何切块宽度都必须等价于稠密掩码参考；切块只该影响显存，不该影响数值。"""
         cfg = tiny_cfg()
         sd = random_sd(cfg)
         grid_thw = torch.tensor([[1, 8, 8], [1, 4, 8]])
@@ -350,13 +364,14 @@ class PackedAttentionTest(unittest.TestCase):
             self.assertLess((got - ref).abs().max().item(), ABS_TOL)
 
     def test_segments_are_per_frame(self):
+        """每帧自成一段，``cu_seqlens`` 按帧累加，不按图像累加。"""
         tower = make_tower(tiny_cfg())
         cu = tower.cu_seqlens(torch.tensor([[2, 4, 6], [1, 2, 2]]))
         self.assertEqual(cu.dtype, torch.int32)
         self.assertEqual(cu.tolist(), [0, 24, 48, 52])
 
     def test_segment_isolation(self):
-        """Two images must not see each other: encoding them together == apart."""
+        """两张图像不能互相看见：一起编码必须等于分别编码。"""
         cfg = tiny_cfg()
         sd = random_sd(cfg)
         tower = VisionTower(sd, cfg, device="cpu", dtype=torch.float32)
@@ -365,8 +380,8 @@ class PackedAttentionTest(unittest.TestCase):
         pv2 = blocked_pixels(cfg, torch.tensor([g2]))
         both = tower(torch.cat([pv1, pv2]), torch.tensor([g1, g2]))
         n1 = g1[1] * g1[2] // 4
-        # fp32 matmuls of different M differ in accumulation order, so compare
-        # relatively (a leak between segments would be O(1), not O(1e-6)).
+        # M 不同时 fp32 矩阵乘的累加顺序也不同，所以按相对误差比
+        # （段之间真的串了会是 O(1)，不是 O(1e-6)）。
         for got, want in ((both[:n1], tower(pv1, torch.tensor([g1]))),
                           (both[n1:], tower(pv2, torch.tensor([g2])))):
             rel = ((got - want).norm() / want.norm()).item()
@@ -374,9 +389,14 @@ class PackedAttentionTest(unittest.TestCase):
 
 
 class FullTowerTest(unittest.TestCase):
-    """End to end on random weights: tiling, rope, merge order, gelu choice."""
+    """随机权重上的端到端：切块、rope、merge 顺序、GELU 选型。
+
+    这些用例覆盖的是整条前向串联后仍然正确的组合，单点公式对、组合错的情况
+    只能在这一层暴露。
+    """
 
     def test_matches_reference_single_image(self):
+        """单图端到端：输出形状先去掉了 merge 的降采样，再逐元素对参考。"""
         cfg = tiny_cfg(depth=3)
         sd = random_sd(cfg, seed=1)
         tower = VisionTower(sd, cfg, device="cpu", dtype=torch.float32)
@@ -389,6 +409,7 @@ class FullTowerTest(unittest.TestCase):
         self.assertLess((got - ref).abs().max().item(), ABS_TOL)
 
     def test_matches_reference_multi_image_with_frames(self):
+        """多图加多帧时 merge 之后的 token 总数必须是各段各自降采样后相加。"""
         cfg = tiny_cfg(depth=2)
         sd = random_sd(cfg, seed=2)
         tower = VisionTower(sd, cfg, device="cpu", dtype=torch.float32)
@@ -401,7 +422,7 @@ class FullTowerTest(unittest.TestCase):
         self.assertLess((got - ref).abs().max().item(), ABS_TOL)
 
     def test_merger_uses_exact_gelu_and_block_mlp_tanh(self):
-        """A tanh/exact swap in either place would be ~1e-3 here."""
+        """两处 GELU 不能互换：换错会在该处造成 ~1e-3 的偏差，这个用例就是拿它当哨兵。"""
         cfg = tiny_cfg(depth=1)
         sd = random_sd(cfg, seed=3)
         tower = VisionTower(sd, cfg, device="cpu", dtype=torch.float32)
@@ -413,6 +434,7 @@ class FullTowerTest(unittest.TestCase):
         self.assertLess((got - ref).abs().max().item(), ABS_TOL)
 
     def test_shape_validation(self):
+        """行数与 ``grid_thw`` 不符、或 patch 宽度不对，必须在入口就抛 ``ValueError``。"""
         cfg = tiny_cfg()
         tower = make_tower(cfg)
         with self.assertRaises(ValueError):
@@ -422,7 +444,10 @@ class FullTowerTest(unittest.TestCase):
 
 
 class ConfigAndLayoutTest(unittest.TestCase):
+    """配置解析、键名前缀和 int8 驻留格式，这些在纯 CPU 上就能定死。"""
+
     def test_missing_key_names_the_tensor(self):
+        """缺权重时报错必须点名缺的是哪个张量，否则 297 个键里根本查不出来。"""
         cfg = tiny_cfg()
         sd = random_sd(cfg)
         del sd["blocks.1.attn.proj.bias"]
@@ -431,11 +456,13 @@ class ConfigAndLayoutTest(unittest.TestCase):
         self.assertIn("blocks.1.attn.proj.bias", str(ctx.exception))
 
     def test_non_square_pos_embed_is_rejected(self):
+        """位置表张量数不是完全平方数时无法还原成 48x48，只能拒绝而不能猜。"""
         cfg = tiny_cfg(num_position_embeddings=1000)
         with self.assertRaises(ValueError):
             VisionTower(random_sd(tiny_cfg()), cfg, device="cpu")
 
     def test_stripped_or_prefixed_keys_both_load(self):
+        """checkpoint 里的键带 ``model.visual.`` 前缀，直接喂的裸键不带，两种都得认。"""
         cfg = tiny_cfg()
         sd = random_sd(cfg)
         prefixed = {"model.visual." + k: v for k, v in sd.items()}
@@ -446,6 +473,7 @@ class ConfigAndLayoutTest(unittest.TestCase):
         self.assertLess((a(pv, grid) - b(pv, grid)).abs().max().item(), 1e-7)
 
     def test_int8_round_trip_keeps_matrices_close(self):
+        """量化再反量化后矩阵要落在 0.01 以内，这是 int8 驻留可用的前提。"""
         cfg = tiny_cfg()
         sd = random_sd(cfg)
         tower = VisionTower(sd, cfg, device="cpu", dtype=torch.float32, quant=True)
@@ -454,11 +482,12 @@ class ConfigAndLayoutTest(unittest.TestCase):
         self.assertEqual(q.wq.dtype, torch.int8)
         deq = tower._dequant(q)
         self.assertLess((deq - sd["blocks.0.attn.qkv.weight"]).abs().max().item(), 0.01)
-        # 1-D tensors and the gather table stay in the compute dtype.
+        # 一维张量和 gather 表保持计算 dtype，不参与量化。
         self.assertIsInstance(tower.pos_embed, torch.Tensor)
         self.assertIsInstance(tower.blocks[0].norm1_w, torch.Tensor)
 
     def test_int8_and_fp16_agree_loosely(self):
+        """int8 塔与 fp16 塔只需大致一致：3e-2 挡住布局错，但不该卡死量化噪声。"""
         cfg = tiny_cfg(depth=2)
         sd = random_sd(cfg, seed=7)
         grid = torch.tensor([[1, 4, 4]])
@@ -469,6 +498,7 @@ class ConfigAndLayoutTest(unittest.TestCase):
         self.assertLess(((a - b).norm() / a.norm()).item(), 3e-2)
 
     def test_summary_reports_the_checkpoint_geometry(self):
+        """``summary()`` 的参数量必须和 ``num_params()`` 对得上，它是显存预算的唯一来源。"""
         cfg = tiny_cfg()
         tower = make_tower(cfg)
         s = tower.summary()
@@ -477,36 +507,35 @@ class ConfigAndLayoutTest(unittest.TestCase):
 
 
 class VisionQuantPolicyTest(unittest.TestCase):
-    """``weights.py``'s vision branch, on its key policy (CPU, no checkpoint).
+    """``weights.py`` 视觉分支的键名策略，纯 CPU、不需要 checkpoint。
 
-    What has to be true regardless of the card: the GEMM weights are the only
-    ones int8 helps, the gather table and the conv kernel stay fp16, and the
-    prefix is preserved so ``Qwen35.vision_sd`` can filter it back out.
+    与卡无关、必须恒成立的三条：只有 GEMM 权重能从 int8 受益；gather 表和卷积
+    核保持 fp16；前缀要保留，``Qwen35.vision_sd`` 靠它把视觉权重筛回去。
     """
 
-    #: 2-D matmuls per block: attn.qkv, attn.proj, mlp.linear_fc1, mlp.linear_fc2.
-    #: (The biases and the two LayerNorms are 1-D; the merger adds fc1+fc2.)
+    #: 每个块的二维矩阵乘个数：attn.qkv、attn.proj、mlp.linear_fc1、mlp.linear_fc2。
+    #: 偏置和两个 LayerNorm 是一维的；merger 另外加 fc1 和 fc2。
     GEMMS_PER_BLOCK = V.GEMMS_PER_BLOCK
 
     def test_quantizable_keys(self):
+        """按形状和用途区分：能走 GEMM 的量化，按下标读的 gather 表不量化。"""
         self.assertTrue(V.is_vision_quantizable("model.visual.blocks.0.attn.qkv.weight",
                                                 torch.zeros(3072, 1024)))
         self.assertTrue(V.is_vision_quantizable("model.visual.blocks.23.mlp.linear_fc1.weight",
                                                 torch.zeros(4096, 1024)))
         self.assertTrue(V.is_vision_quantizable("model.visual.merger.linear_fc2.weight",
                                                 torch.zeros(2560, 4096)))
-        # Row-gather table: read by index, not by a GEMM, so int8 would only add a
-        # dequantise to the gather path.
+        # 行 gather 表按下标读，不走 GEMM，量化它只会给 gather 路径多一步反量化。
         self.assertFalse(V.is_vision_quantizable("model.visual.pos_embed.weight",
                                                  torch.zeros(2304, 1024)))
-        # 1-D norms and biases: consumed elementwise, ~0.3 MB in total.
+        # 一维归一化和偏置逐元素消费，总共才 ~0.3 MB，量化反而不划算。
         self.assertFalse(V.is_vision_quantizable("model.visual.blocks.0.norm1.weight",
                                                  torch.zeros(1024)))
         self.assertFalse(V.is_vision_quantizable("model.visual.blocks.0.attn.qkv.bias",
                                                  torch.zeros(3072)))
 
     def test_quantized_key_count_matches_the_tower(self):
-        """4 GEMM weights per block x 24 + 2 merger = 98 of the 297 tensors."""
+        """每个块 4 个 GEMM 权重乘 24 再加 merger 的 2 个，297 个张量里量化 98 个。"""
         cfg = tiny_cfg()
         sd = random_sd(cfg)
         gemms = [k for k, v in sd.items()
@@ -516,14 +545,15 @@ class VisionQuantPolicyTest(unittest.TestCase):
         self.assertEqual(len(sd), 9 + 12 * cfg["depth"])
 
     def test_prefix_is_the_contract(self):
-        """``model.visual.`` is what ``Qwen35.vision_sd`` filters on."""
+        """``model.visual.`` 是 ``Qwen35.vision_sd`` 用来筛选的契约前缀。"""
         self.assertEqual(V.VISUAL_PREFIX, "model.visual.")
 
     def test_vision_is_in_the_reload_order(self):
-        """``engine_api.reload()`` rebuilds every loaded dtype, but only the
-        modules listed in ``_RELOAD_ORDER``; a module that is imported (through
-        ``weights.py``) and not listed makes ``reload()`` raise instead of
-        silently serving a stale class."""
+        """``engine_api.reload()`` 只重建 ``_RELOAD_ORDER`` 里列出的模块。
+
+        通过 ``weights.py`` 间接导入却没登记的模块会让 ``reload()`` 抛错，
+        而不是悄悄继续服务一个过期的类。
+        """
         self.assertTrue(hasattr(V, "__name__"))
         try:
             import engine_api
@@ -532,6 +562,7 @@ class VisionQuantPolicyTest(unittest.TestCase):
         self.assertIn("models.qwen35.vision", engine_api._RELOAD_ORDER)
 
     def test_quant_policy_applied_to_a_tiny_tower(self):
+        """策略落到实际驻留上：块内只有 4 个 GEMM 变成 ``QWeight``，merger 两个，其余不动。"""
         cfg = tiny_cfg()
         sd = random_sd(cfg)
         tower = VisionTower(sd, cfg, device="cpu", dtype=torch.float32, quant=True)
@@ -544,30 +575,28 @@ class VisionQuantPolicyTest(unittest.TestCase):
         self.assertIsInstance(tower.patch_w, torch.Tensor)
 
 
-# DCU + checkpoint: the real weights, against the transformers oracle
-#: Reviewed gates (VISION.md §7).  The primary gate is fp32-vs-fp32, because that is
-#: the only comparison that isolates *formula* error: 24 layers of this tower drive
-#: activations to ~1e3, so bf16 rounds ~8e-3 per step and compounds -- a bf16 oracle
-#: sits 1e-1 from fp32 by itself, which is why "rel_err <= 2e-3 vs a bf16 oracle"
-#: cannot be met by any implementation.
+# DCU + checkpoint 层：真实权重对照 transformers 的对照实现
+#: 已评审的门限（VISION.md 第 7 节）。主门限是 fp32 对 fp32，这是唯一能把
+#: *公式* 误差单独隔离出来的比法：这座塔 24 层会把激活推到 ~1e3，bf16 每步
+#: 舍入 ~8e-3 并逐层累积 —— 一个 bf16 对照实现本身就离 fp32 有 1e-1，所以
+#: 「对 bf16 对照实现做到 rel_err <= 2e-3」任何实现都达不到。
 #:
-#: Measured on the DCU at 256^2: 1.203e-05.  The residual is reduction order, not
-#: maths -- rocBLAS splits the fp32 K dimension differently than the CPU path HF
-#: takes inside the oracle, and the tower stacks 24 layers of it.  It is ~7e-6
-#: relative to the output magnitude and ~1e4x below any formula error (merge order,
-#: head order, rope layout are all O(1)), so 2e-5 is the gate; tightening it to 1e-5
-#: would only measure the two libraries' summation orders against each other.
+#: DCU 上 256^2 实测：1.203e-05。残差来自归约顺序而不是公式 —— rocBLAS 切分
+#: fp32 的 K 维方式和 oracle 里 HF 走的 CPU 路径不同，而这座塔叠了 24 层。
+#: 它相对输出幅度约 7e-6，比任何公式错误（merge 顺序、头序、rope 布局都是
+#: O(1)）低约 1e4 倍，所以门限定在 2e-5；收到 1e-5 只会变成在量两个库的求和
+#: 顺序之差。
 GATE_FP32 = 2e-5
-GATE_FP16 = 3e-2       # engine fp16 vs HF fp32  -- fp16's precision cost (HF fp16
-                       #                      itself is 1.58e-2 away from fp32)
-GATE_BF16_SMOKE = 1.5e-1   # engine fp16 vs HF bf16 -- smoke: runs, right magnitude,
-                           #                      right order; not a numeric gate
+GATE_FP16 = 3e-2       # 引擎 fp16 对 HF fp32 —— 这是 fp16 的精度代价（HF 的 fp16
+                       #                      自己离 fp32 也有 1.58e-2）
+GATE_BF16_SMOKE = 1.5e-1   # 引擎 fp16 对 HF bf16 —— 冒烟用：能跑、量级对、顺序对，
+                           #                      不是数值门限
 
 ORACLE_FIXTURE = pathlib.Path("/root/private_data/engine_vision/oracle_512.pt")
 
 
 def _load_visual(dtype):
-    """``model.visual.*`` from the checkpoint shards, prefix kept, in ``dtype``."""
+    """从 checkpoint 分片里取出 ``model.visual.*``，保留前缀，并转成 ``dtype``。"""
     import json
     from safetensors import safe_open
 
@@ -584,7 +613,11 @@ def _load_visual(dtype):
 
 
 def _hf_vision_model(dtype):
-    """The 4.57.6 oracle with the checkpoint's visual weights loaded."""
+    """装配 4.57.6 的 HF 对照实现模型，并装入 checkpoint 的视觉权重。
+
+    缺键和多键都直接抛 ``AssertionError``：对照实现装错了权重，后面的误差
+    数字就毫无意义。
+    """
     from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLVisionConfig
     from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
 
@@ -602,6 +635,11 @@ def _hf_vision_model(dtype):
 
 
 def _hf_forward(hf, pv, grid, dtype):
+    """跑一次 HF 塔，按 ``float().cpu()`` 返回，好与引擎侧逐元素比。
+
+    不同版本的 HF 前向返回值形状不一（元组与带 ``pooler_output`` 的对象），
+    两种情况都要认。
+    """
     with torch.no_grad():
         out = hf(pv.to("cuda", dtype=dtype), grid_thw=grid.to("cuda"))
     out = out[0] if isinstance(out, (tuple, list)) else out.pooler_output
@@ -609,6 +647,7 @@ def _hf_forward(hf, pv, grid, dtype):
 
 
 def _sample_image(size):
+    """造一张 ``size`` 见方的合成图：横纵渐变加一个红方块，确定且无外部依赖。"""
     import numpy as np
     from PIL import Image
     a = np.zeros((size, size, 3), np.uint8)
@@ -621,14 +660,15 @@ def _sample_image(size):
 @unittest.skipUnless(support.has_cuda() and support.has_model(),
                      f"needs a DCU and the checkpoint at {support.MODEL_DIR}")
 class RealWeightsTest(unittest.TestCase):
-    """Formula correctness, precision cost and resident footprint on real weights.
+    """真实权重上的公式正确性、精度代价与常驻显存占用。
 
-    ``VISION_TEST_SIZES`` bounds the run (default one size: the suite has to fit a
-    slot on the shared card); ``VISION_SIZES=256,512,1024`` runs all three.
+    ``VISION_TEST_SIZES`` 限定跑几个尺寸（默认一个：整套要能塞进共享卡上的
+    一个槽位）；``VISION_SIZES=256,512,1024`` 会把三个都跑一遍。
     """
 
     @classmethod
     def setUpClass(cls):
+        """先数视觉张量个数：对不上 297 说明 checkpoint 不完整，整类直接跳过。"""
         sd = _load_visual(torch.float16)
         if len(sd) != 297:
             raise unittest.SkipTest(f"expected 297 vision tensors, found {len(sd)}")
@@ -638,6 +678,10 @@ class RealWeightsTest(unittest.TestCase):
                      os.environ.get("VISION_TEST_SIZES", "512").split(",") if s.strip()]
 
     def _features(self, size):
+        """用真实的 processor 走一遍预处理，拿到 ``pixel_values`` 和 ``image_grid_thw``。
+
+        预处理必须和线上同源，手工拼张量会绕过 patch 切分和 resize 的细节。
+        """
         from transformers import AutoProcessor
         proc = AutoProcessor.from_pretrained(str(support.MODEL_DIR))
         text = proc.apply_chat_template(
@@ -648,7 +692,7 @@ class RealWeightsTest(unittest.TestCase):
         return out["pixel_values"], out["image_grid_thw"]
 
     def test_primary_gate_fp32_matches_transformers(self):
-        """engine(fp32) vs HF(fp32): the formula gate (no dtype noise at all)."""
+        """引擎 fp32 对 HF fp32：公式门限，完全没有 dtype 噪声。"""
         hf, vcfg = _hf_vision_model(torch.float32)
         try:
             for size in self.sizes:
@@ -671,7 +715,7 @@ class RealWeightsTest(unittest.TestCase):
             torch.cuda.empty_cache()
 
     def test_fp16_precision_cost(self):
-        """engine(fp16) vs HF(fp32) <= 3e-2 -- and compare with HF fp16's own cost."""
+        """引擎 fp16 对 HF fp32 要落在 3e-2 内，并与 HF 自己用 fp16 的代价对照。"""
         hf, vcfg = _hf_vision_model(torch.float32)
         try:
             for size in self.sizes:
@@ -693,7 +737,7 @@ class RealWeightsTest(unittest.TestCase):
             torch.cuda.empty_cache()
 
     def test_bf16_oracle_smoke(self):
-        """engine(fp16) vs HF(bf16) -- magnitude/order smoke only (see GATE_* note)."""
+        """引擎 fp16 对 HF bf16：只验量级和顺序，门限说明见 ``GATE_*`` 注释。"""
         hf, vcfg = _hf_vision_model(torch.bfloat16)
         try:
             for size in self.sizes:
@@ -717,7 +761,7 @@ class RealWeightsTest(unittest.TestCase):
             torch.cuda.empty_cache()
 
     def test_against_fixture_oracle_512(self):
-        """The dumped M0 fixture: shape + magnitude, at whatever dtype it holds."""
+        """对 M0 转储的 fixture：只验形状和量级，不卡 dtype 精度。"""
         if not ORACLE_FIXTURE.exists():
             self.skipTest(f"no oracle fixture at {ORACLE_FIXTURE}")
         o = torch.load(ORACLE_FIXTURE, map_location="cpu")
@@ -732,8 +776,8 @@ class RealWeightsTest(unittest.TestCase):
         self.assertEqual(tuple(got.shape), tuple(ref.shape))
         e = rel_norm(got, ref)
         print(f"\n  fixture oracle_512.pt ({ref.dtype}): rel_err={e:.2e}")
-        # The fixture is a bf16 dump, so it carries the same 1e-1 floor; assert on
-        # the magnitude instead of on a tight bound.
+        # 这份 fixture 是 bf16 转储，同样带着 1e-1 的底噪；所以断言量级，
+        # 而不是断言一个很紧的界。
         self.assertLessEqual(e, GATE_BF16_SMOKE)
         self.assertAlmostEqual(float(got.abs().mean()), float(ref.abs().mean()),
                                delta=0.1 * float(ref.abs().mean()))
@@ -742,9 +786,10 @@ class RealWeightsTest(unittest.TestCase):
 @unittest.skipUnless(support.has_cuda() and support.has_model(),
                      f"needs a DCU and the checkpoint at {support.MODEL_DIR}")
 class WeightLoadingTest(unittest.TestCase):
-    """``weights.py``'s vision branch: what the resident dict has to contain."""
+    """``weights.py`` 的视觉分支：常驻权重字典里必须有什么、必须没有什么。"""
 
     def test_vision_branch_adds_the_tower_and_keeps_the_prefix(self):
+        """默认不量化视觉塔，但键前缀保留，文本侧照旧走 int8。"""
         import json
         import models.qwen35.weights as W
 
@@ -754,10 +799,10 @@ class WeightLoadingTest(unittest.TestCase):
         try:
             vis = [k for k in sd if k.startswith("model.visual.")]
             self.assertEqual(len(vis), 297)
-            # The vision branch must not be routed through the text int8 path: a
-            # quantised tower is opt-in (vision_quant) because it is compute-bound.
+            # 视觉分支不能混进文本的 int8 路径：量化视觉塔要显式开启
+            # （vision_quant），因为它是计算受限而不是带宽受限。
             self.assertFalse(any(isinstance(sd[k], W.QWeight) for k in vis))
-            # The text half still is quantised (existing behaviour).
+            # 文本侧仍然量化，保持原有行为。
             text_q = [k for k in sd if not k.startswith("model.visual.")
                       and isinstance(sd[k], W.QWeight)]
             self.assertGreater(len(text_q), 100)
@@ -768,6 +813,7 @@ class WeightLoadingTest(unittest.TestCase):
             torch.cuda.empty_cache()
 
     def test_vision_none_skips_the_tower(self):
+        """``vision=False`` 时一个视觉张量都不该进常驻字典，语言侧不受影响。"""
         import models.qwen35.weights as W
         sd = W.load_weights(support.MODEL_DIR, vision=False)
         try:
@@ -779,7 +825,7 @@ class WeightLoadingTest(unittest.TestCase):
             torch.cuda.empty_cache()
 
     def test_vision_quant_key_set(self):
-        """int8 residency: the GEMM weights quantised, gather table and 1-D kept."""
+        """int8 驻留：只量化 GEMM 权重，gather 表和一维张量保持原 dtype。"""
         import models.qwen35.weights as W
         from models.qwen35.vision import is_vision_quantizable
         self.assertFalse(is_vision_quantizable("model.visual.pos_embed.weight",
@@ -796,9 +842,9 @@ class WeightLoadingTest(unittest.TestCase):
                           else v.numel() * v.element_size() for v in vis.values())
             print(f"\n  int8 tower: {n_q} QWeight of {len(vis)} tensors, "
                   f"{n_bytes / 1024**3:.3f} GiB")
-            # 4 matmuls x 24 blocks + the merger's 2 fc.
+            # 每块 4 个矩阵乘乘 24 块，加 merger 的 2 个 fc。
             self.assertEqual(n_q, 4 * 24 + 2)
-            # 0.307 GiB int8 + 0.008 GiB of fp16 1-D/norm/gather leftovers.
+            # 0.307 GiB 的 int8 加上 0.008 GiB 的一维/归一化/gather 残留，总量仍在一张卡放得下。
             self.assertLess(n_bytes, 0.33 * 1024**3)
         finally:
             sd = None
