@@ -49,9 +49,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "residual add followed by the zero-centred RMSNorm, in one launch",
           pybind11::arg("x"), pybind11::arg("add"), pybind11::arg("w"),
           pybind11::arg("out"), pybind11::arg("stride") = 0, pybind11::arg("eps") = 1e-6);
+    m.def("add_rms_norm_i8", &add_rms_norm_i8,
+          "residual add + zero-centred RMSNorm, quantised straight to int8, one launch",
+          pybind11::arg("x"), pybind11::arg("add"), pybind11::arg("w"),
+          pybind11::arg("out_q"), pybind11::arg("out_s"), pybind11::arg("stride") = 0,
+          pybind11::arg("eps") = 1e-6, pybind11::arg("threads") = 0);
     m.def("rms_norm_gated", &rms_norm_gated,
           "fused gated RMSNorm: rms(x) * w * silu(gate)", pybind11::arg("x"),
           pybind11::arg("w"), pybind11::arg("gate"), pybind11::arg("eps") = 1e-6);
+    m.def("quant_act_i8", &quant_act_i8,
+          "per-token symmetric int8 quantisation of [M, K], one fp32 scale per row");
+    m.def("w8a8_gemm", &w8a8_gemm,
+          "int8 GEMM C[M, N] = A[M, K] @ W[K, N], int32 accumulate",
+          pybind11::arg("a"), pybind11::arg("w"), pybind11::arg("c"));
+    m.def("w8a8_epilogue", &w8a8_epilogue,
+          "apply both W8A8 scales to an int32 accumulator and narrow once",
+          pybind11::arg("c"), pybind11::arg("xs"), pybind11::arg("ws"),
+          pybind11::arg("out"), pybind11::arg("stride") = 0);
     m.def("kv_quant", &kv_quant,
           "symmetric int8 quantisation of [M, N], one fp32 scale per row, one launch");
     m.def("silu_mul", &silu_mul,

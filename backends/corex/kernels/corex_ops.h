@@ -123,6 +123,29 @@ torch::Tensor rms_norm(torch::Tensor x, torch::Tensor w, int64_t stride, double 
 torch::Tensor add_rms_norm(torch::Tensor x, torch::Tensor add, torch::Tensor w,
                            torch::Tensor out, int64_t stride, double eps);
 
+// @brief 残差相加接零中心 RMSNorm，并把结果直接量化成 int8，一次启动。
+//
+// W8A8 预填充的入口：下一个消费者是 int8 GEMM，它要 int8 激活加每行一个 fp32 scale。
+// 拆开的写法要走三趟 global（写 bf16 2 B → 读 bf16 2 B → 写 int8 1 B，共 5 B/元素），
+// 融合后只有 1 B/元素。2048 行的分块上那是 3.8 GB 的无效往返，实测 ``quant_act_i8``
+// 单独跑就要 10.34 ms/步。
+//
+// 口径要求：与 ``add_rms_norm`` + ``quant_act_i8`` 拆开跑**逐位相同**。和仍然先舍入成
+// bf16 再进均方，absmax 仍然取自同一个归一化结果，量化仍是 round 后夹到 [-127, 127]。
+//
+// @param x [M, N] 残差流，**原地累加**，调用方必须独占。
+// @param add [M, N] 待累加的混合器输出，行间距 ``stride``。
+// @param w [N] 增益，已带 ``1 + w`` 偏移。
+// @param out_q [M, N] int8 目的地，稠密。
+// @param out_s [M] 每行 fp32 scale 目的地。
+// @param stride ``x``/``add`` 的行间距；``0`` 表示 ``N``。
+// @param eps 方差下限。
+// @return ``out_q``。
+// @throws c10::Error dtype、形状或间距与内核矛盾。
+torch::Tensor add_rms_norm_i8(torch::Tensor x, torch::Tensor add, torch::Tensor w,
+                              torch::Tensor out_q, torch::Tensor out_s, int64_t stride,
+                              double eps, int64_t threads_override = 0);
+
 // @brief 乘以门 SiLU 的 RMSNorm，按头归一化。
 //
 // @param x [M, N] 激活，连续存放，bf16 或 fp32。
@@ -146,6 +169,62 @@ torch::Tensor rms_norm_gated(torch::Tensor x, torch::Tensor w, torch::Tensor gat
 // @return ``out_q``，便于调用链串接。
 // @throws c10::Error dtype 或形状与目的地不一致。
 torch::Tensor kv_quant(torch::Tensor x, torch::Tensor out_q, torch::Tensor out_s);
+
+// W8A8 预填充投影：权重与激活都是 int8，int32 累加，epilogue 里乘两个 scale 再窄化一次。
+
+// @brief 把一个 ``[M, K]`` 激活按行（per-token）对称量化成 int8。
+//
+// W8A8 的第一个内核。为什么按行而不是按张量：一行就是一个 token，行与行之间没有
+// 依赖，所以这个 reduction 只在 K 上做、不需要跨块通信，而按张量缩放会把某个 token
+// 的溢出摊到所有 token 上。``1e-5`` 的下限让全零行得到有限 scale 而不是 inf。
+//
+// 与 ``kv_quant`` 是同一套量化约定（`absmax / 127`、夹 `1e-5`、值域 `[-127, 127]`），
+// 故意复用而不是另立一套：两条路径的激活必须能互相替代，否则调完 prefill 再回头
+// 看 decode 时，两个 "int8" 指的就不是同一个数。
+//
+// @param x [M, K] bf16 或 fp32 激活。
+// @param out_q [M, K] int8 目的地，原地写入。
+// @param out_s [M] 每行 scale 的 fp32 目的地，原地写入。
+// @return ``out_q``，便于调用链串接。
+// @throws c10::Error dtype、形状或连续性与目的地不一致。
+torch::Tensor quant_act_i8(torch::Tensor x, torch::Tensor out_q, torch::Tensor out_s);
+
+// @brief int8 GEMM：``C[M, N] = A[M, K] @ W[K, N]``，int32 累加。
+//
+// 本卡实测 int8 GEMM 49.07 TINT8-OPS/s，bf16 42.71 TFLOP/s（27B-4CARD-PLAN.md §3.2），
+// 所以 W8A8 在预填充上是真快 1.27x，而权重全程 int8 还省一半显存。走库而不是手写：
+// 16 个 SM 上很难超过厂商的 49 TINT8-OPS/s，``__dp4a`` 可用只说明"将来要自己写融合
+// 内核有指令基础"。
+//
+// 库只在已知算得对的宽度内调用：``N > 131072`` 实测返回 NaN，所以调用方按 N 切块。
+// 这个上限是卡的性质，不是可调参数，检查放在 Python 侧（``pack.LIB_MAX_N``），这里只
+// 断言自己能索引的形状。
+//
+// @param a [M, K] int8 激活，行主序连续。
+// @param w [K, N] int8 权重，行主序连续。
+// @param c [M, N] int32 累加器目的地，原地写入。
+// @return ``c``。
+// @throws c10::Error dtype 不是 int8、维度不是二维，或形状对不上 K。
+torch::Tensor w8a8_gemm(torch::Tensor a, torch::Tensor w, torch::Tensor c);
+
+// @brief W8A8 的 epilogue：`out = bf16(c[m, n] * xs[m] * ws[n])`，一次窄化。
+//
+// 两个 scale 必须在同一个 fp32 表达式里乘完再窄化。分开两次窄化会把结果多舍入一次，
+// 而这条路要喂 32 层——W8A16 那边为了同一个理由拒绝把 scale 先窄化成 bf16。
+//
+// 为什么是独立的 kernel 而不是 GEMM 的一部分：库的 int8 GEMM 只写 int32，没有
+// epilogue 挂点，而 ``cublasLt`` 的 epilogue 不覆盖 per-token 激活 scale。三次启动
+// 的代价已经计入 27B-4CARD-PLAN.md §3.3 的 8.535 ms。
+//
+// @param c [M, N] int32 GEMM 输出。
+// @param xs [M] 每 token 的激活 scale。
+// @param ws [N] 每输出列的权重 scale。
+// @param out [M, N] 目的地，dtype 是调用方算术用的浮点类型（bf16 或 fp32）。
+// @param stride ``out`` 的行间距；``0`` 表示等于 N。宽投影沿 N 切块时用得上。
+// @return ``out``。
+// @throws c10::Error 形状、dtype 或步长与内核能索引的不一致。
+torch::Tensor w8a8_epilogue(torch::Tensor c, torch::Tensor xs, torch::Tensor ws,
+                            torch::Tensor out, int64_t stride);
 
 // @brief ``out = silu(gate) * up``，即 SwiGLU 乘积，一次启动。
 //
