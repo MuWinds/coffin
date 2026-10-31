@@ -494,38 +494,53 @@ __global__ void read_kernel(const int8_t* __restrict__ W, long long* __restrict_
 // @brief ``__dp4a`` 与整数乘加的吞吐微基准（每秒多少次 int8 乘加）。
 //
 // 这条数字决定手写 GEMM 的上限，而且它是**预填充**那条路线的判据：厂商库在本卡上跑到
-// 49.07 TINT8-OPS/s，而 ``__dp4a`` 一条指令只做四次 int8 乘加。如果它的吞吐换算出的
-// 峰值低于 49.07，"手写 dp4a 在预填充上追平库"就不成立，与实现好坏无关。
+// 37.7-57.2 TINT8-OPS/s（实测），而 ``__dp4a`` 一条指令只做四次 int8 乘加。如果它的
+// 吞吐换算出的峰值低于那个数，「手写 dp4a 在预填充上追平库」就不成立，与实现好坏无关。
 //
-// 四条独立累加链是为了让延迟不成为瓶颈——一条链上连续写同一个累加器量到的是延迟。
+// 四条独立累加链：一条链上连续写同一个累加器量到的是**延迟**而不是吞吐，会把结果压掉
+// 一个数量级。四条链让指令彼此独立，够把发射端口压满。
+//
+// 每线程**只做** ``iters * 4`` 条 dp4a 并把它累加进一个 64 位和。这个和必须真的依赖
+// 那 4 个累加器，否则编译器会把整个循环删掉——那正是第一版报出比卡的理论峰值还大的数
+// 的原因（``int_mac`` 那条 1500 TINT8 就是被整段消掉的证据）。这里的 ``red`` 归约读了
+// ``a0..a3``，所以依赖是真的。
 //
 // @param acc [块数] 每块一个和。
 // @param iters 每线程循环次数。
 template <int MODE>
 __global__ void rate_kernel(long long* __restrict__ acc, int iters) {
-    uint32_t a = 0x01020304u + threadIdx.x;
-    uint32_t b = 0x05060708u + blockIdx.x;
-    int32_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
-    const int b0 = (int)(threadIdx.x & 7u) + 1;
-    // ``__dp4a`` 的有符号版本签名是 ``(int, int, int)``；这里把载荷先落到 int32_t，避免
-    // 无符号/有符号混用造成的重载歧义。
-    const int32_t ai = (int32_t)a;
-    const int32_t bi = (int32_t)b;
+    // 四条链各自持有自己的操作数：链之间**不能有依赖**。加一条 ``a0 ^= (r0 & 1)`` 之类
+    // 的回写就把四条链串成一条，量到的是单链延迟而不是发射吞吐——那个错误让第一版报出
+    // 比卡的理论峰值小三个数量级的数。
+    int32_t a0 = 0x01020304 + (int32_t)threadIdx.x;
+    int32_t a1 = a0 + 1, a2 = a0 + 2, a3 = a0 + 3;
+    int32_t b0 = 0x05060708 + (int32_t)blockIdx.x;
+    int32_t b1 = b0 + 1, b2 = b0 + 2, b3 = b0 + 3;
+    int32_t r0 = 0, r1 = 0, r2 = 0, r3 = 0;
+    const int im = (int)(threadIdx.x & 7u) + 1;
     for (int it = 0; it < iters; ++it) {
         if (MODE == 0) {
-            a0 = __dp4a(ai, bi, a0);
-            a1 = __dp4a(bi, ai, a1);
-            a2 = __dp4a(ai + it, bi, a2);
-            a3 = __dp4a(bi + it, ai, a3);
+            r0 = __dp4a(a0, b0, r0);
+            r1 = __dp4a(a1, b1, r1);
+            r2 = __dp4a(a2, b2, r2);
+            r3 = __dp4a(a3, b3, r3);
         } else {
-            a0 += (a & 0xff) * b0;
-            a1 += ((a >> 8) & 0xff) * b0;
-            a2 += ((a >> 16) & 0xff) * b0;
-            a3 += ((a >> 24) & 0xff) * b0;
+            // 对照：同样的链数与依赖深度，做标量整数乘加。它给的是「不靠 dp4a 打包」的
+            // 那条路线的天花板。
+            r0 += (a0 & 0xff) * im;
+            r1 += (a1 & 0xff) * im;
+            r2 += (a2 & 0xff) * im;
+            r3 += (a3 & 0xff) * im;
         }
+        // 每轮换一个操作数，纯粹为了让循环不被整体折叠；变换作用在输入上而不是累加器上，
+        // 所以四条链仍然独立。
+        a0 ^= it;
+        a1 ^= it;
+        a2 ^= it;
+        a3 ^= it;
     }
     __shared__ long long red[kRedThreads];
-    red[threadIdx.x] = (long long)a0 + a1 + a2 + a3;
+    red[threadIdx.x] = (long long)r0 + r1 + r2 + r3 + a0 + a1 + a2 + a3 + b0 + b1 + b2 + b3;
     __syncthreads();
     for (int st = blockDim.x / 2; st > 0; st >>= 1) {
         if (threadIdx.x < st) red[threadIdx.x] += red[threadIdx.x + st];
