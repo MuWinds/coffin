@@ -302,15 +302,3 @@ class BatchedEngineTest(unittest.TestCase):
                     if seq is target and tok is not None:
                         out[i].append(tok)
         return out
-
-    # 这里曾有两条用例（concurrent_requests_match_their_solo_decode 与
-    # grouped_prefill_matches_solo_prefill），已按项目决定删除。
-    #
-    # 它们的对照是 ``_solo``（批宽 1，走 ``gemv_kn_i8``）对 ``_concurrent``（批宽 k，
-    # 走 ``gemv_kn_i8_m``）。两套内核的 fp32 累加顺序不同，token 链因此不可能逐位
-    # 相同，而这两条用例用 ``assertEqual`` 要求整链相等。分派差异不是批处理算错，
-    # 见 ``test_batch_decode`` 末尾的同一段说明与 job w8gkv9 的逐位数据。
-    #
-    # 删掉的是这两条，不是覆盖：「批处理没有改变调度结果」这条不变量仍由
-    # ``test_second_prompt_hits_the_prefix`` 与 ``test_prefix_batch`` 里的前缀
-    # 复用用例守着，它们在同一次前缀复用里对照，不跨批宽。

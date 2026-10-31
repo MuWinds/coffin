@@ -199,22 +199,5 @@ class BatchDecodeTest(support.ModelTestCase):
         finally:
             self._free(blocks)
 
-    # 这里曾有五条用例（same_prompt_every_row / different_prefix_lengths /
-    # bucket_padding / interleaved_prefill / row_holes），已按项目决定删除。
-    #
-    # 它们全都用 ``_reference`` 作对照，而那条路径走 ``decode_step``（单流，批宽 1）:
-    #
-    #   参考臂   decode_step               -> M=1 -> ``gemv_kn_i8``
-    #   被测臂   decode_batch(B, bucket)   -> M=B -> ``gemv_kn_i8_m``
-    #
-    # 两套内核的 fp32 累加顺序不同，logits 不逐位一致，几步解码后 argmax 会翻。
-    # 这不是批处理算错：与 ``setUpClass`` 同配置下 8 条相同 prompt 的预填充实测
-    # logits 0.0 ULP、KV 的 int8 码差 0（job w8gkv9）。用例比 ``prefill_group``
-    # docstring 写的契约（「argmax 相同、logits 在几个 bf16 ULP 之内」）更严。
-    #
-    # 上面那条 ``bucket 1`` 的用例留了下来：它的两条臂批宽都是 1，落在同一个 GEMV
-    # 分派上，逐位比较在那里是有意义的判据。要把这几条加回来，得让参考臂也跑批宽 B
-    # （其余行填哨兵），否则测到的仍然是两套内核的差异，而不是批处理对不对。
-
 if __name__ == "__main__":
     unittest.main()

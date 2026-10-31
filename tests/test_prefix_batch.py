@@ -5,7 +5,7 @@ Module: ``coffin/tests``。把分页模型包进 ``llm_engine.LLMEngine``，再�
 ``matched`` 计数做断言的测试。
 
 Constraints:
-    * 热跑的参照是同一个引擎的 *冷* 跑，中间清空基数树；若换第二个模型做对照，
+    * 热跑的参照是同一个引擎的冷跑，中间清空基数树；若换第二个模型做对照，
       16 GB 卡上就要多放一份 4B 权重。
     * 准入顺序本身是被测对象的地方用 ``add_request`` 加手工 ``step``，因为
       ``generate`` 拥有整个循环，会把准入时机藏起来。
@@ -96,20 +96,6 @@ class BatchedPrefixTest(unittest.TestCase):
         cold_b = self._generate(PREFIX + TAIL_B)
         self.assertEqual(cold_b["matched"], 0)
         self.assertEqual(warm_b["tokens"], cold_b["tokens"])
-
-    # 这里曾有一条 ``test_concurrent_identical_prompts_reuse_the_prefix``，已按项目
-    # 决定删除。它要求两个内容相同的请求 token 链完全相等，但两者的批宽不同：
-    #
-    #   第一个请求先单独准入，在批宽 1 下解码 -> ``gemv_kn_i8``
-    #   第二个请求在它解码时并入，两个请求一起在批宽 2 下解码 -> ``gemv_kn_i8_m``
-    #
-    # 两套内核的 fp32 累加顺序不同，``assertEqual(out[0], out[1])`` 不可能恒成立。
-    # 同一段理由见 ``test_batch_decode`` 末尾。
-    #
-    # 「并发请求能复用到前缀」这条不变量没有失去覆盖：它由同文件的
-    # ``test_cold_then_warm_identical_prompt`` 与 ``test_prefix_stats_report_cached_blocks``
-    # 守着，那两条只看命中了多少块，不看 token 是否逐位相同。
-
 
     def test_grouped_prefill_populates_the_prefix_cache(self) -> None:
         """分块预填充走的是另一条代码路径，但它同样要留下冷跑命中所需的、按块对齐的状态快照。"""

@@ -148,26 +148,6 @@ class PrefillBatchTest(support.ModelTestCase):
             f"{label}: max abs diff {diff:.4f} ({diff / unit:.1f} bf16 ULP, "
             f"{int((got != ref).sum())} of {got.numel()} differ)")
 
-    # 这里曾经有两条用例（``test_group_prefill_matches_solo`` 与
-    # ``test_same_prompt_grouped``），已按项目决定删除。删掉是因为它们把**跨批宽**的
-    # 两条解码路径当作必须逐位相同来比，而那不是引擎的契约：
-    #
-    #   ``_solo`` 走 ``decode_batch(1, 1)``  -> M=1 -> ``gemv_kn_i8``
-    #   ``_group`` 走 ``decode_batch(k, bucket)`` -> M=k -> ``gemv_kn_i8_m``
-    #
-    # 两套内核的 fp32 累加顺序不同，logits 因此不逐位一致，4 步解码后 argmax 会翻。
-    # 这与 ``Qwen35.prefill_group`` 的 docstring 一致（「不同的 GEMM M 会改变累加次序，
-    # 所以契约是 argmax 相同、logits 在几个 bf16 ULP 之内」）—— 用例比契约更严。
-    #
-    # 预填充本身**是对的**，这一点是测出来的，不是推的。与 ``setUpClass`` 完全相同的
-    # 配置（分页 + ``enable_batching(9)`` + ``capture_batch``）下，8 条相同 prompt：
-    #
-    #   seq=0..7   logits 0.0 ULP   KV 的 int8 码差 0   （逐位相同，job w8gkv9）
-    #
-    # 分叉只出现在预填充**之后**的解码步，原因就是上面那条批宽分派。谁要把这两条用例
-    # 加回来，对照臂必须落在同一个批宽上（例如让 solo 也跑 ``decode_batch(k, bucket)``
-    # 并把其余行填成哨兵），否则测的仍然是两套内核的差异。
-
     def test_single_sequence_group_is_bitwise_prefill(self):
         """只有一个序列时 GEMM 形状不变，所以这种情形能也必须按位相同。"""
         ids = _tokens(88, off=3)
