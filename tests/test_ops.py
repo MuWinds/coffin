@@ -111,7 +111,7 @@ class ChunkedDeltaRuleTest(unittest.TestCase):
 
 @support.needs_hip
 class ConvSeqTest(unittest.TestCase):
-    """``hip_ops.conv1d_silu_seq`` 必须复现 conv+SiLU，连带 state 一起。"""
+    """``bops.conv1d_silu_seq`` 必须复现 conv+SiLU，连带 state 一起。"""
 
     C = 8192
 
@@ -122,10 +122,10 @@ class ConvSeqTest(unittest.TestCase):
 
     def _check(self, x, st0):
         """把内核的输出与携带的 state 同 eager 链路逐项比对。"""
-        import hip_ops
+        from backends.hip import shim as hip_ops
         ref, ref_st = _depthwise_conv_eager(self.conv_w, x, st0.clone())
         got_st = st0.clone()
-        got = hip_ops.conv1d_silu_seq(self.conv_w, x, got_st)
+        got = bops.conv1d_silu_seq(self.conv_w, x, got_st)
         # 实测：state 逐位相同，输出约 1e-7。1e-5 的界来自输出 bf16 量化，
         # 不是累加误差。
         self.assertLess(support.rel_err(got, ref), 1e-5)
@@ -153,15 +153,15 @@ class ConvSeqTest(unittest.TestCase):
 
     def test_chunk_boundaries_carry_state(self):
         """分块预填充不能在块边界上把卷积的 3 token 历史重新起头。"""
-        import hip_ops
+        from backends.hip import shim as hip_ops
         T = 300
         x = (torch.randn(T, self.C, device="cuda") * 0.5).to(torch.bfloat16)
         st0 = torch.randn(self.C, 3, device="cuda")
         ref, ref_st = _depthwise_conv_eager(self.conv_w, x, st0.clone())
         st = st0.clone()
-        parts = [hip_ops.conv1d_silu_seq(self.conv_w, x[:100], st),
-                 hip_ops.conv1d_silu_seq(self.conv_w, x[100:180], st),
-                 hip_ops.conv1d_silu_seq(self.conv_w, x[180:], st)]
+        parts = [bops.conv1d_silu_seq(self.conv_w, x[:100], st),
+                 bops.conv1d_silu_seq(self.conv_w, x[100:180], st),
+                 bops.conv1d_silu_seq(self.conv_w, x[180:], st)]
         got = torch.cat(parts, dim=0)
         self.assertLess(support.rel_err(got, ref), 1e-5)
         self.assertLess(support.rel_err(st, ref_st), 1e-5)
@@ -169,14 +169,14 @@ class ConvSeqTest(unittest.TestCase):
 
 @support.needs_hip
 class PrepSeqTest(unittest.TestCase):
-    """``hip_ops.delta_prep_seq`` 必须复现 q/k 归一化、头扩展与 beta/g。"""
+    """``bops.delta_prep_seq`` 必须复现 q/k 归一化、头扩展与 beta/g。"""
 
     def test_matches_eager_maths_and_layout(self):
         """prep 内核同时把布局定死。
 
         输出一转置或跨步错位，就会把错值悄悄喂给 delta 内核。
         """
-        import hip_ops
+        from backends.hip import shim as hip_ops
 
         torch.manual_seed(0)
         nv, nk, dk, dv = 32, 16, 128, 128
@@ -202,7 +202,7 @@ class PrepSeqTest(unittest.TestCase):
                     vt = torch.empty(nv, T, dv, device="cuda")
                     bt = torch.empty(nv, T, device="cuda")
                     gt = torch.empty(nv, T, device="cuda")
-                    hip_ops.delta_prep_seq(qkv, b, a, neg_expA, dt_bias,
+                    bops.delta_prep_seq(qkv, b, a, neg_expA, dt_bias,
                                            qt, kt, vt, bt, gt, qscale, rep)
 
                     qe = qkv[:, :kdim].reshape(T, nk, dk).float()
@@ -235,7 +235,7 @@ class F16GemvTest(unittest.TestCase):
 
         2e-2 的界覆盖的是 fp16 存储，不是内核误差。
         """
-        import hip_ops
+        from backends.hip import shim as hip_ops
         for N, K in self.SHAPES:
             with self.subTest(N=N, K=K):
                 wb = (torch.randn(N, K, dtype=torch.float32, device="cuda") * 0.02
@@ -254,7 +254,7 @@ class F16GemvTest(unittest.TestCase):
 
     def test_batched_small_m_shapes(self):
         """批量入口是另一个内核：数学相同，切块方式不同。"""
-        import hip_ops
+        from backends.hip import shim as hip_ops
         for N, K in self.SHAPES[:3]:
             wb = (torch.randn(N, K, dtype=torch.float32, device="cuda") * 0.02
                   ).to(torch.bfloat16)
@@ -285,7 +285,7 @@ class Int8GemvTest(unittest.TestCase):
         对反量化权重取 1e-2 隔出内核误差，对 float 权重取 2e-2 卡住量化本身的
         误差。
         """
-        import hip_ops
+        from backends.hip import shim as hip_ops
         from int8_weights import QWeight
         for N, K in self.SHAPES:
             with self.subTest(N=N, K=K):
@@ -306,7 +306,7 @@ class Int8GemvTest(unittest.TestCase):
 
         单向量用例覆盖不到它。
         """
-        import hip_ops
+        from backends.hip import shim as hip_ops
         from int8_weights import QWeight
         for N, K in self.SHAPES[:3]:
             w = (torch.randn(N, K, dtype=torch.float32, device="cuda") * 0.02

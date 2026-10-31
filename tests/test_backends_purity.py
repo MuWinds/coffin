@@ -398,9 +398,6 @@ def audit(root: Path = ROOT, budgets: dict[str, dict[str, dict[str, int]]] | Non
 ALLOWLISTS: dict[str, dict[str, dict[str, int]]] = {
     "R1_hip_ops_import": {
         "probe": {
-            "tests/support.py": 1,
-            "tests/test_attention.py": 1,
-            "tests/test_ops.py": 7,
         },
         "prod": {
         },
@@ -413,7 +410,7 @@ ALLOWLISTS: dict[str, dict[str, dict[str, int]]] = {
     },
     "R3_cuda_literal": {
         "probe": {
-            "tests/support.py": 7,
+            "tests/support.py": 8,
             "tests/test_attention.py": 3,
             "tests/test_backends.py": 4,
             "tests/test_mtp.py": 4,

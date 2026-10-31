@@ -47,11 +47,25 @@ _DEV = backends.device
 
 
 def _has_native_norm() -> bool:
-    """两个融合入口是否都由原生内核承担。"""
+    """两个融合入口是否都由原生内核承担。
+
+    注意 ``backends.ops`` 是**已解析的表实例**，不是工厂函数 —— 写成
+    ``backends.ops()`` 会 ``TypeError``，而那个异常被上一行的
+    ``device == "cpu"`` 提前返回盖住：坏守卫在本地永远是「跳过」，在卡上永远让整个
+    模块 import 失败。两个结果都错，它既没有保护什么也没有报出问题。
+
+    判据只能直接问扩展：这两个融合入口不是 :class:`~backends.protocol.Ops` 的条目
+    （它们是可选优化，不该逼每个后端都提供一个假实现），所以表里查不到。
+    """
     if backends.caps().device == "cpu":
         return False
-    ops = backends.ops()
-    return hasattr(ops, "rms_norm_i8") and hasattr(ops, "add_rms_norm_i8")
+    try:
+        from backends.corex import kernels
+
+        module = kernels.load_kernels()
+    except Exception:                            # noqa: BLE001 - no toolchain is a skip
+        return False
+    return hasattr(module, "rms_norm_i8") and hasattr(module, "add_rms_norm_i8")
 
 
 @unittest.skipUnless(_has_native_norm(), "needs a backend with native fused norm kernels")

@@ -64,18 +64,39 @@ def has_cuda() -> bool:
 def has_hip() -> bool:
     """HIP 扩展已构建且可加载时返回真（在纯 CPU 机器上永远不会构建）。
 
-    导入放在函数内部：导入 ``hip_ops`` 会加载编译好的扩展，在没有 DCU 驱动的
-    机器上会直接中止进程。
+    判据是**选中的后端是不是 ``hip``**，而不是 ``import hip_ops``。那个顶层模块在
+    CoreX 移植（``b05c677``）里搬进了 ``backends/hip/``，``import hip_ops`` 自此
+    必然 ``ModuleNotFoundError``。
+
+    这个坏掉的导入之所以长期没被发现，是因为它在 ``torch.cuda.is_available()`` 之后：
+    没有卡的开发机上直接返回 ``False``，跳过门正常工作；**一旦在有卡的机器上跑全量
+    ``unittest discover``，``support`` 在 import 阶段就炸，整个测试套件一条都跑不了。**
+    也就是说这行代码只在真机上出错，而真机才是唯一能被它保护的地方。
+
+    导入放在函数内部：选后端会加载已编译的扩展，在没有驱动的机器上会中止进程。
     """
     if not torch.cuda.is_available():
         return False
-    import hip_ops
-    return hip_ops.available()
+    import backends
+
+    return backends.caps().name == "hip"
 
 
 def has_model() -> bool:
-    """checkpoint 是否在磁盘上；开销够小，可以在导入时调用。"""
-    return (MODEL_DIR / "config.json").is_file()
+    """checkpoint 是否在磁盘上；开销够小，可以在导入时调用。
+
+    ``is_file()`` 会抛 ``PermissionError`` 而不是返回 ``False``：默认路径
+    ``/root/private_data/models/Qwen3.5-4B`` 在集群上属于 root，而 ``SCNET_MODEL``
+    没设时本模块在 import 阶段就访问它，于是**整个测试套件一条都跑不了**，报错还落在
+    ``support`` 的 import 行上、看着像环境问题而不是「没设环境变量」。
+
+    判据只用「读得到 config.json」，任何 ``OSError`` 都算没有：这条函数只决定跳不跳过，
+    它不该有失败模式。
+    """
+    try:
+        return (MODEL_DIR / "config.json").is_file()
+    except OSError:
+        return False
 
 
 #: 需要 DCU。纯 torch 内核也要靠它持有张量。

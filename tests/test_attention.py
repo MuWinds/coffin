@@ -1,7 +1,7 @@
 """分块注意力路径必须与未分块的路径给出相同结果。
 
 Module: ``coffin/tests``。加载模型和 HIP 扩展，然后在运行中的模型上替换注意力
-入口；套件里其他测试不得这样 monkey-patch ``hip_ops``。
+入口；套件里其他测试不得这样 monkey-patch ``backends.ops``。
 
 Constraints:
     * 一致性按 bf16 ULP 判定，而不是 fp32 相对误差：这个引擎吐出的张量全是
@@ -97,10 +97,11 @@ class AttnBlockTest(support.ModelTestCase):
 
     def test_decode_kernel_matches_eager_attention(self):
         """分块的解码内核对手写未分块的 eager 参考实现。"""
-        import hip_ops
+        import dataclasses
+
+        import backends
         from models.qwen35 import full_attn
         from ops.dtypes import D, NEG_INF
-
         def eager_attn(q, gate, kcache, vcache, kscale, vscale, out, pos, rep,
                        scale, part_acc=None, part_ml=None):
             """整窗注意力：内核替换掉的那套算法，作为对照留在这里。"""
@@ -120,18 +121,23 @@ class AttnBlockTest(support.ModelTestCase):
             return y * gate.sigmoid()
 
         toks = _tokens(PREFILL_TOKENS)
-        real = hip_ops.attn
+        toks = _tokens(PREFILL_TOKENS)
+        # ``backends.ops`` 是 frozen dataclass，不能就地改写字段。替代入口的正确做法是
+        # 换一张表再挂回 ``full_attn`` 的模块属性 —— 旧版 monkey-patch ``hip_ops.attn``，
+        # 而那个顶层模块在 CoreX 移植里搬进了 ``backends/hip/``，import 直接失败。
+        real = backends.ops
+        eager_table = dataclasses.replace(real, attn_decode=eager_attn)
         try:
             for step in range(3):
                 outs = []
-                for fn in (real, eager_attn):
+                for table in (real, eager_table):
                     self.model.reset()
                     self.model.prefill(toks)
                     for i in range(step):
                         self.model.logits(BASE[i])
-                    hip_ops.attn = fn
+                    full_attn.bops = table
                     outs.append(self.model.logits(BASE[step]).float().clone())
-                hip_ops.attn = real
+                full_attn.bops = real
                 pos = PREFILL_TOKENS + step
                 blocks = -(-(pos + 1) // ATTN_KEY_BLOCK)
                 ok, diff, differing, same = _compare(outs[0], outs[1])
@@ -143,7 +149,7 @@ class AttnBlockTest(support.ModelTestCase):
                         f"differing {differing}/{outs[0].numel()}")
         finally:
             hip_ops.attn = real
-
+            full_attn.bops = real
 
 @support.needs_model
 class PrefillEquivalenceTest(support.ModelTestCase):
