@@ -32,6 +32,7 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -46,6 +47,13 @@ constexpr int QUANT_THREADS = 256;
 
 //: epilogue 每块线程数。
 constexpr int EPI_THREADS = 256;
+
+//: epilogue 的块数。固定按部件规模给（16 个 SM x 8），不随形状走。
+//
+// 这正是 epilogue 从 205 GB/s 提到 260-318 GB/s 的那一处改动：按形状起块数时
+// ``gate_up`` 在 M=2048 是 147456 个块，每块只做一轮 256 个元素，速率归块调度器管。
+// 8 是实测最好的那一档（每 SM 8 块足够填满流水，再多只是增加调度）。
+constexpr int EPI_BLOCKS = 16 * 8;
 
 //: 库 GEMM 仍然算得对的输出列上限，与 ``pack.LIB_MAX_N`` 是同一个数。
 //
@@ -97,28 +105,52 @@ __global__ void quant_act_i8_kernel(const XT* __restrict__ x, int8_t* __restrict
     }
 }
 
-// @brief 施加两个 W8A8 scale 并窄化一次。
+// @brief 施加两个 W8A8 scale 并窄化一次：一块负责若干行，块内线程沿 ``N`` 扫。
 //
 // 两个 scale 在同一个 fp32 表达式里乘完再窄化，与稠密路径的舍入次数一致。
 //
-// @param c [M, N] int32 GEMM 输出。
+// 为什么不是「一块一行、格点按形状起」：实测这个 epilogue 只跑到拷贝上限的 34-40%
+// （205 GB/s，同样字节的一次 bf16 拷贝是 484-605），而病因是块数——``gate_up`` 在
+// M=2048 时按 ``(ceil(N/256), M)`` 起 72 x 2048 = 147456 个块，每块 256 个元素，
+// 等于每 1 KiB 输出一个块，速率归块调度器管。把块数压到常量后微基准上是
+// 1.19-1.35x（``docs/W8A8_PLAN.md`` §1.5f）。
+//
+// 为什么是「行在外、列在内」而不是一维铺平：铺平后每个元素都要用 ``i / N`` 求行号，
+// 而设备上的整数除法是 20 条指令量级的序列，这个内核的算术只有两次乘。真实预填充里
+// 大量调用是小 M（``o_proj`` 一类每次只有几百行），那样每个元素一次除法就把块数带来
+// 的收益全吃回去——实测端到端 epilogue 从 19.04 ms 退到 21.24 ms 就是它的代价。
+// 行在外就没有除法，因为行号由 ``blockIdx`` 和块内循环直接给出。
+//
+// 用 float 倒数替代除法也不行：``total`` 最大到 2.68e8，超过 float 的 24 位整数精度
+// （1.68e7），行号会整个错位。
+//
+// **没有**跟着上 128 位向量化，虽然那看起来是同一个方向：实测 ``vec4`` 和
+// ``rowvec4`` 只有二维版的 0.4-0.9 倍。这个内核本来就是连续访存，向量化只减少了
+// 指令数，却把每块并行处理的元素数除以四。这与 GEMV 上「宽加载 +24%」的结论相反，
+// 因为 GEMV 每个线程读的是不相邻的列，那里宽加载才真的合并了事务。
+//
+// @param c [M, N] int32 GEMM 输出，连续存放。
 // @param xs [M] 每 token 激活 scale。
 // @param ws [N] 每输出列权重 scale。
-// @param out [M, N] 目的地。
-// @param N 行宽。
-// @param stride ``out`` 的行间距。
+// @param out 目的地，行间距 ``stride``。
+// @param M 行数。
+// @param N 读入的行宽。
+// @param stride ``out`` 的行间距；沿 N 切块时它大于 ``N``。
 template <typename XT>
 __global__ void w8a8_epilogue_kernel(const int32_t* __restrict__ c,
                                      const float* __restrict__ xs,
                                      const float* __restrict__ ws,
-                                     XT* __restrict__ out, int N, int stride) {
-    const int m = blockIdx.y;
-    const float xm = xs[m];
-    const int32_t* cr = c + (size_t)m * N;
-    XT* orow = out + (size_t)m * stride;
-    for (int col = blockIdx.x * blockDim.x + threadIdx.x; col < N;
-         col += blockDim.x * gridDim.x) {
-        orow[col] = CxScalar<XT>::from_float((float)cr[col] * xm * ws[col]);
+                                     XT* __restrict__ out, int M, int N,
+                                     int stride) {
+    for (int m = blockIdx.x; m < M; m += gridDim.x) {
+        const float xm = xs[m];
+        const int32_t* cr = c + (size_t)m * N;
+        // 写指针按 ``stride`` 走：沿 N 切块时 ``out`` 的行距大于本块宽度，用块宽当
+        // 间距会把第二行写回第一行尾部。
+        XT* orow = out + (size_t)m * stride;
+        for (int col = threadIdx.x; col < N; col += blockDim.x) {
+            orow[col] = CxScalar<XT>::from_float((float)cr[col] * xm * ws[col]);
+        }
     }
 }
 
@@ -225,19 +257,20 @@ torch::Tensor w8a8_epilogue(torch::Tensor c, torch::Tensor xs, torch::Tensor ws,
                 "out must be [M, N] with stride >= N");
 
     const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
-    const int blocks = (N + EPI_THREADS - 1) / EPI_THREADS;
-    const dim3 grid(blocks, M);
+    // 块数固定按部件规模给，不随形状走：形状决定每块轮询多少行，而不是起多少个块。
+    // 行数少到一个块都不满时退到「够用就好」，否则空转的块只是白花调度。
+    const int blocks = std::max(1, std::min(EPI_BLOCKS, M));
     const bool o32 = out.scalar_type() == torch::kFloat;
     TORCH_CHECK(o32 || out.scalar_type() == torch::kBFloat16,
                 "out must be bf16 or fp32, got ", out.scalar_type());
     if (o32) {
-        w8a8_epilogue_kernel<float><<<grid, EPI_THREADS, 0, stream>>>(
+        w8a8_epilogue_kernel<float><<<blocks, EPI_THREADS, 0, stream>>>(
             c.data_ptr<int32_t>(), xs.data_ptr<float>(), ws.data_ptr<float>(),
-            reinterpret_cast<float*>(out.data_ptr()), N, st);
+            reinterpret_cast<float*>(out.data_ptr()), M, N, st);
     } else {
-        w8a8_epilogue_kernel<uint16_t><<<grid, EPI_THREADS, 0, stream>>>(
+        w8a8_epilogue_kernel<uint16_t><<<blocks, EPI_THREADS, 0, stream>>>(
             c.data_ptr<int32_t>(), xs.data_ptr<float>(), ws.data_ptr<float>(),
-            reinterpret_cast<uint16_t*>(out.data_ptr()), N, st);
+            reinterpret_cast<uint16_t*>(out.data_ptr()), M, N, st);
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
