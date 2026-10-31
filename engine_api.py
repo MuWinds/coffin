@@ -50,7 +50,7 @@ class Model(Protocol):
     直接读取的属性有：
 
     ``max_seq``
-        KV 缓存和 RoPE 表按它构造的上下文窗口。
+        KV cache 和 RoPE 表按它构造的上下文窗口。
     ``pos1``
         长度为 1 的设备张量，装着当前位置。服务端和 ``PrefixCacheEngine`` 靠读写
         它来移动窗口，所以它属于契约，而不是私有细节。
