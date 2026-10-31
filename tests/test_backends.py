@@ -877,12 +877,18 @@ class DependencyDirectionTest(unittest.TestCase):
         self.assertEqual(self.S0_ALLOWLIST["backends/hip/__init__.py"], ("hip_ops",))
 
     def test_package_imports_without_an_accelerator_or_a_build(self):
-        """导入这个包就是纯 CPU 机器会做的事；在那里尝试构建会改写环境并失败。"""
+        """导入这个包就是纯 CPU 机器会做的事；在那里尝试构建会改写环境并失败。
+
+        这里必须**显式**把 ``COFFIN_BACKEND=reference`` 传给子进程，不能依赖自动探测：
+        ``_run_py`` 会清掉外层环境里的 ``COFFIN_BACKEND``，于是在**有卡**的主机上自动
+        探测会正当地选中 ``corex``，这条断言就挂。它挂的原因不是代码坏了，是测试假设了
+        「这台机器没有加速卡」—— 那正是它在本机能过、在卡上过不了的原因。
+        """
         probe = ("import sys, backends\n"
                  "assert backends.caps().name == 'reference', backends.caps().name\n"
                  "assert 'hip_ops' not in sys.modules, 'imported the HIP shim'\n"
                  "print(backends.status())\n")
-        done = _run_py(probe)
+        done = _run_py(probe, env={"COFFIN_BACKEND": "reference"})
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("backend=reference", done.stdout)
 
