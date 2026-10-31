@@ -38,6 +38,7 @@ Constraints:
 from __future__ import annotations
 
 import functools
+import os
 from typing import Any
 
 import torch
@@ -70,6 +71,58 @@ _PREFILL_MIN_M = 64
 #: 为了避开库而必须分块时，每次内核启动处理的行数。:func:`_gemv_rows` 最多把这么
 #: 多行并进一次权重读取，正好对上小 M 内核的特化范围。
 _ROW_CHUNK = 8
+
+#: 宽指令张量核 GEMM 的形状门限，按**权重字节数**而不是 K 或 N 单独判。
+#:
+#: 实测（4B 的真实预填充形状，M=2048，同一张卡同进程，``docs/TCU_INT8.md``）：
+#:
+#:   形状            K      N      TCU ms   库 ms    相对
+#:   gate_up       2560  18432     3.44     5.75   1.67x
+#:   full_attn     2560  10240     1.80     3.26   1.81x
+#:   linear_attn   2560  12352     2.35     3.92   1.66x
+#:   o_proj        4096   2560     0.84     1.18   1.41x
+#:   k5120         5120   2560     1.12     1.33   1.20x
+#:   mlp_down      9216   2560     2.14     2.01   0.94x   <- 唯一输
+#:
+#: 判据**不是** ``K * N``：``o_proj``（10.5 MB）与 ``k5120``（13.1 MB）都远小于任意
+#: 一个 24 MB 门限，却都赢；而 ``mlp_down``（23.6 MB）最大却输。真正的区别在
+#: **K 有多深**——``mlp_down`` 是 K=9216 的深归约、N 只有 2560，一次预填充要沿 K 走
+#: 144 个 k-tile，TCU 的块间固定开销摊不薄；其余形状 N 宽 K 浅。所以门限落在 K 上。
+#:
+#: 这个数只决定走哪条路，两条路的**数值逐位相同**（int32 累加是精确的，epilogue 的
+#: 舍入次数也一样），所以分派错了只会慢、不会错。``COFFIN_I8_GEMM`` 可覆盖：
+#: ``tcu`` 强制走 TCU，``lib`` 强制走库做 A/B。
+_TCU_MAX_K = 8192
+
+
+def _use_tcu_gemm(rows: int, k: int, n: int, available: bool) -> bool:
+    """决定这次预填充投影走宽指令 TCU 内核还是库。
+
+    Args:
+        rows: 激活行数 ``M``。
+        k: 内维。
+        n: 输出列数。
+        available: 扩展里有没有 ``w8a8_gemm_tcu``。旧构建没有它，而「扩展能加载」
+            不等于「这个入口在」，所以两者分开判。
+
+    Returns:
+        走 TCU 时为 ``True``。
+
+    Raises:
+        ValueError: ``COFFIN_I8_GEMM`` 是个不认识的值。静默回退会让一次 A/B 看起来
+            像「两边一样快」，而实际两边跑的是同一条路。
+    """
+    if not available:
+        return False
+    forced = os.environ.get("COFFIN_I8_GEMM", "").strip().lower()
+    if forced in {"tcu", "tensor", "i8x8"}:
+        return True
+    if forced in {"lib", "cublas"}:
+        return False
+    if forced:
+        raise ValueError(
+            f"COFFIN_I8_GEMM={forced!r} is not one of 'tcu' / 'lib'")
+    return k <= _TCU_MAX_K
 
 
 def _is_corex_host() -> tuple[bool, str]:
@@ -372,12 +425,19 @@ def _w8a8_rows(packed: pack.KnQWeight, act: torch.Tensor) -> torch.Tensor:
     # 量化排在循环外：一份激活只按行量化一次，切块只在 N 上做，所以每块共用同一
     # 份 int8 激活和同一份 scale。
     module.quant_act_i8(act, xq, xs)
+    use_tcu = _use_tcu_gemm(rows, k, n, hasattr(module, "w8a8_gemm_tcu"))
     for start in range(0, n, pack.LIB_MAX_N):
         stop = min(n, start + pack.LIB_MAX_N)
         width = stop - start
         block = packed.wt[:, start:stop]
         if not block.is_contiguous():
             block = block.contiguous()
+        if use_tcu:
+            # 融合路径没有 int32 缓冲，也没有第二个内核：累加器留在寄存器里，
+            # 乘完两个 scale 直接出浮点。
+            module.w8a8_gemm_tcu(xq, block, xs, packed.scale[start:stop],
+                                 out[:, start:stop])
+            continue
         acc = torch.empty((rows, width), dtype=torch.int32, device=act.device)
         module.w8a8_gemm(xq, block, acc)
         # 行距传 ``n`` 而不是块宽：``out`` 的列切片在最内层仍然连续到 ``n``，

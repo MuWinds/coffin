@@ -71,6 +71,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "apply both W8A8 scales to an int32 accumulator and narrow once",
           pybind11::arg("c"), pybind11::arg("xs"), pybind11::arg("ws"),
           pybind11::arg("out"), pybind11::arg("stride") = 0);
+    m.def("w8a8_gemm_tcu", &w8a8_gemm_tcu,
+          "wide-instruction (i8x8) tensor-core int8 GEMM with the epilogue fused: "
+          "out[M, N] = (A[M, K] @ W[K, N]) scaled, in one launch",
+          pybind11::arg("a"), pybind11::arg("w"), pybind11::arg("xs"),
+          pybind11::arg("ws"), pybind11::arg("out"));
     m.def("kv_quant", &kv_quant,
           "symmetric int8 quantisation of [M, N], one fp32 scale per row, one launch");
     m.def("silu_mul", &silu_mul,
