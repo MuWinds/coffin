@@ -39,6 +39,7 @@ from typing import Any
 import torch
 
 from int8_weights import QWeight
+from w4a8_weights import W4A8Weight
 
 #: 索引文件名。加载器靠它认出一个目录是预量化的，所以这个名字不能在任何
 #: checkpoint 里出现。
@@ -47,6 +48,7 @@ INDEX_NAME = "quant_index.json"
 #: 索引格式标识。布局一改就递增：读旧格式的加载器会明确报错，而不是按新布局错读
 #: 字节——错读出来的 int8 是一堆看似合理的数字。
 FORMAT = "coffin-int8-kn-v1"
+W4A8_FORMAT = "coffin-w4a8-kn-v1"
 
 #: 文本默认前缀，与 ``models/qwen35/weights.py`` 的那一组一致。
 DEFAULT_PREFIX = "model.language_model."
@@ -89,10 +91,9 @@ def read_index(model_dir: str | Path) -> dict:
 
     path = Path(model_dir) / INDEX_NAME
     index = json.loads(path.read_text(encoding="utf-8"))
-    if index.get("format") != FORMAT:
+    if index.get("format") not in {FORMAT, W4A8_FORMAT}:
         raise ValueError(
-            f"{path}: format {index.get('format')!r} is not {FORMAT!r}; "
-            f"re-run coffin/tools/quant_disk.py against the checkpoint")
+            f"{path}: unsupported quantized format {index.get('format')!r}")
     return index
 
 
@@ -222,6 +223,10 @@ def load(model_dir: str | Path, *, device: torch.device, quant: bool = True,
 
     model_dir = Path(model_dir)
     index = read_index(model_dir)
+    if index["format"] == W4A8_FORMAT:
+        return _load_w4a8(model_dir, index, device=device, quant=quant,
+                          prefix=prefix, weight_dtype=weight_dtype,
+                          vision=vision, vision_quant=vision_quant)
     _require_kn_backend()
 
     stored_dtype = index.get("weight_dtype")
@@ -278,6 +283,62 @@ def load(model_dir: str | Path, *, device: torch.device, quant: bool = True,
                     scale = handle.get_tensor(scale_key)
                     sd[key] = _check_q8(key, wt, scale, meta) if quant else (
                         _check_q8(key, wt, scale, meta).dequant(weight_dtype))
+                else:
+                    sd[key] = handle.get_tensor(key)
+    return sd
+
+
+def _load_w4a8(model_dir: Path, index: dict, *, device: torch.device,
+               quant: bool, prefix: str, weight_dtype: torch.dtype | None,
+               vision: bool | None, vision_quant: bool) -> dict:
+    """读取 W4A8 分组权重；非量化调用显式反量化到目标 dtype。"""
+    from safetensors import safe_open
+
+    if quant:
+        _require_kn_backend()
+    if vision_quant:
+        raise ValueError(f"{model_dir}: W4A8 disk format keeps the vision tower dense")
+    _check_source_config(model_dir, index)
+    take_vision = bool(index.get("vision")) if vision is None else bool(vision)
+    if take_vision and not index.get("vision"):
+        raise RuntimeError(f"{model_dir}: W4A8 index does not contain vision tensors")
+    if weight_dtype is None:
+        weight_dtype = _dtype_from_name(index.get("weight_dtype"))
+    elif _name_of(weight_dtype) != index.get("weight_dtype"):
+        raise ValueError(f"{model_dir}: W4 weights were quantized from "
+                         f"{index.get('weight_dtype')}, not {_name_of(weight_dtype)}")
+
+    prefixes = (prefix, "mtp.", "lm_head.")
+    wanted = {key: meta for key, meta in index["tensors"].items()
+              if key.startswith(prefixes)
+              or (take_vision and key.startswith(VISUAL_PREFIX))}
+    if not wanted:
+        raise ValueError(f"{model_dir}: index holds no tensor under {prefixes}")
+
+    sd: dict[str, Any] = {}
+    for shard in sorted({meta["shard"] for meta in wanted.values()}):
+        path = model_dir / shard
+        if not path.is_file():
+            raise FileNotFoundError(f"{model_dir}: index names missing shard {shard}")
+        with safe_open(str(path), framework="pt", device=_device_arg(device)) as handle:
+            available = set(handle.keys())
+            for key, meta in wanted.items():
+                if meta["shard"] != shard:
+                    continue
+                if key not in available:
+                    raise ValueError(f"{path}: index names missing tensor {key}")
+                if meta.get("kind") == "q4":
+                    scale_key = meta.get("scale_key")
+                    if scale_key not in available:
+                        raise ValueError(f"{path}: {key} has no scale tensor {scale_key}")
+                    packed = handle.get_tensor(key)
+                    scale = handle.get_tensor(scale_key)
+                    if (list(packed.shape) != meta.get("packed_shape")
+                            or list(scale.shape) != meta.get("scale_shape")):
+                        raise ValueError(f"{path}: packed shape mismatch for {key}")
+                    value = W4A8Weight(packed, scale, k=int(meta["k"]),
+                                       group_size=int(meta["group_size"]))
+                    sd[key] = value if quant else value.to(weight_dtype)
                 else:
                     sd[key] = handle.get_tensor(key)
     return sd

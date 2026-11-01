@@ -41,6 +41,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "batched W8A16 GEMV: int8 [K, N] weights, x [M, K] -> y [M, N]",
           pybind11::arg("wt"), pybind11::arg("x"), pybind11::arg("scale"),
           pybind11::arg("threads") = 0, pybind11::arg("unroll") = 0);
+    m.def("gemv_kn_w4", &gemv_kn_w4,
+          "group-scaled packed W4 GEMV with bf16/fp32 activations",
+          pybind11::arg("packed"), pybind11::arg("scale"), pybind11::arg("x"),
+          pybind11::arg("k"), pybind11::arg("group_size"));
+    m.def("w4a8_gemv", &w4a8_gemv,
+          "分组 W4 与 int8 激活的整数点积，int32 逐组累加",
+          pybind11::arg("a"), pybind11::arg("w"), pybind11::arg("xs"),
+          pybind11::arg("ws"), pybind11::arg("out"), pybind11::arg("group_size"));
+    m.def("w4a8_gemm_tcu", &w4a8_gemm_tcu,
+          "分组 packed W4 与 int8 激活的张量核投影",
+          pybind11::arg("a"), pybind11::arg("w"), pybind11::arg("xs"),
+          pybind11::arg("ws"), pybind11::arg("out"), pybind11::arg("group_size"));
+    m.def("quant_act_i8_scaled", &quant_act_i8_scaled,
+          "按跨 rank 共享的逐行 scale 量化激活",
+          pybind11::arg("x"), pybind11::arg("out"), pybind11::arg("xs"));
     // 归一化。
     m.def("rms_norm", &rms_norm, "fused zero-centred RMSNorm over pitched [M, N] rows",
           pybind11::arg("x"), pybind11::arg("w"), pybind11::arg("stride") = 0,

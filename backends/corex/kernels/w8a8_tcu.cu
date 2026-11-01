@@ -40,10 +40,12 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime.h>
 #include <mma.h>
 
 #include <algorithm>
+#include <climits>
 #include <cstdint>
 
 namespace {
@@ -360,7 +362,158 @@ __global__ void gemm_tcu_kernel(const int8_t* __restrict__ W, const int8_t* __re
     store_epi<XT>(acc, out, xs, ws, m0 + 64 * wn, n0 + 64 * wm, M, N, stride);
 }
 
+// W4 每组需同时持有 int32 点积和 fp32 跨组和；缩小 tile 限制寄存器压力。
+constexpr int W4_TILE = 128;
+constexpr int W4_THREADS = 256;
+constexpr int W4_SHARED = 2 * (BK / 16) * 1024;
+
+// @brief 一次读取四列 packed 字节，分别把低、高 nibble 放进相邻 K 行。
+__device__ __forceinline__ void stage_w4(int8_t* sa, const uint8_t* W,
+                                         int n0, int k0, int N, int K) {
+    for (int t = threadIdx.x; t < BK / 2 * (W4_TILE / 4); t += W4_THREADS) {
+        const int k = (t / (W4_TILE / 4)) * 2;
+        const int j = t % (W4_TILE / 4);
+        const int n = n0 + j * 4;
+        unsigned bytes = 0x88888888u;
+        if (k0 + k < K && n < N) {
+            if ((N & 3) == 0 && n + 3 < N) {
+                bytes = *reinterpret_cast<const unsigned*>(W + (size_t)((k0 + k) / 2) * N + n);
+            } else {
+                for (int c = 0; c < 4; ++c) {
+                    if (n + c < N) {
+                        const unsigned v = W[(size_t)((k0 + k) / 2) * N + n + c];
+                        bytes = (bytes & ~(255u << (8 * c))) | (v << (8 * c));
+                    }
+                }
+            }
+        }
+        const int warp_row = j >> 4;
+        const int n4 = (j & 15) * 4;
+        for (int half = 0; half < 2; ++half) {
+            unsigned word = 0;
+            for (int c = 0; c < 4; ++c) {
+                const int q = (int)((bytes >> (8 * c + half * 4)) & 15) - 8;
+                word |= ((unsigned)q & 255) << (8 * c);
+            }
+            const int kk = k + half;
+            *reinterpret_cast<unsigned*>(sa + warp_row * (BK / 16) * 1024
+                + (kk >> 4) * 1024 + off_a(n4, kk & 15)) = word;
+        }
+    }
+}
+
+// @brief 激活只暂存本块的 128 行，不生成全矩阵解包副本。
+__device__ __forceinline__ void stage_w4_act(int8_t* sb, const int8_t* A,
+                                             int m0, int k0, int M, int K) {
+    for (int t = threadIdx.x; t < W4_TILE * (BK / 4); t += W4_THREADS) {
+        const int m = t / (BK / 4);
+        const int k = (t % (BK / 4)) * 4;
+        unsigned word = 0;
+        if (m0 + m < M && k0 + k + 3 < K)
+            word = *reinterpret_cast<const unsigned*>(A + (size_t)(m0 + m) * K + k0 + k);
+        *reinterpret_cast<unsigned*>(sb + (m >> 6) * (BK / 16) * 1024
+            + (k >> 4) * 1024 + off_b(k & 15, m & 63)) = word;
+    }
+}
+
+// @brief 每组清空整数累加器，施加该组 scale 后再加入 fp32 跨组和。
+template <typename XT>
+__global__ void w4_gemm_tcu(const uint8_t* W, const int8_t* A, const float* xs,
+                             const float* ws, XT* out, int M, int N, int K, int gs) {
+    extern __shared__ int8_t shared[];
+    int8_t* sa = shared;
+    int8_t* sb = shared + W4_SHARED;
+    const int warp = threadIdx.x >> 6;
+    const int wm = warp / 2, wn = warp % 2;
+    const int n0 = blockIdx.x * W4_TILE, m0 = blockIdx.y * W4_TILE;
+    const int lane = __ivcorex_lane_id();
+    float total[64] = {};
+    for (int g = 0; g < (K + gs - 1) / gs; ++g) {
+        v4i32 acc[16];
+#pragma unroll
+        for (int i = 0; i < 16; ++i) acc[i] = {0, 0, 0, 0};
+        for (int k0 = g * gs; k0 < min(K, (g + 1) * gs); k0 += BK) {
+            stage_w4(sa, W, n0, k0, N, K);
+            stage_w4_act(sb, A, m0, k0, M, K);
+            __syncthreads();
+            const int8_t* wa = sa + wm * (BK / 16) * 1024;
+            const int8_t* wb = sb + wn * (BK / 16) * 1024;
+            unsigned a0[4], a1[4], b0[4], b1[4];
+#pragma unroll
+            for (int t = 0; t < BK / 32; ++t) {
+                ld_a(a0, wa + t * 2048); ld_a(a1, wa + t * 2048 + 1024);
+                ld_b(b0, wb + t * 2048); ld_b(b1, wb + t * 2048 + 1024);
+                mma_tile(a0, a1, b0, b1, acc);
+            }
+            __syncthreads();
+        }
+#pragma unroll
+        for (int rt = 0; rt < 4; ++rt) {
+#pragma unroll
+            for (int ct = 0; ct < 4; ++ct) {
+                const v4i32 v = acc[4 * rt + ct];
+                const int vals[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    const int n = n0 + 64 * wm + 16 * rt + (lane >> 4) + 4 * q;
+                    if (n < N) total[(4 * rt + ct) * 4 + q] +=
+                        (float)vals[q] * ws[(size_t)g * N + n];
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int rt = 0; rt < 4; ++rt) {
+#pragma unroll
+        for (int ct = 0; ct < 4; ++ct) {
+            const int m = m0 + 64 * wn + 16 * ct + (lane & 15);
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const int n = n0 + 64 * wm + 16 * rt + (lane >> 4) + 4 * q;
+                if (m < M && n < N) out[(size_t)m * N + n] =
+                    CxScalar<XT>::from_float(total[(4 * rt + ct) * 4 + q] * xs[m]);
+            }
+        }
+    }
+}
+
 }  // namespace
+
+// @brief 用张量核直接消费 packed W4；group 必须按 64 对齐，K 按 4 对齐。
+torch::Tensor w4a8_gemm_tcu(torch::Tensor a, torch::Tensor w, torch::Tensor xs,
+                            torch::Tensor ws, torch::Tensor out, int64_t gs) {
+    TORCH_CHECK(a.is_cuda() && a.dim() == 2 && w.dim() == 2 && out.dim() == 2,
+                "CUDA 2-D activation, weight and output required");
+    const int64_t M = a.size(0), K = a.size(1), N = w.size(1);
+    TORCH_CHECK(K > 0 && N > 0 && K <= INT_MAX && N <= INT_MAX && M <= INT_MAX
+                && K % 4 == 0 && gs > 0 && gs <= 1048576 && gs % BK == 0,
+                "K must align to four and group_size to 64");
+    TORCH_CHECK(a.scalar_type() == torch::kChar && w.scalar_type() == torch::kByte
+                && xs.scalar_type() == torch::kFloat && ws.scalar_type() == torch::kFloat,
+                "int8 activation, packed uint8 weight and fp32 scales required");
+    TORCH_CHECK(w.size(0) * 2 >= K && xs.dim() == 1 && xs.numel() == M
+                && ws.dim() == 2 && ws.size(0) == (K + gs - 1) / gs && ws.size(1) == N
+                && out.size(0) == M && out.size(1) == N, "shape mismatch");
+    TORCH_CHECK(out.scalar_type() == torch::kFloat || out.scalar_type() == torch::kBFloat16,
+                "bf16 or fp32 output required");
+    for (const auto& t : {a, w, xs, ws, out})
+        TORCH_CHECK(t.device() == a.device() && t.is_contiguous(),
+                    "all tensors must be contiguous on the same device");
+    if (!M) return out;
+    const c10::cuda::CUDAGuard guard(a.device());
+    const dim3 grid((N + W4_TILE - 1) / W4_TILE, (M + W4_TILE - 1) / W4_TILE);
+    const auto stream = c10::cuda::getCurrentCUDAStream();
+    auto run = [&](auto tag) {
+        using XT = decltype(tag);
+        w4_gemm_tcu<XT><<<grid, W4_THREADS, 2 * W4_SHARED, stream>>>(
+            w.data_ptr<uint8_t>(), a.data_ptr<int8_t>(), xs.data_ptr<float>(),
+            ws.data_ptr<float>(), reinterpret_cast<XT*>(out.data_ptr()), M, N, K, gs);
+    };
+    if (out.scalar_type() == torch::kFloat) run(float{});
+    else run(uint16_t{});
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
 
 torch::Tensor w8a8_gemm_tcu(torch::Tensor a, torch::Tensor w, torch::Tensor xs,
                             torch::Tensor ws, torch::Tensor out) {

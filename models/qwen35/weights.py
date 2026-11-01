@@ -94,6 +94,13 @@ def load_weights(model_dir: str | Path, prefix: str = "model.language_model.",
             一个会在第一张图上失败的引擎。
     """
     model_dir = Path(model_dir)
+    from models.qwen35.parallel import context, load_weights as load_parallel_weights
+
+    parallel = context()
+    if parallel is not None:
+        if not quant or vision_quant:
+            raise ValueError("tensor parallel W4 loading requires quant=True and dense vision")
+        return load_parallel_weights(model_dir, _device, parallel, vision=vision)
     if quantized_load.is_quantized_dir(model_dir):
         return quantized_load.load(
             model_dir, device=_device, quant=quant, prefix=prefix,

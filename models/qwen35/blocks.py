@@ -24,6 +24,7 @@ from backends import ops as bops
 from models.qwen35.batch import batch_proj, wide_proj
 from models.qwen35.full_attn import FullAttn
 from models.qwen35.linear_attn import LinearAttn
+from models.qwen35.parallel import row_projection
 from ops.gemv import _proj
 from ops.norm import RMSNorm
 
@@ -45,7 +46,7 @@ class MLP:
             bench: 透传给投影；``False`` 跳过自动调优。
         """
         self.gate_up = _proj(sd, [f"{p}.gate_proj", f"{p}.up_proj"], bench)
-        self.down = _proj(sd, [f"{p}.down_proj"], bench)
+        self.down = row_projection(_proj(sd, [f"{p}.down_proj"], bench))
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         """把块作用在一行或少数几行上（解码路径）。

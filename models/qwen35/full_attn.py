@@ -38,6 +38,7 @@ from backends import caps as _caps
 from backends import device as _device
 from backends import ops as bops
 from models.qwen35.batch import batch_proj
+from models.qwen35.parallel import row_projection
 from models.qwen35.tuning import ATTN_SPLIT, PREFILL_ATTN_KB
 from ops.dtypes import D, NEG_INF, WF
 from ops.gemv import _proj
@@ -80,7 +81,7 @@ class FullAttn:
         self.max_seq = max_seq
 
         self.qkv = _proj(sd, [f"{p}.q_proj", f"{p}.k_proj", f"{p}.v_proj"], bench)
-        self.o_proj = _proj(sd, [f"{p}.o_proj"], bench)
+        self.o_proj = row_projection(_proj(sd, [f"{p}.o_proj"], bench))
         self.q_norm = RMSNorm(sd[f"{p}.q_norm.weight"])
         self.k_norm = RMSNorm(sd[f"{p}.k_norm.weight"])
 

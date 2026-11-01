@@ -394,6 +394,19 @@ class TextOnlyTest(unittest.TestCase):
 class PrefixEnginePathTest(unittest.TestCase):
     """单流预填充路径必须插入并匹配加盐键，且把 ``mm`` 转发出去。"""
 
+    def test_disjoint_request_reclaims_previous_full_pool(self) -> None:
+        """连续长请求不共享前缀时，旧请求释放后必须重新淘汰缓存再分配。"""
+        engine = make_engine(FakeModel())
+        length = (NUM_BLOCKS - 1) * BLOCK
+        engine.prefill(list(range(1000, 1000 + length)))
+        engine.prefill(list(range(2000, 2000 + length)))
+        self.assertEqual(engine.last_matched, 0)
+        self.assertEqual(engine.seq.num_tokens, length)
+        self.assertGreater(engine.radix.num_evicted_blocks, 0)
+        engine.release()
+        engine.radix.clear()
+        self.assertEqual(engine.pool.num_free, NUM_BLOCKS)
+
     def test_insert_then_match_single_stream(self) -> None:
         """``mm`` 到达模型才是图像嵌入真正注入的时刻；缺了它，一次缓存命中会静默地把图丢掉。"""
 

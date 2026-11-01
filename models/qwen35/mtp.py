@@ -34,6 +34,7 @@ from backends import device as _device
 from models.qwen35.batch import batch_proj
 from models.qwen35.blocks import MLP
 from models.qwen35.full_attn import FullAttn
+from models.qwen35.parallel import row_projection
 from models.qwen35.tuning import PREFILL_ATTN_TILE, PREFILL_MTP_CHUNK
 from ops import runtime
 from ops.dtypes import D
@@ -68,7 +69,7 @@ class MTP:
         self.embed = TiedEmbedding(sd["model.language_model.embed_tokens.weight"], bench)
         self.pre_norm_emb = RMSNorm(sd[f"{p}.pre_fc_norm_embedding.weight"])
         self.pre_norm_hid = RMSNorm(sd[f"{p}.pre_fc_norm_hidden.weight"])
-        self.fc = _proj(sd, [f"{p}.fc"], bench)
+        self.fc = row_projection(_proj(sd, [f"{p}.fc"], bench))
         self.in_ln = RMSNorm(sd[f"{p}.layers.0.input_layernorm.weight"])
         self.attn = FullAttn(sd, f"{p}.layers.0.self_attn", cfg, bench, max_seq)
         self.post_ln = RMSNorm(sd[f"{p}.layers.0.post_attention_layernorm.weight"])

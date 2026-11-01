@@ -136,6 +136,10 @@ class RuntimeLifecycleMixin:
 
         # 每个引擎模块按依赖先后 reload：顺序反了会让旧类绑到新张量上。
         engine_api.reload()
+        if int(os.environ.get("WORLD_SIZE", "1")) > 1:
+            from models.qwen35.parallel import configure
+
+            configure(int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"]))
         self.processor = None    # transformers 的类重新导入过：惰性重建
         self._processor_failed = None
         self.n_reload += 1
@@ -486,11 +490,29 @@ class RuntimeChatMixin:
         try:
             from transformers import AutoProcessor
 
-            self.processor = AutoProcessor.from_pretrained(self.model_dir)
+            processor = AutoProcessor.from_pretrained(self.model_dir)
+            if getattr(processor, "image_processor", None) is None:
+                # 旧版 AutoProcessor 不认识 Qwen3VLProcessor 时会返回 tokenizer；
+                # 静态图片沿用 checkpoint 声明的 Qwen2VL 图像算法，不改权重或模板。
+                config_path = Path(self.model_dir) / "preprocessor_config.json"
+                config = json.loads(config_path.read_text(encoding="utf-8"))
+                if (config.get("processor_class") != "Qwen3VLProcessor"
+                        or config.get("image_processor_type") != "Qwen2VLImageProcessorFast"):
+                    raise ValueError("AutoProcessor returned an object without an image processor")
+                from transformers import AutoImageProcessor, Qwen2VLProcessor
+
+                image_processor = AutoImageProcessor.from_pretrained(
+                    self.model_dir, use_fast=True,
+                    min_pixels=self.image_min_pixels, max_pixels=self.image_max_pixels)
+                processor = Qwen2VLProcessor(image_processor=image_processor,
+                                            tokenizer=self.tok)
+            if getattr(processor, "image_processor", None) is None:
+                raise ValueError("loaded processor has no image processor")
         except Exception as exc:  # noqa: BLE001 - reported as a 503, not a crash
             self._processor_failed = f"{type(exc).__name__}: {exc}"
             raise MMError(f"could not load the image processor: "
                           f"{self._processor_failed}", 503) from None
+        self.processor = processor
         print(f"[serve] image processor ready: {type(self.processor).__name__} "
               f"({type(self.processor.image_processor).__name__})", flush=True)
         return self.processor

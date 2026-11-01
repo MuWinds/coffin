@@ -25,6 +25,61 @@ import backends
 from .runtime_service import Server
 from .runtime_support import MMError
 
+_TP_LOCK = threading.Lock()
+
+
+def _init_tensor_parallel():
+    """在多进程服务启动时建立 Gloo 组并绑定模型分片。
+
+    Returns:
+        ``(rank, world_size, dist)``；单进程服务返回 ``None``。
+    """
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    if world <= 1:
+        return None
+    rank = int(os.environ["RANK"])
+    import torch.distributed as dist
+
+    dist.init_process_group("gloo", init_method="env://", rank=rank,
+                           world_size=world)
+    from models.qwen35.parallel import configure
+
+    configure(rank, world)
+    return rank, world, dist
+
+
+def _run_request(srv_model: "Server", req: dict):
+    """在所有 rank 上按同序执行请求，只有 rank 0 使用返回值。
+
+    Gloo 的请求广播与模型归约共享同一个进程组；锁覆盖整次生成，防止 HTTP
+    线程并发改变 collective 顺序。
+    """
+    if req.get("op") == "chat_stream":
+        yield from srv_model.stream_chat(req)
+        return
+    result = srv_model.handle(req)
+    yield result
+
+
+def _tp_worker(srv_model: "Server", dist) -> None:
+    """等待 rank 0 广播请求，并在本地推进同一份服务状态。"""
+    srv_model.start()
+    while True:
+        payload = [None]
+        dist.broadcast_object_list(payload, src=0)
+        req = payload[0]
+        try:
+            result = None
+            for result in _run_request(srv_model, req):
+                pass
+            if isinstance(result, dict) and result.get("stopping"):
+                srv_model.stop()
+                break
+        except Exception:
+            srv_model.stop()
+            raise
+    dist.destroy_process_group()
+
 def serve(model_dir: str, max_seq: int, bench: bool, sock_path: str,
           spec_k: int = 0, int8: bool = True, prefix_cache: bool = True,
           block_size: int = 64, snapshots: int = 8, snapshot_interval: int = 512,
@@ -70,6 +125,7 @@ def serve(model_dir: str, max_seq: int, bench: bool, sock_path: str,
         prefill_quantum: 一个请求每步最多预填充多少 prompt token。调度器用它把长
             prompt 和短 prompt 交错开；0 表示退回该步的全部 token 预算。
     """
+    tp = _init_tensor_parallel()
     srv_model = Server(model_dir, max_seq, bench, spec_k, int8, prefix_cache, block_size,
                        snapshots, snapshot_interval, max_seconds, max_num_seqs,
                        num_blocks, spec_batch, spec_sparse_k, spec_min_ctx,
@@ -96,6 +152,9 @@ def serve(model_dir: str, max_seq: int, bench: bool, sock_path: str,
           f"  vision={'off' if not srv_model.vision else ('int8' if srv_model.vision_int8 else 'fp16')}"
           f" (max {srv_model.image_max_pixels} px, {srv_model.max_images} imgs)",
           flush=True)
+    if tp is not None and tp[0] != 0:
+        _tp_worker(srv_model, tp[2])
+        return
     if os.path.exists(sock_path):
         os.unlink(sock_path)
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -121,6 +180,8 @@ def serve(model_dir: str, max_seq: int, bench: bool, sock_path: str,
     srv.close()
     if os.path.exists(sock_path):
         os.unlink(sock_path)
+    if tp is not None:
+        tp[2].destroy_process_group()
 
 
 def _serve_connection(srv_model: "Server", conn: socket.socket) -> None:
@@ -143,14 +204,30 @@ def _serve_connection(srv_model: "Server", conn: socket.socket) -> None:
             buf += chunk
         req = json.loads(buf.decode() or "{}")
         t0 = time.time()
+        tp = int(os.environ.get("WORLD_SIZE", "1")) > 1
         if req.get("op") == "chat_stream":
             # 每个 token 一行回复，客户端才能把它们当作 SSE 转发出去。
-            for line in srv_model.stream_chat(req):
-                conn.sendall((json.dumps(line, ensure_ascii=False) + "\n").encode())
+            if tp:
+                with _TP_LOCK:
+                    import torch.distributed as dist
+
+                    dist.broadcast_object_list([req], src=0)
+                    for line in srv_model.stream_chat(req):
+                        conn.sendall((json.dumps(line, ensure_ascii=False) + "\n").encode())
+            else:
+                for line in srv_model.stream_chat(req):
+                    conn.sendall((json.dumps(line, ensure_ascii=False) + "\n").encode())
             print(f"[serve] chat_stream -> {round((time.time() - t0) * 1000, 1)}ms",
                   flush=True)
             return
-        rep = srv_model.handle(req)
+        if tp:
+            with _TP_LOCK:
+                import torch.distributed as dist
+
+                dist.broadcast_object_list([req], src=0)
+                rep = srv_model.handle(req)
+        else:
+            rep = srv_model.handle(req)
         rep["wall_ms"] = round((time.time() - t0) * 1000, 1)
         conn.sendall((json.dumps(rep, ensure_ascii=False) + "\n").encode())
         print(f"[serve] {req.get('op')} -> {rep.get('wall_ms')}ms", flush=True)

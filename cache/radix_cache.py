@@ -20,7 +20,7 @@ Constraints:
     * 块键带着该块的媒体签名（见下面的*媒体加盐*），而没有媒体信息时插入的边只
       允许被证明无图的数据块复用。这一步做错，就是把一张图的 KV 交给另一张图。
     * 不加锁。``llm_engine`` 的步进循环是唯一的写者，它轮流驱动两个调用方；
-      ``refcount`` 数的是活着的序列数，不是块数。
+      分页池的 ``refcount`` 统一记录树与活序列持有的引用。
 
 混合模型：
 Qwen3.5 把 8 层*全注意力*（分页 KV，可共享）和 24 层*线性注意力*交错排布，后者的
@@ -169,7 +169,7 @@ class RadixNode:
     ``sigs``）。拆分一条边会保持这种平行结构。
     """
 
-    __slots__ = ("parent", "children", "key", "blocks", "refcount",
+    __slots__ = ("parent", "children", "key", "blocks",
                  "last_access", "block_states", "sigs")
 
     def __init__(self, parent: Optional["RadixNode"] = None, key: tuple = (),
@@ -187,8 +187,6 @@ class RadixNode:
         #: 沿这条边的 token id；满足 ``len(key) == len(blocks) * bs``。
         self.key: tuple = tuple(key)
         self.blocks: list[int] = list(blocks or [])
-        #: 停在这个节点上的活序列数；这是阻止一条边被淘汰的唯一东西。
-        self.refcount = 0
         self.last_access = time.time()
         self.block_states: list[Optional[LinearStates]] = [None] * len(self.blocks)
         #: 每块的媒体签名。``None`` 表示这条边里没有图像 token，子键就是普通的
@@ -304,7 +302,6 @@ class RadixCache:
                 # 部分命中的边：前缀在这条边内部就分叉了，它下面不可能再匹配，
                 # 遍历到此结束。
                 break
-            child.refcount += 1
             child.last_access = now
             node = child
 
@@ -538,7 +535,6 @@ class RadixCache:
         bs = self.bs
         mid = RadixNode(parent=child.parent, key=child.key[:nb * bs],
                         blocks=child.blocks[:nb])
-        mid.refcount = child.refcount
         mid.last_access = child.last_access
         mid.block_states = child.block_states[:nb]
         mid.sigs = child.sigs[:nb] if child.sigs is not None else None
@@ -583,10 +579,9 @@ class RadixCache:
     def _evictable_leaf(self) -> Optional[RadixNode]:
         """最久没被访问、且块没有任何其他持有者的叶子。
 
-        叶子只有同时满足两个条件才可回收：没有序列停靠在它上面
-        （``refcount == 0``），并且池里没有别的引用（``cache.refcount[b] == 1``，
-        也就是只剩树自己那份）。淘汰一个仍被序列共享的块会破坏那条序列的 KV，所以
-        这类叶子即使是叶子也会被跳过。
+        只有每个块都仅剩树自己的引用（``cache.refcount[b] == 1``）才可回收。
+        调用方按块释放匹配结果，不持有节点句柄；再维护节点计数会让释放后的
+        前缀永久不可淘汰，尤其是匹配回退到状态快照或节点被拆分之后。
 
         Returns:
             淘汰候选；整棵树都被钉住时返回 ``None``。
@@ -596,7 +591,7 @@ class RadixCache:
         while stack:
             n = stack.pop()
             for c in n.children.values():
-                if (c.is_leaf and c.refcount == 0
+                if (c.is_leaf
                         and all(self.cache.refcount[b] == 1 for b in c.blocks)):
                     if c.last_access < best_t:
                         best, best_t = c, c.last_access

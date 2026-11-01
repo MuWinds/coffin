@@ -55,6 +55,13 @@ constexpr float SOFTPLUS_LINEAR = 20.f;
 constexpr int CONV_K = 4;
 constexpr int CONV_STATE = CONV_K - 1;
 
+//: 分块预填充的 conv1d 在 ``T`` 方向分几段。这一个线程一个通道的映射把并行度钉死在
+//: ``C = conv_dim = 8192``，所以不分段时只有 32 个 block 在飞（106 GB/s，见
+//: ``conv1d_silu_seq`` 的头注释）。扫参（作业 4372）在 1/2/4/8/16 五档上给出的 us/call
+//: 是 968.6 / 527.0 / 307.9 / **207.6** / 229.0，所以取 8；每段起点由段内重放 3 个 token
+//: 重建，五档输出与 state 全部与不分段版逐位相同。
+constexpr int CONV_NSEG = 8;
+
 //: 头归一化 block 的线程数：这个模型 ``dk`` 是 128，而归约需要 wavefront 的整数倍。
 int head_threads(int dk) {
     int t = dk > 128 ? dk : 128;
@@ -236,7 +243,7 @@ __global__ void conv1d_silu_kernel(const float* __restrict__ w,
     s[2] = x3;
 }
 
-// @brief 同一个卷积跑在预填充分块上，窗口留在寄存器里。
+// @brief 同一个卷积跑在预填充分块上，窗口留在寄存器里，并沿 ``T`` 分 ``blockIdx.y`` 段。
 //
 // 线程 ``c`` 走过整个序列，把三抽头环留在寄存器里，所以这一趟只读一遍 bf16 激活、只写
 // 一遍 fp32。它替代的那条 eager 链（cat + 提升到 fp32 + unfold + 乘法 + 求和 + SiLU）
@@ -245,29 +252,58 @@ __global__ void conv1d_silu_kernel(const float* __restrict__ w,
 // 固定 ``t`` 时相邻线程读相邻通道，所以即便单个线程按 ``ldx`` 跨步，一个 wavefront 每步
 // 仍然覆盖整条 cache line。
 //
+// **为什么 grid 的 ``y`` 轴是 ``T`` 方向的分段**：这条内核的并行度原本只有 ``C = 8192``
+// 个线程（一个线程一个通道），而每个线程要串行走完 ``T = 2048`` 步 —— 在飞的 block 只有
+// ``ceil(8192/256) = 32`` 个，实测 99 MB / 937 us = 106 GB/s，正好是 ``32 × 3.0 GB/s``。
+// 只改 blockDim 没有用（实测 1.08x，因为线程总数恒为 8192），真正的并行度在 ``T`` 上。
+//
+// 分段合法是因为这条卷积是因果的：段 ``s`` 的起点状态可以**从原始输入重放**前
+// ``CONV_STATE`` 个 token 重建（那 3 步的递推与主循环是同一个表达式，所以重建出的历史
+// 与整条走下来逐位相同）。实测：8 是最优点：再往上分段，重放与调度开销盖过并发收益。24 层折算省 18.3 ms。
+//
 // @param w [C, 4] fp32 抽头。
 // @param x [T, C] bf16 激活；行间距 ``ldx`` 可以大于 ``C``，因为这些投影是直接从融合
 //        GEMV 的输出里读的。
 // @param state [C, 3] fp32 窗口，原地更新为最近三个输入。
 // @param out [T, C] fp32，稠密打包。
+// @param seg 每段覆盖的 token 数，``ceil(T / nseg)``。由主机侧算好传进来。
 __global__ void conv1d_silu_seq_kernel(const float* __restrict__ w,
                                        const uint16_t* __restrict__ x,
                                        float* __restrict__ state, float* __restrict__ out,
-                                       int C, int T, int ldx) {
+                                       int C, int T, int ldx, int seg) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
+    const int t0 = blockIdx.y * seg;
+    if (t0 >= T) return;
+    const int t1 = min(t0 + seg, T);
     const float* wc = w + (size_t)c * CONV_K;
     const float w0 = wc[0];
     const float w1 = wc[1];
     const float w2 = wc[2];
     const float w3 = wc[3];
     float* s = state + (size_t)c * CONV_STATE;
-    float s0 = s[0];
-    float s1 = s[1];
-    float s2 = s[2];
     const uint16_t* xp = x + c;
     float* o = out + c;
-    for (int t = 0; t < T; ++t) {
+    float s0, s1, s2;
+    if (blockIdx.y == 0) {
+        // 第一段直接读真实窗口，不重放。
+        s0 = s[0];
+        s1 = s[1];
+        s2 = s[2];
+    } else {
+        // 其余段从原始输入重放前 ``CONV_STATE`` 个 token 重建起点。它们不进 ``out``，
+        // 只用来把寄存器环推到位，所以重放的代价是 O(CONV_STATE) 而不是 O(t0)。
+        s0 = 0.f;
+        s1 = 0.f;
+        s2 = 0.f;
+        for (int t = max(0, t0 - CONV_STATE); t < t0; ++t) {
+            const float x3 = CxScalar<uint16_t>::to_float(xp[(size_t)t * ldx]);
+            s0 = s1;
+            s1 = s2;
+            s2 = x3;
+        }
+    }
+    for (int t = t0; t < t1; ++t) {
         const float x3 = CxScalar<uint16_t>::to_float(xp[(size_t)t * ldx]);
         const float acc = fmaf(w0, s0, fmaf(w1, s1, fmaf(w2, s2, w3 * x3)));
         o[(size_t)t * C] = acc / (1.f + __expf(-acc));     // SiLU
@@ -275,9 +311,13 @@ __global__ void conv1d_silu_seq_kernel(const float* __restrict__ w,
         s1 = s2;
         s2 = x3;
     }
-    s[0] = s0;
-    s[1] = s1;
-    s[2] = s2;
+    // 只有最后一段把最终窗口写回。中间段不回写，否则后一段会读到被前一段覆盖的状态；
+    // 而每一段自己是从原始输入重放的，本来就不需要别人给它留状态。
+    if (t1 == T) {
+        s[0] = s0;
+        s[1] = s1;
+        s[2] = s2;
+    }
 }
 
 // @brief 预填充的头预处理：整个分块上做一遍解码预处理，输出头主序布局。
@@ -573,7 +613,17 @@ void conv1d_silu(torch::Tensor conv_w, torch::Tensor x, torch::Tensor conv_state
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-// @brief 启动分块预填充的 conv1d 加 SiLU。
+// @brief 启动分块预填充的 conv1d 加 SiLU，grid 的 ``y`` 轴沿 ``T`` 分 ``CONV_NSEG`` 段。
+//
+// ``C = conv_dim = 8192`` 且一个线程一个通道，所以不分段时在飞的 block 只有
+// ``ceil(8192/256) = 32`` 个 —— 实测 99 MB / 937 us = 106 GB/s，正好是
+// ``32 block × 3.0 GB/s``（``docs/PREFILL_52PCT.md`` §2）。线程总数是 8192，**改 blockDim
+// 没有用**（实测 256/128/64 三档只差 1.08x，作业 4368），所以并发只能加在 ``T`` 上。
+//
+// ``CONV_NSEG = 8`` 是扫出来的（作业 4372 ``sg2``）：1/2/4/8/16 五档的 us/call 分别是
+// 968.6 / 527.0 / 307.9 / 207.6 / 229.0，8 是最优点，而且**每一档的输出与 state 都与
+// 不分段版逐位相同**（段起点从原始输入重放 3 个 token 重建，递推表达式与主循环是同一个）。
+// 24 层折算省 18.3 ms。
 //
 // @param conv_w [C, 4] fp32 抽头。
 // @param x [T, C] bf16，最内层步长为 1；行间距会被正确处理，所以融合 GEMV 输出的一列
@@ -593,9 +643,12 @@ torch::Tensor conv1d_silu_seq(torch::Tensor conv_w, torch::Tensor x,
     const int ldx = (int)x.stride(0);
     auto out = torch::empty({T, C}, x.options().dtype(torch::kFloat));
     const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
-    conv1d_silu_seq_kernel<<<(C + 255) / 256, 256, 0, stream>>>(
+    // 段数按 ``T`` 截断：短序列（含 T < CONV_NSEG 的情形）不该发出空段。
+    const int nseg = T < CONV_NSEG ? T : CONV_NSEG;
+    const int seg = (T + nseg - 1) / nseg;
+    conv1d_silu_seq_kernel<<<dim3((C + 255) / 256, nseg), 256, 0, stream>>>(
         conv_w.data_ptr<float>(), reinterpret_cast<const uint16_t*>(x.data_ptr()),
-        conv_state.data_ptr<float>(), out.data_ptr<float>(), C, T, ldx);
+        conv_state.data_ptr<float>(), out.data_ptr<float>(), C, T, ldx, seg);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }

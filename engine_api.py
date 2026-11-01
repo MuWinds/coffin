@@ -435,6 +435,7 @@ _RELOAD_ORDER = (
     "ops",
     "models.qwen35.tuning", "models.qwen35.weights", "models.qwen35.batch",
     "models.qwen35.vision",
+    "models.qwen35.parallel",
     "models.qwen35.linear_attn",
     "models.qwen35.full_attn", "models.qwen35.blocks", "models.qwen35.mtp",
     "models.qwen35.model", "models.qwen35", "models",

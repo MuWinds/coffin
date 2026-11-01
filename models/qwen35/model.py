@@ -106,6 +106,11 @@ class Qwen35:
         model_dir = Path(model_dir)
         self.raw_cfg = json.loads((model_dir / "config.json").read_text())
         self.cfg = self.raw_cfg["text_config"]
+        from models.qwen35.parallel import context, local_config
+
+        self.parallel = context()
+        if self.parallel is not None:
+            self.cfg = local_config(self.cfg, self.parallel.world_size)
         self.max_seq = max_seq
         #: 本实例是否拥有该 state dict、可以在消费张量的同时释放它们。自己加载时是；
         #: 调用方提供的字典保持完整，同一批张量才能在重载时重建模型。

@@ -91,6 +91,16 @@ torch::Tensor gemv_kn_i8(torch::Tensor wt, torch::Tensor x, torch::Tensor scale,
 torch::Tensor gemv_kn_i8_m(torch::Tensor wt, torch::Tensor x, torch::Tensor scale,
                             int64_t threads, int64_t unroll);
 
+torch::Tensor gemv_kn_w4(torch::Tensor packed, torch::Tensor scale, torch::Tensor x,
+                         int64_t k, int64_t group_size);
+
+// @brief 分组 W4 与 int8 激活的整数投影，返回调用方提供的浮点输出。
+torch::Tensor w4a8_gemv(torch::Tensor a, torch::Tensor w, torch::Tensor xs,
+                        torch::Tensor ws, torch::Tensor out, int64_t group_size);
+torch::Tensor w4a8_gemm_tcu(torch::Tensor a, torch::Tensor w, torch::Tensor xs,
+                            torch::Tensor ws, torch::Tensor out, int64_t group_size);
+torch::Tensor quant_act_i8_scaled(torch::Tensor x, torch::Tensor out, torch::Tensor xs);
+
 // 归一化。
 
 // @brief 带行间距的 ``[M, N]`` 最后一轴零中心 RMSNorm。

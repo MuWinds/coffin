@@ -1245,6 +1245,62 @@ torch::Tensor gemv_kn_i8_m(torch::Tensor wt, torch::Tensor x, torch::Tensor scal
     return launch_i8_m<float, 8>(wt, x, y, M, scale, N, K, th, sp);
 }
 
+template <typename XT>
+__global__ void gemv_kn_w4_kernel(const uint8_t* __restrict__ packed,
+                                  const float* __restrict__ scale,
+                                  const XT* __restrict__ x, XT* __restrict__ y,
+                                  int K, int N, int group_size) {
+    const int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= N) return;
+    float acc = 0.f;
+    for (int k = 0; k < K; ++k) {
+        const uint8_t byte = packed[(size_t)(k >> 1) * N + n];
+        const int q = (int)((k & 1) ? (byte >> 4) : (byte & 0x0f)) - 8;
+        const float w = (float)q * scale[(size_t)(k / group_size) * N + n];
+        acc += w * CxScalar<XT>::to_float(x[k]);
+    }
+    y[n] = CxScalar<XT>::from_float(acc);
+}
+
+torch::Tensor gemv_kn_w4(torch::Tensor packed, torch::Tensor scale, torch::Tensor x,
+                         int64_t k, int64_t group_size) {
+    TORCH_CHECK(packed.dim() == 2 && packed.scalar_type() == torch::kByte,
+                "packed weight must be 2-D uint8 [ceil(K/2), N]");
+    TORCH_CHECK(scale.dim() == 2 && scale.scalar_type() == torch::kFloat,
+                "scale must be 2-D fp32 [groups, N]");
+    TORCH_CHECK(x.dim() == 1, "activation must be 1-D [K]");
+    TORCH_CHECK(packed.is_contiguous() && scale.is_contiguous() && x.is_contiguous(),
+                "contiguous inputs required");
+    TORCH_CHECK(packed.device() == scale.device() && packed.device() == x.device(),
+                "packed weight, scale, and activation must share a device");
+    TORCH_CHECK(k > 0 && group_size > 0 && x.numel() == k,
+                "invalid K, group_size, or activation length");
+    const int N = (int)packed.size(1);
+    const int groups = (int)((k + group_size - 1) / group_size);
+    TORCH_CHECK(packed.size(0) * 2 >= k && scale.size(0) == groups
+                    && scale.size(1) == N,
+                "packed or scale shape does not match K/group_size/N");
+    const bool x16 = x.scalar_type() == torch::kBFloat16;
+    TORCH_CHECK(x16 || x.scalar_type() == torch::kFloat,
+                "activation must be bf16 or fp32");
+    auto y = torch::empty({N}, x.options());
+    const int threads = pick_threads(N);
+    const int blocks = (N + threads - 1) / threads;
+    auto stream = c10::cuda::getCurrentCUDAStream();
+    if (x16) {
+        gemv_kn_w4_kernel<uint16_t><<<blocks, threads, 0, stream>>>(
+            packed.data_ptr<uint8_t>(), scale.data_ptr<float>(),
+            reinterpret_cast<const uint16_t*>(x.data_ptr()),
+            reinterpret_cast<uint16_t*>(y.data_ptr()), (int)k, N, (int)group_size);
+    } else {
+        gemv_kn_w4_kernel<float><<<blocks, threads, 0, stream>>>(
+            packed.data_ptr<uint8_t>(), scale.data_ptr<float>(), x.data_ptr<float>(),
+            y.data_ptr<float>(), (int)k, N, (int)group_size);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return y;
+}
+
 // @brief 小 M 投影：``M`` 行激活只把权重读一遍。
 //
 // ``M`` 为 2/4/8 时走宽度被编译进去的内核；其它 ``M`` 一次服务一行，那是正确的，只在契约

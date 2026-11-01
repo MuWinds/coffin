@@ -33,6 +33,7 @@ import torch
 from backends import device as _device
 from backends import ops as bops
 from models.qwen35.batch import batch_proj
+from models.qwen35.parallel import row_projection
 from models.qwen35.tuning import CKPT
 from ops.delta import chunked_delta
 from ops.dtypes import D
@@ -70,7 +71,7 @@ class LinearAttn:
 
         self.qkvzb_a = _proj(sd, [f"{p}.in_proj_qkv", f"{p}.in_proj_z",
                                   f"{p}.in_proj_b", f"{p}.in_proj_a"], bench)
-        self.out_proj = _proj(sd, [f"{p}.out_proj"], bench)
+        self.out_proj = row_projection(_proj(sd, [f"{p}.out_proj"], bench))
         self.norm = RMSNormGated(sd[f"{p}.norm.weight"])
         # 卷积核到达时是 [conv_dim, 1, 4]；最后一维保持在最后，融合算子才能把四个
         # 抽头当作一段连续的 stride-1 数据读。

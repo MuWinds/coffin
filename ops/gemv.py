@@ -31,6 +31,7 @@ import torch
 
 from backends import ops as bops
 from int8_weights import QWeight
+from w4a8_weights import W4A8Weight
 
 
 class GEMV:
@@ -54,7 +55,9 @@ class GEMV:
                 纯粹是签名改动。
         """
         self.q = w if isinstance(w, QWeight) else None
-        self.N, self.K = (self.q.n, self.q.k) if self.q is not None else w.shape
+        self.q4 = w if isinstance(w, W4A8Weight) else None
+        quant = self.q if self.q is not None else self.q4
+        self.N, self.K = (quant.n, quant.k) if quant is not None else w.shape
         #: 权重，按算子表接受的形式给：普通张量，或者带着 packed 缓冲区和 scale 的
         #: ``QWeight``。算子表按类型分派，所以这里是两种存储形式重新合一的地方，
         #: 调用点永远看不出差别。
@@ -133,7 +136,14 @@ class GEMVGroup:
                 K；拼接会用形状错误拦住不合规的组合。
             bench: 透传给 :class:`GEMV`。
         """
-        if isinstance(ws[0], QWeight):
+        if isinstance(ws[0], W4A8Weight):
+            if not all(isinstance(w, W4A8Weight) for w in ws):
+                raise ValueError("fused projections must use the same weight format")
+            self.sizes = [w.n for w in ws]
+            fused = W4A8Weight.cat_output(ws)
+        elif isinstance(ws[0], QWeight):
+            if not all(isinstance(w, QWeight) for w in ws):
+                raise ValueError("fused projections must use the same weight format")
             self.sizes = [w.n for w in ws]
             k = ws[0].k
             total = sum(self.sizes)

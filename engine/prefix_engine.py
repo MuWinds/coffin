@@ -121,16 +121,15 @@ class PrefixCacheEngine:
             raise ValueError("empty prompt")
         model, pool, bm = self.model, self.pool, self.bm
         bs = pool.bs
-        # 先淘汰再分配：请求一旦握住了块，淘汰本该回收的叶子恰好就是它马上要
-        # 占用的那些。
-        bm.reserve((len(tokens) + bs - 1) // bs + 1)
-
         blocks, matched, states = bm.match_prefix(tokens[:-1], require_states=True,
                                                   mm=mm)
         if self.seq is not None:
             self.seq.free()
         seq = SeqKV(pool, blocks, matched)
         self.seq = seq
+        # 先接住匹配前缀，再释放旧请求，最后只为未命中部分腾空间。旧请求仍持有
+        # 块时淘汰会失败，而按完整 prompt 淘汰还会提前丢掉本可复用的前缀。
+        bm.reserve((len(tokens) + bs - 1) // bs - len(blocks) + 1)
         bm.assign(blocks, 0)
         if states is not None:
             model.restore_linear_states(states)

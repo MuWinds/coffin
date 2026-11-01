@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import functools
 import os
+from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -47,6 +48,7 @@ from backends import reference
 from backends.corex import kernels, pack
 from backends.protocol import Backend, Caps, Ops, OpFn, make_device
 from int8_weights import QWeight
+from w4a8_weights import W4A8Weight
 
 #: 后端标识符，即 ``COFFIN_BACKEND=corex`` 选中的名字。
 NAME = "corex"
@@ -308,6 +310,8 @@ def linear(w: torch.Tensor | QWeight | pack.KnWeight, x: torch.Tensor) -> torch.
         RuntimeError: 扩展不可用且直接走到了这个入口；经 :func:`ops` 走的话由参考
             实现应答。
     """
+    if isinstance(w, W4A8Weight):
+        return _w4_rows(w, x)
     if x.dim() != 1:
         return _gemv_rows(w, x)
     packed = pack.as_kn(w)
@@ -334,6 +338,8 @@ def linear_m(w: torch.Tensor | QWeight | pack.KnWeight, x: torch.Tensor) -> torc
     Raises:
         RuntimeError: 扩展不可用。
     """
+    if isinstance(w, W4A8Weight):
+        return _w4_rows(w, x)
     if x.shape[0] > _ROW_CHUNK:
         return linear_prefill(w, x)
     return _gemv_rows(w, x)
@@ -390,6 +396,33 @@ def _gemv_rows(w: torch.Tensor | QWeight | pack.KnWeight,
         else:
             out[start:stop] = module.gemv_kn_m(packed.wt, chunk.contiguous())
     return _restore(out, dtype)
+
+
+def _w4_rows(w: W4A8Weight, x: torch.Tensor,
+             activation_scale: torch.Tensor | None = None) -> torch.Tensor:
+    """量化激活到 int8，再以逐组 int32 累加消费 packed W4 权重。"""
+    module = _kernels()
+    dtype = x.dtype
+    if x.dim() not in (1, 2) or x.shape[-1] != w.k:
+        raise ValueError("W4 projection expects [K] or [M, K] activations")
+    if x.device != w.packed.device:
+        raise ValueError("W4 weight and activation must share a device")
+    act = _compute_dtype(x).reshape(-1, w.k).contiguous()
+    xq = torch.empty(act.shape, dtype=torch.int8, device=act.device)
+    xs = (torch.empty(act.shape[0], dtype=torch.float32, device=act.device)
+          if activation_scale is None else activation_scale)
+    out = torch.empty((act.shape[0], w.n), dtype=act.dtype, device=act.device)
+    if act.shape[0]:
+        with torch.cuda.device(act.device) if act.is_cuda else nullcontext():
+            if activation_scale is None:
+                module.quant_act_i8(act, xq, xs)
+            else:
+                module.quant_act_i8_scaled(act, xq, xs)
+            if act.shape[0] >= 32 and w.k % 4 == 0 and w.group_size % 64 == 0:
+                module.w4a8_gemm_tcu(xq, w.packed, xs, w.scale, out, w.group_size)
+            else:
+                module.w4a8_gemv(xq, w.packed, xs, w.scale, out, w.group_size)
+    return _restore(out[0] if x.dim() == 1 else out, dtype)
 
 
 def _w8a8_rows(packed: pack.KnQWeight, act: torch.Tensor) -> torch.Tensor:
@@ -470,6 +503,8 @@ def linear_prefill(w: torch.Tensor | QWeight | pack.KnWeight,
     Raises:
         RuntimeError: 扩展不可用，而宽 ``N`` 形状需要它。
     """
+    if isinstance(w, W4A8Weight):
+        return _w4_rows(w, x)
     packed = pack.as_kn(w)
     rows = x.shape[0]
     if rows < _PREFILL_MIN_M:
@@ -1226,6 +1261,18 @@ def triangular_solve(lower: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
         # 本主机没有工具链：纯 torch 替换仍然给出答案，让结构性调用或参考实现路径的
         # 调用方照常工作。
         return _solve_blocked(lower, rhs)
+    # 两个操作数都必须做成连续的，而 ``rhs`` 这一条是在真卡上被否掉之后才确认的。
+    #
+    # ``solve.cu`` 的文件头确实写着它「支持批步长 0，也就是 ``eye.expand`` 直接可用」，
+    # 而 ``solve_kernel`` 里的 ``rhs_b = rhs + b * ldr`` 也确实是按 ``ldr`` 读的 ——
+    # 但**同一个 ``ldr`` 也被用来定位输出**：``out_b = out + b * ldr``，而 ``out`` 是
+    # 内核自己 ``torch::empty`` 出来的连续张量。于是 ``rhs`` 是 ``expand`` 时 ``ldr == 0``，
+    # 全部 ``bn`` 个批条目都写进第 0 个 —— 其余部分是未初始化的显存。
+    #
+    # 实测后果（作业 4363）：贪心 ids 从 ``[6, 24218, 10, 4838, 1665, 15]`` 变成
+    # ``[2, 18, 22, 22, 22, 22]``，且两轮之间还在变（读到的垃圾每次都不同）。
+    # 所以「省掉一次实体化」这句话在契约上是对的、在实现上是错的：要省这 16.78 MB，
+    # 得给 ``rhs`` 和 ``out`` 各传一个批步长，那是改内核，不是改这一行。
     return module.triangular_solve(lower.contiguous(), rhs.contiguous())
 
 

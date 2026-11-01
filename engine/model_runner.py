@@ -777,6 +777,9 @@ class ModelRunner:
     def sample(logits: torch.Tensor, temperature: float) -> int:
         """从 ``logits`` 里挑一个 token。
 
+        Gloo 张量并行下随机采样由 rank 0 定稿并广播；各 rank 的 logits 有舍入差异时，
+        独立抽样会让 KV 状态从下一个 token 起永久分叉。贪心路径结果确定，不通信。
+
         Args:
             logits: ``[vocab]`` 的 logits，可能是 bf16。
             temperature: 取 ``0`` 时选 argmax；采样路径会先升到 fp32，因为 bf16
@@ -787,5 +790,12 @@ class ModelRunner:
         """
         if temperature > 0:
             p = torch.softmax(logits.float() / temperature, dim=-1)
-            return int(torch.multinomial(p, 1))
+            token = int(torch.multinomial(p, 1))
+            dist = torch.distributed
+            if dist.is_initialized() and dist.get_backend() == "gloo":
+                agreed = torch.tensor([token if dist.get_rank() == 0 else 0],
+                                      dtype=torch.int64)
+                dist.broadcast(agreed, src=0)
+                token = int(agreed[0])
+            return token
         return int(logits.argmax())
