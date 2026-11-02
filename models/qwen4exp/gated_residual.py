@@ -5,8 +5,8 @@ Qwen4-Exp 的主干宽度是 ``hc_count * hidden_size``，每一层没有 pre-no
 一个 block 的输出被复制到 4 路残差流上、每路乘一个自己的标量门，所以写门输出是
 ``[B, S, hc_count]`` 而不是逐通道的。
 
-Module: ``coffin/models/qwen4exp``。依赖同族的 ``norm``；被 ``blocks`` 和
-``model`` 调用。
+Module: ``coffin/models/qwen4exp``。依赖同族的 ``norm`` 与 ``proj``；被 ``blocks``
+和 ``model`` 调用。
 
 Constraints:
     * 读门最后是 ``.mean(dim=-2)`` 不是 ``sum``。用 sum 会让读门输入的尺度随
@@ -25,6 +25,7 @@ from torch import nn
 
 from models.qwen4exp.config import TextConfig
 from models.qwen4exp.norm import RMSNorm
+from models.qwen4exp.proj import Proj
 
 
 class GatedResidual(nn.Module):
@@ -55,12 +56,16 @@ class GatedResidual(nn.Module):
         hc_hidden_size = self.hc_count * self.hidden_size
         self.hc_norm = RMSNorm(hc_hidden_size, group_size=self.hidden_size,
                                eps=config.rms_norm_eps)
-        self.input_mix_weight_down = nn.Linear(hc_hidden_size, config.hc_lowrank, bias=False)
-        self.input_mix_weight_up = nn.Linear(config.hc_lowrank, hc_hidden_size, bias=False)
+        self.input_mix_weight_down = Proj(hc_hidden_size, config.hc_lowrank)
+        self.input_mix_weight_up = Proj(config.hc_lowrank, hc_hidden_size)
         # 只有层内的两套需要写门：它们要把 block 输出写回 4 路残差流。末端
         # mixer 只做塌缩，多一个写门就是多一份永远不用的参数。
+        #
+        # 写门只有 hc_count = 4 行，是整步里最窄的一档（4 x 10240）：行主序下实测
+        # 1.792 ms，换 ``[K, N]`` 后 0.134 ms（作业 4489）。48 层乘两套就是 96 个，
+        # 它们和宽投影走同一条路。
         self.block_inject_weight = (
-            nn.Linear(hc_hidden_size, self.hc_count, bias=False) if use_combine else None)
+            Proj(hc_hidden_size, self.hc_count) if use_combine else None)
 
     def forward(
         self, hyper_input: torch.Tensor

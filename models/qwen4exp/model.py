@@ -11,8 +11,10 @@
 * 末端 mixer 是 ``use_combine=False`` 的 ``GatedResidual``，它把
   ``[B, S, 10240]`` 塌回 ``[B, S, 2560]``，这一步就是收口。
 
-Module: ``coffin/models/qwen4exp``。族的顶层之一：依赖同族所有模块；不 import
-``backends`` / ``ops``，因为它是与硬件无关的数值基准。
+Module: ``coffin/models/qwen4exp``。族的顶层之一：依赖同族所有模块；它不 import
+``backends`` / ``ops``，因为它是与硬件无关的数值基准。唯一的例外是 ``proj``：稠密
+投影的布局与分派由后端决定，这是全族唯一需要平台事实的地方，所以那件事整个搬到
+``proj`` 里，本文件仍然只写几何。
 
 Constraints:
     * 位置表是**全表**，要跨步缓存：indexer 给压缩块算 RoPE 需要"块首 token 的
@@ -34,6 +36,7 @@ from torch import nn
 from models.qwen4exp.blocks import DecoderLayer
 from models.qwen4exp.config import TextConfig
 from models.qwen4exp.gated_residual import GatedResidual
+from models.qwen4exp.proj import Proj, QuantizedEmbedding, release_quantized_placeholders
 from models.qwen4exp.rope import RotaryEmbedding
 
 
@@ -146,12 +149,16 @@ class TextModel(nn.Module):
                 每层在 MoE 之后调一次，语义同 ``all_reduce(SUM)``；``None`` 表示
                 单卡。入参形状是 ``[B, S, hidden_size]`` 的 fp32，即
                 ``parallel.ShmAllReduce`` 要的那个。
+            quantized: 稠密投影与 embed_tokens 的 bf16 权重不建，改为等待量化产物
+                （``proj.set_quantized``）。量化路径必须打开：不打开的话
+                ``to_empty`` 会先分配一份马上要丢的 bf16 矩阵，48 层是 9 GiB 量级。
         """
         super().__init__()
         self.config = config
         self.combine = combine
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size,
-                                         config.pad_token_id)
+        self.embed_tokens = QuantizedEmbedding(config.vocab_size, config.hidden_size,
+                                               config.pad_token_id,
+                                               quantized=quantized)
         self.layers = nn.ModuleList(
             [DecoderLayer(config, layer_idx, local_experts=local_experts,
                           stream_ngram=stream_ngram, quantized=quantized)
@@ -159,6 +166,21 @@ class TextModel(nn.Module):
         self.rotary_emb = RotaryEmbedding(config)
         # 末端没有 final RMSNorm，塌缩由这个 use_combine=False 的 mixer 完成。
         self.hyper_connection_mixer = GatedResidual(config, use_combine=False)
+        if quantized:
+            self.release_quantized_placeholders()
+
+    def release_quantized_placeholders(self) -> int:
+        """摘掉本子树里所有稠密投影的 bf16 占位权重，交给量化产物供货。
+
+        只在 ``quantized=True`` 的构造末尾调用一次。层内的投影由 ``DecoderLayer``
+        建，而 ``blocks.py`` 不在这次改动的范围里，所以这一步放在模型侧统一走一遍
+        ——它要做的事恰好就是「按名字把所有 :class:`Proj` 找出来」，而名字在构造
+        完成时已经定型。
+
+        Returns:
+            摘掉占位参数的模块个数，供装载日志核对量化接上了几个投影。
+        """
+        return release_quantized_placeholders(self)
 
     def prepare_position_ids(self, position_ids: torch.Tensor | None, batch: int, seq: int,
                              past_len: int = 0, device: torch.device | None = None
@@ -300,13 +322,16 @@ class CausalLM(nn.Module):
                 :class:`TextModel`。
             stream_ngram: 不分配 PLE 的 n-gram 表；见 :class:`TextModel`。
             combine: MoE 专家输出的跨 rank 归约；见 :class:`TextModel`。
+            quantized: 稠密投影与 embed_tokens 不建 bf16 权重；见
+                :class:`TextModel`。``lm_head`` 是 ``[248320, 2560]``，bf16 是 1.27 GB，
+                量化后 0.64 GB，而它是每步读得最宽的一个投影。
         """
         super().__init__()
         self.config = config
         self.model = TextModel(config, local_experts=local_experts,
                                quantized=quantized,
                                stream_ngram=stream_ngram, combine=combine)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = Proj(config.hidden_size, config.vocab_size, quantized=quantized)
 
     def forward(self, input_ids: torch.Tensor | None = None,
                 inputs_embeds: torch.Tensor | None = None,

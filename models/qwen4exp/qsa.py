@@ -18,9 +18,12 @@ Module: ``coffin/models/qwen4exp``。依赖 ``config``、``norm``、``rope``；�
 ``blocks`` 调用。
 
 Constraints:
-    * 索引器逐 query 选块是 ``B * S`` 次 Python 循环——参考实现就是这么写的，
-      正确性基准也只需要它对。向量化（``[B*S, num_blocks]`` 批量 top-k）属于
-      预填充性能工作，换实现时必须与本模块逐位对齐。
+    * 选块有两条实现，必须逐位同掩码：``select`` 是批量版（``[B*S, num_blocks]``
+      打分 + 一次 top-k），``select_reference`` 是参考实现的逐 query 循环，只留作
+      对拍基线。改其中一条就必须让 ``tests/test_qwen4exp_qsa_select.py`` 两边都对得起。
+    * 批量版的打分走一次大 matmul，与逐条 matmul 相比最后一位的舍入可能不同；
+      掩码在正常数据上逐位一致，但精确并列且只差 1 ulp 的两个块可能换序。这是
+      换来 1536 次循环降到 12 次 Python 循环的代价。
     * 注意力在 fp32 上做 softmax，再 cast 回 query 的 dtype。
 """
 
@@ -34,6 +37,7 @@ from torch import nn
 
 from models.qwen4exp.config import TextConfig
 from models.qwen4exp.norm import RMSNorm
+from models.qwen4exp.proj import Proj, proj_from_config
 from models.qwen4exp.rope import apply_rotary_pos_emb
 
 
@@ -134,11 +138,15 @@ class QSAIndexer(nn.Module):
         self.token_budget = int(config.indexer_budget)
         self.compress_ratio = int(config.indexer_compress_ratio)
         self.block_topk = config.indexer_block_topk
-        self.index_qk_proj = nn.Linear(
+        # 索引器投影同样走 ``Proj``：它是 12 个 QSA 层里每层都跑的窄投影
+        # （``N = (4 + 1) * 128 = 640``），而 ``[N, K]`` 行主序在 M=1 下实测只有
+        # 17.3 GB/s，换成后端的 ``[K, N]`` GEMV 是它的十倍量级。留成 ``nn.Linear``
+        # 会让这 12 层每步都退回那条慢路，而 logits 完全正常，只有账本能发现。
+        self.index_qk_proj = proj_from_config(
+            config,
             config.hidden_size,
             (self.index_n_heads + self.index_kv_heads) * self.index_head_dim,
-            bias=False,
-        )
+            bias=False)
         self.q_layernorm = RMSNorm(self.index_head_dim, eps=config.rms_norm_eps)
         self.k_layernorm = RMSNorm(self.index_head_dim, eps=config.rms_norm_eps)
 
@@ -207,7 +215,21 @@ class QSAIndexer(nn.Module):
                visible: torch.Tensor,
                full_cos: torch.Tensor, full_sin: torch.Tensor,
                kv_length: int) -> torch.Tensor:
-        """逐 query 选块，返回稠密 bool 掩码 ``[1, S, kv_length]``。
+        """批量选块：所有 query 的块打分拼成一次 matmul、一次 top-k。
+
+        参考实现是 ``B * S`` 次 Python 循环，每次都是 nonzero / index_select /
+        matmul / topk / cat / scatter 一串小算子。prefill seq=128 摊到 12 个 QSA
+        层上是 1536 次循环，而每次循环的 GPU 时间远小于发射开销，所以先把它压成
+        每个 ``compress_ratio`` 一组的规整表。
+
+        每个 query 能看到的元素个数不同，变量长度无法直接拼成批量张量，因此分两步：
+        先把 ``[B*S, kv_length]`` 的可见掩码一次性 nonzero 成"按 query 连续"的
+        下标流，用一次 cumsum 求出每个 query 的起点、再用减法还原出它在自己行内的
+        名次；名次小于 ``num_blocks * compress_ratio`` 的前缀就是整块部分，其余是
+        无条件保留的尾部。整块部分散写进 ``[B*S, max_blocks, compress_ratio]`` 的
+        规整表，后面的池化、旋转、打分、top-k 全在表上批量做，一次算子覆盖全部
+        query；买不到表的位置（该 query 的块数少于 ``max_blocks``）留着 -1，打分前
+        用 ``-inf`` 压掉。
 
         Args:
             query: 已归一化、已旋转的索引器 query，``[B, S, index_n_heads, dim]``。
@@ -220,6 +242,189 @@ class QSAIndexer(nn.Module):
         Returns:
             ``[B, 1, S, kv_length]`` 的 bool 掩码：选中块的全部 token、加上不足
             一整块的尾部。
+        """
+        batch, seq = query.shape[:2]
+        rows = batch * seq
+        ratio = self.compress_ratio
+        head_dim = self.index_head_dim
+        tokens = raw_keys.shape[1]
+
+        # 可见掩码的第二维是头，恒为 1；按行展平后下标流就是 [B*S] 行连续。
+        entries, counts = self._flatten_visible(visible, rows, kv_length)
+        entry_rows, entry_cols = entries
+        num_blocks = counts // ratio
+        block_starts = num_blocks * ratio
+        max_blocks = int(num_blocks.max())
+        # 每个 query 能选中的块数受自己的块数与全局预算双重限制，批量版只能按
+        # min(block_topk, max_blocks) 统一取，多出来的名额由 -inf 掩码滤掉。
+        max_picked = min(self.block_topk, max_blocks)
+        row_first = torch.cumsum(counts, 0) - counts
+        entry_rank = torch.arange(entry_rows.numel(), device=query.device) \
+            - row_first.index_select(0, entry_rows)
+        block_part = entry_rank < block_starts.index_select(0, entry_rows)
+        tail_part = ~block_part
+        # 尾部无条件保留，槽位紧跟在"最多能选中的块 token"之后。用上限而不是实际
+        # 选中数当起点，槽位就只由块数决定、与 top-k 选了什么无关；槽位之间的相对
+        # 顺序不影响最终掩码，所以这个静态偏移足够。
+        tail_slot = max_picked * ratio + (entry_rank - block_starts.index_select(0, entry_rows))
+
+        if max_blocks > 0:
+            table = self._block_table(entry_rows, entry_cols, entry_rank, block_part,
+                                      rows, max_blocks, ratio)
+            keys = self._batched_block_keys(raw_keys, table, rows, seq, tokens,
+                                            full_cos, full_sin, batch)
+            scores = torch.matmul(
+                query.reshape(rows, -1, head_dim).float(),
+                keys.float().transpose(1, 2)).transpose(1, 2)
+            # relu 逐头施加、在求和之前；除数是 sqrt(index_head_dim)。
+            scores = torch.relu(scores).sum(dim=-1) / math.sqrt(head_dim)
+            # 够不着 max_blocks 的槽位是补出来的 -1 块，必须先压成 -inf 再 top-k，
+            # 否则它们会被选进结果、再散写成越界的 token 下标。
+            block_rank = torch.arange(max_blocks, device=query.device)
+            scores = scores.masked_fill(
+                block_rank.unsqueeze(0) >= num_blocks.unsqueeze(1), float("-inf"))
+            picked = scores.topk(max_picked, dim=1).indices
+            offsets = torch.arange(ratio, device=query.device)
+            slot = torch.arange(rows, device=query.device).unsqueeze(1)
+            # 选中块的 token 在规整表里是连续的一段，一次 index_select 就展平回
+            # "按 query 连续的 token 下标"。
+            picked_tokens = table.reshape(-1).index_select(
+                0, ((slot * (max_blocks * ratio) + picked * ratio).unsqueeze(-1)
+                    + offsets).reshape(-1)).view(rows, max_picked * ratio)
+            tail_rows = entry_rows[tail_part]
+            tail_tokens = entry_cols[tail_part]
+        else:
+            # 一个整块都没有：全部 query 只剩尾部，下标流原样搬过去。
+            picked_tokens = torch.zeros((rows, 0), dtype=torch.long, device=query.device)
+            tail_rows, tail_tokens = entry_rows, entry_cols
+
+        # 缓冲宽度按本次实际需要的列数算，不必固定成 token_budget + ratio - 1：
+        # 短上下文（decode、小 prefill）下宽出几十倍，scatter 和随后的稠密化都白做。
+        width = max(int(tail_slot.max()) + 1, max_picked * ratio) if entry_rank.numel() \
+            else max_picked * ratio
+        selected = torch.full((rows, width), -1, dtype=torch.long, device=query.device)
+        if picked_tokens.numel():
+            selected[:, :max_picked * ratio] = picked_tokens
+        if tail_rows.numel():
+            selected.view(-1)[tail_rows * width + tail_slot[tail_part]] = tail_tokens
+        return self.dense_mask(selected.view(batch, seq, width), kv_length)
+
+    def _flatten_visible(self, visible: torch.Tensor, rows: int,
+                         kv_length: int) -> tuple[tuple[torch.Tensor, torch.Tensor],
+                                                  torch.Tensor]:
+        """把 ``[B, 1, S, kv_length]`` 的可见掩码展成按行连续的下标流。
+
+        ``torch.nonzero`` 在整表上按行优先遍历，所以同一行的列下标天然按升序
+        连续出现——参考实现逐 query 拿到的 ``local_visible`` 正是这个顺序，分块
+        才和它对得上。这里把这个性质当作契约用，不再逐行排序。
+
+        Args:
+            visible: ``[B, 1, S, kv_length]`` 的 bool 掩码。
+            rows: ``B * S``。
+            kv_length: 掩码的最后一维宽度。
+
+        Returns:
+            ``((entry_rows, entry_cols), counts)``：下标流里每个元素属于哪一行、
+            是哪一列，以及每行的可见元素数。
+        """
+        flat = visible.reshape(rows, kv_length)
+        entries = torch.nonzero(flat, as_tuple=False)
+        return (entries[:, 0], entries[:, 1]), flat.sum(dim=1, dtype=torch.long)
+
+    @staticmethod
+    def _block_table(entry_rows: torch.Tensor, entry_cols: torch.Tensor,
+                     entry_rank: torch.Tensor, block_part: torch.Tensor,
+                     rows: int, max_blocks: int, ratio: int) -> torch.Tensor:
+        """把整块部分的下标散写进 ``[B*S, max_blocks, ratio]`` 的规整表。
+
+        规整表是批量化的前提：池化与旋转要求每组恰好 ``ratio`` 个连续槽位。块数
+        不足 ``max_blocks`` 的行由 -1 补齐，取数前统一 clamp，选到哪个补位槽都
+        不越界——它们绝不会被选中，因为打分前已经被压成 ``-inf``。
+
+        Args:
+            entry_rows: 整块部分元素所属的行。
+            entry_cols: 整块部分元素在 ``kv_length`` 里的列下标。
+            entry_rank: 整块部分元素在自己行内的名次。
+            block_part: 只保留整块部分元素的总掩码。
+            rows: ``B * S``。
+            max_blocks: 本批最大的整块数。
+            ratio: ``compress_ratio``。
+
+        Returns:
+            ``[B*S, max_blocks, ratio]`` 的 long 表，空位是 -1。
+        """
+        width = max_blocks * ratio
+        table = torch.full((rows, width), -1, dtype=torch.long, device=entry_cols.device)
+        rows_sel = entry_rows[block_part]
+        table.view(-1)[rows_sel * width + entry_rank[block_part]] = entry_cols[block_part]
+        return table.view(rows, max_blocks, ratio)
+
+    def _batched_block_keys(self, raw_keys: torch.Tensor, table: torch.Tensor,
+                            rows: int, seq: int, tokens: int,
+                            full_cos: torch.Tensor, full_sin: torch.Tensor,
+                            batch: int) -> torch.Tensor:
+        """在规整表上批量做块池化 → k_layernorm → 块首旋转。
+
+        与 :meth:`block_keys` 同一套语义，只是把 ``[nblocks, ratio]`` 换成
+        ``[B*S*max_blocks, ratio]``：池化仍在 fp32 里做，块首取规整表的第 0 列。
+        索引用的是一维偏移 ``batch * T + 位置``，因为规整表里同一 query 的各块
+        分属不同 batch 行，二维 index_select 反而要先构造配对下标。
+
+        Args:
+            raw_keys: ``[B, T, index_head_dim]`` 的全部原始 key。
+            table: ``[B*S, max_blocks, ratio]`` 的整块下表。
+            rows: ``B * S``。
+            seq: 每个 batch 行的 query 数。
+            tokens: ``T``。
+            full_cos: 全表余弦 ``[B, T, rotary_dim]``。
+            full_sin: 全表正弦，同形状。
+            batch: ``B``。
+
+        Returns:
+            ``[B*S, max_blocks, index_head_dim]`` 的块 key。
+        """
+        ratio = self.compress_ratio
+        head_dim = self.index_head_dim
+        max_blocks = table.shape[1]
+        block_row = torch.arange(rows * max_blocks, device=table.device) // max_blocks
+        block_batch = block_row // seq
+        # -1 补位槽统一取 0 号 token：它们的 key 是垃圾，但打分会被 -inf 压掉，
+        # 任何取值都不影响结果，而 clamp 换掉了逐块判空的分支。
+        offsets = table.reshape(rows * max_blocks, ratio).clamp(min=0)
+        gathered = raw_keys.reshape(batch * tokens, head_dim).index_select(
+            0, (block_batch.unsqueeze(1) * tokens + offsets).reshape(-1)
+        ).view(rows * max_blocks, ratio, head_dim)
+        # 池化在 fp32 里做：bf16 上先平均再归一化会把小块的能量差抹掉。
+        pooled = self.k_layernorm(gathered.float().mean(dim=1).to(raw_keys.dtype))
+        block_start = table[:, :, 0].reshape(rows * max_blocks).clamp(min=0)
+        embed_index = block_batch * tokens + block_start
+        rotated = apply_rotary_pos_emb(
+            pooled.unsqueeze(1),
+            cos=full_cos.reshape(batch * tokens, -1).index_select(0, embed_index),
+            sin=full_sin.reshape(batch * tokens, -1).index_select(0, embed_index),
+        )
+        return rotated.squeeze(1).view(rows, max_blocks, head_dim)
+
+    def select_reference(self, query: torch.Tensor, raw_keys: torch.Tensor,
+                         visible: torch.Tensor,
+                         full_cos: torch.Tensor, full_sin: torch.Tensor,
+                         kv_length: int) -> torch.Tensor:
+        """逐 query 选块的参考实现，只用来给 :meth:`select` 对拍。
+
+        ``B * S`` 次 Python 循环，每次一串小算子，prefill 上慢到不可接受；保留它
+        是因为它逐字对应参考实现，改批量版时唯一可靠的判据就是它与批量版逐位
+        同掩码。生产路径改用 :meth:`select`。
+
+        Args:
+            query: 已归一化、已旋转的索引器 query，``[B, S, index_n_heads, dim]``。
+            raw_keys: ``[B, S, index_dim]``。
+            visible: 4 维 bool 可见掩码，``[B, 1, S, kv_length]``。
+            full_cos: 全表余弦 ``[B, T, rotary_dim]``。
+            full_sin: 全表正弦，同形状。
+            kv_length: 掩码的最后一维宽度。
+
+        Returns:
+            ``[B, 1, S, kv_length]`` 的 bool 掩码。
         """
         batch, seq = query.shape[:2]
         buffer_width = self.token_budget + self.compress_ratio - 1
@@ -357,14 +562,18 @@ class Attention(nn.Module):
         self.num_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
         # q_proj 的行数是 2 倍：一半 query、一半输出门，按 head 交错排列。
-        self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim * 2,
-                                bias=config.attention_bias)
-        self.k_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim,
-                                bias=config.attention_bias)
-        self.v_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim,
-                                bias=config.attention_bias)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, config.hidden_size,
-                                bias=config.attention_bias)
+        # 五个投影都走 ``Proj``，理由是真机账本：48 层里 12 个 QSA 层的这五个投影
+        # 在一步 decode 里合计 110 ms 的 ``GemmEx_kernel::gemmh`，而同一份权重换成
+        # ``[K, N]`` + 后端 GEMV 是 4.5 ms。``bias`` 由 ``proj_from_config`` 按
+        # ``attention_bias`` 决定，与参考实现一致。
+        self.q_proj = proj_from_config(
+            config, config.hidden_size, self.num_heads * self.head_dim * 2)
+        self.k_proj = proj_from_config(
+            config, config.hidden_size, self.num_key_value_heads * self.head_dim)
+        self.v_proj = proj_from_config(
+            config, config.hidden_size, self.num_key_value_heads * self.head_dim)
+        self.o_proj = proj_from_config(
+            config, self.num_heads * self.head_dim, config.hidden_size)
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.indexer = QSAIndexer(config, layer_idx)

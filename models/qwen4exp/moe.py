@@ -14,17 +14,22 @@
 数学上整块的输出是
 ``y[t] = Σ_k w[t,k] * Expert_{idx[t,k]}(x[t]) + sigmoid(g_s[t]) * Shared(x[t])``。
 
-Module: ``coffin/models/qwen4exp``。依赖 ``config``；被 ``blocks`` 调用。
+Module: ``coffin/models/qwen4exp``。依赖 ``config`` 与 ``proj``（共享专家是稠密投影）；被
+``blocks`` 调用。
 
 Constraints:
     * 聚合必须按专家分组做（``index_add_``），不能展开成"每 token 跑 10 次完整
       GEMM"：真实配置下专家权重是 ``[512, 1280, 2560]``，展开会读 10 倍权重。
     * int8 打包时必须逐 expert 保持 ``[K, N]`` 行主序，不能把 512 个专家摊平成
       一个 2D 矩阵——``grouped_gemm`` 用固定偏移寻址。
+    * W4A8 分派路径上不许出现主机往返。``.tolist()`` / ``int(tensor)`` 每次都要
+      等一次设备到主机的拷贝，而 decode 一步只有 1 个 token、48 层各来一遍，
+      付的全是固定开销：分组内核吃的是设备指针，前缀和没有理由回主机。
 """
 
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 
 import torch
@@ -32,9 +37,22 @@ import torch.nn.functional as F
 from torch import nn
 
 from models.qwen4exp.config import TextConfig
+from models.qwen4exp.proj import proj_from_config
 
 #: 块内激活。Qwen 系列固定 silu，这里手写以免引入除 ``torch`` 之外的依赖。
 _ACTIVATIONS = {"silu": F.silu, "gelu": F.gelu}
+
+#: 量化分派路径是否逐层把专家下标读回主机校验范围。
+#:
+#: 默认关闭。那次校验要把 ``min`` / ``max`` 两个设备标量取回主机，48 层 decode
+#: 一步就是 96 次同步；而 decode 只有 1 个 token、每层 10 个下标，这份开销与
+#: token 数无关，全是白付。下标又由 ``TopKRouter`` 在 ``[0, num_experts)`` 上选出，
+#: 正常情况下不可能越界。
+#:
+#: 需要查融合内核或 EP 映射时设 ``COFFIN_MOE_CHECK=1``（要在进程启动前设好，这里
+#: 只在导入时读一次）。越界照旧抛 ``ValueError``，文案与 bf16 路径逐字相同，报错点
+#: 不会因为跑的是哪条路径而变。
+_CHECK_DISPATCH = bool(os.environ.get("COFFIN_MOE_CHECK"))
 
 
 class MLP(nn.Module):
@@ -62,9 +80,16 @@ class MLP(nn.Module):
         self.hidden_size = config.hidden_size
         self.intermediate_size = (config.shared_expert_intermediate_size
                                   if intermediate_size is None else intermediate_size)
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        # 共享专家是**稠密**的、每卡算一份完整，所以它走投影层，不走下面的分组专家
+        # 内核。它不是 ``nn.Linear`` 而是 :class:`~models.qwen4exp.proj.Proj`，因为
+        # 它和 GDN/QSA 的投影一样受行主序布局的拖累：``[640, 2560]`` 在 M=1 上实测
+        # 0.550 ms，换 ``[K, N]`` 后 0.050 ms，48 层合计约 63 ms（作业 4489/4492）。
+        self.gate_proj = proj_from_config(config, self.hidden_size, self.intermediate_size,
+                                         bias=False)
+        self.up_proj = proj_from_config(config, self.hidden_size, self.intermediate_size,
+                                       bias=False)
+        self.down_proj = proj_from_config(config, self.intermediate_size, self.hidden_size,
+                                        bias=False)
         if config.hidden_act not in _ACTIVATIONS:
             raise ValueError(f"unsupported activation {config.hidden_act!r}.")
         self.act_fn = _ACTIVATIONS[config.hidden_act]
@@ -299,16 +324,18 @@ class Experts(nn.Module):
 
         Raises:
             ValueError: ``top_k_index`` 与 ``top_k_weights`` 形状不一致，或下标
-                越界。
+                越界。越界检查在 W4A8 分派路径上默认跳过（见
+                :data:`_CHECK_DISPATCH`），路由正确时它永远不会触发。
         """
         if top_k_index.shape != top_k_weights.shape:
             raise ValueError(
                 f"top_k index/weight shape mismatch: {tuple(top_k_index.shape)} vs "
                 f"{tuple(top_k_weights.shape)}.")
-        if int(top_k_index.max()) >= self.num_experts or int(top_k_index.min()) < 0:
-            raise ValueError(
-                f"expert index out of range [0, {self.num_experts}), got "
-                f"[{int(top_k_index.min())}, {int(top_k_index.max())}].")
+        if self._grouped is None or _CHECK_DISPATCH:
+            if int(top_k_index.max()) >= self.num_experts or int(top_k_index.min()) < 0:
+                raise ValueError(
+                    f"expert index out of range [0, {self.num_experts}), got "
+                    f"[{int(top_k_index.min())}, {int(top_k_index.max())}].")
 
         final = torch.zeros_like(hidden_states)
         tokens, top_k = top_k_index.shape
@@ -333,28 +360,39 @@ class Experts(nn.Module):
         # 收集起来。展开成"每 token 跑 10 次完整 GEMM"会把权重读放大 10 倍。
         order = torch.argsort(local_index, stable=True)
         sorted_local = local_index[order]
-        counts = torch.bincount(sorted_local, minlength=self.num_local_experts).tolist()
+        # ``minlength`` 不能省：桶数少了会静默丢掉号大的专家。号越界时多出来的
+        # 桶反而把前缀和撑长，内核按 ``E+1`` 校验长度会当场拒绝，不会算错。
+        counts = torch.bincount(sorted_local, minlength=self.num_local_experts)
 
         if self._grouped is not None:
-            # W4A8 路径：激活先按专家排好序，两个投影各一次分组内核调用。
-            # 权重在不在这条路上的唯一判据是构造时挂上的 ``_grouped``，见
-            # :meth:`set_quantized`；没有它就走下面的 bf16 循环。
-            offsets = torch.tensor([0] + list(torch.cumsum(
-                torch.tensor(counts, dtype=torch.int32), 0)), dtype=torch.int32,
-                device=hidden_states.device)
-            packed_state = hidden_states[token_sel[order]]
+            # 前缀和全程留在设备上：``moe_grouped`` 本来就收设备侧 int32 指针，
+            # ``.tolist()`` 再 ``torch.tensor(...)`` 只是来回搬一趟，代价是每层
+            # 一次主机同步。
+            offsets = torch.zeros(counts.numel() + 1, dtype=torch.int32,
+                                  device=counts.device)
+            offsets[1:] = torch.cumsum(counts, 0)
+
+            # 激活按专家把行收拢一次。``token_sel[order]`` 只物化这一份，累加那
+            # 一步直接复用它：下游还要用它做 gather 下标，再算一遍就是一次多余的
+            # ``[tokens * top_k]`` 整数索引拷贝。
+            gathered_tokens = token_sel[order]
+            packed_state = hidden_states[gathered_tokens]
             up_gate = self._grouped(packed_state, offsets)
+            # 权重按 (token, 槽位) 取，不能按 token 取：同一 token 的 10 个专家
+            # 各有各的权重，按 token 取会把它们串起来。
             gate, up = up_gate.chunk(2, dim=-1)
             current_hidden = self.act_fn(gate) * up
             current_hidden = self._grouped(current_hidden, offsets, down_proj=True)
-            # 权重按 (token, 槽位) 取，不能按 token 取：同一 token 的 10 个专家
-            # 各有各的权重，按 token 取会把它们串起来。
             current_hidden = current_hidden * weights_sel[order, None]
-            final.index_add_(0, token_sel[order], current_hidden.to(final.dtype))
+            # 一次 ``index_add_`` 累加全部槽位，而不是像 bf16 循环那样逐专家累加。
+            # 两者差了 bf16 的累加次序（末位一个 ulp），逐专家版才能和循环路径逐位
+            # 相同，但那是 128 次启动；decode 一步只有 10 个槽位，不值得。
+            final.index_add_(0, gathered_tokens, current_hidden.to(final.dtype))
             return final
 
+        counts_list = counts.tolist()
         start = 0
-        for expert_idx, count in enumerate(counts):
+        for expert_idx, count in enumerate(counts_list):
             if count == 0:
                 continue
             rows = order[start:start + count]
@@ -399,7 +437,10 @@ class SparseMoeBlock(nn.Module):
         self.gate = TopKRouter(config)
         self.experts = Experts(config, local_experts, quantized)
         self.shared_expert = MLP(config, intermediate_size=config.shared_expert_intermediate_size)
-        self.shared_expert_gate = nn.Linear(config.hidden_size, 1, bias=False)
+        # 逐 token 的标量门只有 1 行输出，仍是整步里最窄的一档：``[1, 2560]`` 行主序
+        # 实测 0.782 ms，换 ``[K, N]`` 后 0.056 ms（作业 4489），48 层约 35 ms。
+        self.shared_expert_gate = proj_from_config(config, config.hidden_size, 1,
+                                                   bias=False)
 
     def forward(self, hidden_states: torch.Tensor,
                 combine: callable | None = None) -> torch.Tensor:

@@ -6,7 +6,8 @@
 token、短序列上看着差不多对"的类型。
 
 Module: ``coffin/models/qwen4exp``。依赖 ``config``（几何）、``norm``
-（``RMSNormGated``）和 ``util``（depthwise 卷积）；被 ``blocks`` 调用。
+（``RMSNormGated``）、``util``（depthwise 卷积）和 ``proj``（稠密投影）；被
+``blocks`` 调用。
 
 Constraints:
     * 递推状态是 ``[B, num_v_heads, head_k_dim, head_v_dim]`` 的 **fp32**。
@@ -30,6 +31,7 @@ from torch import nn
 
 from models.qwen4exp.config import TextConfig
 from models.qwen4exp.norm import RMSNormGated
+from models.qwen4exp.proj import Proj
 from models.qwen4exp.util import apply_padding_mask, causal_depthwise_conv
 
 
@@ -286,6 +288,7 @@ class GatedDeltaNet(nn.Module):
 
         Args:
             config: 文本配置。
+            layer_idx: 零基层号。
         """
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -314,13 +317,16 @@ class GatedDeltaNet(nn.Module):
         self.norm = RMSNormGated(
             self.head_v_dim, eps=self.layer_norm_epsilon,
             activation=config.output_gate_type or config.hidden_act)
-        self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
+        self.out_proj = Proj(self.value_dim, self.hidden_size)
 
-        self.in_proj_qkv = nn.Linear(self.hidden_size, self.key_dim * 2 + self.value_dim,
-                                     bias=False)
-        self.in_proj_z = nn.Linear(self.hidden_size, self.value_dim, bias=False)
-        self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
-        self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
+        self.in_proj_qkv = Proj(self.hidden_size, self.key_dim * 2 + self.value_dim)
+        self.in_proj_z = Proj(self.hidden_size, self.value_dim)
+        # b/a 只有 48 行（num_v_heads），是整步里最窄的一档：一个 ``[48, 2560]`` 的
+        # 行主序矩阵在 M=1 上实测 0.49 ms，换 ``[K, N]`` 后 0.078 ms（作业 4489）。
+        # 48 层加起来 216 个这样的投影占掉旧路径 245.2 ms，所以它们必须和宽投影走
+        # 同一条路，不能因为「太小了 F.linear 也无所谓」被放过。
+        self.in_proj_b = Proj(self.hidden_size, self.num_v_heads)
+        self.in_proj_a = Proj(self.hidden_size, self.num_v_heads)
 
     def forward(self, hidden_states: torch.Tensor, conv_mask: torch.Tensor | None = None,
                 conv_state: torch.Tensor | None = None,

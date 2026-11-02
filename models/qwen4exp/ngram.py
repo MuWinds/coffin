@@ -6,7 +6,8 @@
 代码里。
 
 Module: ``coffin/models/qwen4exp``。依赖 ``config``（几何）、``norm``（三处
-零中心 RMSNorm）和 ``util``（短卷积）；被 ``blocks`` 调用。
+零中心 RMSNorm）、``proj``（两次稠密投影）和 ``util``（短卷积）；被 ``blocks``
+调用。
 
 Constraints:
     * 乘法用 int64、XOR 不能换成加法、``torch.remainder`` 不能换成 C 的 ``%``
@@ -30,6 +31,7 @@ from torch import nn
 
 from models.qwen4exp.config import TextConfig
 from models.qwen4exp.norm import RMSNorm
+from models.qwen4exp.proj import Proj
 from models.qwen4exp.util import apply_padding_mask, causal_depthwise_conv
 
 _MASK64 = (1 << 64) - 1
@@ -398,8 +400,8 @@ class PLELayer(nn.Module):
         # 跨度是 1 + dilation*(k-1)，少存一段就会让感受野整体前移。
         self.short_conv_state_len = (conv_kernel_size - 1) * conv_dilation
         self.conv_dilation = conv_dilation
-        self.key_proj = nn.Linear(self.ple_embed_dim, hc_hidden_size, bias=False)
-        self.value_proj = nn.Linear(self.ple_embed_dim, self.hidden_size, bias=False)
+        self.key_proj = Proj(self.ple_embed_dim, hc_hidden_size)
+        self.value_proj = Proj(self.ple_embed_dim, self.hidden_size)
         self.norm_key = RMSNorm(hc_hidden_size, group_size=self.hidden_size,
                                 eps=config.rms_norm_eps)
         self.norm_query = RMSNorm(hc_hidden_size, group_size=self.hidden_size,

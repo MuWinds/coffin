@@ -281,7 +281,8 @@ def plan(source: TensorSource, config: TextConfig,
 
 
 def verify(plan_result: LoadPlan, state_dict: dict[str, torch.Tensor],
-           subtree: str | None = None, skip_experts: bool = False) -> list[str]:
+           subtree: str | None = None, skip_experts: bool = False,
+           provided: frozenset[str] = frozenset()) -> list[str]:
     """核对计划覆盖了模型的每一个参数。
 
     流式模式下 n-gram 表不是模型参数（它由调用方按分片传入），所以账目里的
@@ -292,6 +293,9 @@ def verify(plan_result: LoadPlan, state_dict: dict[str, torch.Tensor],
         state_dict: 目标模型的 ``state_dict``（可以用 meta 设备构造，零内存）。
         subtree: 只核对这个前缀下的参数；``None`` 表示整个模型。
         skip_experts: 不要求专家栈有源张量（量化路径）。
+        provided: 由量化产物供货、因而**既不进 state_dict 也不该进计划**的参数名，
+            见 :func:`quantized_param_keys`。它们两头都要排除：留在 ``missing`` 里会
+            报「模型参数没有源张量」，留在 ``extra`` 里会报「计划张量不是模型参数」。
 
     Returns:
         问题描述列表；空列表表示全部对上。调用方把它当断言用。
@@ -300,7 +304,7 @@ def verify(plan_result: LoadPlan, state_dict: dict[str, torch.Tensor],
         ValueError: 目标里出现了计划外的参数名（映射表写了一种不存在的张量）。
     """
     problems: list[str] = []
-    planned = set(plan_result.assignments)
+    planned = set(plan_result.assignments) - set(provided)
     expected = {key for key in state_dict
                 if subtree is None or key.startswith(subtree)}
     # n-gram 表走 ``plan_result.ngram`` 单独一条路（由 128 个分片拼出来），所以不在
@@ -323,6 +327,35 @@ def verify(plan_result: LoadPlan, state_dict: dict[str, torch.Tensor],
         raise ValueError(
             f"{len(extra)} planned tensors are not model parameters, e.g. {extra[:5]}")
     return problems
+
+
+def quantized_param_keys(model: torch.nn.Module) -> frozenset[str]:
+    """列出由量化权重提供的参数名
+
+    量化路径下 ``proj.Proj`` / ``proj.QuantizedEmbedding`` 的 bf16 占位权重在模型
+    构造时就被释放（``release_quantized_placeholders``），于是它们既不在
+    ``state_dict`` 里，也不该出现在按源张量规划出来的计划里：源那边读到的是
+    ``W4A8Weight``，``copy_`` 装不进去，而真正的挂载由 ``set_quantized`` 完成。
+
+    为什么选这条路，而不是「保留同形状的 meta 参数、量化后再置 None」：``to_empty``
+    是 ``empty_like`` 每个 meta 参数，它不看这个参数之后会不会被删，于是 48 层稠密
+    投影的 9 GiB 会先被实化再扔掉。``moe.Experts`` 已经在同一个坑里 OOM 过一次
+    ，所以这次直接让键从计划里消失。
+
+    Args:
+        model: 已构造完成的模型。
+
+    Returns:
+        参数名集合，形如 ``{"model.layers.0.linear_attn.in_proj_qkv.weight"}``。只含
+        明确声明 ``owns_quantized_weight`` 的模块；非量化模型上为空集。
+    """
+    keys: set[str] = set()
+    for name, module in model.named_modules():
+        if not getattr(module, "owns_quantized_weight", False):
+            continue
+        prefix = f"{name}." if name else ""
+        keys.add(prefix + "weight")
+    return frozenset(keys)
 
 
 def slice_experts(tensor: torch.Tensor, local_experts: Sequence[int] | None,
@@ -386,8 +419,9 @@ def load_into(model: torch.nn.Module, source: TensorSource, config: TextConfig,
         skip_experts: 不装专家栈；量化路径下见 :func:`plan`。
 
     Returns:
-        一个字典，含 ``loaded`` / ``skipped`` / ``ngram`` 三个计数，便于在日志里
-        核对"装了多少个"。张量本身不进返回值，它们已经进了模型。
+        一个字典，含 ``loaded`` / ``skipped`` / ``ngram`` / ``quantized`` 四个计数，
+        便于在日志里核对"装了多少个"。``quantized`` 是本次被摘出计划的参数个数，见
+        :func:`quantized_param_keys`。张量本身不进返回值，它们已经进了模型。
 
     Raises:
         KeyError: 源里缺模型需要的张量。
@@ -395,9 +429,19 @@ def load_into(model: torch.nn.Module, source: TensorSource, config: TextConfig,
     """
     plan_result = plan(source, config, local_experts, with_lm_head, subtree=subtree,
                        max_layers=max_layers, skip_experts=skip_experts)
+    # 量化路径下稠密投影没有 bf16 参数可以 ``copy_``，它们的源张量是 ``W4A8Weight``，
+    # 由调用方在装载完成之后交给 ``proj.set_quantized``。这一条必须在 ``verify``
+    # 之前算出来：计划里留着这些键，两边都会报错（模型侧说没有源，计划侧说不是参数）。
+    provided = quantized_param_keys(model)
+    if provided:
+        if subtree is not None:
+            provided = frozenset(key for key in provided if key.startswith(subtree))
+        plan_result.assignments = {name: key for name, key
+                                   in plan_result.assignments.items()
+                                   if name not in provided}
     target_state = model.state_dict()
     problems = verify(plan_result, target_state, subtree=subtree,
-                      skip_experts=skip_experts)
+                      skip_experts=skip_experts, provided=provided)
     if problems:
         raise KeyError("; ".join(problems))
 
@@ -438,7 +482,8 @@ def load_into(model: torch.nn.Module, source: TensorSource, config: TextConfig,
             loaded += 1
 
     return {"loaded": loaded, "skipped": len(plan_result.skipped),
-            "ngram": len(plan_result.ngram), "experts": local_experts}
+            "ngram": len(plan_result.ngram), "experts": local_experts,
+            "quantized": len(provided)}
 
 
 def _gather_ngram(source: TensorSource,
