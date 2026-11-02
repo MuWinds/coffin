@@ -1,19 +1,27 @@
 """Qwen4-Exp 用到的两种 RMSNorm：零中心的普通版与线性注意力的门控版。
 
-它们**不是同一个类配一个开关**：``Qwen4ExpTextRMSNorm`` 的权重语义是
+它们不是同一个类配一个开关：``Qwen4ExpTextRMSNorm`` 的权重语义是
 ``1 + w``（checkpoint 存的是相对 1 的偏移、初始化全 0），
 ``Qwen4ExpTextRMSNormGated`` 的权重则是普通的 ``w``（初始化全 1），且把门放
 在归一化**之后**。按普通增益去乘偏移量不会有任何形状错误，只会让每一处归一化
 从"恒等 1"变成"恒等 0"（``ARCH_SPEC.md`` §12 第 5 条），所以这里是两个类。
 
-Module: ``coffin/models/qwen4exp``。只依赖 ``torch``；被 ``gated_residual``、
-``qsa``、``gdn``、``ngram`` 调用。
+Module: ``coffin/models/qwen4exp``。依赖 ``torch`` 与 ``backends``（取融合归一化
+核，以及判断后端是否用内核承担它）；被 ``gated_residual``、``qsa``、``gdn``、
+``ngram`` 调用。
 
 Constraints:
     * 归一化必须全程 fp32，乘完 ``1 + w`` 之后再一次性转回入参 dtype。分两步在
       bf16 上乘会在激活量级大时看到差异，而这条路径在 48 层里每层跑 8 次。
+      CoreX 原生核的算子是 ``v * inv * w``（fp32 算、末尾只舍入一次），实测与这条
+      torch 链**逐位相同**，所以走核不改变数值，只减少发射。
+    * 归一化优先走后端原生核，拿不到时退回纯 torch 链。判断依据必须是
+      ``Caps.native``，不能是「表里那一格是不是 ``None``」——解析器总会用参考实现
+      把缺的补齐，所以每个名字永远可调用（见 :func:`_has_native`）。
     * ``group_size`` 的语义是"把最后一维切成若干等长组、每组独立算 RMS"，
       权重仍是整条向量的宽度。残差流能稳住靠的就是 4 路各保尺度、不互相稀释。
+      分组路径不回退到 ``bops.rms_norm``：后者对整条最后一维归一化，用在 4 路
+      残差流上会把各路能量摊平，形状全对、尺度全错。
     * 这里绝不出现 ``torch.nn.functional.rms_norm``：那是 torch 2.4+ 的 API，
       部署目标是 2.1.0。
 """
@@ -22,6 +30,9 @@ from __future__ import annotations
 
 import torch
 from torch import nn
+
+from backends import caps as _caps
+from backends import ops as bops
 
 
 def _silu(x: torch.Tensor) -> torch.Tensor:
@@ -40,6 +51,23 @@ def _silu(x: torch.Tensor) -> torch.Tensor:
 
 #: 门控归一化允许的激活。参考实现的配置校验也只放行这两个。
 _GATE_ACTIVATIONS = {"silu": _silu, "sigmoid": torch.sigmoid}
+
+
+def _has_native(name: str) -> bool:
+    """报告当前后端是否用自写内核承担 ``name``。
+
+    只能问 ``Caps.native``，不能问算子表里那一格是不是 ``None``：解析器
+    （``backends.reference.fill``）总会拿参考实现把缺的补齐，所以每个名字在任何
+    后端上都可调用。拿「非 ``None``」当「有核」，会让这条分派恒为真，于是在只有
+    参考实现的主机上走进一条每步多两次拷贝的路，而它读起来和走核完全一样。
+
+    Args:
+        name: :class:`~coffin.backends.protocol.Ops` 的算子名。
+
+    Returns:
+        本后端有该算子的内核时为 ``True``。
+    """
+    return name in _caps().native
 
 
 class RMSNorm(nn.Module):
@@ -66,9 +94,38 @@ class RMSNorm(nn.Module):
         self.eps = eps
         self.weight = nn.Parameter(torch.zeros(dim))
         self.group_size = group_size
+        # 折好的 ``1 + w`` 与它对应的权重版本号。``bops.rms_norm`` 的契约是「增益
+        # 已经带着 checkpoint 的偏移」，所以偏移必须在什么时候折一次，而不是每次
+        # 调用现算——现算就是又一次逐元素拷贝加一次加法，省下的发射又还回去。
+        #
+        # 登记成**非持久** buffer 而不是普通属性，有两个原因都必须满足：普通属性
+        # 不会被 ``.to(device)`` / ``.to(dtype)`` 搬走，模块上卡之后这里还是 CPU 上的
+        # 那份增益，而报错要到内核逐元素比对时才出现；持久 buffer 会进 ``state_dict``，
+        # 于是 ``weights.verify`` 把它当成「模型有、checkpoint 没有」的多余参数。
+        self.register_buffer("_gain", None, persistent=False)
+        self._gain_version: int | None = None
         if group_size is not None and dim % group_size != 0:
             raise ValueError(
                 f"hidden_size ({dim}) must be divisible by group_size ({group_size}).")
+
+    def _folded_gain(self) -> torch.Tensor:
+        """返回缓存里的 ``1 + w`` 增益，权重变了就重折。
+
+        缓存靠 ``weight._version`` 失效，不靠调用方记得来通知。主路径在加载时用
+        ``state_dict`` 的视图 ``copy_`` 灌权重，那会推进版本号；只有绕过 autograd
+        的 ``.data.copy_`` 不推进它。这条路径只在测试里用来把 fixture 灌进来，而
+        那些测试每次都是新模块（版本号从 0 开始、缓存也还没建），所以不会读到陈旧
+        的增益。真机上权重在装载后不再变，缓存于是只折这一次。
+
+        Returns:
+            ``[dim]`` 的增益，dtype 与设备跟随 ``weight``。
+        """
+        version = self.weight._version
+        if self._gain is None or self._gain_version != version:
+            with torch.no_grad():
+                self._gain = (1.0 + self.weight.float()).to(self.weight.dtype)
+            self._gain_version = version
+        return self._gain
 
     def _norm(self, x: torch.Tensor) -> torch.Tensor:
         """在 fp32 上算 RMS 归一化，不含权重。
@@ -87,12 +144,20 @@ class RMSNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """归一化并把零中心权重折进去。
 
+        不分组的形状优先走后端融合核：这一路在 48 层里每层被调用若干次
+        （``q_norm``/``k_norm``/indexer 的两处 layernorm 合计 4 次 × 12 层），
+        纯 torch 串每次是 6-8 个算子，也就是每步约 84 次启动。核只做一次启动。
+        核的算术是 ``v * inv * w``（fp32 算、末尾舍入一次），与下面那条 torch 链
+        实测逐位相同，所以换路不改变数值。
+
         Args:
             x: 任意 dtype 的激活，末维宽度为 ``dim``。
 
         Returns:
             与 ``x`` 同形状、同 dtype 的张量。
         """
+        if self.group_size is None and _has_native("rms_norm"):
+            return bops.rms_norm(x, self._folded_gain(), 0, self.eps)
         output = self._norm(x.float())
         # 权重是相对 1 的偏移量：checkpoint 里会出现负值，直接当增益用会把
         # 整层输出压成 0 附近。
@@ -144,6 +209,13 @@ class RMSNormGated(nn.Module):
         三处顺序不能动：归一化在门**之前**；权重不偏移（直接乘）；门的激活在
         fp32 上算。门只影响幅度不影响归一化统计，反过来写会得到另一条曲线。
 
+        ``activation == "silu"`` 时走 ``bops.rms_norm_gated``，其余回退纯 torch。
+        **真实配置是 ``sigmoid``（``output_gate_type``），所以这条路今天的实测收益
+        是 0**：CoreX 的 ``rms_norm_gated`` 内核把激活写死成 silu（``norm.cu`` 里
+        ``gv / (1 + exp(-gv))``，没有开关）。保留这条分派不是性能项，是为了别的
+        配置能吃到核，以及把「核只做 silu」这件事钉在调用点上——在这里悄悄按 silu
+        算，等于把一个看着正常的 logits 换成另一个。
+
         Args:
             hidden_states: 归一化输入，末维宽度为 ``hidden_size``。
             gate: 门输入，形状与 ``hidden_states`` 一致；来自 ``in_proj_z``。
@@ -151,6 +223,9 @@ class RMSNormGated(nn.Module):
         Returns:
             与 ``hidden_states`` 同形状、同 dtype。
         """
+        if self.activation == "silu" and _has_native("rms_norm_gated"):
+            return bops.rms_norm_gated(hidden_states, self.weight.to(hidden_states.dtype),
+                                       gate, self.variance_epsilon)
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
@@ -173,6 +248,10 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6,
              group_size: int | None = None) -> torch.Tensor:
     """无状态的零中心 RMSNorm，供只需要一次前向的路径使用。
 
+    这是模块级的普通函数而不是类的方法：它没有地方缓存折好的增益，所以每次调用都
+    现折一次 ``1 + w``。需要反复调用的地方一律用 :class:`RMSNorm`，那里折一次就
+    常驻。
+
     Args:
         x: 末维宽度为 ``weight.numel()`` 的激活。
         weight: 零中心权重（语义是 ``1 + w``）。
@@ -188,6 +267,8 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6,
     dim = x.shape[-1]
     if group_size is not None and dim % group_size != 0:
         raise ValueError(f"hidden_size ({dim}) must be divisible by group_size ({group_size}).")
+    if group_size is None and _has_native("rms_norm"):
+        return bops.rms_norm(x, (1.0 + weight.float()).to(x.dtype), 0, eps)
     xf = x.float()
     if group_size is not None:
         xf = xf.reshape(*xf.shape[:-1], -1, group_size)

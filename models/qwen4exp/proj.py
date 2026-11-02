@@ -10,7 +10,8 @@
 
 Module: ``coffin/models/qwen4exp``。族里唯一 import ``backends`` 的地方：布局转换与
 查表 dtype 都是平台事实，只能由后端回答。被 ``gdn`` / ``ngram`` / ``gated_residual`` /
-``model`` 使用，本模块不 import 它们。
+``moe`` / ``model`` 使用，本模块不 import 它们。``moe`` 用的是 :func:`dispatch_linear`
+而不是 :class:`Proj`——路由矩阵是 ``nn.Parameter`` 而不是模块，但它必须走同一套派发。
 
 Constraints:
     * 布局转换只许发生一次，而且只许由后端做。``bops.linear*`` 对裸 bf16 权重内部走
@@ -50,6 +51,59 @@ _ACT_DTYPE = _caps().act_dtype
 #: 2..8 行是「所有行共用一次权重读取」的语义，再多就交给 GEMM。两个后端的换手点都
 #: 落在这附近，所以这里只挑入口，具体走哪个内核仍由后端决定。
 _SMALL_ROWS = 8
+
+
+def dispatch_linear(w, x: torch.Tensor, n: int | None = None) -> torch.Tensor:
+    """把一次 ``[..., K] -> [..., N]`` 投影按行数派给后端的三个语义入口。
+
+    单独成一个函数，是因为 :class:`Proj` 之外还有一处必须走同一条路：MoE 的路由
+    矩阵。它在一步 decode 里是 48 次 ``[1, 2560] x [2560, 512]``，原先直接
+    ``F.linear(x, weight)``，吃的是 checkpoint 的 ``[N, K]`` 行主序，本卡上实测
+    共 **30.234 ms / 一步**（作业 q4land6 的 ``aten::linear`` 48 次、629.9 us 一次，
+    占那一步设备时间的 11.1%）。而权重只有 2.62 MB，按本卡 575 GB/s 的上限读一遍
+    是 4.6 us —— 差的三个数量级全在布局与派发上，不在算术上。
+
+    它和 :meth:`Proj.forward` 共用这一段的理由不是省几行：两处的分派规则必须
+    一起改，否则某天调 ``_SMALL_ROWS`` 会只生效一半，而那半边的症状是「某个投影
+    慢回去了」，账本上只表现为一行数字变大。
+
+    Args:
+        w: 权重，契约布局 ``[N, K]``；也可以是后端已打包的形式（``W4A8Weight``、
+            ``pack.KnWeight``），它们自己带 ``n``。
+        x: 激活，``[..., K]``，最后一维的 stride 必须是 1，否则这里先拷一份。
+        n: 输出宽度，只在激活为空批时用来造结果。``None`` 表示从 ``w`` 推断。
+
+    Returns:
+        与 ``x`` 同前导形状、最后一维为 ``N`` 的张量，dtype 同 ``x``。
+
+    Raises:
+        ValueError: ``n`` 既没给、``w`` 又没有可读的 ``n`` 或二维形状。空批时
+            悄无声息地返回一个宽度错的结果，会让错误在很远的加法处才暴露。
+
+    """
+    lead = x.shape[:-1]
+    if x.stride(-1) != 1:
+        x = x.contiguous()
+    flat = x.reshape(-1, x.shape[-1])
+    if flat.shape[0] == 0:
+        # 空批不该进内核：多数内核至少要求一行，而空激活在数学上就是个空结果。
+        width = n
+        if width is None:
+            width = getattr(w, "n", None)
+        if width is None:
+            if w.dim() != 2:
+                raise ValueError(
+                    f"cannot infer the output width of {type(w).__name__}; pass n")
+            width = int(w.shape[0])
+        return x.new_empty(*lead, width)
+    if flat.shape[0] == 1:
+        # 解码入口收 ``[K]``；这里不要传 ``[1, K]``，契约就是这么分的。
+        out = bops.linear(w, flat[0]).unsqueeze(0)
+    elif flat.shape[0] <= _SMALL_ROWS:
+        out = bops.linear_m(w, flat)
+    else:
+        out = bops.linear_prefill(w, flat)
+    return out.reshape(*lead, out.shape[-1])
 
 
 class Proj(nn.Linear):
@@ -220,20 +274,7 @@ class Proj(nn.Linear):
             raise ValueError(
                 f"projection expects [..., {self.in_features}], got {tuple(x.shape)}")
         lead = x.shape[:-1]
-        if x.stride(-1) != 1:
-            x = x.contiguous()
-        flat = x.reshape(-1, self.in_features)
-        if flat.shape[0] == 0:
-            # 空批不该进内核：多数内核至少要求一行，而空激活在数学上就是个空结果。
-            return x.new_empty(*lead, self.out_features)
-        source = self._source
-        if flat.shape[0] == 1:
-            # 解码入口收 ``[K]``；这里不要传 ``[1, K]``，契约就是这么分的。
-            out = bops.linear(source, flat[0]).unsqueeze(0)
-        elif flat.shape[0] <= _SMALL_ROWS:
-            out = bops.linear_m(source, flat)
-        else:
-            out = bops.linear_prefill(source, flat)
+        out = dispatch_linear(self._source, x, self.out_features)
         if self.bias is not None:
             # bias 加在收敛后的激活 dtype 上，而 ``nn.Linear`` 把它折进 GEMM 的 epilogue
             # 在 fp32 里加，两者相差一次舍入。本族真实配置无 bias，这条分支只为让
@@ -427,6 +468,7 @@ def release_quantized_placeholders(root: nn.Module) -> int:
 __all__ = [
     "Proj",
     "QuantizedEmbedding",
+    "dispatch_linear",
     "proj_from_config",
     "release_quantized_placeholders",
 ]

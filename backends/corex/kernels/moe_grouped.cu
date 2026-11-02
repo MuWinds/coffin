@@ -38,9 +38,9 @@ namespace {
 
 // @brief 一个专家的一段行 × 一个输出列块上做 W4A8 点积。
 //
-// 线程布局：``blockIdx.x`` 切输出列（``n``），``blockIdx.z`` 选专家，行在块内
-// 由 ``blockDim.y`` 分摊。``MT`` 是每线程负责的行数，让一次权重读取服务多行——
-// decode 期这几乎总是划算，因为同一专家的权重只读一次而激活很小。
+// 线程布局：``blockIdx.x`` 切输出列（``n``），``blockIdx.z`` 选专家，行由
+// ``blockIdx.y`` 与 ``threadIdx.y`` **两级**分摊——``blockDim.y × gridDim.y`` 个线程
+// 各领一行，再按这个乘积步进。两级都必须出现在行号里，见下面行循环的注释。
 //
 // @param x       已排序的 int8 激活，``[tokens, K]``。
 // @param xs       逐 token 的激活 scale，``[tokens]`` fp32。
@@ -73,7 +73,15 @@ __global__ void moe_grouped_kernel(const int8_t* x, const float* xs,
 
     // 沿 K 的组循环，逐组做 dp4a 再乘组 scale。同一组的整数和留在 int32 里，
     // 换成 float 只发生在乘 scale 之后——提前转换会让 4 位量化的误差累积。
-    for (int r = blockIdx.y * blockDim.y; r < rows; r += gridDim.y * blockDim.y) {
+    //
+    // 行号是 ``blockIdx.y * blockDim.y + threadIdx.y``，**``threadIdx.y`` 必须在里面**。
+    // 少了它的那一版起点只取 ``blockIdx.y * blockDim.y``、步长 ``gridDim.y * blockDim.y``，
+    // 于是 ``r`` 只走得到 ``blockDim.y`` 的整数倍——``blockDim.y == 2`` 时就是**全是偶数**：
+    // 每个专家的奇数行从未被任何线程写过，输出留的是 ``torch.empty`` 的未初始化显存。
+    // 症状是同一份输入连调两次给出不同结果（实测 gate_up 两次逐元素相同 = False），
+    // 有时是垃圾浮点数、有时是 nan，而它 48 层每层两个投影都要走一次。
+    for (int r = blockIdx.y * blockDim.y + threadIdx.y; r < rows;
+         r += gridDim.y * blockDim.y) {
         const int token = begin + r;
         const int8_t* xrow = x + (size_t)token * K;
         float total = 0.f;

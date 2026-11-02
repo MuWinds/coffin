@@ -37,7 +37,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from models.qwen4exp.config import TextConfig
-from models.qwen4exp.proj import proj_from_config
+from models.qwen4exp.proj import dispatch_linear, proj_from_config
 
 #: 块内激活。Qwen 系列固定 silu，这里手写以免引入除 ``torch`` 之外的依赖。
 _ACTIVATIONS = {"silu": F.silu, "gelu": F.gelu}
@@ -147,7 +147,13 @@ class TopKRouter(nn.Module):
             raise ValueError(
                 f"router expects hidden dim {self.hidden_dim}, got {hidden_states.shape[-1]}.")
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
-        router_logits = F.linear(hidden_states, self.weight)
+        # 走 ``dispatch_linear`` 而不是 ``F.linear``：checkpoint 的 ``[N, K]`` 行主序在本卡
+        # 上是慢的那一种。一步 decode 里这 48 次调用原先合计 30.234 ms（作业 q4land6 的
+        # ``aten::linear`` 行，629.9 us/次，占那一步设备时间的 11.1%），而权重只有 2.62 MB，
+        # 按 575 GB/s 读一遍是 4.6 us。路由矩阵是 ``nn.Parameter`` 而不是 ``Proj``，所以
+        # 它请不到 ``Proj.forward`` 那套派发，但必须走同一条规则：两处分开写，某天调
+        # ``_SMALL_ROWS`` 就会只生效一半。
+        router_logits = dispatch_linear(self.weight, hidden_states, self.num_experts)
         # softmax 在 fp32 上做再 top-k：低精度下 top-k 的顺序会抖动，而顺序决定
         # 选中哪个专家。
         router_probs = F.softmax(router_logits, dtype=torch.float, dim=-1)
