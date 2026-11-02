@@ -44,6 +44,7 @@ import torch.nn.functional as F
 
 from backends.protocol import Caps, Ops, make_device
 from int8_weights import QWeight
+from w4a8_weights import W4A8MoEWeight
 
 #: Mask fill value; ``-inf`` makes the softmax weight exactly zero.
 NEG_INF = float("-inf")
@@ -93,6 +94,42 @@ def _linear(w: torch.Tensor | QWeight, x: torch.Tensor,
     compute = torch.promote_types(x.dtype, weight_dtype)
     dense = w.dequant(compute) if isinstance(w, QWeight) else w.to(compute)
     return F.linear(x.to(compute), dense).to(x.dtype)
+
+
+def _moe_grouped(w, x: torch.Tensor, offsets: torch.Tensor,
+                 weight_dtype: torch.dtype) -> torch.Tensor:
+    """把按专家排好序的激活逐专家投影，作为 ``moe_grouped`` 的正确性基线。
+
+    这里的写法是**参考语义**，不是实现：每个专家单独做一次 ``F.linear``，范围由
+    ``offsets`` 给出。它慢（E 次小 GEMM），但每一步都直接对应公式，所以任何内核
+    版本都能拿它当 oracle。
+
+    空专家要跳过：``offsets[e] == offsets[e+1]`` 时对 ``[0, K]`` 做矩阵乘，
+    多数后端能算但会白付一次启动，而 decode 期 128 个专家里往往只有几个非空。
+
+    Args:
+        w: 专家栈，``[E, N, K]``，可以是 :class:`W4A8MoEWeight`。
+        x: 激活，``[tokens, K]``，已按专家号排序。
+        offsets: ``[E+1]`` 前缀和，第 ``e`` 个专家吃 ``x[offsets[e]:offsets[e+1]]``。
+        weight_dtype: int8 权重要反量化到的 dtype（权重比激活宽时不反量化）。
+
+    Returns:
+        ``[tokens, N]``，dtype 同 ``x``。
+    """
+    experts = len(offsets) - 1
+    limit = int(offsets[-1])
+    out = torch.empty((limit, w.n), dtype=x.dtype, device=x.device)
+    bounds = offsets.tolist()
+    for index in range(experts):
+        begin, end = bounds[index], bounds[index + 1]
+        if begin == end:
+            continue
+        dense = (w.expert(index) if hasattr(w, "expert") else w[index])
+        compute = torch.promote_types(x.dtype, weight_dtype)
+        body = (dense.dequant(compute) if isinstance(dense, QWeight)
+                else dense.to(compute))
+        out[begin:end] = F.linear(x[begin:end].to(compute), body).to(x.dtype)
+    return out
 
 
 def _rms_norm(x: torch.Tensor, w: torch.Tensor, stride: int = 0,
@@ -870,6 +907,7 @@ def build(caps: Caps | None = None) -> Ops:
         delta_batch=_delta_batch,
         delta_normed=_delta_normed,
         triangular_solve=_triangular_solve,
+        moe_grouped=functools.partial(_moe_grouped, weight_dtype=c.weight_dtype),
     )
 
 

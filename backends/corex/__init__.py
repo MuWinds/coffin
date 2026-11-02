@@ -425,6 +425,49 @@ def _w4_rows(w: W4A8Weight, x: torch.Tensor,
     return _restore(out[0] if x.dim() == 1 else out, dtype)
 
 
+def moe_grouped(w, x: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+    """按专家分组做 W4A8 投影，每个专家的权重一步只读一遍。
+
+    与 :func:`_w4_rows` 的区别只在并行维：那个是"一行激活对一个投影"，这个是
+    "一个专家对其全部路由行"。decode 期每个专家平均只分到 1-2 行，按 token 分组
+    会把 2.4 MB 的专家权重读到 token 数的倍数；按专家分组只读一遍。
+
+    激活先整体量成 int8，再交给内核：量化是逐 token 的，与哪些 token 属于哪个专家
+    无关，所以可以在分组之前一次做完，不必按段各量化一次。
+
+    Args:
+        w: 专家栈，:class:`W4A8MoEWeight`，``[E, N, K]``。
+        x: 激活，``[tokens, K]``，已按专家号排序。
+        offsets: ``[E+1]`` 前缀和，int32 或 int64；空段表示该专家没有行。
+
+    Returns:
+        ``[tokens, N]``，dtype 同 ``x``。
+
+    Raises:
+        ValueError: 激活或前缀和的形状与权重不自洽。
+    """
+    module = _kernels()
+    if x.dim() != 2 or x.shape[-1] != w.k:
+        raise ValueError("grouped MoE expects [tokens, K] activations")
+    if int(offsets.numel()) != len(w) + 1:
+        raise ValueError(f"offsets must have {len(w) + 1} entries")
+    tokens = x.shape[0]
+    dtype = x.dtype
+    if tokens == 0:
+        return torch.empty((0, w.n), dtype=dtype, device=x.device)
+
+    act = _compute_dtype(x).reshape(tokens, w.k).contiguous()
+    xq = torch.empty(act.shape, dtype=torch.int8, device=act.device)
+    xs = torch.empty(tokens, dtype=torch.float32, device=act.device)
+    out = torch.empty((tokens, w.n), dtype=act.dtype, device=act.device)
+    # 前缀和必须是 int32：内核按 int32 索引，int64 传进去会读错偏移。
+    bounds = offsets.to(dtype=torch.int32, device=act.device).contiguous()
+    with torch.cuda.device(act.device):
+        module.quant_act_i8(act, xq, xs)
+        module.moe_grouped(xq, xs, w.packed, w.scale, bounds, out, w.group_size)
+    return _restore(out, dtype)
+
+
 def _w8a8_rows(packed: pack.KnQWeight, act: torch.Tensor) -> torch.Tensor:
     """用三个 W8A8 内核做一次预填充投影：量化激活、int8 GEMM、乘两个 scale。
 
@@ -1308,6 +1351,7 @@ _NATIVE: dict[str, OpFn] = {
     "delta_batch": delta_batch,
     "delta_normed": delta_normed,
     "triangular_solve": triangular_solve,
+    "moe_grouped": moe_grouped,
 }
 
 #: 本后端所有内核的表；缺席的由解析器补齐。

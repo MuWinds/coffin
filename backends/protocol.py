@@ -75,6 +75,9 @@ _OP_NAMES: tuple[str, ...] = (
     # 三角求解：分块 delta 规则每个块要反解一个单位下三角方程组，那是*库*能力，
     # 不是模型数学。
     "triangular_solve",
+    # 稀疏专家的分组投影：每个专家只算路由到它的那几行。与上面三个 ``linear*``
+    # 分开命名，因为它的并行维是"专家 × 行"而不是"行"，切法完全不同。
+    "moe_grouped",
 )
 
 
@@ -195,6 +198,16 @@ class Ops:
     #: 权重为 int8 时，没有反量化 GEMM 的后端会为这次调用把 ``w`` 实体化成
     #: :attr:`Caps.weight_dtype`，这个取舍是对的，因为预填充是算力受限的。
     linear_prefill: OpFn | None = None
+    #: ``moe_grouped(w, x, offsets) -> y``：稀疏专家的融合投影。
+    #: ``w`` 是 :class:`W4A8MoEWeight`（``[E, N, K]`` 的专家栈），``x`` 是
+    #: ``[tokens, K]`` 且已按专家号排好序，``offsets`` 是 ``[E+1]`` 的前缀和
+    #: （第 ``e`` 个专家吃 ``x[offsets[e]:offsets[e+1]]``）。返回 ``[tokens, N]``。
+    #:
+    #: 为什么要这个算子而不是模型侧循环：一个 decode 步里 48 层 × 10 个路由槽位
+    #: 会退化成几百次小 GEMM，每次只带几行激活却要读一整个专家（2.4 MB），
+    #: 权重读取被放大到 token 数的倍数。按专家分组后每个专家的权重在一个步里
+    #: 只读一遍，这是 decode 期 MoE 唯一可行的形态。
+    moe_grouped: OpFn | None = None
     #: ``rms_norm(x, w, stride=0, eps=1e-6) -> y``：对 ``[M, N]`` 最后一轴做零中心
     #: RMSNorm（有效系数 ``1 + w``，由调用方折好）。``stride`` 是行与行之间的元素
     #: 间距，让指向更宽缓冲区的视图能原地归一化而不必拷贝；``0`` 表示「从 ``x`` 里

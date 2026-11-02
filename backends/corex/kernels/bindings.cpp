@@ -141,4 +141,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("triangular_solve", &triangular_solve,
           "unit-lower-triangular solve A X = B over a batch of [L, L] systems",
           pybind11::arg("lower"), pybind11::arg("rhs"));
+
+    m.def("hyper_norm", &hyper_norm,
+          "分组 RMSNorm：hc 路残差流各自在 hidden 维上归一化",
+          pybind11::arg("x"), pybind11::arg("w"), pybind11::arg("out"),
+          pybind11::arg("hidden"), pybind11::arg("hc"), pybind11::arg("eps"));
+    m.def("hyper_down", &hyper_down,
+          "Gated Residual 的 down 投影加 silu 门",
+          pybind11::arg("normed"), pybind11::arg("wt"), pybind11::arg("out"),
+          pybind11::arg("hc"));
+    m.def("moe_grouped", &moe_grouped,
+          "\u5206\u7ec4 W4A8 \u6295\u5f71\uff1a\u6bcf\u4e2a\u4e13\u5bb6\u53ea\u7b97\u8def\u7531\u5230\u5b83\u7684\u884c",
+          pybind11::arg("a"), pybind11::arg("xs"), pybind11::arg("w"),
+          pybind11::arg("ws"), pybind11::arg("offsets"), pybind11::arg("out"),
+          pybind11::arg("group_size"));
+    m.def("hyper_up", &hyper_up,
+          "Gated Residual 的 up 投影加读门塌缩与写门",
+          pybind11::arg("normed"), pybind11::arg("up_wt"), pybind11::arg("low"),
+          pybind11::arg("inj_wt"), pybind11::arg("mixed"), pybind11::arg("inject"),
+          pybind11::arg("hidden"), pybind11::arg("hc"), pybind11::arg("lowrank"));
 }

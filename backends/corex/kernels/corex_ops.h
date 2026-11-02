@@ -492,3 +492,65 @@ torch::Tensor delta_normed(torch::Tensor q, torch::Tensor k, torch::Tensor v,
 // @return [bn, L, n]，dtype 同 ``rhs``。
 // @throws c10::Error 形状或布局是内核索引不了的，包括 ``L`` 大到装不进共享内存。
 torch::Tensor triangular_solve(torch::Tensor lower, torch::Tensor rhs);
+
+// Gated Residua）：Qwen4-Exp 每层两套，48 层就是 96 次调用。
+// 参考实现里每套是八次 torch 调用，光发射就与本层权重带宽同量级，所以融合。
+
+// @brief 对残差流做分组 RMSNorm：每 `hidden` 个元素一组，各自归一化。
+//
+// @param x   残差流，`[rows, hidden * hc]` 连续，bf16 或 fp32。
+// @param w   零中心权重，`[hidden * hc]` fp32，前向按 `1 + w`。
+// @param out 目标缓冲，`[rows, hidden * hc]` 连续，dtype 同 `x`。
+// @param hidden 每流宽度。
+// @param hc     流数，上限 8。
+// @param eps    方差下限。
+// @return out。
+// @throws c10::Error 布局、dtype、形状或组数不符合契约。
+torch::Tensor hyper_norm(torch::Tensor x, torch::Tensor w, torch::Tensor out,
+                         int64_t hidden, int64_t hc, double eps);
+
+// @brief down 投影加 `silu(v / hc)`：`[rows, K] -> [rows, lowrank]`。
+//
+// @param normed 归一化后的激活，`[rows, K]` 连续。
+// @param wt     down 权重，`[K, lowrank]` 连续，dtype 同 `normed`。
+// @param out    `[rows, lowrank]` 连续目标。
+// @param hc     读门的除数。
+// @return out。
+// @throws c10::Error 布局、dtype 或形状不符合契约。
+torch::Tensor hyper_down(torch::Tensor normed, torch::Tensor wt, torch::Tensor out,
+                         int64_t hc);
+
+// @brief up 投影加读门塌缩，同时算写门。
+//
+// @param normed 归一化后的激活，`[rows, hidden*hc]` 连续。
+// @param up_wt  up 权重，`[lowrank, hidden*hc]` 连续。
+// @param low    down 的输出，`[rows, lowrank]` 连续。
+// @param inj_wt 写门权重，`[hidden*hc, hc]` 连续，dtype 同 `normed`。
+// @param mixed  `[rows, hidden]` 连续目标：读门塌缩结果。
+// @param inject `[rows, hc]` 连续 fp32 目标：写门。
+// @param hidden 每流宽度。
+// @param hc     流数。
+// @param lowrank down 的秩。
+// @return mixed。
+// @throws c10::Error 布局、dtype 或形状不符合契约。
+torch::Tensor hyper_up(torch::Tensor normed, torch::Tensor up_wt, torch::Tensor low,
+                       torch::Tensor inj_wt, torch::Tensor mixed, torch::Tensor inject,
+                       int64_t hidden, int64_t hc, int64_t lowrank);
+
+// 稀疏专家的分组投影：每个专家只算路由到它的行。与单投影分开，因为它的并行维
+// 是"专家 × 行"，切法完全不同。
+
+// @brief 分组 W4A8 投影：``[tokens, K] -> [tokens, N]``，每专家独立权重。
+//
+// @param a        已按专家号排序的 int8 激活，``[tokens, K]`` 连续。
+// @param xs       逐 token 激活 scale，``[tokens]`` fp32。
+// @param w        专家栈 packed W4，``[E, ceil(K/2), N]`` 连续 uint8。
+// @param ws       专家栈 scale，``[E, ceil(K/group), N]`` 连续 fp32。
+// @param offsets  ``[E+1]`` 前缀和，int32；空段表示该专家没有行。
+// @param out      ``[tokens, N]`` 连续，bf16 或 fp32。
+// @param group_size K 轴权重分组大小。
+// @return out。
+// @throws c10::Error 布局、设备、dtype、形状或前缀和不自洽。
+torch::Tensor moe_grouped(torch::Tensor a, torch::Tensor xs, torch::Tensor w,
+                          torch::Tensor ws, torch::Tensor offsets,
+                          torch::Tensor out, int64_t group_size);
