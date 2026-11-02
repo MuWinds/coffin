@@ -39,7 +39,7 @@ from typing import Any
 import torch
 
 from int8_weights import QWeight
-from w4a8_weights import W4A8Weight
+from w4a8_weights import W4A8MoEWeight, W4A8Weight
 
 #: 索引文件名。加载器靠它认出一个目录是预量化的，所以这个名字不能在任何
 #: checkpoint 里出现。
@@ -338,6 +338,23 @@ def _load_w4a8(model_dir: Path, index: dict, *, device: torch.device,
                         raise ValueError(f"{path}: packed shape mismatch for {key}")
                     value = W4A8Weight(packed, scale, k=int(meta["k"]),
                                        group_size=int(meta["group_size"]))
+                    sd[key] = value if quant else value.to(weight_dtype)
+                elif meta.get("kind") == "q4-moe":
+                    # MoE 的融合专家栈。必须走独立分支：``packed`` 是三维的
+                    # ``[E, ceil(K/2), N]``，喂给 ``W4A8Weight`` 会被它按
+                    # ``[N, K]`` 解释，而 ``[512, 1280, 2560]`` 恰好也能过分组形状
+                    # 校验——不报错，只是之后每次取专家都取错位置。落进 ``else``
+                    # 更糟：三维 uint8 会被原样塞进 state dict。
+                    scale_key = meta.get("scale_key")
+                    if scale_key not in available:
+                        raise ValueError(f"{path}: {key} has no scale tensor {scale_key}")
+                    packed = handle.get_tensor(key)
+                    scale = handle.get_tensor(scale_key)
+                    if (list(packed.shape) != meta.get("packed_shape")
+                            or list(scale.shape) != meta.get("scale_shape")):
+                        raise ValueError(f"{path}: packed shape mismatch for {key}")
+                    value = W4A8MoEWeight(packed, scale, k=int(meta["k"]),
+                                          group_size=int(meta["group_size"]))
                     sd[key] = value if quant else value.to(weight_dtype)
                 else:
                     sd[key] = handle.get_tensor(key)
