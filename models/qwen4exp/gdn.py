@@ -396,6 +396,9 @@ class GatedDeltaNet(nn.Module):
         self._decode_bufs: dict = {}
         #: ``-exp(A_log)`` / ``dt_bias`` 的缓存，见 :meth:`_decay_constants`。
         self._decay_cache: tuple | None = None
+        #: 四个 ``in_proj`` 拼成一个权重后的闭包缓存，见 :meth:`_fused_in_proj`。
+        #: ``None`` 表示还没算过；``((), None)`` 表示算过且不适用。
+        self._fused_in_cache = None
 
     def _fused_ready(self) -> bool:
         """本后端是否真的能跑融合解码步。
@@ -410,6 +413,63 @@ class GatedDeltaNet(nn.Module):
             两个内核都在 ``caps().native`` 里、且融合路径已被真机验证时为 ``True``。
         """
         return _DECODE_FUSED_VERIFIED and _DECODE_OPS <= _caps().native
+
+    def _fused_in_proj(self):
+        """把四个 ``in_proj`` 沿输出轴拼成一个权重，返回一次投影的闭包。
+
+        四个投影共享 ``K = hidden_size`` 且都是 W4A8（同 ``group_size``），所以
+        ``cat_output`` 的契约正好成立：``packed`` 是 ``[ceil(K/2), N_i]``、
+        ``scale`` 是 ``[groups, N_i]``，沿 N 拼接后与拼好的 ``packed`` 一一对应 ——
+        **不需要重排，数值逐位等价**。
+
+        为什么值得：decode 一步里 W4A8 投影共 316 次 ``w4a8_dot`` + 约 403 次
+        ``quant_act_i8``（``q4budget2``），而 GDN 的四个投影在 36 个线性层上各一次。
+        合并后把这部分从「4 次投影 + 4 次量化」压到「1 次投影 + 1 次量化」，
+        并且激活只读一遍。
+
+        Returns:
+            ``(hidden) -> packed_output`` 的闭包，输出最后一维是
+            ``key_dim*2 + value_dim*2 + num_v_heads*2``；任一前置条件不满足时
+            （非量化路径、有 bias、形状不合）返回 ``None``，调用方退回四次投影。
+        """
+        cached = self._fused_in_cache
+        if cached is not None:
+            return cached[1]
+
+        from w4a8_weights import W4A8Weight
+
+        parts = (self.in_proj_qkv, self.in_proj_z, self.in_proj_b, self.in_proj_a)
+        weights = []
+        for module in parts:
+            weight = getattr(module, "_quantized", None)
+            if not isinstance(weight, W4A8Weight) or module.bias is not None:
+                # 非量化路径（bf16 ``[K,N]``）也能拼，但那条路不是 decode 的热路径，
+                # 而拼接会让 ``pack.as_kn`` 的身份记忆化失效。所以只在 W4A8 上做。
+                # 有 bias 的站点同样跳过：``W4A8Weight`` 里没有 bias。
+                self._fused_in_cache = ((), None)
+                return None
+            weights.append(weight)
+        merged = W4A8Weight.cat_output(weights)
+        total_out = sum(module.out_features for module in parts)
+
+        def project(hidden: torch.Tensor) -> torch.Tensor:
+            """一次投影出四段拼接的结果。
+
+            Args:
+                hidden: ``[B, S, hidden_size]``。
+
+            Returns:
+                ``[B, S, total_out]``，dtype 同 ``hidden``。
+            """
+            # 走后端入口而不是 ``Proj.forward``：后者会再走一遍派发与 reshape，
+            # 而这里形状已知（decode 是 1 行、prefill 是整段）。
+            from backends import ops as bops
+
+            flat = hidden.reshape(-1, self.hidden_size)
+            return bops.linear_m(merged, flat).reshape(*hidden.shape[:-1], total_out)
+
+        self._fused_in_cache = (tuple(id(w) for w in weights), project)
+        return project
 
     def _decode_scratch(self, rows: int, device: torch.device,
                         dtype: torch.dtype) -> dict:
@@ -580,10 +640,31 @@ class GatedDeltaNet(nn.Module):
         hidden_states = apply_padding_mask(hidden_states, conv_mask)
         batch, seq, _ = hidden_states.shape
 
-        mixed_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)
-        z = self.in_proj_z(hidden_states).reshape(batch, seq, -1, self.head_v_dim)
-        b = self.in_proj_b(hidden_states)
-        a = self.in_proj_a(hidden_states)
+        # 四个 in_proj 吃**同一份** hidden_states。分开调用会把激活重复读四遍、
+        # 并且各发一次内核（W4A8 路径上每次还额外带一次 ``quant_act_i8``）。
+        #
+        # 实测依据（作业 ``q4budget2``/``q4attrib3``）：一步 decode 里 ``w4a8_dot`` 316 次、
+        # ``quant_act_i8`` 约 403 次，而 GDN 的四个投影在 36 个线性层上各出现一次 ——
+        # 合并后这部分从 4 次投影 + 4 次量化降到 1 次投影 + 1 次量化。
+        #
+        # 用 :meth:`W4A8Weight.cat_output` 沿输出轴拼：四者共享 ``K`` 与 ``group_size``，
+        # 而 scale 是逐组的 ``[groups, N]``，沿 N 拼接正好与拼接后的 packed 对齐，
+        # 所以**不需要额外转置或重排，数值上也逐位等价**。
+        fused = self._fused_in_proj()
+        if fused is not None:
+            packed = fused(hidden_states)
+            qkv_n = self.key_dim * 2 + self.value_dim
+            mixed_qkv = packed[..., :qkv_n].transpose(1, 2)
+            z = packed[..., qkv_n:qkv_n + self.value_dim].reshape(
+                batch, seq, -1, self.head_v_dim)
+            b = packed[..., qkv_n + self.value_dim:qkv_n + self.value_dim
+                       + self.num_v_heads]
+            a = packed[..., qkv_n + self.value_dim + self.num_v_heads:]
+        else:
+            mixed_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)
+            z = self.in_proj_z(hidden_states).reshape(batch, seq, -1, self.head_v_dim)
+            b = self.in_proj_b(hidden_states)
+            a = self.in_proj_a(hidden_states)
 
         # 卷积状态存投影之后、激活之前的值：激活是卷积之后才做的，把它一起存
         # 会让热启动时多算一次 silu。

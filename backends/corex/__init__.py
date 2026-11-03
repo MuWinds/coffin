@@ -39,7 +39,6 @@ from __future__ import annotations
 
 import functools
 import os
-from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -464,20 +463,34 @@ def _w4_rows(w: W4A8Weight, x: torch.Tensor,
         raise ValueError("W4 projection expects [K] or [M, K] activations")
     if x.device != w.packed.device:
         raise ValueError("W4 weight and activation must share a device")
-    act = _compute_dtype(x).reshape(-1, w.k).contiguous()
+    act = _compute_dtype(x)
+    # 只在真的需要时 reshape/contiguous。``x`` 在 decode 路径上几乎总是已经
+    # ``[1, K]``（或 ``[K]``）且连续，而 ``.reshape(-1, K)`` 与 ``.contiguous()``
+    # 即使什么都不做也各付一次 Python 分发 —— 一步 316 次 W4A8 投影就是 632 次。
+    if act.dim() != 2 or act.shape[1] != w.k:
+        act = act.reshape(-1, w.k)
+    if not act.is_contiguous():
+        act = act.contiguous()
     rows = act.shape[0]
     xq, xs = _w4_scratch(rows, w.k, act.device, activation_scale)
     out = torch.empty((rows, w.n), dtype=act.dtype, device=act.device)
     if rows:
-        with torch.cuda.device(act.device) if act.is_cuda else nullcontext():
-            if activation_scale is None:
-                module.quant_act_i8(act, xq, xs)
-            else:
-                module.quant_act_i8_scaled(act, xq, xs)
-            if rows >= 32 and w.k % 4 == 0 and w.group_size % 64 == 0:
-                module.w4a8_gemm_tcu(xq, w.packed, xs, w.scale, out, w.group_size)
-            else:
-                module.w4a8_gemv(xq, w.packed, xs, w.scale, out, w.group_size)
+        # 分支提到循环外：这几个条件只由形状决定，而它每次调用都要判一遍。
+        if rows >= 32 and w.k % 4 == 0 and w.group_size % 64 == 0:
+            gemm = module.w4a8_gemm_tcu
+        else:
+            gemm = module.w4a8_gemv
+        # **不套 ``torch.cuda.device(...)``**。那个上下文管理器每次都走一遍
+        # ``c10::cuda::OptionalCUDAGuard``：读当前设备、比较、必要时切换、出块再
+        # 恢复。而扩展自己的每个入口都已经有 ``CUDAGuard guard(t.device())``
+        # （见 ``corex_ops.h`` 的 Constraints），张量也在正确的设备上，所以在
+        # 单卡路径上它什么也没做——一步 316 次投影就是 316 次纯开销。
+        # 多卡时由调用方保证当前设备，或由扩展的 guard 兜住。
+        if activation_scale is None:
+            module.quant_act_i8(act, xq, xs)
+        else:
+            module.quant_act_i8_scaled(act, xq, xs)
+        gemm(xq, w.packed, xs, w.scale, out, w.group_size)
     return _restore(out[0] if x.dim() == 1 else out, dtype)
 
 
@@ -551,20 +564,68 @@ def moe_grouped(w, x: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
     if tokens == 0:
         return torch.empty((0, w.n), dtype=dtype, device=x.device)
 
-    act = _compute_dtype(x).reshape(tokens, w.k).contiguous()
-    xq = torch.empty(act.shape, dtype=torch.int8, device=act.device)
-    xs = torch.empty(tokens, dtype=torch.float32, device=act.device)
-    # **必须 zeros 而不是 empty。** 分组内核只写 ``offsets`` 覆盖到的那些行，尾部
-    # （没有有效槽位对应）一个字节都不写。调用方会把整块结果乘上一个含 0 的权重
-    # 掩码再加回去，而 ``0 * nan`` 还是 ``nan`` —— 用 ``empty`` 就等于把未初始化
-    # 显存里的任意位（可能是 nan/inf）乘进残差流。
+    # 这一段是**主机侧**的主要成本（一条路径 48 层 x 2 次）。原来每次调用做四件事：
+    # ``_compute_dtype`` / ``reshape`` / ``contiguous`` / 两个 ``torch.empty`` /
+    # 一个 ``torch.zeros`` / 一个 ``offsets.to(int32)`` —— 六次分配加两次转换，
+    # 而它们描述的东西在一步之内完全不变（形状只由 tokens 决定，``offsets`` 本来就是
+    # int32 且在各 rank 间同构）。
+    #
+    # 所以这里按「形状键」把 xq/xs/out 复用起来，并短路掉那些已经是目标状态的转换。
+    act = x if x.dtype in (torch.bfloat16, torch.float32) else x.float()
+    if act.shape != (tokens, w.k) or not act.is_contiguous():
+        act = act.reshape(tokens, w.k).contiguous()
+    # 只复用 ``xq`` / ``xs`` 这对**纯暂存**：它们从不被返回、只在这次调用里被内核
+    # 读写，所以复用无别名风险。``out`` 不复用 —— 它是返回值，调用方可能把它挂进
+    # 残差流或是留着做后续加法，复用会让上一步的结果被就地覆盖。这一条与
+    # ``_w4_rows`` 里"out 必须每次新建"是同一条理由。
+    xq, xs = _moe_scratch(tokens, w.k, act.device)
+    # out 必须清零：分组内核只写 ``offsets`` 覆盖到的行，尾部一个字节都不写，而
+    # 调用方会把整块结果乘一个含 0 的权重掩码再加回去 —— ``0 * nan`` 还是 ``nan``。
     out = torch.zeros((tokens, w.n), dtype=act.dtype, device=act.device)
-    # 前缀和必须是 int32：内核按 int32 索引，int64 传进去会读错偏移。
-    bounds = offsets.to(dtype=torch.int32, device=act.device).contiguous()
-    with torch.cuda.device(act.device):
-        module.quant_act_i8(act, xq, xs)
-        module.moe_grouped(xq, xs, w.packed, w.scale, bounds, out, w.group_size)
+    # ``offsets`` 已经是 int32 连续时不要 ``.to()``：``.to`` 同 dtype 仍是一次
+    # Python 层分发，而这里每层要付两次。
+    if offsets.dtype == torch.int32 and offsets.is_contiguous():
+        bounds = offsets
+    else:
+        bounds = offsets.to(dtype=torch.int32, device=act.device).contiguous()
+    # 同样不套 ``torch.cuda.device(...)``：扩展入口自带 ``CUDAGuard``，而单卡路径
+    # 上当前设备本来就是对的。一步 96 次就是 96 次纯开销。
+    module.quant_act_i8(act, xq, xs)
+    module.moe_grouped(xq, xs, w.packed, w.scale, bounds, out, w.group_size)
     return _restore(out, dtype)
+
+
+#: ``(tokens, k, device)`` → ``(xq, xs)`` 的分组 MoE 激活暂存。
+#:
+#: 一步 decode 里 ``moe_grouped`` 被调 96 次（48 层 x gate_up/down），原来每次新建
+#: ``xq``/``xs``/``out`` 三个张量 = 288 次分配。这里只缓存前两个：它们是纯暂存，
+#: 从不返回、也没有别名；``out`` 必须每次新建（见上）。
+#:
+#: 单线程引擎主循环（``llm_engine`` 单线程驱动），不需要锁。条数上限是防御性的。
+_MOE_SCRATCH: dict = {}
+_MOE_SCRATCH_MAX = 16
+
+
+def _moe_scratch(tokens: int, k: int, device: torch.device):
+    """取（必要时分配）分组 MoE 的激活暂存。
+
+    Args:
+        tokens: 行数。
+        k: 激活宽度。
+        device: 目标设备。
+
+    Returns:
+        ``(xq, xs)``：``[tokens, k]`` 的 int8 与 ``[tokens]`` 的 fp32。
+    """
+    key = (tokens, k, device)
+    pair = _MOE_SCRATCH.get(key)
+    if pair is None:
+        if len(_MOE_SCRATCH) >= _MOE_SCRATCH_MAX:
+            _MOE_SCRATCH.clear()
+        pair = (torch.empty((tokens, k), dtype=torch.int8, device=device),
+                torch.empty(tokens, dtype=torch.float32, device=device))
+        _MOE_SCRATCH[key] = pair
+    return pair
 
 
 def moe_dispatch(expert_idx: torch.Tensor, local_table: torch.Tensor,

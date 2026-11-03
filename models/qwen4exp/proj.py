@@ -82,6 +82,13 @@ def dispatch_linear(w, x: torch.Tensor, n: int | None = None) -> torch.Tensor:
 
     """
     lead = x.shape[:-1]
+    # decode 一步里本函数被调约 485 次（``q4attrib3`` 按调用点量到），而每一步
+    # ``stride`` / ``reshape`` / ``unsqueeze`` 都是一次 Python 分发。这里把
+    # 「已经是 [1, K] 连续」这条最常见的情形短路掉：它占 decode 的绝大多数调用，
+    # 而那种输入既不需要拷贝也不需要 reshape。
+    if x.dim() == 2 and x.shape[0] == 1 and x.stride(-1) == 1 and x.is_contiguous():
+        # 解码入口收 ``[K]``；契约就是这么分的，不要传 ``[1, K]``。
+        return bops.linear(w, x[0]).unsqueeze(0)
     if x.stride(-1) != 1:
         x = x.contiguous()
     flat = x.reshape(-1, x.shape[-1])
