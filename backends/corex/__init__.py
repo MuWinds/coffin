@@ -1199,6 +1199,193 @@ def delta_normed(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                                    qscale, rep)
 
 
+# 超连接（Gated Residual）
+#
+# 这三个适配器背后是 ``kernels/hyper.cu`` 的三个内核，它们一层里被调两套、48 层就是
+# 96 套，每套从八次 torch 启动压到三次。三者的权重全部按内核的 ``[K, N]`` 契约收，
+# 转置由 ``pack.as_kn`` 按对象身份记忆化承担一次——与 ``linear`` 同一条路，所以
+# 模型侧不需要知道本后端的布局。
+
+
+def _hyper_rows(x: torch.Tensor) -> torch.Tensor:
+    """把 ``[..., width]`` 摊平成内核要求的 ``[rows, width]`` 连续张量。
+
+    不用 :func:`_pitch_rows`：那个按行间距做 ``as_strided`` 视图，而
+    ``hyper.cu`` 的三个内核都用 ``ptr + row * width`` 直接寻址、并在入口
+    ``TORCH_CHECK(is_contiguous())``。带间距的视图会被内核拒绝；更糟的是把它
+    ``reshape`` 成连续的内存会静默拷贝，于是内核写进临时张量、调用方拿到旧值。
+
+    Args:
+        x: 最后一维是通道宽的激活。
+
+    Returns:
+        二维连续视图（本身连续时是同一个张量的视图，不是拷贝）。
+
+    Raises:
+        ValueError: ``x`` 不是连续布局。这里显式拒绝，因为静默拷贝会让写入丢失。
+    """
+    if not x.is_contiguous():
+        raise ValueError("hyper ops need contiguous activations")
+    return x.reshape(-1, x.shape[-1])
+
+
+#: 超连接权重从 W4A8 实体化成 bf16 的缓存，键是 ``(id(W4A8Weight), 激活 dtype)``。
+#:
+#: 为什么键里带 dtype：内核对权重与激活的 dtype 一致性有硬断言，而同一个
+#: ``W4A8Weight`` 在不同臂上可能配不同的激活 dtype；只按 ``id()`` 记住一份会让第二次
+#: 拿到 dtype 不符的矩阵，然后被内核拒绝。
+#:
+#: 为什么必须实体化：``hyper.cu`` 的三个内核只吃 bf16/fp32 的致密矩阵，没有反量化
+#: 通路（那是 ``w4a8_gemv`` 的事，而它的输出形状是"激活 × 列"，与这里的
+#: ``[lowrank, K]`` 权重转置对不上）。而真机量化产物确实覆盖了超连接的投影：它们是
+#: 二维、行数 10240/320，全部过了 ``classify`` 的 q4 判据。
+#:
+#: 代价是每套超连接多 58.7 MB 常驻：``input_mix_weight_down`` 的 ``[10240, 2560]``
+#: 是 52.4 MB、``input_mix_weight_up`` 的 ``[10240, 320]`` 是 6.55 MB、写门的
+#: ``[4, 10240]`` 是 81.9 KB（bf16 实体化）。48 层 × 2 套 = 96 套合计 **约 5.6 GB**。
+#: 这是拿显存换 768 次发射（768 × 5.75 us 的启动地板 = 4.4 ms）的取舍，不是免费的，
+#: 也不是笔误。真机上必须把 ``resident=`` 打出来并与基线比：那个差值是这笔账的实付金额。
+#:
+#: 用普通 dict 而不是 weakref 表：``W4A8Weight`` 带 ``__slots__`` 且没有
+#: ``__weakref__`` 槽位，弱引用建不出来；而这个字典的条目数是模型的固定几何
+#: （每层两套 × 三个权重），不是一个随调用增长的缓存，同时持有强引用正好挡住
+#: ``id()`` 被回收后复用。
+_HYPER_DENSE: dict[tuple[int, torch.dtype], "pack.KnWeight"] = {}
+
+
+def _hyper_weight(w, act_dtype: torch.dtype) -> "pack.KnWeight":
+    """把超连接的权重备成内核能读的 ``[K, N]`` 致密矩阵，dtype 强制对齐激活。
+
+    ``hyper.cu`` 的入口断言是 ``wt.scalar_type() == normed.scalar_type()``，所以权重
+    dtype 必须显式跟着激活走，不能指望"加载器已经把它转成 bf16 了"：
+
+    * ``W4A8Weight`` 没有转置形态，只能先实体化成 ``act_dtype`` 再转置（这是当前唯一
+      能跑的路，代价见 :data:`_HYPER_DENSE`）。
+    * ``pack.as_kn`` 对**已经打包**的权重是幂等直返的，不会改 dtype。而 ``KnWeight``
+      不是 ``nn.Module`` 也不是 buffer，``model.to(dtype=...)`` 搬不动它——于是真机上
+      会出现"激活 bf16、权重 fp32"，内核直接拒绝（作业 4543，on 臂第一层就死在这里）。
+      这一条与 ``gdn.py`` 记录的 fp32 输出外溢是同一类事故：**dtype 契约必须由适配器
+      自己收口，不能靠上游自觉**。
+
+    Args:
+        w: 契约布局 ``[N, K]`` 的权重：``nn.Parameter``、``pack.KnWeight`` 或
+            :class:`W4A8Weight`。
+        act_dtype: 归一化激活的 dtype，内核要求权重与它一致。
+
+    Returns:
+        ``[K, N]`` 连续致密矩阵的打包形式，dtype 为 ``act_dtype``。
+
+    Raises:
+        ValueError: 既不是可识别的权重类型，也不是二维张量。
+    """
+    if isinstance(w, W4A8Weight):
+        key = (id(w), act_dtype)
+        hit = _HYPER_DENSE.get(key)
+        if hit is not None:
+            return hit
+        dense = pack.to_kn(w.to(act_dtype), act_dtype)
+        _HYPER_DENSE[key] = dense
+        return dense
+    packed = pack.as_kn(w, act_dtype)
+    if packed.wt.dtype == act_dtype:
+        return packed
+    # 已打包但 dtype 不符（``as_kn`` 幂等直返那条路）。这一步只在首次见到该权重时
+    # 发生一次，之后由 ``as_kn`` 的对象身份缓存接管。
+    return pack.KnWeight(packed.wt.to(act_dtype).contiguous())
+
+
+def hyper_norm(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor,
+               hidden: int, hc: int, eps: float = 1e-6) -> torch.Tensor:
+    """经融合内核做分组零中心 RMSNorm：``hc`` 路流各自在 ``hidden`` 维上归一化。
+
+    不复用 :func:`rms_norm`：那个对整条最后一维归一化，用在 4 路残差流上会把各路
+    能量摊平，形状全对、尺度全错。
+
+    Args:
+        x: 残差流，``[..., hidden * hc]`` 连续。
+        w: 零中心权重，``[hidden * hc]``，前向按 ``1 + w``。内核只接受 fp32，
+            这里只在 dtype 不符时拷一次。
+        out: 目的地，形状与 dtype 同 ``x``，原地写入。
+        hidden: 每路宽度。
+        hc: 路数，内核上限 8。
+        eps: 方差下限。
+
+    Returns:
+        ``out``，便于调用链串接。
+
+    Raises:
+        RuntimeError: 扩展不可用。
+        ValueError: 某个操作数不是连续布局。
+    """
+    module = _kernels()
+    act = _compute_dtype(x)
+    gain = w if w.dtype == torch.float32 else w.to(torch.float32)
+    return module.hyper_norm(_hyper_rows(act), gain.contiguous(),
+                             _hyper_rows(out), hidden, hc, eps)
+
+
+def hyper_down(normed: torch.Tensor, wt: torch.Tensor, out: torch.Tensor,
+               hc: int) -> torch.Tensor:
+    """经融合内核做读门的降维投影，并 ``silu(v / hc)``。
+
+    除以 ``hc`` 发生在 silu **之前**，与内核一致：silu 不是线性的，顺序换了就是
+    另一条曲线。
+
+    Args:
+        normed: 归一化后的激活，``[..., K]`` 连续。
+        wt: 降维权重，契约布局 ``[lowrank, K]``；内核要 ``[K, lowrank]``，转置由
+            :func:`pack.as_kn` 按对象身份记忆化承担，与 :func:`linear` 同一条路。
+        out: 目的地，``[..., lowrank]``，dtype 同 ``normed``，原地写入。
+        hc: 读门除数。
+
+    Returns:
+        ``out``，便于调用链串接。
+
+    Raises:
+        RuntimeError: 扩展不可用。
+        ValueError: 某个操作数不是连续布局。
+    """
+    module = _kernels()
+    act = _compute_dtype(normed)
+    packed = _hyper_weight(wt, act.dtype)
+    return module.hyper_down(_hyper_rows(act), packed.wt, _hyper_rows(out), hc)
+
+
+def hyper_up(normed: torch.Tensor, up_wt: torch.Tensor, low: torch.Tensor,
+             inj_wt: torch.Tensor, mixed: torch.Tensor, inject: torch.Tensor,
+             hidden: int, hc: int, lowrank: int) -> torch.Tensor:
+    """经融合内核做读门升维、加权 mean 与写门，一次启动。
+
+    读门塌缩是 ``mean`` 不是 ``sum``，写门是 ``2 * sigmoid(dot / hc)``；三处都在
+    内核里，这里的职责只是把两个权重备成 ``[K, N]``。
+
+    Args:
+        normed: 归一化后的激活，``[..., hidden * hc]`` 连续。
+        up_wt: 升维权重，契约布局 ``[hidden * hc, lowrank]``。
+        low: 降维输出，``[..., lowrank]`` 连续。
+        inj_wt: 写门权重，契约布局 ``[hc, hidden * hc]``。
+        mixed: 读门塌缩结果的目的地，``[..., hidden]``，原地写入。
+        inject: 写门的目的地，``[..., hc]`` fp32，原地写入。
+        hidden: 每路宽度。
+        hc: 路数。
+        lowrank: 降维秩。
+
+    Returns:
+        ``mixed``，便于调用链串接。
+
+    Raises:
+        RuntimeError: 扩展不可用。
+        ValueError: 某个操作数不是连续布局。
+    """
+    module = _kernels()
+    act = _compute_dtype(normed)
+    packed_up = _hyper_weight(up_wt, act.dtype)
+    packed_inj = _hyper_weight(inj_wt, act.dtype)
+    return module.hyper_up(_hyper_rows(act), packed_up.wt, _hyper_rows(low),
+                           packed_inj.wt, _hyper_rows(mixed), _hyper_rows(inject),
+                           hidden, hc, lowrank)
+
+
 #: 三角求解里每个块的行数，从大到小。在本卡 L=512 上对块大小 32/64/128/256 实测：
 #: 256 最快（2.48 ms），128 是病态的（9.3 ms），所以这个选择比算法本身更要紧。试过
 #: 的每种块大小都正确到 1e-07，因此它纯粹是个速度旋钮——这也是行数不能被最优块整除
@@ -1352,6 +1539,9 @@ _NATIVE: dict[str, OpFn] = {
     "delta_normed": delta_normed,
     "triangular_solve": triangular_solve,
     "moe_grouped": moe_grouped,
+    "hyper_norm": hyper_norm,
+    "hyper_down": hyper_down,
+    "hyper_up": hyper_up,
 }
 
 #: 本后端所有内核的表；缺席的由解析器补齐。
@@ -1439,6 +1629,7 @@ _DECODE_OPS: frozenset[str] = frozenset({
     "attn_paged", "attn_paged_batch", "attn_paged_multi_q", "conv1d_silu",
     "conv1d_silu_seq", "conv1d_silu_batch", "delta_prologue", "delta_prologue_batch",
     "delta_prep_seq", "delta", "delta_batch", "delta_normed",
+    "hyper_norm", "hyper_down", "hyper_up",
 })
 
 

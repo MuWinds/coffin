@@ -89,7 +89,7 @@ class OpTableTest(unittest.TestCase):
     def test_names_are_the_contract_ops(self):
         """改名或漏名对每个调用点都是契约破坏，所以元组按字面钉死。"""
         self.assertEqual(Ops.NAMES, (
-            "linear", "linear_m", "linear_prefill",
+            "linear", "linear_m", "linear_prefill", "moe_grouped",
             "rms_norm", "add_rms_norm", "rms_norm_gated", "kv_quant", "silu_mul",
             "rope_apply",
             "attn_decode", "attn_paged", "attn_paged_batch", "attn_paged_multi_q",
@@ -97,8 +97,9 @@ class OpTableTest(unittest.TestCase):
             "delta_prologue", "delta_prologue_batch", "delta_prep_seq",
             "delta", "delta_batch", "delta_normed",
             "triangular_solve",
+            "hyper_norm", "hyper_down", "hyper_up",
         ))
-        self.assertEqual(len(Ops.NAMES), 23)
+        self.assertEqual(len(Ops.NAMES), 27)
 
     def test_names_match_the_dataclass_fields_in_order(self):
         """这条元组是手工维护的，可能与 dataclass 漂移；这里就是漂移报警器。"""

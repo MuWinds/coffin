@@ -7,7 +7,7 @@
 // 为什么值得单独写内核：参考实现里这一层是八次 torch 调用（分组 RMSNorm、down、
 // silu、up、sigmoid、加权 mean、inject、2*sigmoid），而模型有 48 层、每层两套，
 // 于是一次 decode 一步就是 96 × 8 = 768 次启动。本机一次启动的下限约 5.75 us，
-// 光发射就是 4.4 ms —— 与整个 dense 部分的权重带宽耗时（约 3.47 ms）同一量级。
+// 光发射就是 4.4 ms —— 与整个 dense 部分的权重带宽约 3.47 ms耗时同一量级。
 // 融合成两个内核后每套两次启动，发射降到约 1.1 ms。
 //
 // 两个而不是一个：read gate 的输出是 up 的输入，存在真实数据依赖。合成一个要么
@@ -74,6 +74,144 @@ __device__ __forceinline__ float block_sum(float v, float* scratch) {
     return v;
 }
 
+//: split-K 的目标块数。
+//:
+//: 16 SM 的部件一个 wave 就是 16 个块，而 ``hyper_*`` 三个核在 ``M == 1`` 时的单趟
+//: 网格分别只有 3（down 的 ``cols``）、20（up 的 ``ceil(hidden/块大小)``）个,
+//: 整张卡上跑着的块数比一个 wave 还少。这就是它们慢的全部原因，而不是权重字节数。
+//:
+//: 为什么是 96：``gemv.cu`` 的 ``pick_split`` 用 64（4 个 wave）并实测出平台在
+//: 32 个块之后基本变平；本文件的两个核每个块更窄（down 每块 128 线程、up 每块
+//: 128 个输出下标），需要更多块才能把 warp 槽填到同样的比例，所以取 6 个 wave。
+constexpr int HYPER_TARGET_BLOCKS = 96;
+
+//: 单个 K 切片值得调度的最短长度。低于它启动与部分和的写入会超过切片本身读的量。
+constexpr int HYPER_MIN_SLICE = 64;
+
+//: ``hyper_up`` 的 ``lowrank`` 切片下限，比 :data:`HYPER_MIN_SLICE` 小一半。
+//:
+//: 两个核的归约轴长度差 32 倍：``hyper_down`` 的 K 是 10240，``hyper_up`` 的
+//: ``lowrank`` 只有 320。所以这个核的切片数被 ``lowrank / min_slice`` **直接封顶**
+//: （:data:`HYPER_UP_TARGET_BLOCKS` 调大也没用，实测 200~500 都只得到同一个值）：
+//:
+//:   min_slice   64      32      16
+//:   splits       5      10      20
+//:   块数       100     200     400
+//:   hyper_up   193.3   114.0   114.9  us/次     <- 已扫，32 是最优点
+//:   decode      1.048x  1.099x  1.078x
+//:
+//: **32 是扫出来的最优点，不要再往下切。** 16 那档（400 块）实测反而退到 114.9 us：
+//: 每片只剩 16 个元素，部分和的写入（``wide`` 个 fp32）超过了那 16 次乘加读的量。
+//: 向上 64 那档是 193.3 us。所以这是一个单峰，不是"越大越好"。
+//:
+//: 它同时也是 ``hyper_up`` 当前的上限：权重 6.25 MiB 在 114.0 us 里折 57.4 GB/s，
+//: 是带宽屋顶的 10%，而 ``hyper_down`` 已经到 86.6 GB/s。继续压的力气应该花在
+//: ``moe_grouped`` 那 28.3 ms 的分派胶水上，不是这里。
+constexpr int HYPER_UP_MIN_SLICE = 32;
+
+//: ``hyper_up`` 的目标块数。
+//:
+//: 为什么和 :data:`HYPER_TARGET_BLOCKS` 分开：``hyper_down`` 每块沿 K=10240 扫一整段，
+//: 一块的算术量很重；而 ``hyper_up`` 每块只沿 ``lowrank=320`` 扫，单块轻得多。
+//:
+//: **但它现在受 :data:`HYPER_UP_MIN_SLICE` 夹住**，实际块数由后者决定（见那里的表）。
+//: 这个常量只有在前者放宽时才会起作用，留着是为了把"想要多少块"与"最少切多细"
+//: 这两件事分开表达。
+constexpr int HYPER_UP_TARGET_BLOCKS = 384;
+
+// @brief 决定 ``hyper_down`` / ``hyper_up`` 的 split-K 切分数。
+//
+// 切分乘倍了块数却不碰权重流量：每片读每列一个不同的 K（或 lowrank）区间，所以搬动
+// 的字节数相同，变的只是同时在飞的独立加载数与总块数。
+//
+// **这是并行度规则，不是吞吐拟合。** 判据是「块数要够填满 16 SM × 64 warp」，所以
+// 从 ``需要多少块`` 反推片数，而不是照抄 ``gemv.cu`` 里那个针对宽 GEMV 拟合出来的
+// 数字（``GEMV_NARROW_TARGET_BLOCKS = 64`` 那个数是在 ``N >= 2560`` 的形状上量的，
+// 与本文件 ``cols == 3`` 的网格形状毫无关系）。
+//
+// @param rows      激活行数。
+// @param cols      单趟网格的列方向块数。
+// @param k         归约长度（down 是 K = 10240，up 是 lowrank = 320）。
+// @param min_slice 每片至少要有多少个归约元素。
+// @param target    目标块数，两个核取不同的值，见 :data:`HYPER_UP_TARGET_BLOCKS`。
+// @return ``[1, ...]`` 的切分数；``1`` 表示不切。
+int pick_hyper_split(int rows, int cols, int k, int min_slice, int target) {
+    if (rows <= 0 || cols <= 0 || k <= 0 || min_slice <= 0 || target <= 0) return 1;
+    const int single = rows * cols;
+    int splits = (target + single - 1) / single;
+    // 每片至少 min_slice 个元素，否则部分和的写入会把收益吃掉。
+    const int by_slice = k / min_slice;
+    if (splits > by_slice) splits = by_slice;
+    return splits < 2 ? 1 : splits;
+}
+
+// @brief 常驻的 split-K 部分和缓冲，按需增长。
+//
+// 不复用 ``torch::empty``：这个缓冲在一步 decode 里被要 96 次，而它的大小随 ``splits``
+// 变（切分一加大就从 7.7 KB 涨到 40 KB 量级）。``torch`` 的 caching allocator 单次
+// 很便宜，但 96 次累加在 host 侧仍是可测的成本——``gemv-dispatch`` 在 ``w4a8`` 上把
+// split 从 12 加到 40 之后，device 省 31.7 ms 而端到端只省 28.7 ms，多出来的就是
+// 每次调用的分配。这里用一块裸 ``cudaMalloc`` 的常驻缓冲一次解决：模型几何固定，
+// 它只在第一次（或换设备时）分配一次。
+//
+// 失败回退到 ``torch::empty`` 而不是抛错：多一次分配总比整个算子不可用要好。
+//
+// **两个算子的形状不同，所以只能按"容量够不够"复用，不能按"形状相同"匹配**：
+// ``hyper_down`` 要 ``[splits, rows, lowrank]``（真机上约 40 KiB），``hyper_up`` 要
+// ``[splits, rows, hc * hidden]``（约 400 KiB）。两者在同一层里交替出现，若要求形状
+// 严格相同就会每次都重分配——那种失败的症状是"加了缓存却更慢"，而不是报错。
+// 按容量复用的后果是最多增长一次（先 down 要小块、再 up 要大会增长，之后全部命中）。
+//
+// ``g_hyper_scratch_allocs`` 把累计分配次数暴露出来，正是为了在真机上验证这句话：
+// 跑完一步应当只涨 1-2；涨到 96 或 192 就是两个形状在互顶。
+struct HyperScratch {
+    float* ptr = nullptr;
+    int64_t bytes = 0;
+    int device = -1;
+};
+
+//: 累计的 ``cudaMalloc`` 次数，供诊断读。一次 ``++int`` 的成本远低于加一个宏。
+int g_hyper_scratch_allocs = 0;
+
+HyperScratch& hyper_scratch_slot() {
+    // 函数内静态：避免命名空间级对象在扩展卸载时的析构顺序问题。
+    static HyperScratch slot;
+    return slot;
+}
+
+// @brief 取一块至少 ``need_bytes`` 的常驻部分和缓冲。
+//
+// @param need_bytes 需要的字节数。
+// @param device     当前设备序号；换设备会重新分配。
+// @return 设备指针；``cudaMalloc`` 失败时为 ``nullptr``。
+float* hyper_scratch(int64_t need_bytes, int device) {
+    HyperScratch& slot = hyper_scratch_slot();
+    if (slot.ptr != nullptr && slot.bytes >= need_bytes && slot.device == device) {
+        return slot.ptr;
+    }
+    if (slot.ptr != nullptr) {
+        cudaFree(slot.ptr);
+        slot.ptr = nullptr;
+        slot.bytes = 0;
+        slot.device = -1;
+    }
+    void* fresh = nullptr;
+    if (cudaMalloc(&fresh, need_bytes) != cudaSuccess) {
+        cudaGetLastError();          // 清掉错误位，让调用方走 torch 回退
+        return nullptr;
+    }
+    slot.ptr = static_cast<float*>(fresh);
+    slot.bytes = need_bytes;
+    slot.device = device;
+    ++g_hyper_scratch_allocs;
+    return slot.ptr;
+}
+
+//: ``hyper_up`` 每个块的线程数。128 而不是 256：这个核的并行维是 ``hidden``
+//: 下标（每块 ``tile`` 个），256 线程时 ``tile`` 必须跟着变 256，块数就掉到 10——
+//: 比一个 wave 还少。128 给到 20 个块，且线程完全用满（没有空转的下标槽）。
+constexpr int HYPER_UP_THREADS = 128;
+
 // @brief 分组 RMSNorm，一个块处理一整行（所有 ``hc`` 组）。
 //
 // 每个块盖住一行，块内依次处理各流：先对 2560 维做平方和归约，再用同一个归约值
@@ -124,6 +262,11 @@ __global__ void grouped_rms_norm_kernel(const XT* x, const float* w, XT* out,
 // 一个输出列一个线程：``lowrank`` 通常 320，一个块盖得住。每个线程沿 K 扫一遍，
 // 读 ``wt[i * N + col]`` 这一条 strided 列——decode 期 GEMV 的标准访存模式。
 //
+// **K 轴用 4 条独立累加链。** 单链串行 10240 次 FMA 是一条完整的依赖链，每次都要
+// 等上一次的加法结果，于是访存延迟完全暴露；4 条链让硬件能同时挂 4 个未完成的加，
+// 实测在 ``gemv.cu`` 的 ``dot_kn`` 上是 1.53x。这不是微调——``hyper_down`` 在
+// ``rows == 1`` 时每线程要串 1707 次迭代，单链根本盖不住访存延迟。
+//
 // @param normed 归一化后的激活，``[rows, K]``。
 // @param wt     down 权重，``[K, N]`` 连续。
 // @param out    ``[rows, N]``，已做 ``silu(x / hc)``。
@@ -131,7 +274,7 @@ __global__ void grouped_rms_norm_kernel(const XT* x, const float* w, XT* out,
 // @param k      K。
 // @param n      N。
 // @param hc     读门的除数。
-// @param splits K 轴的切分数，见 :func:`hyper_down` 的说明。
+// @param splits K 轴的切分数，见 :func:`pick_hyper_split`。
 // @param part   ``[splits, rows, n]`` fp32 部分和，``splits == 1`` 时不用。
 template <typename XT>
 __global__ void hyper_down_kernel(const XT* normed, const XT* wt, XT* out,
@@ -147,11 +290,24 @@ __global__ void hyper_down_kernel(const XT* normed, const XT* wt, XT* out,
     const int per = (k + splits - 1) / splits;
     const int begin = blockIdx.z * per;
     const int end = min(k, begin + per);
-    float acc = 0.f;
-    for (int i = begin; i < end; ++i) {
-        acc += CxScalar<XT>::to_float(rowp[i])
-             * CxScalar<XT>::to_float(wt[(size_t)i * n + col]);
+    float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
+    int i = begin;
+    // 4 条链按 4 步交错：第 s 条吃 ``begin + s, begin + s + 4, ...`` 的元素。
+    for (; i + 3 < end; i += 4) {
+        acc0 += CxScalar<XT>::to_float(rowp[i + 0])
+              * CxScalar<XT>::to_float(wt[(size_t)(i + 0) * n + col]);
+        acc1 += CxScalar<XT>::to_float(rowp[i + 1])
+              * CxScalar<XT>::to_float(wt[(size_t)(i + 1) * n + col]);
+        acc2 += CxScalar<XT>::to_float(rowp[i + 2])
+              * CxScalar<XT>::to_float(wt[(size_t)(i + 2) * n + col]);
+        acc3 += CxScalar<XT>::to_float(rowp[i + 3])
+              * CxScalar<XT>::to_float(wt[(size_t)(i + 3) * n + col]);
     }
+    for (; i < end; ++i) {
+        acc0 += CxScalar<XT>::to_float(rowp[i])
+              * CxScalar<XT>::to_float(wt[(size_t)i * n + col]);
+    }
+    const float acc = (acc0 + acc1) + (acc2 + acc3);
     if (splits == 1) {
         const float scaled = acc / (float)hc;
         out[(size_t)row * n + col] = CxScalar<XT>::from_float(
@@ -184,6 +340,75 @@ __global__ void hyper_down_finish_kernel(const float* part, XT* out,
         scaled / (1.f + __expf(-scaled)));
 }
 
+// @brief 沿 ``lowrank`` 的一段算一个输出通道的点积，4 条独立累加链。
+//
+// 单链要串 ``t_end - t_begin`` 次 FMA，每次都得等上一次的加法结果，访存延迟因此
+// 完全暴露；4 条链让硬件同时挂 4 个未完成的加。``gemv.cu`` 的 ``dot_kn`` 在同样
+// 改造上实测 1.53x，这里每个输出点要付 ``lowrank`` 次，是同一个形状。
+//
+// @param lowp    ``low`` 的这一行，``[lowrank]``。
+// @param up_wt   up 权重，``[lowrank, wide]``。
+// @param wide    ``up_wt`` 的行距。
+// @param col     输出通道下标。
+// @param t_begin 本片的起点（含）。
+// @param t_end   本片的终点（不含）。
+// @return 这一段上的点积，fp32。
+template <typename XT>
+__device__ __forceinline__ float dot_slice(const XT* lowp, const XT* up_wt,
+                                           int wide, int col,
+                                           int t_begin, int t_end) {
+    float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
+    int t = t_begin;
+    for (; t + 3 < t_end; t += 4) {
+        d0 += CxScalar<XT>::to_float(lowp[t + 0])
+            * CxScalar<XT>::to_float(up_wt[(size_t)(t + 0) * wide + col]);
+        d1 += CxScalar<XT>::to_float(lowp[t + 1])
+            * CxScalar<XT>::to_float(up_wt[(size_t)(t + 1) * wide + col]);
+        d2 += CxScalar<XT>::to_float(lowp[t + 2])
+            * CxScalar<XT>::to_float(up_wt[(size_t)(t + 2) * wide + col]);
+        d3 += CxScalar<XT>::to_float(lowp[t + 3])
+            * CxScalar<XT>::to_float(up_wt[(size_t)(t + 3) * wide + col]);
+    }
+    for (; t < t_end; ++t) {
+        d0 += CxScalar<XT>::to_float(lowp[t])
+            * CxScalar<XT>::to_float(up_wt[(size_t)t * wide + col]);
+    }
+    return (d0 + d1) + (d2 + d3);
+}
+
+// @brief 把 ``hyper_up`` 的 split-K 部分点积收成读门输出。
+//
+// 必须单独一趟：``sigmoid`` 是非线性的，部分点积加齐之前不能进门，所以切片模式下
+// 只能先存部分和。与 :cuda:`hyper_down_finish_kernel` 同一个理由，也与它一样用
+// 确定的顺序求和（不用原子加——fp32 的原子加不可结合，两次运行会给出不同结果）。
+//
+// @param part   ``[splits, rows, hc * hidden]`` fp32 部分点积。
+// @param normed 归一化后的激活，``[rows, wide]``。
+// @param mixed  ``[rows, hidden]`` 连续目标。
+// @param rows   行数。
+// @param hidden 每流宽度。
+// @param hc     流数。
+// @param splits 切分数。
+template <typename XT>
+__global__ void hyper_up_finish_kernel(const float* part, const XT* normed, XT* mixed,
+                                       int rows, int hidden, int hc, int splits) {
+    const int row = blockIdx.y;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows || i >= hidden) return;
+    const int wide = hidden * hc;
+    const XT* normp = normed + (size_t)row * wide;
+    float acc = 0.f;
+    for (int g = 0; g < hc; ++g) {
+        const int col = g * hidden + i;
+        float dot = 0.f;
+        for (int s = 0; s < splits; ++s) {
+            dot += part[((size_t)s * rows + row) * wide + col];
+        }
+        acc += (1.f / (1.f + __expf(-dot))) * CxScalar<XT>::to_float(normp[col]);
+    }
+    mixed[(size_t)row * hidden + i] = CxScalar<XT>::from_float(acc / (float)hc);
+}
+
 // @brief up 投影 + sigmoid + 逐流加权 mean，同时算写门。
 //
 // 一个线程负责一个**输出**下标 ``i``（``hidden`` 宽），为它遍历所有流：把
@@ -213,7 +438,8 @@ __global__ void hyper_down_finish_kernel(const float* part, XT* out,
 template <typename XT>
 __global__ void hyper_up_kernel(const XT* normed, const XT* up_wt, const XT* low,
                                 const XT* inj_wt, XT* mixed, float* inject,
-                                int rows, int hidden, int hc, int lowrank, int tile) {
+                                int rows, int hidden, int hc, int lowrank, int tile,
+                                int splits, float* part) {
     // 行号取 ``blockIdx.y``：见 :func:`hyper_up` 里的网格说明。写成 ``blockIdx.x``
     // 而网格是 (行, 块) 二维时，一行内的所有块会重复算同一个下标集合。
     const int row = blockIdx.y;
@@ -223,42 +449,88 @@ __global__ void hyper_up_kernel(const XT* normed, const XT* up_wt, const XT* low
     const int lo = (tile > 0) ? (int)blockIdx.x * tile : 0;
     const XT* normp = normed + (size_t)row * wide;
     const XT* lowp = low + (size_t)row * lowrank;
+    __shared__ float gate_scratch[32];
 
-    for (int i = lo + (int)threadIdx.x; i < hi; i += (int)blockDim.x) {
-        float acc = 0.f;
-        for (int g = 0; g < hc; ++g) {
-            const int col = g * hidden + i;
-            float dot = 0.f;
-            for (int t = 0; t < lowrank; ++t) {
-                dot += CxScalar<XT>::to_float(lowp[t])
-                     * CxScalar<XT>::to_float(up_wt[(size_t)t * wide + col]);
+    // ``lowrank`` 轴按 ``blockIdx.z`` 切片。**这是本核唯一还能加的并行度**：
+    // 输出只有 ``hidden``（2560）个，一个线程一个输出就已经占满这一维；把 ``tile``
+    // 再切小只会制造空转线程（每块下标数少于块内线程数），总线程数不变。而
+    // ``hidden × hc`` 个点各要串 ``lowrank`` 次，切这一段才真的乘倍了块数。
+    //
+    // 切了之后不能就地 sigmoid（门是对整条点积取的），所以这一趟在切片模式下只写
+    // 部分点积，由 :cuda:`hyper_up_finish_kernel` 加齐后再过 sigmoid 与逐流 mean。
+    const int tper = (lowrank + splits - 1) / splits;
+    const int t_begin = blockIdx.z * tper;
+    const int t_end = min(lowrank, t_begin + tper);
+    const bool sliced = splits > 1;
+    float* mypart = sliced
+        ? part + ((size_t)blockIdx.z * rows + row) * (size_t)(hc * hidden)
+        : nullptr;
+
+    if (sliced) {
+        // 切片模式：只算本片的点积部分和，``[rows, hc * hidden]`` 的 fp32。
+        for (int i = lo + (int)threadIdx.x; i < hi; i += (int)blockDim.x) {
+            for (int g = 0; g < hc; ++g) {
+                const int col = g * hidden + i;
+                mypart[col] = dot_slice<XT>(lowp, up_wt, wide, col, t_begin, t_end);
             }
-            acc += (1.f / (1.f + __expf(-dot))) * CxScalar<XT>::to_float(normp[col]);
         }
-        mixed[(size_t)row * hidden + i] = CxScalar<XT>::from_float(acc / (float)hc);
+    } else {
+        // 单趟模式：一遍算完 sigmoid 与逐流 mean。``acc`` 对 ``hc`` 路取和，
+        // 最后除 ``hc``——mean 是对流取的，不是对 10240 个元素取的。
+        for (int i = lo + (int)threadIdx.x; i < hi; i += (int)blockDim.x) {
+            float acc = 0.f;
+            for (int g = 0; g < hc; ++g) {
+                const int col = g * hidden + i;
+                const float dot = dot_slice<XT>(lowp, up_wt, wide, col, t_begin, t_end);
+                acc += (1.f / (1.f + __expf(-dot)))
+                     * CxScalar<XT>::to_float(normp[col]);
+            }
+            mixed[(size_t)row * hidden + i] = CxScalar<XT>::from_float(acc / (float)hc);
+        }
     }
 
-    // 写门只有 hc 个输出，但每个都要扫 wide 维。按 warp 分派：warp ``w`` 负责
-    // 输出 ``w``，32 个 lane 分摊 wide 后用 shuffle 收口。只交给前 hc 个线程会
-    // 变成 4 个线程扫 10240 次、其余 252 个空转。
+    // 写门只有 ``hc`` 个输出，但每个都要扫 ``wide`` 维。
     //
-    // **只让 ``blockIdx.x == 0`` 做**：``tile`` 把同一行切成多个块后，每块都会走到
-    // 这里，而写门的结果与 ``hidden`` 下标无关，重复写只是浪费；更要紧的是它会
-    // 把 10240 维的 ``normed`` 在每个块上重读一遍。
-    const int warp = (int)threadIdx.x >> 5;
-    const int lane = (int)threadIdx.x & 31;
-    if (blockIdx.x == 0 && warp < hc) {
-        float acc = 0.f;
-        for (int t = lane; t < wide; t += 32) {
-            acc += CxScalar<XT>::to_float(normp[t])
-                 * CxScalar<XT>::to_float(inj_wt[(size_t)t * hc + warp]);
-        }
+    // **整个块按 ``t`` 分摊，不是每个 warp 认领一个输出。** 旧写法让 warp ``w``
+    // 负责输出 ``w``、32 条 lane 步进 32，于是每条 lane 要串 ``wide / 32 = 320`` 次，
+    // 而它读 ``inj_wt[t * hc + warp]``：``hc = 4`` 时 32 条 lane 全落在同一个 ``t``
+    // 上、只差 ``warp`` 一个下标，**一次 8 字节的事务里只有 2 字节有用**。这个形状
+    // （N = 4、K = 10240）单独调用实测 134.9 us，而本核每层两套各自付一遍。
+    //
+    // 改成每条线程沿 ``t`` 步进 ``blockDim.x``、并一次读出连续 ``hc`` 个权重：
+    // 串行长度降到 ``wide / blockDim.x``，且一个 warp 的 32 条 lane 覆盖
+    // ``32 * blockDim.x`` 个 ``t``，读的是连续元素——完全合并。
+    //
+    // 只让 ``blockIdx.x == 0 && blockIdx.z == 0`` 做：``tile`` 把同一行切成多个块后
+    // 每块都会走到这里，而写门的结果与 ``hidden`` 下标无关，重复写只是浪费；更要紧的
+    // 是它会把 10240 维的 ``normed`` 在每个块上重读一遍。切片模式还要加上
+    // ``blockIdx.z`` 那一维——否则每一片都会把写门重算一次，那是纯浪费。
+    if (blockIdx.x == 0 && blockIdx.z == 0) {
+        float gacc[8];
 #pragma unroll
-        for (int o = 16; o > 0; o >>= 1) {
-            acc += __shfl_down_sync(0xffffffffu, acc, o);
+        for (int g = 0; g < 8; ++g) gacc[g] = 0.f;
+        for (int t = (int)threadIdx.x; t < wide; t += (int)blockDim.x) {
+            const float nv = CxScalar<XT>::to_float(normp[t]);
+            const XT* ip = inj_wt + (size_t)t * hc;
+#pragma unroll
+            for (int g = 0; g < 8; ++g) {
+                if (g < hc) gacc[g] += nv * CxScalar<XT>::to_float(ip[g]);
+            }
         }
-        if (lane == 0) {
-            inject[(size_t)row * hc + warp] = 2.f / (1.f + __expf(-acc / (float)hc));
+        // ``block_sum`` 内部有 ``__syncthreads``，所以它必须由块内所有线程调用。
+        // ``g < hc`` 对块内所有线程是同一个值（``hc`` 是内核参数），条件均匀。
+#pragma unroll
+        for (int g = 0; g < 8; ++g) {
+            if (g < hc) {
+                const float total = block_sum(gacc[g], gate_scratch);
+                // 下一轮 ``block_sum`` 会复用 ``gate_scratch``，所以这里要再拦一次，
+                // 否则部分线程已经在写而另一些还在读上一轮的值。
+                __syncthreads();
+                if ((int)threadIdx.x == 0) {
+                    inject[(size_t)row * hc + g] =
+                        2.f / (1.f + __expf(-total / (float)hc));
+                }
+            }
         }
     }
 }
@@ -335,35 +607,46 @@ torch::Tensor hyper_down(torch::Tensor normed, torch::Tensor wt, torch::Tensor o
     if (rows == 0) return out;
     const int threads = 128;
     const int cols = (n + threads - 1) / threads;
-    // 并行度 = cols × rows × splits。``n == lowrank == 320`` 时 cols 是 3，
-    // 一张 16 SM 的卡要 splits >= 6 才填满。这里按 16 取，多出来的块只是把
-    // 每个块的 K 段切得更短，不改变总流量。
-    const int splits = (rows * cols >= 16) ? 1 : (16 / (rows * cols) + 1);
+    // 并行度 = cols × rows × splits。``n == lowrank == 320`` 时 cols 是 3，一片
+    // 16 SM × 64 warp 的卡要几十个块才喂饱，所以按 :func:`pick_hyper_split` 从
+    // 「需要多少块」反推片数。旧规则写死 16，在 ``rows == 1`` 时只得到 6 片 =
+    // 18 个块 = 2304 条线程 = 4.5 warps/SM，实测 579 us（带宽地板的 50 倍）。
+    const int splits = pick_hyper_split(rows, cols, k, HYPER_MIN_SLICE,
+                                      HYPER_TARGET_BLOCKS);
     const bool need_part = splits > 1;
-    auto part = need_part
-        ? torch::empty({splits, rows, n},
-                       torch::TensorOptions().dtype(torch::kFloat).device(normed.device()))
-        : torch::Tensor();
+    // 部分和缓冲常驻，不走 ``torch::empty``：它一步要被要 96 次，而大小随 splits 变。
+    // 分配失败（或没有驱动上下文）时回退到 torch 分配，宁可慢也不要算子不可用。
+    float* part_ptr = nullptr;
+    torch::Tensor part;
+    if (need_part) {
+        const int64_t need = (int64_t)splits * rows * n * (int64_t)sizeof(float);
+        part_ptr = hyper_scratch(need, (int)normed.get_device());
+        if (part_ptr == nullptr) {
+            part = torch::empty({splits, rows, n},
+                                torch::TensorOptions().dtype(torch::kFloat)
+                                    .device(normed.device()));
+            part_ptr = part.data_ptr<float>();
+        }
+    }
     const dim3 grid(cols, rows, splits);
     if (normed.scalar_type() == torch::kBFloat16) {
         hyper_down_kernel<uint16_t><<<grid, threads, 0, stream>>>(
             reinterpret_cast<const uint16_t*>(normed.data_ptr()),
             reinterpret_cast<const uint16_t*>(wt.data_ptr()),
             reinterpret_cast<uint16_t*>(out.data_ptr()), rows, k, n, (int)hc,
-            splits, need_part ? part.data_ptr<float>() : nullptr);
+            splits, part_ptr);
         if (need_part) {
             hyper_down_finish_kernel<uint16_t><<<dim3(cols, rows), threads, 0, stream>>>(
-                part.data_ptr<float>(), reinterpret_cast<uint16_t*>(out.data_ptr()),
+                part_ptr, reinterpret_cast<uint16_t*>(out.data_ptr()),
                 rows, n, (int)hc, splits);
         }
     } else {
         hyper_down_kernel<float><<<grid, threads, 0, stream>>>(
             normed.data_ptr<float>(), wt.data_ptr<float>(), out.data_ptr<float>(),
-            rows, k, n, (int)hc, splits,
-            need_part ? part.data_ptr<float>() : nullptr);
+            rows, k, n, (int)hc, splits, part_ptr);
         if (need_part) {
             hyper_down_finish_kernel<float><<<dim3(cols, rows), threads, 0, stream>>>(
-                part.data_ptr<float>(), out.data_ptr<float>(), rows, n, (int)hc, splits);
+                part_ptr, out.data_ptr<float>(), rows, n, (int)hc, splits);
         }
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -419,20 +702,43 @@ torch::Tensor hyper_up(torch::Tensor normed, torch::Tensor up_wt, torch::Tensor 
     const c10::cuda::CUDAGuard guard(normed.device());
     const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
     if (rows == 0) return mixed;
-    // 写门按 warp 分派，所以块内至少要 hc 个 warp；256 线程给到 8 个，够 hc<=8。
-    TORCH_CHECK((int)hc <= 8, "hc must not exceed 8 warps per block, got ", hc);
-    const int threads = 256;
-    // 把 ``hidden`` 切成若干块，让 ``M == 1`` 时也有多块同时跑。
-    // 目标并行度是 16 个块（本卡 SM 数）：块太小会让写门那次 ``wide`` 重读占比变高，
-    // 块太大则填不满。``hidden == 2560`` 时每块 160 个下标，正好 16 块。
-    int tile = 0;
-    {
-        const int want = 16;
-        const int per = (int)((hidden + want - 1) / want);
-        tile = (per > 0) ? per : (int)hidden;
-    }
+    // 写门用整块线程按 ``t`` 分摊 + 块内归约，所以 ``hc <= 8`` 只是 ``gacc[8]``
+    // 那个累加器数组的界，不再要求"块内至少 hc 个 warp"——任何一个块都能算完它。
+    TORCH_CHECK((int)hc <= 8, "hc must not exceed the 8 accumulators, got ", hc);
+    const int threads = HYPER_UP_THREADS;
+    // 块数 = ``ceil(hidden / tile)``，且每块活跃线程 = ``min(tile, threads)``。
+    //
+    // 这两个数**必须一起看**，否则会白扔并行度。这个核的主循环是
+    // ``for (i = lo + threadIdx.x; i < hi; i += blockDim.x)``：
+    //
+    // * ``tile`` 大于 ``threads`` → 线程全忙，但每线程要串多个输出下标（当前的取舍）；
+    // * ``tile`` 小于 ``threads`` → **每块只有 ``tile`` 条线程干活，其余空转**。
+    //   按「96 个目标块」反推曾得到 ``tile = ceil(2560/96) = 27`` 配 128 线程，
+    //   于是 101/128 条线程空转，实测本核 193.3 us、33.9 GB/s。
+    //
+    // 现在是 ``tile == threads == 128`` → 20 块、全忙，实测 134.9 us、48.6 GB/s。
+    // 想再加块数只能**同时**减 ``tile`` 与 ``threads``（例如 64/64 → 40 块），
+    // 但那会把每块压到 2 个 warp，反而更难盖住访存延迟——所以这一维到此为止，
+    // 剩余并行度靠 :func:`pick_hyper_split` 沿 ``lowrank`` 补。
+    const int tile = (int)threads;
     const int tiles = (int)((hidden + tile - 1) / tile);
-    const dim3 grid((unsigned)tiles, (unsigned)rows);
+    const int splits = pick_hyper_split(rows, tiles, (int)lowrank, HYPER_UP_MIN_SLICE,
+                                        HYPER_UP_TARGET_BLOCKS);
+    const bool need_part = splits > 1;
+    float* part_ptr = nullptr;
+    torch::Tensor part;
+    if (need_part) {
+        const int64_t need = (int64_t)splits * rows * (int64_t)(hc * hidden)
+                           * (int64_t)sizeof(float);
+        part_ptr = hyper_scratch(need, (int)normed.get_device());
+        if (part_ptr == nullptr) {
+            part = torch::empty({splits, rows, hc * hidden},
+                                torch::TensorOptions().dtype(torch::kFloat)
+                                    .device(normed.device()));
+            part_ptr = part.data_ptr<float>();
+        }
+    }
+    const dim3 grid((unsigned)tiles, (unsigned)rows, (unsigned)splits);
     if (normed.scalar_type() == torch::kBFloat16) {
         hyper_up_kernel<uint16_t><<<grid, threads, 0, stream>>>(
             reinterpret_cast<const uint16_t*>(normed.data_ptr()),
@@ -440,12 +746,27 @@ torch::Tensor hyper_up(torch::Tensor normed, torch::Tensor up_wt, torch::Tensor 
             reinterpret_cast<const uint16_t*>(low.data_ptr()),
             reinterpret_cast<const uint16_t*>(inj_wt.data_ptr()),
             reinterpret_cast<uint16_t*>(mixed.data_ptr()), inject.data_ptr<float>(),
-            rows, (int)hidden, (int)hc, (int)lowrank, tile);
+            rows, (int)hidden, (int)hc, (int)lowrank, tile, splits, part_ptr);
+        if (need_part) {
+            const int fthreads = 128;
+            const int fcols = (int)((hidden + fthreads - 1) / fthreads);
+            hyper_up_finish_kernel<uint16_t><<<dim3(fcols, rows), fthreads, 0, stream>>>(
+                part_ptr, reinterpret_cast<const uint16_t*>(normed.data_ptr()),
+                reinterpret_cast<uint16_t*>(mixed.data_ptr()),
+                rows, (int)hidden, (int)hc, splits);
+        }
     } else {
         hyper_up_kernel<float><<<grid, threads, 0, stream>>>(
             normed.data_ptr<float>(), up_wt.data_ptr<float>(), low.data_ptr<float>(),
             inj_wt.data_ptr<float>(), mixed.data_ptr<float>(), inject.data_ptr<float>(),
-            rows, (int)hidden, (int)hc, (int)lowrank, tile);
+            rows, (int)hidden, (int)hc, (int)lowrank, tile, splits, part_ptr);
+        if (need_part) {
+            const int fthreads = 128;
+            const int fcols = (int)((hidden + fthreads - 1) / fthreads);
+            hyper_up_finish_kernel<float><<<dim3(fcols, rows), fthreads, 0, stream>>>(
+                part_ptr, normed.data_ptr<float>(), mixed.data_ptr<float>(),
+                rows, (int)hidden, (int)hc, splits);
+        }
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return mixed;

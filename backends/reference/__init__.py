@@ -867,6 +867,125 @@ def _triangular_solve(lower: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
                                          unitriangular=True)
 
 
+def _hyper_norm(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor,
+                hidden: int, hc: int, eps: float = 1e-6) -> torch.Tensor:
+    """Grouped zero-centred RMSNorm of the hyper-connection residual stream.
+
+    Every ``hidden`` elements of the last axis is its own RMS group. The grouping is
+    semantics, not a blocking choice: the ``hc`` streams of the residual have
+    different scales and keeping them apart is the whole reason the structure
+    exists. Normalising the flattened width instead yields a plausible-looking
+    number that silently flattens those scales, which is the failure this signature
+    is shaped to prevent -- ``rms_norm`` cannot express it.
+
+    Arithmetic order matches the kernel: fp32 square mean, fp32 ``rsqrt``, multiply
+    by ``1 + w`` in fp32, and a single rounding back to ``x``'s dtype.
+
+    Args:
+        x: Residual stream, ``[rows, hidden * hc]``, contiguous.
+        w: Zero-centred weight, ``[hidden * hc]`` fp32, applied as ``1 + w``.
+        out: Destination, same shape and dtype as ``x``, written in place.
+        hidden: Width of one stream.
+        hc: Number of streams.
+        eps: Variance floor.
+
+    Returns:
+        ``out``, for call chaining.
+
+    Raises:
+        ValueError: The width is not ``hidden * hc``. Broadcasting would otherwise
+            rescale the wrong stream while every shape still checks out.
+    """
+    if x.shape[-1] != hidden * hc:
+        raise ValueError(
+            f"residual stream width {x.shape[-1]} != hidden*hc {hidden * hc}")
+    xf = x.to(torch.float32).reshape(*x.shape[:-1], hc, hidden)
+    inv = torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + eps)
+    gain = (1.0 + w.to(torch.float32)).reshape(hc, hidden)
+    out.copy_((xf * inv * gain).reshape(*x.shape[:-1], hidden * hc).to(x.dtype))
+    return out
+
+
+def _hyper_down(normed: torch.Tensor, wt: torch.Tensor, out: torch.Tensor,
+                hc: int) -> torch.Tensor:
+    """Read-gate down projection followed by ``silu(v / hc)``.
+
+    ``wt`` arrives in the checkpoint layout ``[lowrank, K]``, the same ``[N, K]``
+    the rest of the contract uses; a ``weight_layout == "kn"`` backend transposes
+    it once on its own side. The division by ``hc`` must precede ``silu`` -- silu
+    is not linear, so applying it first is a different curve with unchanged shapes.
+
+    Args:
+        normed: Normalised activation, ``[rows, K]``.
+        wt: Down weight, ``[lowrank, K]``, contiguous, same dtype as ``normed``.
+        out: Destination, ``[rows, lowrank]``, written in place.
+        hc: Number of residual streams, i.e. the read-gate divisor.
+
+    Returns:
+        ``out``, for call chaining.
+
+    Raises:
+        ValueError: ``wt``'s K does not match the activation width.
+    """
+    if wt.shape[-1] != normed.shape[-1]:
+        raise ValueError(
+            f"down weight has K={wt.shape[-1]}, activation has K={normed.shape[-1]}")
+    # fp32 累加、末尾只舍入一次：内核也是这样，bf16 矩阵乘在这里会比内核多一次舍入。
+    scaled = (normed.to(torch.float32) @ wt.to(torch.float32).t()) / hc
+    out.copy_(F.silu(scaled).to(normed.dtype))
+    return out
+
+
+def _hyper_up(normed: torch.Tensor, up_wt: torch.Tensor, low: torch.Tensor,
+              inj_wt: torch.Tensor, mixed: torch.Tensor, inject: torch.Tensor,
+              hidden: int, hc: int, lowrank: int) -> torch.Tensor:
+    """Read-gate up projection plus the weighted stream mean, and the write gate.
+
+    Three independent things can be wired wrong here while every shape stays
+    correct, which is why the reference spells all three out:
+
+    * the collapse is a **mean** over streams, not a sum -- a sum scales the read
+      gate by ``hc``;
+    * the write gate is ``2 * sigmoid(dot / hc)`` -- the ``2`` makes a zero input
+      give weight 1, so the initialisation is the plain residual add, and the
+      division by ``hc`` must be inside the sigmoid or the gate saturates;
+    * both gates read the *normalised* state, not the raw stream.
+
+    Args:
+        normed: Normalised activation, ``[rows, hidden * hc]``.
+        up_wt: Up weight, ``[hidden * hc, lowrank]``, contiguous.
+        low: Down output, ``[rows, lowrank]``.
+        inj_wt: Write-gate weight, ``[hc, hidden * hc]``, contiguous.
+        mixed: Destination for the collapsed stream, ``[rows, hidden]``.
+        inject: Destination for the write gate, ``[rows, hc]`` fp32.
+        hidden: Width of one stream.
+        hc: Number of streams.
+        lowrank: Rank of the down projection.
+
+    Returns:
+        ``mixed``, for call chaining.
+
+    Raises:
+        ValueError: The widths do not describe ``hidden``/``hc``/``lowrank``.
+    """
+    wide = hidden * hc
+    if normed.shape[-1] != wide or low.shape[-1] != lowrank:
+        raise ValueError(
+            f"hyper_up got normed width {normed.shape[-1]} (want {wide}) and "
+            f"low rank {low.shape[-1]} (want {lowrank})")
+    if up_wt.shape != (wide, lowrank) or inj_wt.shape != (hc, wide):
+        raise ValueError(
+            f"hyper_up weights are {tuple(up_wt.shape)} and {tuple(inj_wt.shape)}, "
+            f"expected {(wide, lowrank)} and {(hc, wide)}")
+    nf = normed.to(torch.float32)
+    gate = torch.sigmoid(low.to(torch.float32) @ up_wt.to(torch.float32).t())
+    streams = gate.reshape(*normed.shape[:-1], hc, hidden)
+    normed_streams = nf.reshape(*normed.shape[:-1], hc, hidden)
+    mixed.copy_((streams * normed_streams).mean(dim=-2).to(normed.dtype))
+    inject.copy_(2.0 * torch.sigmoid(nf @ inj_wt.to(torch.float32).t() / hc))
+    return mixed
+
+
 def build(caps: Caps | None = None) -> Ops:
     """Build the reference op table.
 
@@ -877,7 +996,7 @@ def build(caps: Caps | None = None) -> Ops:
             backend's weight dtype rather than to the reference's.
 
     Returns:
-        A table with all 18 entries callable. The reference never leaves a gap:
+        A table with all 27 entries callable. The reference never leaves a gap:
         a missing entry here would be a hole in the safety net that every other
         backend relies on.
     """
@@ -908,6 +1027,9 @@ def build(caps: Caps | None = None) -> Ops:
         delta_normed=_delta_normed,
         triangular_solve=_triangular_solve,
         moe_grouped=functools.partial(_moe_grouped, weight_dtype=c.weight_dtype),
+        hyper_norm=_hyper_norm,
+        hyper_down=_hyper_down,
+        hyper_up=_hyper_up,
     )
 
 
@@ -977,7 +1099,7 @@ def ops() -> Ops:
     """Return the reference table.
 
     Returns:
-        The memoised all-18 table. Every entry is callable.
+        The memoised all-27 table. Every entry is callable.
     """
     return _OPS
 

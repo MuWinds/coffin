@@ -50,6 +50,7 @@ _OP_NAMES: tuple[str, ...] = (
     "linear",            # 1 行或少数几行
     "linear_m",          # 小 M 的批，一次权重读取
     "linear_prefill",    # 预填充分块的 GEMM（大 M）
+    "moe_grouped",       # 稀疏专家：并行维是"专家 × 行"，与上面三档切法不同
     # 归一化。
     "rms_norm",
     "add_rms_norm",
@@ -75,9 +76,11 @@ _OP_NAMES: tuple[str, ...] = (
     # 三角求解：分块 delta 规则每个块要反解一个单位下三角方程组，那是*库*能力，
     # 不是模型数学。
     "triangular_solve",
-    # 稀疏专家的分组投影：每个专家只算路由到它的那几行。与上面三个 ``linear*``
-    # 分开命名，因为它的并行维是"专家 × 行"而不是"行"，切法完全不同。
-    "moe_grouped",
+    # 超连接（Gated Residual）：Qwen4-Exp 每层两套、48 层，参考实现的八次 torch
+    # 调用折算到一步 decode 是 768 次发射。三个名字按数据依赖切开，见 Ops 的字段注释。
+    "hyper_norm",
+    "hyper_down",
+    "hyper_up",
 )
 
 
@@ -175,7 +178,7 @@ class Caps:
 class Ops:
     """一个后端的扁平设备算子表；字段名就是契约。
 
-    这张表是*全的*：每个后端都回答全部 18 个名字。原生后端返回自己的内核；
+    这张表是全的：每个后端都回答全部名字。原生后端返回自己的内核；
     :mod:`coffin.backends` 里的解析器把后端留成 ``None`` 的名字补上参考实现。
     因此 ``None`` 只在原生后端自己的表里才有意义，表示「这里没有内核」——绝不是一个
     会漏到模型代码里的缺口。
@@ -343,6 +346,39 @@ class Ops:
     #: 恒为单位元（它是 ``I`` 加上严格下三角乘积），开放成标志就是一个没有调用方
     #: 能有意设置的旋钮。
     triangular_solve: OpFn | None = None
+    #: ``hyper_norm(x, w, out, hidden, hc, eps) -> out``：把残差流按
+    #: ``hidden`` 宽分组、每组独立做一次零中心 RMSNorm。``x``/``out`` 是
+    #: ``[rows, hidden * hc]`` 连续 bf16 或 fp32，``w`` 是 ``[hidden * hc]`` 连续
+    #: fp32 且已经是 ``1 + w`` 后的增益。
+    #:
+    #: 分组是语义而不是分块策略：``hc`` 路残差流各自保尺度，整条一起归一化会得到一个
+    #: 看着合理的数，而那恰好抹平了 4 路之间的尺度差——保留这个差正是超连接存在的
+    #: 理由。所以它不能复用 :attr:`rms_norm`。
+    hyper_norm: OpFn | None = None
+    #: ``hyper_down(normed, wt, out, hc) -> out``：读门的降维投影，输出已做
+    #: ``silu(v / hc)``。``normed`` 是 ``[rows, K]``，``wt`` 是**契约布局**
+    #: ``[lowrank, K]``（``weight_layout == "kn"`` 的后端自己在加载时转置一次，
+    #: 与 :attr:`linear` 同一条约定），``out`` 是 ``[rows, lowrank]``。
+    #:
+    #: 除以 ``hc`` 必须发生在 silu **之前**：``silu`` 不是线性的，顺序换了就是另一条
+    #: 曲线，而且形状全对。
+    hyper_down: OpFn | None = None
+    #: ``hyper_up(normed, up_wt, low, inj_wt, mixed, inject, hidden, hc, lowrank)
+    #: -> mixed``：读门的升维投影、``sigmoid`` 门，再对 ``hc`` 路流做加权
+    #: **mean**，同时一并算出写门。``up_wt`` 是 ``[hidden * hc, lowrank]``、
+    #: ``inj_wt`` 是 ``[hc, hidden * hc]``，两者都是契约布局；``mixed`` 是
+    #: ``[rows, hidden]``，``inject`` 是 ``[rows, hc]`` 的 fp32。
+    #:
+    #: 三个语义点各自都能单独接错而形状不变：塌缩是 ``mean`` 不是 ``sum``（用 sum
+    #: 会把读门尺度放大 ``hc`` 倍）；写门是 ``2 * sigmoid(dot / hc)``（漏掉 2 会让
+    #: 整个 block 的贡献减半，不除 ``hc`` 会让门饱和）；那只 ``2`` 让零输入处权重
+    #: 正好是 1，于是初始化附近等价于原始残差相加。
+    #:
+    #: 它值得单独成为一个算子，是因为参考写法是八次 torch 调用、每层两套、48 层，
+    #: 一步 decode 就是 768 次发射；而一步只流 2.33 GB 权重。见
+    #: ``backends/corex/kernels/hyper.cu`` 的 ``hyper_up``：门、加权和、写门共享同一份
+    #: ``normed``，拆开就要把它读三遍。
+    hyper_up: OpFn | None = None
 
     #: 规范算子名，按字段顺序。
     NAMES: ClassVar[tuple[str, ...]] = _OP_NAMES
@@ -400,8 +436,7 @@ class Ops:
         """列出这张表自己就能回答的算子名。
 
         Returns:
-            带可调用对象的名字，按规范顺序。在原生后端上这就是它的内核清单；在
-            参考后端上是全部 18 个。
+            带可调用对象的名字，按规范顺序。在原生后端上这就是它的内核清单
         """
         return tuple(name for name, fn in self.as_dict().items() if fn is not None)
 
