@@ -45,10 +45,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "group-scaled packed W4 GEMV with bf16/fp32 activations",
           pybind11::arg("packed"), pybind11::arg("scale"), pybind11::arg("x"),
           pybind11::arg("k"), pybind11::arg("group_size"));
+    // 调优旋钮全部带默认值 ``0``（= 沿用已发布的规则），所以不传它们时这一条与
+    // 引入旋钮之前逐位相同。名字与 ``gemv_kn_i8`` 保持同一套：同一个概念在两个核上
+    // 换名字，扫描脚本就没法共用一份形状表。
     m.def("w4a8_gemv", &w4a8_gemv,
           "分组 W4 与 int8 激活的整数点积，int32 逐组累加",
           pybind11::arg("a"), pybind11::arg("w"), pybind11::arg("xs"),
-          pybind11::arg("ws"), pybind11::arg("out"), pybind11::arg("group_size"));
+          pybind11::arg("ws"), pybind11::arg("out"), pybind11::arg("group_size"),
+          pybind11::arg("threads") = 0, pybind11::arg("unroll") = 0,
+          pybind11::arg("split") = 0, pybind11::arg("width") = 0);
     m.def("w4a8_gemm_tcu", &w4a8_gemm_tcu,
           "分组 packed W4 与 int8 激活的张量核投影",
           pybind11::arg("a"), pybind11::arg("w"), pybind11::arg("xs"),

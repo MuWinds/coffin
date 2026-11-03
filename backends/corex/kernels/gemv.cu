@@ -35,6 +35,7 @@
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime.h>
+#include <algorithm>
 
 namespace {
 
@@ -652,14 +653,62 @@ int pick_threads(int64_t N) {
     return 64;
 }
 
+//: 窄形状（``N < GEMV_NARROW_MIN_N``）的 split-K 目标块数。
+//:
+//: 一个分片就是网格上的 ``blocks`` 个块，所以 ``split * blocks`` 才是总块数。窄形状
+//: 单趟只有 1-5 个块，而 16 SM 的部件一个 wave 就是 16 个块——**整张卡上跑着的块数
+//: 比一个 wave 还少**，这就是它们慢的全部原因。
+//:
+//: 64 = 4 个 wave。实测（``diag/qwen4/probe_q4_gemv_dispatch.py``，M = 1）：
+//:
+//:   split      1       2       4       8      16      32      64
+//:   N=48    200.7   174.1    94.4    54.5    35.8    29.3    29.6   （us）
+//:   块数        1       2       4       8      16      32      64
+//:
+//: 平台在 32 块（16 SM 的 2 倍 wave），s32 与 s64 相差 1%。目标取 64 而不是 32，
+//: 是因为目标块数会被 :data:`GEMV_MIN_SLICE` 再封顶一次，而封顶之后 N=48 恰好落在
+//: 40 片——仍在 s32/s64 那个平底盆里。
+//:
+//: **这三个窄形状常量（本项、``GEMV_NARROW_SLICE``、``GEMV_NARROW_MIN_N``）是拟合，
+//: 不是推导：用它们拟合 4 个窄形状（``gdn_in_proj_a``、``shared_expert_gate``、
+//: ``block_inject``、``hyper_mix_down``），比例并不好。** 之所以还是这样写而不是硬编码
+//: 一张表，是因为窄形状的 ``N``/``K`` 本来就不是整数（``N = 1``、``4``、``48``、``320``），
+//: 写下个模型的形状表一个都盖不住。任何要动它们的人先看这段：它是一条**样本不足的
+//: 拟合**，改它之前请先补至少三个不同 ``K`` 的窄形状实测。
+constexpr int GEMV_NARROW_TARGET_BLOCKS = 64;
+
+//: 窄形状每个分片能覆盖的 K 元素软上限。它管的是「长 K + 窄 N」这一类形状：
+//: ``hyper_mix_down``（N = 320, K = 10240）在 5 个块上单趟要串 10240 个元素，实测
+//: s8 = 177.2 us 而 s64 = 44.3 us（**4 倍**）。160 这个值让它拿到 64 片。
+//:
+//: 与 :data:`GEMV_MIN_SLICE` 的区别：那个是**硬**下界（低于它启动开销盖不住收益），
+//: 这个是**软**上限（超过它串行链太长），所以前者用 min 夹、后者用 max 提。
+constexpr int GEMV_NARROW_SLICE = 160;
+
+//: 走「窄形状」规则的最大列数。``N >= 2048`` 时 ``pick_threads`` 给 256 线程，单趟
+//: 就有 8 个块以上，补块数的需求消失，而历史实测（下面 ``pick_split`` 的注释表）给出
+//: 宽形状的最优就是 4-8——所以上界以上一律沿用历史规则，一个字不改。
+constexpr int GEMV_NARROW_MIN_N = 2048;
+
+//: bf16 分片的硬上限，同时也是分片缓冲区的界。归约要花 ``8 * split * N`` 字节，
+//: ``split = 64`` 时在 ``N = 248320`` 上也只有 127 MB 量级的一次性流量。
+constexpr int GEMV_MAX_SPLIT = 64;
+
+//: 值得调度的最短 K 切片。低于约 64 个元素时，启动和部分和的写入会超过切片本身读的量。
+//: 它同时封顶了分片缓冲区的流量：``split <= K / 64`` 把归约开销封在权重流量的
+//: ``8 / 64`` = 12.5%。
+constexpr int GEMV_MIN_SLICE = 64;
+
 // @brief Split-K 宽度，或 ``1`` 表示跑单趟内核。
 //
 // 切分乘倍了块数却不碰权重流量：每个分片读每列一个不同的 K 区间，所以搬动的字节数相同，
-// 变的只是同时在飞的独立加载数。在一张拷贝带宽上限 575 GB/s 的 16 SM 部件上，单趟在多数
-// 形状上都让卡缺少内存级并行，所以切分是默认而不是例外。
+// 变的只是同时在飞的独立加载数与总块数。
 //
-// 在 BI-V100 上实测，每个配置都对过主机侧 fp64 参考。第一张表才是有用的那张——它是
-// *解码步* 实际付的代价，经 ``backends.ops.linear`` 测得，所以包含了启动和部分和归约：
+// **两段式**，因为两类形状的最优由不同的量决定，用一条连续规则拟合会两边都不准：
+//
+// 宽形状（``N >= GEMV_NARROW_MIN_N``）——列数自己就能铺满卡，分片只用来摊短 K 切片。
+// 这一段是**历史规则原样保留**，它的数字来自下面这张表（经 ``backends.ops.linear``
+// 测得，含启动与归约）：
 //
 //   shape      N       K      split 1      split 4      split 8
 //   mlp_up     9216    2560   0.292 ms     0.152 ms     --
@@ -668,27 +717,76 @@ int pick_threads(int64_t N) {
 //   o_proj     2560    4096   0.329 ms     --           0.085 ms
 //   lm_head    248320  2560   3.478 ms     2.961 ms     --
 //
-// 那张表里打进了对早先推理的两次纠正，两次都是拿一个任务换来的：
+// 那张表里打进了两次纠正：「只在单趟网格填不满卡时才切分」是错的（mlp_up 的 36 个块
+// 已经两个 wave，四路切分仍有 1.92x）；「窄形状没收益」也是反的（mlp_down / o_proj
+// 才是切分最值的，对单趟 4.1x / 3.9x）。所以宽形状这一段**不动**：任何重写都要先有
+// 新实测，而本次解码账本里的 264 次调用全是窄形状。
 //
-//   * 「只在单趟网格填不满卡时才切分」是错的。mlp_up 的 9216 列在 16 个 SM 上是 36 个
-//     块——已经两个 wave 了——而四路切分仍然有 1.92x 的收益。受限的从来不是 *块* 的占用率，
-//     而是在飞的加载数。
-//   * 「窄形状没收益」也错了，而且是反的。mlp_down 和 o_proj 才是切分最值的形状（对单趟
-//     分别是 4.1x 和 3.9x）——它们恰恰是可铺开的列数最少的那些。
+// 窄形状（``N < GEMV_NARROW_MIN_N``）——单趟只有 1-5 个块，**整张卡上的块数比一个
+// wave 还少**。这一段是本次修正的重点，旧规则在这里是反的：
 //
-// 切分必须尊重的是 ``K``：每个分片拿到 ``K / split``，而切片太短时部分和那一趟吃掉的好处
-// 会超过收益。mlp_down 在这里所有形状里 K 最长，取 8，也是这个函数会返回的最大值。
+//   shape                 N     K      blocks  旧 split  实时最优  旧规则代价
+//   gdn_in_proj_a/b       48    2560     1        5         32       2.79x
+//   shared_expert_gate    1     2560     1        5         32       --
+//   block_inject          4     10240    1        8         32       --
+//   hyper_mix_down        320   10240    5        8         64       4.00x
+//
+// 旧规则给 ``want = 8``（``N < 4096``）再被 ``by_k = K / 512`` 上限 8 夹住，所以
+// ``N = 48, K = 2560`` 只拿到 **5 片**——5 个块、320 条线程，而 16 个 SM 的容量是它的
+// 两个数量级倍。实测 s5 = 78.3 us，s32 = 29.3 us。
+//
+// **``block_inject`` 与 ``hyper_mix_down`` 会被融合删掉，这一段对它们生效是窄形状规则
+// 的必然结果，不是专门优化。** 前者（``N = 4``, ``K = 10240``, 96 次/步）算的正是
+// ``hyper.cu`` 里 ``hyper_up`` 内部的逐流写门，后者（``N = 320``, ``K = 10240``,
+// 24 次/步）是 ``hyper_down`` 的下投影；融合上线后这 120 次调用**不是变快，是不存在**。
+// 所以按需删除：删掉这两个形状对本规则无影响（它没有任何形状特例），但要一起确认
+// ``gdn_in_proj_a/b`` 与 ``shared_expert_gate`` 仍然吃到 32 片以上。
+//
+// 数值影响已经量化（作业 ``q4layer4``，同一份 .so、两臂只差一个环境变量、都 12 步）：
+// 分派从 5/8 片改到 32/40 片之后，末层 logits 的 absmax 是 12.375 对 12.625（2.0%）、
+// std 是 1.086 对 1.132（4.1%），**greedy ids 12/12 逐位一致**。逐层看，首个分叉在
+// 第 2 层（第 0、1 层逐位相同，说明两次运行本身是确定性的），48 层的总放大倍数 9.2x、
+// 最大单层放大 2.79x。所以差异是 **fp32 部分和累加顺序**的必然结果（split 改变的是
+// 加法的结合方式，而 fp32 加法不满足结合律），不是实现错误。
+//
+// 性能侧：作业 ``q4disp6`` 是 234.50 ms、作业 ``q4final2``（删掉 A/B 开关之后重跑）
+// 是 233.13 ms，**差 0.6%，在跨作业抖动内**，而两个核的 us/call 分别为
+// ``gemv_kn_split`` 27.2 对 27.17、``w4a8_dot`` 46.9 对 46.88——到小数点后一位一致。
+// 所以 234.50 不是单次幸运值，删开关也没有改变行为。
+//
+// 顺带一条排错经验：这个结论第一次没拿到，因为 A/B 对照臂用**文本手术**构造失败了两次
+// （sed 改常量在数学上不可能等价；花括号配对替换函数体吞掉了相邻的 ``pick_split_i8``）。
+// 两次的症状都不在操作处。构造对照臂要么用同一份产物的运行时开关，要么用两份独立源码，
+// 不要用文本替换。
+//
+// @param N 输出列数。
+// @param K 归约长度；它通过 :data:`GEMV_MIN_SLICE` 给分片数设硬下界。
+// @param threads 每块线程数，它决定单趟块数。
+// @return ``[1, GEMV_MAX_SPLIT]`` 里的分片数。
 int pick_split(int64_t N, int64_t K, int threads) {
     if (K < 1024) return 1;
-
-    // 切片短于约 512 时，第二次启动就不划算了。
-    const int64_t by_k = K / 512 > 8 ? 8 : K / 512;
+    const int64_t blocks = threads > 0 ? (N + threads - 1) / threads : N;
+    if (blocks <= 0) return 1;
+    const int64_t by_k = K / GEMV_MIN_SLICE;
     if (by_k < 2) return 1;
 
-    // 宽形状靠列就能填满卡，所以比窄形状需要的帮助少。mlp_up/qkv_gate 实测在 4 最好、在 8
-    // 变差；更窄的统统在 8 最好。阈值就放在扫描给出的交叉点上。
-    const int64_t want = N >= 4096 ? 4 : 8;
-    return (int)(want < by_k ? want : by_k);
+    if (N >= GEMV_NARROW_MIN_N) {
+        // 宽形状：历史规则逐字保留（含 ``N >= 4096 ? 4 : 8`` 与 ``by_k`` 的 8 上限）。
+        const int64_t want = N >= 4096 ? 4 : 8;
+        const int64_t cap = by_k < 8 ? by_k : 8;
+        return (int)(want < cap ? want : cap);
+    }
+
+    // 窄形状：两个来源各给出一个下界，取大的那个。
+    //   补块数 —— 单趟块数越少，需要越多分片才能凑到 4 个 wave；
+    //   摊长 K —— 每片覆盖的 K 元素超过一个软上限时，串行链就成了瓶颈。
+    const int64_t by_blocks = (GEMV_NARROW_TARGET_BLOCKS + blocks - 1) / blocks;
+    const int64_t by_slice = (K + GEMV_NARROW_SLICE - 1) / GEMV_NARROW_SLICE;
+    int64_t want = by_blocks > by_slice ? by_blocks : by_slice;
+    if (want < 2) want = 2;
+    if (want > by_k) want = by_k;
+    if (want > GEMV_MAX_SPLIT) want = GEMV_MAX_SPLIT;
+    return (int)want;
 }
 
 //: int8 的 split-K 规则要维持的常驻块数。下面每个实测最优点都落在该乘积上或相差不超过一个
@@ -764,6 +862,11 @@ int pick_split_i8(int64_t N, int64_t K, int threads) {
 // U=1 和 U=2/U=4 一起实例化，尽管它从不是默认值：它是形状扫描里的对照组。没有它，一个 U=4
 // 的测量就分不清「展开有用」和「循环开销本来就不是瓶颈」，而扫描会留下一个它从未证明有用的
 // 旋钮。
+//
+// U=8 和 U=16 也是同一个理由，但方向相反：窄形状上 ``U=4`` 实测着落在延迟上而不是带宽上
+// （见 :func:`pick_unroll` 的实测表），而在飞加载数就是 ``U``，只有把实例化摆在那里，扫描
+// 才量得到更深的展开。分辨率也很要紧：``K = 2560`` 用 U=8 时每个分片按 32 个元素对齐，
+// U=16 按 64 对齐，两者在 ``split`` 不与 ``K`` 整除时的尾巴代价不同档。
 template <typename WT, typename XT>
 torch::Tensor launch_plain(const torch::Tensor& wt, const torch::Tensor& x,
                            torch::Tensor& y, int N, int K, int threads, int unroll) {
@@ -776,6 +879,10 @@ torch::Tensor launch_plain(const torch::Tensor& wt, const torch::Tensor& x,
         gemv_kn_kernel<WT, XT, 1><<<blocks, threads, 0, stream>>>(wp, xp, yp, N, K);
     } else if (unroll == 2) {
         gemv_kn_kernel<WT, XT, 2><<<blocks, threads, 0, stream>>>(wp, xp, yp, N, K);
+    } else if (unroll == 8) {
+        gemv_kn_kernel<WT, XT, 8><<<blocks, threads, 0, stream>>>(wp, xp, yp, N, K);
+    } else if (unroll == 16) {
+        gemv_kn_kernel<WT, XT, 16><<<blocks, threads, 0, stream>>>(wp, xp, yp, N, K);
     } else {
         gemv_kn_kernel<WT, XT, 4><<<blocks, threads, 0, stream>>>(wp, xp, yp, N, K);
     }
@@ -803,6 +910,12 @@ torch::Tensor launch_split(const torch::Tensor& wt, const torch::Tensor& x,
     } else if (unroll == 2) {
         gemv_kn_split_kernel<WT, XT, 2><<<grid, threads, 0, stream>>>(wp, xp, pp, N, K,
                                                                      split, per);
+    } else if (unroll == 8) {
+        gemv_kn_split_kernel<WT, XT, 8><<<grid, threads, 0, stream>>>(wp, xp, pp, N, K,
+                                                                     split, per);
+    } else if (unroll == 16) {
+        gemv_kn_split_kernel<WT, XT, 16><<<grid, threads, 0, stream>>>(wp, xp, pp, N, K,
+                                                                      split, per);
     } else {
         gemv_kn_split_kernel<WT, XT, 4><<<grid, threads, 0, stream>>>(wp, xp, pp, N, K,
                                                                      split, per);

@@ -95,8 +95,27 @@ torch::Tensor gemv_kn_w4(torch::Tensor packed, torch::Tensor scale, torch::Tenso
                          int64_t k, int64_t group_size);
 
 // @brief 分组 W4 与 int8 激活的整数投影，返回调用方提供的浮点输出。
+//
+// @param a [M,K] 连续 int8 激活，已由 ``quant_act_i8`` 归一化。
+// @param w [至少 ceil(K/2),N] 连续 uint8 packed 权重。
+// @param xs [M] fp32 激活 scale。
+// @param ws [ceil(K/group_size),N] fp32 权重 scale。
+// @param out [M,N] 连续 bf16 或 fp32 输出。
+// @param group_size K 轴权重分组大小。
+// @param threads 每块线程数，``0`` 表示按 ``N`` 选。
+// @param unroll 每个分片内 K 循环的展开度，``1``/``2``/``4``；``0`` 表示 1。
+//        ``1`` 精确复现引入这个参数之前的核，所以默认路径逐位不变。
+// @param split 分片数，``0`` 表示按 ``N``/``K`` 选；``1`` 强制单趟。
+// @param width 一个线程负责的相邻输出列数：``4`` 时每个 k 步读一个对齐的 32 位字
+//        而不是 4 个单字节。合法值是 ``1``、``2``、``4``；``N % width`` 必须为 ``0``，
+//        不满足时折回 ``1``。``0`` 表示自动，而自动目前就是 ``1``——宽加载的交叉点
+//        只能由真机扫描给出，见 ``w4a8.cu`` 的 ``pick_cw``。
+// @return out。
+// @throws c10::Error 布局、设备、dtype、形状或整数累加范围不符合契约。
 torch::Tensor w4a8_gemv(torch::Tensor a, torch::Tensor w, torch::Tensor xs,
-                        torch::Tensor ws, torch::Tensor out, int64_t group_size);
+                        torch::Tensor ws, torch::Tensor out, int64_t group_size,
+                        int64_t threads, int64_t unroll, int64_t split,
+                        int64_t width);
 torch::Tensor w4a8_gemm_tcu(torch::Tensor a, torch::Tensor w, torch::Tensor xs,
                             torch::Tensor ws, torch::Tensor out, int64_t group_size);
 torch::Tensor quant_act_i8_scaled(torch::Tensor x, torch::Tensor out, torch::Tensor xs);
