@@ -65,6 +65,7 @@ _OP_NAMES: tuple[str, ...] = (
     "attn_paged",
     "attn_paged_batch",
     "attn_paged_multi_q",
+    "attn_sparse",       # QSA 稀疏注意力：只读索引器选中的位置
     # Gated DeltaNet：深度卷积 + SiLU，然后是循环。
     "conv1d_silu",
     "conv1d_silu_seq",
@@ -304,6 +305,22 @@ class Ops:
     #: ``[B, n_blocks]``，1 表示保留）限定哪些 KV 块参与；``None`` 是精确的全
     #: 注意力。
     attn_paged_multi_q: OpFn | None = None
+    #: ``attn_sparse(q, kcache, vcache, sel_idx, sel_len, ctx, out=None,
+    #: scale=None) -> out``：QSA 的**稀疏**注意力，只读索引器选中的位置。
+    #:
+    #: ``q`` 是 ``[rows, nh, hd]`` 未 repeat 的查询头，``kcache``/``vcache`` 是
+    #: ``[nkv, max_seq, hd]`` 头主序（**也不 repeat**）。``sel_idx`` 是
+    #: ``[rows, max_sel]`` int32，行内升序、无效槽为 -1；``sel_len`` 是每行有效数；
+    #: ``ctx`` 是每行因果上界。
+    #:
+    #: 为什么要它而不是用 :attr:`attn_paged`：QSA 的索引器已经把可见范围缩到
+    #: ``budget = 2048``，而 ``attn_paged`` 会扫整个 ``kv_length`` 再用掩码压掉。
+    #: 实测（``q4attn1``）稠密路径在 ``kv=32768`` 时是 16.68 ms/层/步，其中打分
+    #: ``matmul`` 占 55%、``repeat_kv`` 的物化占 10%。稀疏版只遍历选中的位置，
+    #: 并按 ``g = h / rep`` 直接寻址 KV（不物化 16 份）。
+    #:
+    #: ``None`` 表示后端没有这个算子，模型侧退回稠密的 torch 链。
+    attn_sparse: OpFn | None = None
     #: ``conv1d_silu(conv_w, x, conv_state, out) -> out``：单 token 的深度因果卷积
     #: （卷积核 4）+ SiLU。``conv_w`` 是 ``[C, 4]`` fp32，当前 token 在最末；
     #: ``conv_state`` 是 ``[C, 3]`` fp32，被原地平移，所以它是混合器的短期记忆，

@@ -747,6 +747,52 @@ def moe_grouped_gemm(w, x: torch.Tensor, offsets: torch.Tensor,
     return _restore(result, dtype)
 
 
+def attn_sparse(q: torch.Tensor, kcache: torch.Tensor, vcache: torch.Tensor,
+                sel_idx: torch.Tensor, sel_len: torch.Tensor,
+                ctx: torch.Tensor, out: torch.Tensor | None = None,
+                scale: float | None = None) -> torch.Tensor:
+    """QSA 的稀疏注意力：只读 ``sel_idx`` 指出的位置，KV 不物化。
+
+    替掉 ``qsa.py`` 里那三段纯 torch（``repeat_kv`` + ``matmul`` + ``softmax`` +
+    ``matmul``）。作业 ``q4attn1`` 量到它们在 kv=32768 时是 16.68 ms/层/步，其中
+    ``matmul`` 占 55%，而它扫的是整个 ``kv_length`` —— 索引器预算只有 2048，所以
+    94% 的打分作用在已经被判定为「不看」的位置上。
+
+    Args:
+        q: ``[rows, nh, hd]`` bf16，**未 repeat 的查询头**，已旋转。
+        kcache: ``[nkv, max_seq, hd]`` bf16，头主序、**未 repeat**。
+        vcache: 同 ``kcache``。
+        sel_idx: ``[rows, max_sel]`` int32，行内升序，无效槽为 -1。
+        sel_len: ``[rows]`` int32 每行有效位置数。
+        ctx: ``[rows]`` int32 每行因果上界；``>= ctx`` 的位置被跳过。
+        out: 可选输出缓冲；不给则分配。
+        scale: 打分缩放；``None`` 时取 ``hd ** -0.5``，与 ``Attention.scaling`` 一致。
+
+    Returns:
+        ``[rows, nh, hd]`` bf16。
+
+    Raises:
+        ValueError: 形状与权重不自洽。
+        RuntimeError: 扩展不可用。
+    """
+    module = _kernels()
+    if q.dim() != 3:
+        raise ValueError("attn_sparse expects q as [rows, nh, hd]")
+    rows, nh, hd = q.shape
+    if out is None:
+        out = torch.empty((rows, nh, hd), dtype=q.dtype, device=q.device)
+    if scale is None:
+        scale = hd ** -0.5
+    if sel_idx.dtype != torch.int32:
+        sel_idx = sel_idx.to(torch.int32)
+    if sel_len.dtype != torch.int32:
+        sel_len = sel_len.to(torch.int32)
+    if ctx.dtype != torch.int32:
+        ctx = ctx.to(torch.int32)
+    module.attn_sparse(q, kcache, vcache, sel_idx, sel_len, ctx, out, float(scale))
+    return out
+
+
 def _w8a8_rows(packed: pack.KnQWeight, act: torch.Tensor) -> torch.Tensor:
     """用三个 W8A8 内核做一次预填充投影：量化激活、int8 GEMM、乘两个 scale。
 
@@ -1819,6 +1865,7 @@ _NATIVE: dict[str, OpFn] = {
     "triangular_solve": triangular_solve,
     "moe_grouped": moe_grouped,
     "moe_grouped_gemm": moe_grouped_gemm,
+    "attn_sparse": attn_sparse,
     "moe_dispatch": moe_dispatch,
     "hyper_norm": hyper_norm,
     "hyper_down": hyper_down,

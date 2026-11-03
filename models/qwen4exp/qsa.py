@@ -1,6 +1,6 @@
 """QSA（Qwen Sparse Attention）：块级索引器 + 带输出门的全注意力。
 
-参考实现是**掩码版**而不是稀疏核：索引器把 KV 按 ``compress_ratio`` 分块、每块
+参考实现是掩码版而不是稀疏核：索引器把 KV 按 ``compress_ratio`` 分块、每块
 池化成一个 key、用 indexer 的查询头打分、选出 ``block_topk`` 个块，再把整块的
 token 放回可见集合；注意力本身仍然跑完整 ``Q @ Kᵀ``，只是把没选的 key 打分置
 ``-inf``。QSA 因此不省任何矩阵乘——这是正确性基准，稀疏核是后面的事。
@@ -39,6 +39,20 @@ from models.qwen4exp.config import TextConfig
 from models.qwen4exp.norm import RMSNorm
 from models.qwen4exp.proj import Proj, proj_from_config
 from models.qwen4exp.rope import apply_rotary_pos_emb
+
+from backends import ops as bops
+
+#: 走稀疏注意力的最小 ``kv_length``。
+#:
+#: 作业 ``q4sspeed2`` 量到交叉点在 4096：短上下文下稀疏核（每位置两次归约）比稠密的
+#: 库内核贵，长上下文下它「只读索引器选中的 2048 个位置」的优势压倒一切：
+#:
+#:     kv=2048   dense 0.587 ms  sparse 0.906 ms  0.65x
+#:     kv=4096   dense 1.229 ms  sparse 0.905 ms  1.36x
+#:     kv=32768  dense 7.560 ms  sparse 0.904 ms  8.36x
+#:
+#: 所以按长度分档，短上下文继续走稠密路径 —— 那是它更快的地方。
+_SPARSE_MIN_KV = 4096
 
 
 @dataclass
@@ -255,32 +269,58 @@ class QSAIndexer(nn.Module):
         head_dim = self.index_head_dim
         tokens = raw_keys.shape[1]
 
-        # 可见掩码的第二维是头，恒为 1；按行展平后下标流就是 [B*S] 行连续。
-        entries, counts = self._flatten_visible(visible, rows, kv_length)
-        entry_rows, entry_cols = entries
-        num_blocks = counts // ratio
-        block_starts = num_blocks * ratio
         # ``max_blocks`` 决定后面所有张量的宽度，所以它必须是一个 Python int。
         #
-        # **但不需要每次同步。** ``decode`` 时每层可见的 token 数只随位置 +1 增长，
-        # 而 ``num_blocks = floor(visible / ratio)`` —— 它每 ``ratio`` 步才变一次。
-        # 这里原来每层都 ``int(num_blocks.max())``，即一步 12 次设备到主机的同步，
-        # 每次都要等整条流跑到这里。改成「按 ``kv_length`` 缓存」：同一个
-        # ``kv_length`` 下 ``max_blocks`` 由可见掩码唯一决定，而 decode 一步里
-        # 各层的 ``kv_length`` 相同，所以一层算过一次之后其余 11 层直接命中。
-        #
-        # 键里带 ``rows``：prefill 的 batch/seq 可能与 decode 不同，混用会让宽度
-        # 取错。缓存条数上限是防御性的，形状随上下文增长会换键。
+        # ``decode`` 时每层可见的 token 数只随位置 +1 增长，而 ``num_blocks =
+        # floor(visible / ratio)`` —— 它每 ``ratio`` 步才变一次。这里原来每层都
+        # ``int(num_blocks.max())``，即一步 12 次设备到主机的同步。改成按
+        # ``(kv_length, rows)`` 缓存：同一个 ``kv_length`` 下 ``max_blocks`` 由可见
+        # 掩码唯一决定，而 decode 一步里各层的 ``kv_length`` 相同。
         cache_key = (kv_length, rows)
         max_blocks = self._max_blocks_cache.get(cache_key)
         if max_blocks is None:
-            max_blocks = int(num_blocks.max())
+            # ``counts`` 要算才知道每行可见多少 token；而 ``_flatten_visible`` 会顺带
+            # 做一次 ``nonzero``。为了不重复算，这里先只求 ``counts``，只有真正需要
+            # 走慢路径时才要下标流。
+            counts = visible.reshape(rows, kv_length).sum(dim=1, dtype=torch.long)
+            max_blocks = int((counts // ratio).max())
             if len(self._max_blocks_cache) >= 64:
                 self._max_blocks_cache.clear()
             self._max_blocks_cache[cache_key] = max_blocks
+        else:
+            counts = visible.reshape(rows, kv_length).sum(dim=1, dtype=torch.long)
+
+        # 整段快路径：块数没超过预算时，选出来的掩码就是 ``visible`` 本身。
+        #
+        # 推理：``max_picked = min(block_topk, max_blocks)``，所以 ``max_blocks <=
+        # block_topk`` 时 ``max_picked == max_blocks``，``scores.topk(max_blocks)``
+        # 从 ``max_blocks`` 个里取 ``max_blocks`` 个，全取。而每行的
+        # ``block_part`` 覆盖它自己的 ``num_blocks * ratio`` 个 token、``tail_part``
+        # 覆盖剩下的，两者并起来正是该行**全部**可见 token。既然块全被选中、尾部又
+        # 无条件保留，结果必然等于 ``visible``。逐位相等，不是近似。
+        #
+        # 这不是微优化：QSA 层每层 6.61 ms、12 层合计 79.3 ms，占一步 45%
+        # 而下面那段 ``_block_table`` / ``_batched_block_keys``
+        # / ``.float()`` 的 matmul / ``relu().sum()`` / ``topk`` / ``index_select`` /
+        # ``dense_mask`` 在 ``S=1`` 时是纯固定开销（约 60 次 torch 分发）。
+        #
+        # 覆盖范围很大：``block_topk = budget / ratio = 2048 / 4 = 512``，而
+        # ``max_blocks = floor(kv_length / ratio)``，所以 ``kv_length <= 2048`` 都走这里
+        # —— 短上下文 decode 与中小 prefill 全包含在内。
+        if max_blocks <= self.block_topk:
+            if visible.dtype == torch.bool:
+                return visible
+            return visible.to(torch.bool)
+
+        # 可见掩码的第二维是头，恒为 1；按行展平后下标流就是 [B*S] 行连续。
+        entries, _counts = self._flatten_visible(visible, rows, kv_length)
+        entry_rows, entry_cols = entries
+        num_blocks = counts // ratio
+        block_starts = num_blocks * ratio
         # 每个 query 能选中的块数受自己的块数与全局预算双重限制，批量版只能按
         # min(block_topk, max_blocks) 统一取，多出来的名额由 -inf 掩码滤掉。
         max_picked = min(self.block_topk, max_blocks)
+
         row_first = torch.cumsum(counts, 0) - counts
         entry_rank = torch.arange(entry_rows.numel(), device=query.device) \
             - row_first.index_select(0, entry_rows)
@@ -636,6 +676,66 @@ class Attention(nn.Module):
         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.indexer = QSAIndexer(config, layer_idx)
 
+    def _sparse_attention(self, query_states: torch.Tensor,
+                          cache: "AttentionCache",
+                          merged_mask: torch.Tensor,
+                          kv_length: int,
+                          attn_sparse) -> torch.Tensor | None:
+        """上下文够长时走稀疏内核，把选中集合直接喂给它。
+
+        选中集合就是 ``merged_mask``（索引器选中的 ∩ 因果可见）。**不重新计算**：
+        把掩码转成 ``sel_idx``/``sel_len`` 比再跑一遍索引器便宜得多，而且保证
+        两条路的可见集合逐位一致——那是等价性的前提。
+
+        Args:
+            query_states: ``[B, num_heads, 1, head_dim]``，已旋转但**未缩放**——稠密
+                路径也是先 ``matmul`` 再乘 ``self.scaling``，所以缩放只施加一次，
+                由内核的 ``scale`` 参数负责。
+            cache: 含 ``keys``/``values``，形状 ``[B, num_kv_heads, kv_length, head_dim]``。
+            merged_mask: ``[B, 1, 1, kv_length]`` 的 bool 掩码。
+            kv_length: 缓存里的键数（内核用它做因果上界）。
+            attn_sparse: 后端算子；``None`` 表示不可用。
+
+        Returns:
+            ``[B, 1, num_heads, head_dim]`` 的注意力输出（未乘输出门），或 ``None``
+            表示这个情形不该走稀疏路径。
+        """
+        if attn_sparse is None or query_states.shape[2] != 1:
+            return None
+        batch = query_states.shape[0]
+        if batch != 1:
+            # 稀疏核的 ``sel_idx`` 是每行一条；批量 decode 需要行偏移，暂不支持。
+            return None
+        if merged_mask.dtype != torch.bool:
+            # 加性掩码在这里要反推可见集合，容易出错；生产路径传的是 bool。
+            return None
+
+        # ``[1, 1, 1, kv]`` -> 每行的选中位置。升序由 ``nonzero`` 保证，
+        # 正是稀疏核要求的顺序。
+        visible = merged_mask.reshape(kv_length)
+        sel = torch.nonzero(visible, as_tuple=False).flatten().to(torch.int32)
+        if sel.numel() == 0:
+            return None
+        # 稀疏核按 ``rep`` 把查询头映射到 KV 头，所以 ``nkv`` 必须整除 ``nh``。
+        keys = cache.keys
+        values = cache.values
+        if keys.shape[1] == 0 or query_states.shape[1] % keys.shape[1] != 0:
+            return None
+        # 内核要求 ``[nkv, max_seq, hd]`` 头主序、连续；cache 是 ``[1, nkv, kv, hd]``。
+        kcache = keys[0].contiguous()
+        vcache = values[0].contiguous()
+        # 内核要求 ``[rows, nh, hd]`` 三维。``query_states`` 是
+        # ``[B, nh, 1, hd]``，所以按 ``[:, :, 0, :]`` 收紧**中间的 1** 保留 batch 轴；
+        # 写成 ``[0, :, 0, :]`` 会把 batch 轴也去掉、退化成二维，内核直接拒绝。
+        q_in = query_states[:, :, 0, :].contiguous()
+        out = attn_sparse(
+            q_in, kcache, vcache,
+            sel.unsqueeze(0), torch.tensor([sel.numel()], dtype=torch.int32,
+                                           device=sel.device),
+            torch.tensor([kv_length], dtype=torch.int32, device=sel.device),
+            scale=self.scaling)
+        return out.unsqueeze(2)
+
     def forward(self, hidden_states: torch.Tensor,
                 position_embeddings: tuple[torch.Tensor, torch.Tensor],
                 attention_mask: torch.Tensor,
@@ -694,9 +794,40 @@ class Attention(nn.Module):
         else:
             new_cache = cache.append(key_states, value_states, raw_index_keys)
 
+        # 稀疏快路径：上下文够长时，索引器已经把可见集合缩到 ``budget`` 个 token，
+        # 而稠密路径仍要扫整个 ``kv_length``（先算出来再被 ``-inf`` 压掉）。
+        #
+        # 实测：
+        #
+        #     kv      dense     sparse    加速
+        #     512     0.205 ms  0.236 ms  0.87x
+        #     2048    0.587     0.906     0.65x
+        #     4096    1.229     0.905     1.36x
+        #     8192    2.158     0.905     2.38x
+        #     32768   7.560     0.904     8.36x
+        #
+        # 交叉点在 kv = 4096：短上下文下稀疏核「每位置两次归约」的开销比稠密的
+        # 库内核贵，长上下文下「只读 2048 个位置」的优势压倒一切。所以按长度分档，
+        # 不给短上下文添乱（12 层折算在 kv=2048 时稀疏反而多花 3.83 ms）。
+        #
+        # 只在 ``seq == 1`` 启用：prefill 的注意力是 ``[S, kv]`` 矩阵乘，本来就吃满
+        # 算力，而稀疏核是「一头一行一个 block」，在 prefill 上会退化。
+        #
+        # ``kv_len`` 取**缓存实际的键数**：``Attention.forward`` 的作用域里没有索引器
+        # 那个 ``kv_length``（它在 ``QSAIndexer.select`` 内），而缓存长度才是本层真正
+        # 要扫的长度。
+        kv_len = int(new_cache.keys.shape[2])
+        if seq == 1 and kv_len >= _SPARSE_MIN_KV:
+            sparse_out = self._sparse_attention(
+                query_states, new_cache, merged_mask, kv_len,
+                getattr(bops, "attn_sparse", None))
+            if sparse_out is not None:
+                attn_output = sparse_out.reshape(*input_shape, -1)
+                attn_output = attn_output * torch.sigmoid(gate)
+                return self.o_proj(attn_output), new_cache
+
         keys = repeat_kv(new_cache.keys, self.num_key_value_groups)
         values = repeat_kv(new_cache.values, self.num_key_value_groups)
-
         attn_weights = torch.matmul(query_states, keys.transpose(2, 3)) * self.scaling
         if merged_mask.dtype != torch.bool:
             attn_weights = attn_weights + merged_mask

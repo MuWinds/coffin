@@ -623,3 +623,29 @@ void moe_dispatch(torch::Tensor expert_idx, torch::Tensor local_table,
 void moe_grouped_gemm(torch::Tensor a, torch::Tensor xs, torch::Tensor w,
                       torch::Tensor ws, torch::Tensor offsets,
                       torch::Tensor out, int64_t group_size);
+
+// QSA 的稀疏注意力：只读索引器选中的位置。
+
+// @brief 稀疏精确 softmax 注意力，KV 不物化、不扫全窗口。
+//
+// 替掉 ``qsa.py`` 里那三段纯 torch（``repeat_kv`` + ``matmul`` + ``softmax`` +
+// ``matmul``）。那三段在 kv=32768 时是 16.68 ms/层/步，
+// 其中 ``matmul`` 占 55%，而它扫的是整个 ``kv_length``，索引器预算只有 2048，
+// 所以 94% 的打分作用在已经被判定为「不看」的位置上。本内核只遍历选中的位置。
+//
+// 顺带省掉 ``repeat_kv``：GQA 下按 ``g = h / rep`` 直接寻址 KV，不把 2 个 KV 头
+// 物化成 16 份（那一条在 kv=32768 时是 1.67 ms/层/步）。
+//
+// @param q        ``[rows, nh, hd]`` bf16 连续。
+// @param kcache   ``[nkv, max_seq, hd]`` bf16 连续（头主序，未 repeat）。
+// @param vcache   同 ``kcache``。
+// @param sel_idx  ``[rows, max_sel]`` int32 连续，行内升序，无效为 -1。
+// @param sel_len  ``[rows]`` int32 连续。
+// @param ctx      ``[rows]`` int32 连续，每行的因果上界。
+// @param out      ``[rows, nh, hd]`` bf16 连续。
+// @param scale    打分缩放。
+// @return out。
+// @throws c10::Error 布局、设备、dtype 或形状不自洽。
+torch::Tensor attn_sparse(torch::Tensor q, torch::Tensor kcache, torch::Tensor vcache,
+                          torch::Tensor sel_idx, torch::Tensor sel_len,
+                          torch::Tensor ctx, torch::Tensor out, double scale);

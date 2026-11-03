@@ -176,6 +176,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("a"), pybind11::arg("xs"), pybind11::arg("w"),
           pybind11::arg("ws"), pybind11::arg("offsets"), pybind11::arg("out"),
           pybind11::arg("group_size"));
+    m.def("attn_sparse", &attn_sparse,
+          "QSA \u7684\u7a00\u758f\u6ce8\u610f\u529b\uff1a\u53ea\u8bfb\u7d22\u5f15\u5668\u9009\u4e2d\u7684\u4f4d\u7f6e",
+          pybind11::arg("q"), pybind11::arg("kcache"), pybind11::arg("vcache"),
+          pybind11::arg("sel_idx"), pybind11::arg("sel_len"), pybind11::arg("ctx"),
+          pybind11::arg("out"), pybind11::arg("scale"));
     m.def("hyper_up", &hyper_up,
           "Gated Residual 的 up 投影加读门塌缩与写门",
           pybind11::arg("normed"), pybind11::arg("up_wt"), pybind11::arg("low"),
