@@ -37,7 +37,7 @@ KERNEL_DIR = Path(__file__).resolve().parent
 #: （探针、实验）进不了生产构建，也让这份清单可复核。
 _SOURCES = ("bindings.cpp", "gemv.cu", "w8a8.cu", "norm.cu", "attn.cu", "linear_attn.cu",
             "delta.cu", "solve.cu", "w8a8_tcu.cu", "w4a8.cu", "hyper.cu",
-            "moe_grouped.cu")
+            "moe_grouped.cu", "moe_dispatch.cu")
 
 #: 驱动不报告 ISA 时的回退值。``ivcore10`` 是 BI-V100 的架构
 #: （``COREX_PORT.md`` §0）；报告了别的值的卡就用那个值，所以加载器把 ``arch``

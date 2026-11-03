@@ -159,7 +159,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "\u5206\u7ec4 W4A8 \u6295\u5f71\uff1a\u6bcf\u4e2a\u4e13\u5bb6\u53ea\u7b97\u8def\u7531\u5230\u5b83\u7684\u884c",
           pybind11::arg("a"), pybind11::arg("xs"), pybind11::arg("w"),
           pybind11::arg("ws"), pybind11::arg("offsets"), pybind11::arg("out"),
-          pybind11::arg("group_size"));
+          pybind11::arg("group_size"),
+          // 紧凑非空专家表，可为 None。decode 一个 token 只碰约 10 个专家，而每卡
+          // 持 128 个；按全量开 z 维会让 92% 的 block 一进来就退出。
+          pybind11::arg("active") = pybind11::none());
+    m.def("moe_dispatch", &moe_dispatch,
+          "\u5206\u6d3e\uff1a\u8def\u7531\u7ed3\u679c \u2192 \u524d\u7f00\u548c + \u884c\u5e8f",
+          pybind11::arg("expert_idx"), pybind11::arg("local_table"),
+          pybind11::arg("out_offsets"), pybind11::arg("out_slot_pos"),
+          pybind11::arg("out_tokens"), pybind11::arg("out_slots"),
+          pybind11::arg("scratch"),
+          pybind11::arg("slots"), pybind11::arg("local_experts"),
+          pybind11::arg("num_experts"), pybind11::arg("top_k"));
     m.def("hyper_up", &hyper_up,
           "Gated Residual 的 up 投影加读门塌缩与写门",
           pybind11::arg("normed"), pybind11::arg("up_wt"), pybind11::arg("low"),

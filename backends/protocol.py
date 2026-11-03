@@ -51,6 +51,7 @@ _OP_NAMES: tuple[str, ...] = (
     "linear_m",          # 小 M 的批，一次权重读取
     "linear_prefill",    # 预填充分块的 GEMM（大 M）
     "moe_grouped",       # 稀疏专家：并行维是"专家 × 行"，与上面三档切法不同
+    "moe_dispatch",      # 路由结果 → 前缀和 + 行序（替掉十来个 torch 小算子）
     # 归一化。
     "rms_norm",
     "add_rms_norm",
@@ -211,6 +212,17 @@ class Ops:
     #: 权重读取被放大到 token 数的倍数。按专家分组后每个专家的权重在一个步里
     #: 只读一遍，这是 decode 期 MoE 唯一可行的形态。
     moe_grouped: OpFn | None = None
+    #: ``moe_dispatch(expert_idx, local_table, slots, local_experts, num_experts,
+    #: top_k) -> (offsets, slot_pos, token_of_pos)``：一次内核算出分组要的前缀和与行序。
+    #:
+    #: 存在的理由是把「路由结果 → 分组偏移」这段从十来个 torch 小算子压成一次发射。
+    #: 实测（``q4attrib3``）这段在一步 decode 里是 **672 次内核**（48 层 × 14 个），
+    #: 而输入只有 ``slots`` 个整数；按 5.76 µs 的发射地板是 3.87 ms/步。
+    #:
+    #: 返回的三项配合起来，模型侧只需要一次整数 ``index_select`` 收拢激活、一次
+    #: ``index_add_`` 加回去，不再需要 ``nonzero``/``argsort``/``bincount``/``cumsum``。
+    #: ``None`` 表示后端没有这个算子，模型侧退回纯 torch 的那条链。
+    moe_dispatch: OpFn | None = None
     #: ``rms_norm(x, w, stride=0, eps=1e-6) -> y``：对 ``[M, N]`` 最后一轴做零中心
     #: RMSNorm（有效系数 ``1 + w``，由调用方折好）。``stride`` 是行与行之间的元素
     #: 间距，让指向更宽缓冲区的视图能原地归一化而不必拷贝；``0`` 表示「从 ``x`` 里

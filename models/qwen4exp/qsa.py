@@ -359,6 +359,18 @@ class QSAIndexer(nn.Module):
         table.view(-1)[rows_sel * width + entry_rank[block_part]] = entry_cols[block_part]
         return table.view(rows, max_blocks, ratio)
 
+    #: 块池化一次处理多少个 query 行。
+    #:
+    #: 未分块时 ``_batched_block_keys`` 会把 ``[rows * max_blocks, ratio, head_dim]``
+    #: 整体 ``.float()`` 一把：``rows = B*S``、``max_blocks ≈ S/ratio``，所以那个中间量
+    #: 随序列长度**平方**增长。真机实测（作业 q4prebase1）prefill ``seq=2048`` 时显存
+    #: 占到 26.04 GiB / 31.72 GiB 然后 OOM，报错点就在这一行的 ``gathered.float()``。
+    #:
+    #: 按行切成 256 行一批，峰值降到 ``[256 * max_blocks, ratio, head_dim]``，与总行数
+    #: 无关。256 是权衡：再小则每批 launch 的固定开销占比变高，再大则 ``seq=2048`` 仍会
+    #: 顶到 1 GiB 量级的临时量。
+    _POOL_ROW_CHUNK = 256
+
     def _batched_block_keys(self, raw_keys: torch.Tensor, table: torch.Tensor,
                             rows: int, seq: int, tokens: int,
                             full_cos: torch.Tensor, full_sin: torch.Tensor,
@@ -369,6 +381,10 @@ class QSAIndexer(nn.Module):
         ``[B*S*max_blocks, ratio]``：池化仍在 fp32 里做，块首取规整表的第 0 列。
         索引用的是一维偏移 ``batch * T + 位置``，因为规整表里同一 query 的各块
         分属不同 batch 行，二维 index_select 反而要先构造配对下标。
+
+        **按行分块做**，见 :attr:`_POOL_ROW_CHUNK`：整批一把做时那个 fp32 中间量随
+        ``S`` 平方增长，``seq=2048`` 直接 OOM。分块只改变处理顺序、不改变任何算术：
+        每一行各自池化、各自归一化、各自旋转，行与行之间没有归约。
 
         Args:
             raw_keys: ``[B, T, index_head_dim]`` 的全部原始 key。
@@ -386,24 +402,43 @@ class QSAIndexer(nn.Module):
         ratio = self.compress_ratio
         head_dim = self.index_head_dim
         max_blocks = table.shape[1]
-        block_row = torch.arange(rows * max_blocks, device=table.device) // max_blocks
-        block_batch = block_row // seq
-        # -1 补位槽统一取 0 号 token：它们的 key 是垃圾，但打分会被 -inf 压掉，
-        # 任何取值都不影响结果，而 clamp 换掉了逐块判空的分支。
-        offsets = table.reshape(rows * max_blocks, ratio).clamp(min=0)
-        gathered = raw_keys.reshape(batch * tokens, head_dim).index_select(
-            0, (block_batch.unsqueeze(1) * tokens + offsets).reshape(-1)
-        ).view(rows * max_blocks, ratio, head_dim)
-        # 池化在 fp32 里做：bf16 上先平均再归一化会把小块的能量差抹掉。
-        pooled = self.k_layernorm(gathered.float().mean(dim=1).to(raw_keys.dtype))
-        block_start = table[:, :, 0].reshape(rows * max_blocks).clamp(min=0)
-        embed_index = block_batch * tokens + block_start
-        rotated = apply_rotary_pos_emb(
-            pooled.unsqueeze(1),
-            cos=full_cos.reshape(batch * tokens, -1).index_select(0, embed_index),
-            sin=full_sin.reshape(batch * tokens, -1).index_select(0, embed_index),
-        )
-        return rotated.squeeze(1).view(rows, max_blocks, head_dim)
+        if rows == 0 or max_blocks == 0:
+            return table.new_zeros((rows, max_blocks, head_dim),
+                                   dtype=raw_keys.dtype)
+
+        # 这些量只由形状决定，先在块外算一次：每批重复算会把多次 launch 白付回去。
+        flat_keys = raw_keys.reshape(batch * tokens, head_dim)
+        flat_cos = full_cos.reshape(batch * tokens, -1)
+        flat_sin = full_sin.reshape(batch * tokens, -1)
+        out = torch.empty((rows, max_blocks, head_dim), dtype=raw_keys.dtype,
+                          device=raw_keys.device)
+
+        for start in range(0, rows, self._POOL_ROW_CHUNK):
+            stop = min(rows, start + self._POOL_ROW_CHUNK)
+            blk = stop - start
+            block_row = (torch.arange(start * max_blocks, stop * max_blocks,
+                                      device=table.device) // max_blocks)
+            block_batch = block_row // seq
+            # -1 补位槽统一取 0 号 token：它们的 key 是垃圾，但打分会被 -inf 压掉，
+            # 任何取值都不影响结果，而 clamp 换掉了逐块判空的分支。
+            offsets = table[start:stop].reshape(blk * max_blocks, ratio).clamp(min=0)
+            gathered = flat_keys.index_select(
+                0, (block_batch.unsqueeze(1) * tokens + offsets).reshape(-1)
+            ).view(blk * max_blocks, ratio, head_dim)
+            # 池化在 fp32 里做：bf16 上先平均再归一化会把小块的能量差抹掉。
+            pooled = self.k_layernorm(gathered.float().mean(dim=1).to(raw_keys.dtype))
+            block_start = table[start:stop, :, 0].reshape(blk * max_blocks).clamp(min=0)
+            embed_index = block_batch * tokens + block_start
+            rotated = apply_rotary_pos_emb(
+                pooled.unsqueeze(1),
+                cos=flat_cos.index_select(0, embed_index),
+                sin=flat_sin.index_select(0, embed_index),
+            )
+            out[start:stop] = rotated.squeeze(1).view(blk, max_blocks, head_dim)
+            # 释放本批的 fp32 临时量，别让它攒到下一批之前：``pooled``/``gathered``
+            # 各自是几十 MB 量级，靠 Python 引用计数在循环回到这里时回收。
+            del gathered, pooled, rotated
+        return out
 
     def select_reference(self, query: torch.Tensor, raw_keys: torch.Tensor,
                          visible: torch.Tensor,

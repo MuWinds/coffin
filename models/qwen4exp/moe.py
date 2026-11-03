@@ -237,6 +237,44 @@ class Experts(nn.Module):
         self._grouped = None
         self._quant_gate_up = None
         self._quant_down = None
+        #: 融合分派入口（``bops.moe_dispatch``），后端没有这个算子时为 ``None``，
+        #: 那时退回下面那条纯 torch 链。见 :meth:`_make_dispatch`。
+        self._dispatch = None
+        self._identity_table = None
+
+    def _make_dispatch(self):
+        """取后端的 ``moe_dispatch`` 算子，没有就返回 ``None``。
+
+        判据用 ``caps().native`` 而不是「表里有没有这个字段」：参考实现会把每个名字
+        都补齐，拿表当开关等于在没有内核的平台上接上一串候选调用。理由与
+        ``gated_residual._HYPER_OPS`` 相同。
+
+        Returns:
+            ``bops.moe_dispatch``，或 ``None``。
+        """
+        from backends import caps as _caps
+        from backends import ops as _ops
+
+        if "moe_dispatch" not in _caps().native:
+            return None
+        return getattr(_ops, "moe_dispatch", None)
+
+    def _local_or_identity(self, device: torch.device) -> torch.Tensor:
+        """取分派内核要的「全局号 → 本地号」表；非分片时恒等。
+
+        Args:
+            device: 目标设备。
+
+        Returns:
+            ``[num_experts]`` 的 int32 表。
+        """
+        if self.local_experts is not None:
+            return self._local_table(device).to(torch.int32)
+        table = self._identity_table
+        if table is None or table.device != device:
+            table = torch.arange(self.num_experts, dtype=torch.int32, device=device)
+            self._identity_table = table
+        return table
 
     def set_quantized(self, gate_up, down) -> None:
         """把专家栈换成 W4A8 版本，并启用分组投影。
@@ -272,6 +310,9 @@ class Experts(nn.Module):
         # 补成 ``None`` 让任何误用立刻报错，而不是悄悄拿回一份旧的 bf16 张量。
         self.gate_up_proj = None
         self.down_proj = None
+        # 融合分派只有在分组内核可用时才有意义：它算出的 ``offsets`` / 行序是给
+        # ``moe_grouped`` 用的。两者必须一起开，否则会拿一条路的输出喂另一条路。
+        self._dispatch = self._make_dispatch()
 
     def _make_grouped(self):
         """返回一个 ``(x, offsets, down_proj=False) -> y`` 的分派函数。
@@ -309,11 +350,37 @@ class Experts(nn.Module):
         """
         if self.local_experts is None:
             return global_index
-        table = torch.full((self.num_experts,), -1, dtype=torch.long,
-                           device=global_index.device)
-        table[torch.tensor(self.local_experts, dtype=torch.long, device=global_index.device)] = \
-            torch.arange(len(self.local_experts), dtype=torch.long, device=global_index.device)
+        table = self._local_table(global_index.device)
         return table[global_index]
+
+    def _local_table(self, device: torch.device) -> torch.Tensor:
+        """取（必要时建一次）全局号到本地下标的查找表。
+
+        这张表只由 ``local_experts`` 与设备决定，**一步 decode 里却是 48 层各调一次**。
+        原写法每次 ``torch.full`` + 两次 index_put，就是每层两次分配加两次内核启动；
+        实测一步 decode 有 7025 次内核发射、主机侧 227 ms 中有相当比例是这类
+        「每层重建一份常量」的胶水（``q4budget2`` / ``q4host1``）。
+
+        缓存键里带设备：模块 ``.to()`` 之后旧表在另一张卡上，直接复用会索引到错设备。
+
+        Args:
+            device: 入参所在的设备。
+
+        Returns:
+            ``[num_experts]`` 的 int64 表，本地下标处为 ``0..len-1``，其余为 ``-1``。
+        """
+        cached = self._local_tables.get(device) if hasattr(self, "_local_tables") else None
+        if cached is not None:
+            return cached
+        table = torch.full((self.num_experts,), -1, dtype=torch.long, device=device)
+        local = torch.tensor(self.local_experts, dtype=torch.long, device=device)
+        table[local] = torch.arange(len(self.local_experts), dtype=torch.long,
+                                    device=device)
+        if not hasattr(self, "_local_tables"):
+            # 惰性建：``__init__`` 不碰它，免得非分片路径白占一份属性。
+            self._local_tables = {}
+        self._local_tables[device] = table
+        return table
 
     def forward(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor,
                 top_k_weights: torch.Tensor) -> torch.Tensor:
@@ -348,12 +415,60 @@ class Experts(nn.Module):
         flat_index = top_k_index.reshape(-1)
         flat_weights = top_k_weights.reshape(-1)
 
+        # 融合分派：一次内核算出「前缀和 + 收拢后的行序」，替掉原先这么一串
+        # torch 小算子（作业 q4attrib3 按调用点量到，48 层 × 每层各一遍）：
+        #   nonzero / flatten / div / argsort / bincount / cumsum / chunk / mul …
+        # 合计 14 个内核、672 次/步，按本卡 5.76 us 的发射地板是 3.87 ms/步，
+        # 而输入只有 slots 个整数（decode 时 10 个）。见 ``moe_dispatch.cu``。
+        #
+        # ``local_table`` 是缓存好的全局号→本地号表；非分片时它恒等（见
+        # :meth:`_local_table` 与 ``local_experts is None`` 的分支），所以这里
+        # 统一走内核、不再分两条路：分派内核在非分片时就是「不减任何槽位」。
+        if self._dispatch is not None and self._grouped is not None:
+            slots = int(flat_index.numel())
+            local_table = self._local_or_identity(flat_index.device)
+            offsets, _slot_pos, token_of_pos, slot_of_pos = self._dispatch(
+                flat_index, local_table, slots, self.num_local_experts,
+                self.num_experts, top_k)
+            # 收拢激活：一行一个 (token, 槽位)。内核把有效行之外的尾部
+            # ``token_of_pos`` 清成 0，所以这张表可以整块索引，不会越界。
+            packed_state = hidden_states[token_of_pos.long()]
+            up_gate = self._grouped(packed_state, offsets)
+            gate, up = up_gate.chunk(2, dim=-1)
+            current_hidden = self.act_fn(gate) * up
+            current_hidden = self._grouped(current_hidden, offsets, down_proj=True)
+            # 路由权重按**槽位**取：同一 token 的 top_k 个专家各有各的权重。
+            # ``slot_of_pos`` 已经把「收拢后第 p 行来自哪个槽位」算好了 ——
+            # 无效尾部是 -1，clamp 后取第 0 个槽位的权重再乘 0，等于丢弃。
+            #
+            # **不读 ``offsets[-1]`` 回主机**：那是一次设备到主机的同步，而这一步
+            # 正是本轮在 ``bool(keep.any())`` 那里删掉的东西（48 层 × 1 次同步）。
+            # 用掩码乘 0 代替切片，代价是两个逐元素算子和一次 ``index_select``，
+            # 而且分组内核写出的无效行必须是**确定的 0**（见 ``moe_grouped`` 的
+            # ``torch.zeros``），否则 0 乘上未初始化显存里的 nan 还是 nan。
+            valid_pos = slot_of_pos >= 0
+            scale = flat_weights.index_select(
+                0, slot_of_pos.clamp(min=0).long()).to(current_hidden.dtype)
+            scale = scale * valid_pos.to(scale.dtype)
+            current_hidden = current_hidden * scale[:, None]
+            final.index_add_(0, token_of_pos.long(), current_hidden.to(final.dtype))
+            return final
+
         # 分片时先扔掉不归本 rank 的槽位：它们要用 all-to-all 发出去，在这里算
         # 只会白读权重。
         if self.local_experts is not None:
             keep = self.local_index(flat_index) >= 0
-            if not bool(keep.any()):
-                return final
+            # **绝不能在这里 ``bool(keep.any())``**。那是一次设备到主机的同步：
+            # ``any()`` 是设备侧归约，``bool()`` 把结果读回主机，于是主机必须等
+            # 整条流跑到这里才能继续下发。一步 decode 有 48 层，就是 48 次同步，
+            # 而每次同步都把已经排好的下发队列清空——实测主机侧成本 227 ms 与
+            # 端到端 227.02 ms 几乎相等（``q4budget2``），设备只忙了约一半，正是
+            # 这条同步在反复打断流水。
+            #
+            # 空槽位本来就能被下游正确处理：``nonzero`` 返回空表 → ``argsort`` /
+            # ``bincount`` 得到全零桶 → 分组内核按 ``offsets`` 看到每段 0 行、
+            # 一行都不算，``index_add_`` 加一个空表也是空。所以「整批都丢弃」
+            # 这条快速路径**不需要**在主机上做判定，删掉它不改变语义。
             positions_all = torch.nonzero(keep, as_tuple=False).flatten()
         else:
             positions_all = torch.arange(flat_index.numel(), device=flat_index.device)

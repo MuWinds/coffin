@@ -101,7 +101,6 @@ _HYPER_WIRED = True
 _HYPER_FASTER = True
 
 #: ``COFFIN_HYPER_FUSED`` 的取值：``on`` 强制走融合、``off`` 强制走纯 torch 链。
-#:
 #: **它存在的理由是逃生口，不是实验开关。** 默认路径由 :data:`_HYPER_FASTER` 决定，
 #: 所以不设这个变量时行为完全由代码里的结论控制。留着它是为了两种真实情形：
 #:
@@ -116,6 +115,31 @@ _HYPER_FASTER = True
 #: 它是 import 期读的常量，所以两条路必须在**独立进程**里跑——同进程改不了，
 #: 而同进程改了却没生效的日志读起来像"两臂一样快"。
 _HYPER_MODE = os.environ.get("COFFIN_HYPER_FUSED", "").strip().lower()
+
+#: 融合超连接只在**解码量级**的行数上开启（``rows * hc * hidden`` 的激活很小）。
+#:
+#: 三个 ``hyper_*`` 内核是照着 ``M == 1`` 手工调的：``pick_hyper_split`` 从「要多少块
+#: 才喂满 16 SM」反推 split-K 片数，``hyper_up`` 的写门按整块线程分摊。这套调优序列
+#: 在 decode 上实测有效（``hyper_up`` 510.6 → 114.0 us、``hyper_down`` 579.3 → 75.7 us，
+#: 见 ``_HYPER_FASTER`` 上的三轮记录）。**但同一个核在 prefill 上不是这条曲线。**
+#:
+#: 作业 ``q4prebase2`` 的 prefill 设备账本（``seq=2048``，9.66 s）暴露了这件事：
+#:
+#:   moe_grouped   2221 ms / 96 次 =  23.1 ms/次
+#:   hyper_down    1550 ms / 96 次 =  16.1 ms/次   <-- 31.9% 在这一对融合核上
+#:   hyper_up      1536 ms / 96 次 =  16.0 ms/次
+#:   w4_gemm_tcu    925 ms / 317 次 =  2.9 ms/次
+#:
+#: 稠密投影走的是张量核 GEMM（2.9 ms/次），而这两个手工 GEMV 核每次要 16 ms —— 慢 5.5
+#: 倍。原因就是它们没有「大 M 走 GEMM」的形态：``hyper_down`` 是 ``[rows,10240] x
+#: [10240,320]``、``hyper_up`` 是 ``[rows,320] x [320,10240]``，在 ``rows=2048`` 时
+#: 都是标准 GEMM，而内核还在按「一块一列、K 轴切片累加」的 GEMV 结构跑。
+#:
+#: 所以按行数分档：**超过这个数就退回纯 torch 链**——那条链里的 ``Proj`` 会走到
+#: ``linear_prefill`` → ``w4a8_gemm_tcu``/``matmul``，正是 prefill 该走的路。分界取
+#: :data:`proj._SMALL_ROWS`（8）之上的一档，因为 decode 的批量也是 1-8 行，而 16 行
+#: 以上已经确定是 prefill 的领地。
+_HYPER_FUSED_MAX_ROWS = 16
 
 
 class GatedResidual(nn.Module):
@@ -201,6 +225,23 @@ class GatedResidual(nn.Module):
         return (_HYPER_WIRED and _HYPER_FASTER
                 and self.block_inject_weight is not None
                 and _HYPER_OPS <= _caps().native)
+
+    def _fused_ok_for_rows(self, rows: int) -> bool:
+        """本后端的融合超连接在这个行数下是否值得走。
+
+        三个 ``hyper_*`` 核是照 ``M == 1`` 调的，在 prefill 的行数上会输给 GEMM：
+        作业 ``q4prebase2`` 的 ``seq=2048`` 账本里 ``hyper_down``/``hyper_up`` 各
+        16.1 ms/次（96 次共 3086 ms，占 31.9%），而同一份工作走 ``w4_gemm_tcu``
+        只要 2.9 ms/次。见 :data:`_HYPER_FUSED_MAX_ROWS`。
+
+        Args:
+            rows: 本次前导维展平后的行数。
+
+        Returns:
+            行数在融合核的调优区间内为 ``True``；否则应由纯 torch 链（其 ``Proj``
+            会在大 M 上走 ``linear_prefill``）接手。
+        """
+        return rows <= _HYPER_FUSED_MAX_ROWS
 
     def _hyper_gain(self) -> torch.Tensor:
         """返回 ``hc_norm.weight`` 的 fp32 副本，权重变了就重拷。
@@ -334,7 +375,13 @@ class GatedResidual(nn.Module):
 
         # 融合路径在语义上与下面那条链逐项等价（三条都写在 hyper.cu 的 Constraints
         # 里），所以换路只减少发射、不改变算术顺序之外的任何东西。
-        if self._fused_ready():
+        #
+        # 但**只在解码量级的行数上**换：三个融合核是照 M == 1 调的，prefill 的大 M
+        # 上它们每次 16 ms，而同一份工作走张量核 GEMM 只要 2.9 ms（见
+        # :data:`_HYPER_FUSED_MAX_ROWS` 上 q4prebase2 的账本）。超出行数时退回纯
+        # torch 链，那条链里的 ``Proj`` 会自己走 ``linear_prefill``。
+        if self._fused_ready() and self._fused_ok_for_rows(hyper_input.numel()
+                                                            // hyper_input.shape[-1]):
             return self._fused_forward(hyper_input)
 
         hyper_input_normed = self.hc_norm(hyper_input)

@@ -30,6 +30,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAStream.h>
+#include <c10/util/Optional.h>
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <climits>
@@ -47,15 +48,18 @@ namespace {
 // @param w        专家栈的 packed W4，``[E, ceil(K/2), N]``。
 // @param ws       专家栈的 scale，``[E, groups, N]``。
 // @param offsets  ``[E+1]`` 前缀和（设备指针，内核里读两次）。
+// @param active   ``[n_active]`` 的非空专家号；``nullptr`` 表示 z 维就是专家号本身。
 // @param out      ``[tokens, N]`` bf16 或 fp32。
 // @param K, N, group_size 几何。
 // @param experts  专家数，用来给空专家提前退出。
 template <typename XT>
 __global__ void moe_grouped_kernel(const int8_t* x, const float* xs,
                                    const uint8_t* w, const float* ws,
-                                   const int* offsets, XT* out,
+                                   const int* offsets, const int* active, XT* out,
                                    int K, int N, int gs, int experts) {
-    const int expert = blockIdx.z;
+    // 给了紧凑表时 ``blockIdx.z`` 是「第几个非空专家」，要翻译成真专家号；否则
+    // 它本身就是专家号。这一行是 92% 空块被消掉的地方——见 host 侧的长注释。
+    const int expert = (active == nullptr) ? (int)blockIdx.z : active[blockIdx.z];
     if (expert >= experts) return;
     const int begin = offsets[expert];
     const int end = offsets[expert + 1];
@@ -124,11 +128,27 @@ __global__ void moe_grouped_kernel(const int8_t* x, const float* xs,
 //                 ``offsets[E] == tokens``。分布在前缀里的空段表示该专家没有行。
 // @param out      ``[tokens, N]`` 连续，bf16 或 fp32，dtype 由它决定。
 // @param group_size K 轴权重分组大小。
+// @param active   可选，``[n_active]`` int32：**非空专家号**的紧凑表，由调用方用
+//                 ``nonzero(offsets[1:] > offsets[:-1])`` 现成算出来。给了它，网格
+//                 的 z 维就是 ``n_active`` 而不是 ``experts``，``blockIdx.z`` 先经
+//                 它翻译成真正的专家号。空张量（``numel() == 0``）表示退回全量网格。
 // @return out。
 // @throws c10::Error 布局、设备、dtype、形状或前缀和不自洽。
+//
+// 为什么需要 ``active``：decode 一个 token 只选 ``top_k``=10 个专家，而 EP=4 后
+// 每卡持 128 个。按全量网格发射时 z 维是 128，其中只有约 10 个真有行，于是
+// ``grid = (N/128) x min(8,tokens) x 128`` 里 92% 的 block 一进来就
+// ``rows <= 0`` 退出。它们不读权重，但每个都要占一次硬件调度槽，而本卡实测一步
+// 有 92 次这样的发射（``q4budget2``/``q4attrib2``），发射地板又是 5.76 us/次
+// （``q4floor1``）——这笔调度开销是白付的。
+//
+// 判定这一条值得做的算术：``gate_up`` 的 N=1024 给出 grid (8,8,128)=8192 块，
+// 有行的只有 640 块；``down`` 的 N=2560 给出 (20,8,128)=20480 块，有行的 1600 块。
+// 两者都是 **92.2% 的块在空转**。
 torch::Tensor moe_grouped(torch::Tensor a, torch::Tensor xs, torch::Tensor w,
                           torch::Tensor ws, torch::Tensor offsets,
-                          torch::Tensor out, int64_t group_size) {
+                          torch::Tensor out, int64_t group_size,
+                          c10::optional<torch::Tensor> active) {
     TORCH_CHECK(a.is_cuda() && a.dim() == 2 && a.scalar_type() == torch::kChar
                 && a.is_contiguous(), "activation must be contiguous CUDA int8 [tokens, K]");
     TORCH_CHECK(xs.is_cuda() && xs.dim() == 1 && xs.scalar_type() == torch::kFloat
@@ -160,6 +180,25 @@ torch::Tensor moe_grouped(torch::Tensor a, torch::Tensor xs, torch::Tensor w,
     TORCH_CHECK((int)offsets.size(0) == experts + 1, "offsets must have E+1 entries");
     if (tokens == 0) return out;
 
+    // 紧凑专家表：给了就按它的长度开 z 维，否则退回全量。
+    int active_count = experts;
+    const int* active_ptr = nullptr;
+    torch::Tensor active_dev;
+    if (active.has_value() && active->defined() && active->numel() > 0) {
+        TORCH_CHECK(active->is_cuda() && active->dim() == 1
+                    && active->scalar_type() == torch::kInt && active->is_contiguous(),
+                    "active expert map must be contiguous CUDA int32 [n_active]");
+        active_count = (int)active->numel();
+        // 连续化一次：调用方传进来的通常是 ``nonzero().flatten()``，本来就连续，
+        // 但 ``contiguous()`` 在已连续时是零拷贝，留着它比依赖调用方更安全。
+        if (active->is_contiguous()) {
+            active_dev = *active;
+        } else {
+            active_dev = active->contiguous();
+        }
+        active_ptr = active_dev.data_ptr<int>();
+    }
+
     const c10::cuda::CUDAGuard guard(a.device());
     const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
     // 输出列一个线程；行方向再铺一层，让同一专家的权重读取服务多行。
@@ -168,18 +207,18 @@ torch::Tensor moe_grouped(torch::Tensor a, torch::Tensor xs, torch::Tensor w,
     const dim3 block(threads_x, threads_y);
     const dim3 grid((unsigned)((N + threads_x - 1) / threads_x),
                     (unsigned)std::min(8, tokens),
-                    (unsigned)experts);
+                    (unsigned)active_count);
     if (out.scalar_type() == torch::kBFloat16) {
         moe_grouped_kernel<uint16_t><<<grid, block, 0, stream>>>(
             a.data_ptr<int8_t>(), xs.data_ptr<float>(), w.data_ptr<uint8_t>(),
-            ws.data_ptr<float>(), offsets.data_ptr<int>(), 
+            ws.data_ptr<float>(), offsets.data_ptr<int>(), active_ptr,
             reinterpret_cast<uint16_t*>(out.data_ptr()), K, N, (int)group_size,
             experts);
     } else {
         moe_grouped_kernel<float><<<grid, block, 0, stream>>>(
             a.data_ptr<int8_t>(), xs.data_ptr<float>(), w.data_ptr<uint8_t>(),
-            ws.data_ptr<float>(), offsets.data_ptr<int>(), out.data_ptr<float>(),
-            K, N, (int)group_size, experts);
+            ws.data_ptr<float>(), offsets.data_ptr<int>(), active_ptr,
+            out.data_ptr<float>(), K, N, (int)group_size, experts);
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;

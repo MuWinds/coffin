@@ -127,6 +127,7 @@ def _use_tcu_gemm(rows: int, k: int, n: int, available: bool) -> bool:
     return k <= _TCU_MAX_K
 
 
+@functools.lru_cache(maxsize=1)
 def _is_corex_host() -> tuple[bool, str]:
     """在 torch 共享的 ``cuda`` 命名空间里认出本厂商。
 
@@ -134,6 +135,12 @@ def _is_corex_host() -> tuple[bool, str]:
     答 True，而 ``cuda`` 这个设备类型说明不了卡是谁造的。共享命名空间下设备
     *名字* 是唯一的判据，所以这里向驱动要名字，也所以 ROCm 后端额外要求自己的
     构建标记。
+
+    **必须记忆化。** ``probe()`` 从 :func:`_arch` 与 :func:`usable` 两条路被每次
+    算子调用间接问道，而这里的 ``get_device_name`` 会初始化 CUDA 运行时并做一次
+    驱动查询。一步 decode 有几千次算子调用（``q4budget2`` 实测 7025 次发射、
+    主机侧 99.4% 的时间），把它留在热路径上等于每次投影都付一次驱动往返。
+    「这张卡是谁造的」在进程生命周期内不会变，所以缓存是安全的。
 
     Returns:
         ``(matched, device_name)``。驱动调用失败是 ``(False, "")``：「说不清」
@@ -188,6 +195,11 @@ def _arch() -> str:
     失败，而它默默接受的串会指向错误的 ISA。因此只有驱动交回 CoreX 形状的名字时
     才用它；否则返回 :data:`DEFAULT_ARCH`，也就是这张卡被实测时用的值
     （COREX_PORT.md §0）。
+
+    **必须记忆化。** :func:`_kernels` 每次调用都问它，而一次 decode 里有几千次算子
+    调用（``q4budget2`` 实测 7025 次内核发射）。这里的 ``torch.cuda.get_device_properties``
+    会走一遍驱动查询，把它留在热路径上等于给每次投影加一次驱动往返。ISA 是进程级
+    常量，第一次问到的答案永远是正确答案。
 
     Returns:
         给 ``--cuda-gpu-arch=`` 用的 ISA 串；在完全不是 CoreX 的主机上返回 ``""``
@@ -244,8 +256,22 @@ def reason() -> str:
     return "" if err is None else f"kernel build failed: {err}"
 
 
+#: 已加载的扩展模块，由 :func:`_kernels` 填一次。
+#:
+#: 缓存的是**模块对象**而不是 ``load_kernels()`` 的返回值：那个函数自己也是记忆化的，
+#: 但它前面还压着 ``_arch()`` → ``probe()`` → 驱动查询那条链。一步 decode 有几千次
+#: 算子调用、每次都要问一遍，一次属性读取比那条链便宜得多。构建失败时不缓存（保持
+#: ``None``），让异常路径每次照常抛。
+_KERNEL_MODULE: Any = None
+
+
 def _kernels() -> Any:
     """返回已加载的扩展，首次使用时构建。
+
+    这是每次算子调用的必经之路（``linear`` / ``moe_grouped`` / ``rms_norm`` … 全走
+    它），所以第一次之后只允许剩一次属性读取。实测（作业 ``q4host1``）扩展直调
+    ``rms_norm`` 的主机侧成本是 6.7 us/次，而原生 ``torch`` 逐元素是 4.9 us ——
+    差额就是这里的 Python 开销，必须压到接近零。
 
     Returns:
         带 ``gemv_kn`` / ``gemv_kn_m`` / ``rms_norm`` / ``rms_norm_gated`` 入口的
@@ -256,7 +282,12 @@ def _kernels() -> Any:
             走的话这种主机上永远到不了受影响的入口，因为整张表就是参考实现；直接
             调用意味着调用方绕过了表。
     """
-    return kernels.load_kernels(_arch() or DEFAULT_ARCH)
+    global _KERNEL_MODULE
+    module = _KERNEL_MODULE
+    if module is None:
+        module = kernels.load_kernels(_arch() or DEFAULT_ARCH)
+        _KERNEL_MODULE = module
+    return module
 
 
 def _compute_dtype(x: torch.Tensor) -> torch.Tensor:
@@ -400,7 +431,33 @@ def _gemv_rows(w: torch.Tensor | QWeight | pack.KnWeight,
 
 def _w4_rows(w: W4A8Weight, x: torch.Tensor,
              activation_scale: torch.Tensor | None = None) -> torch.Tensor:
-    """量化激活到 int8，再以逐组 int32 累加消费 packed W4 权重。"""
+    """量化激活到 int8，再以逐组 int32 累加消费 packed W4 权重。
+
+    主机侧成本是这个入口的主要问题：一步 decode 有 316 次单行 W4A8 投影
+    （``w4a8_dot`` 计数，作业 ``q4budget2``），而实测 ``bops.linear`` 的 W4A8
+    一档主机耗时 **36.4 us/次**（作业 ``q4host1``），其中原生 torch 分发只占
+    4.9 us。差额几乎全是这里每次调用新建的三个张量（``xq`` / ``xs`` / ``out``）
+    加 ``quant_act_i8`` 的适配：
+
+    * ``xq`` / ``xs`` 是**纯暂存**，形状只由 ``(rows, K)`` 决定，调用方之间不共享
+      也不该看见它们。按 ``(形状, 设备)`` 缓存起来复用，省掉每步 316 次分配。
+    * ``out`` 必须每次新建：它是返回给调用方的结果，复用会让上一步的结果被就地
+      覆盖（而调用方常常还攥着它做后续加法）。
+
+    缓存只按形状键取，不按内容；暂存之间没有别名关系，所以复用是安全的。键里带
+    设备与 dtype：``.to()`` 之后旧缓冲在另一张卡上。
+
+    Args:
+        w: W4A8 权重，逻辑形状 ``[N, K]``。
+        x: 激活，``[K]``、``[M, K]`` 或它们的任意前导形状。
+        activation_scale: 已有的逐行 scale；给了就复用它、不重新分配。
+
+    Returns:
+        与 ``x`` 同前导形状、最后一维为 ``N`` 的张量，dtype 同 ``x``。
+
+    Raises:
+        ValueError: 激活的最后一维不是 ``K``，或与权重不在同一设备。
+    """
     module = _kernels()
     dtype = x.dtype
     if x.dim() not in (1, 2) or x.shape[-1] != w.k:
@@ -408,21 +465,59 @@ def _w4_rows(w: W4A8Weight, x: torch.Tensor,
     if x.device != w.packed.device:
         raise ValueError("W4 weight and activation must share a device")
     act = _compute_dtype(x).reshape(-1, w.k).contiguous()
-    xq = torch.empty(act.shape, dtype=torch.int8, device=act.device)
-    xs = (torch.empty(act.shape[0], dtype=torch.float32, device=act.device)
-          if activation_scale is None else activation_scale)
-    out = torch.empty((act.shape[0], w.n), dtype=act.dtype, device=act.device)
-    if act.shape[0]:
+    rows = act.shape[0]
+    xq, xs = _w4_scratch(rows, w.k, act.device, activation_scale)
+    out = torch.empty((rows, w.n), dtype=act.dtype, device=act.device)
+    if rows:
         with torch.cuda.device(act.device) if act.is_cuda else nullcontext():
             if activation_scale is None:
                 module.quant_act_i8(act, xq, xs)
             else:
                 module.quant_act_i8_scaled(act, xq, xs)
-            if act.shape[0] >= 32 and w.k % 4 == 0 and w.group_size % 64 == 0:
+            if rows >= 32 and w.k % 4 == 0 and w.group_size % 64 == 0:
                 module.w4a8_gemm_tcu(xq, w.packed, xs, w.scale, out, w.group_size)
             else:
                 module.w4a8_gemv(xq, w.packed, xs, w.scale, out, w.group_size)
     return _restore(out[0] if x.dim() == 1 else out, dtype)
+
+
+#: ``(rows, k, device)`` → ``(xq, xs)`` 的 W4A8 激活暂存池。
+#:
+#: 只在单线程的引擎主循环里被读写（``llm_engine`` 单线程驱动，见 ``moe.py`` 的
+#: Constraints），所以不需要锁。条数上限是防御性的：形状随 prompt 长度变化，
+#: 不设限会把每个见过的行数都留一份 int8 缓冲。
+_W4_SCRATCH: dict = {}
+_W4_SCRATCH_MAX = 32
+
+
+def _w4_scratch(rows: int, k: int, device: torch.device,
+                activation_scale: torch.Tensor | None):
+    """取（必要时分配）一对 W4A8 激活暂存。
+
+    Args:
+        rows: 本次的行数。
+        k: 激活宽度。
+        device: 目标设备。
+        activation_scale: 调用方已经持有的 scale；给了就直接用它，不碰缓存。
+
+    Returns:
+        ``(xq, xs)``：``[rows, k]`` 的 int8 与 ``[rows]`` 的 fp32。
+    """
+    if activation_scale is not None:
+        xq = _W4_SCRATCH.get((rows, k, device, True))
+        if xq is None:
+            xq = torch.empty((rows, k), dtype=torch.int8, device=device)
+            _W4_SCRATCH[(rows, k, device, True)] = xq
+        return xq, activation_scale
+    key = (rows, k, device, False)
+    pair = _W4_SCRATCH.get(key)
+    if pair is None:
+        if len(_W4_SCRATCH) >= _W4_SCRATCH_MAX:
+            _W4_SCRATCH.clear()
+        pair = (torch.empty((rows, k), dtype=torch.int8, device=device),
+                torch.empty(rows, dtype=torch.float32, device=device))
+        _W4_SCRATCH[key] = pair
+    return pair
 
 
 def moe_grouped(w, x: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
@@ -459,13 +554,89 @@ def moe_grouped(w, x: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
     act = _compute_dtype(x).reshape(tokens, w.k).contiguous()
     xq = torch.empty(act.shape, dtype=torch.int8, device=act.device)
     xs = torch.empty(tokens, dtype=torch.float32, device=act.device)
-    out = torch.empty((tokens, w.n), dtype=act.dtype, device=act.device)
+    # **必须 zeros 而不是 empty。** 分组内核只写 ``offsets`` 覆盖到的那些行，尾部
+    # （没有有效槽位对应）一个字节都不写。调用方会把整块结果乘上一个含 0 的权重
+    # 掩码再加回去，而 ``0 * nan`` 还是 ``nan`` —— 用 ``empty`` 就等于把未初始化
+    # 显存里的任意位（可能是 nan/inf）乘进残差流。
+    out = torch.zeros((tokens, w.n), dtype=act.dtype, device=act.device)
     # 前缀和必须是 int32：内核按 int32 索引，int64 传进去会读错偏移。
     bounds = offsets.to(dtype=torch.int32, device=act.device).contiguous()
     with torch.cuda.device(act.device):
         module.quant_act_i8(act, xq, xs)
         module.moe_grouped(xq, xs, w.packed, w.scale, bounds, out, w.group_size)
     return _restore(out, dtype)
+
+
+def moe_dispatch(expert_idx: torch.Tensor, local_table: torch.Tensor,
+                 slots: int, local_experts: int, num_experts: int,
+                 top_k: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor,
+                                      torch.Tensor]:
+    """一次内核算出 MoE 分组要的 ``(offsets, slot_pos, token_of_pos, slot_of_pos)``。
+
+    替掉模型侧原本的一串 torch 小算子。作业 ``q4attrib3`` 按调用点量到，一步 decode
+    里这段在 **48 层 × 每层** 各跑一遍：``topk`` / ``div`` / ``sum`` / ``to`` /
+    ``nonzero`` / ``flatten`` / ``div`` / ``argsort`` / ``bincount`` / ``cumsum`` /
+    ``chunk`` / ``mul`` / ``mul`` / ``to`` = **14 个内核,合计 672 次/步**。
+    按本卡 5.76 us 的发射地板（``q4floor1``）是 **3.87 ms/步**,而这些算术的输入
+    只有 ``slots`` 个整数（decode 时 **10** 个）。
+
+    Args:
+        expert_idx: ``[slots]`` 展平的全局专家号,int32 连续。
+        local_table: ``[num_experts]`` 全局号 → 本地号,int32,不归本 rank 为 -1。
+        slots: 槽位数 ``tokens * top_k``。
+        local_experts: 本 rank 的专家数。
+        num_experts: 全局专家数。
+        top_k: 每 token 的专家数,用来从槽位号反推 token 号。
+
+    Returns:
+        ``(offsets, slot_pos, token_of_pos, slot_of_pos)``：
+        ``offsets`` 是 ``[local_experts + 1]`` 前缀和；``slot_pos`` 是 ``[slots]``
+        收拢后的行号（丢弃的为 -1）；``token_of_pos`` / ``slot_of_pos`` 是
+        ``[slots]`` 的「收拢后第 p 行来自哪个 token / 哪个槽位」。
+        **有效行数之外的尾部被清 0**,所以两张位置表可以整块拿去索引。
+
+    Raises:
+        ValueError: 专家数或槽位数与 ``local_table`` 不自洽。
+        RuntimeError: 扩展不可用。
+    """
+    module = _kernels()
+    if expert_idx.dtype != torch.int32:
+        expert_idx = expert_idx.to(torch.int32)
+    if local_table.dtype != torch.int32:
+        local_table = local_table.to(torch.int32)
+    device = expert_idx.device
+    offsets = torch.empty(local_experts + 1, dtype=torch.int32, device=device)
+    slot_pos = torch.empty(slots, dtype=torch.int32, device=device)
+    token_of_pos = torch.empty(slots, dtype=torch.int32, device=device)
+    slot_of_pos = torch.empty(slots, dtype=torch.int32, device=device)
+    scratch = _disp_scratch(local_experts, device)
+    with torch.cuda.device(device):
+        module.moe_dispatch(expert_idx, local_table, offsets, slot_pos,
+                            token_of_pos, slot_of_pos, scratch, slots,
+                            local_experts, num_experts, top_k)
+    return offsets, slot_pos, token_of_pos, slot_of_pos
+
+
+#: ``(local_experts, device)`` → 分派暂存。一步 48 层共用一块,不必每层分配。
+_DISP_SCRATCH: dict = {}
+
+
+def _disp_scratch(local_experts: int, device: torch.device) -> torch.Tensor:
+    """取（必要时分配）分派内核的逐桶游标暂存。
+
+    Args:
+        local_experts: 桶数。
+        device: 目标设备。
+
+    Returns:
+        ``[local_experts]`` 的 int32 张量。
+    """
+    key = (local_experts, device)
+    buf = _DISP_SCRATCH.get(key)
+    if buf is None:
+        buf = torch.empty(local_experts, dtype=torch.int32, device=device)
+        _DISP_SCRATCH[key] = buf
+    return buf
 
 
 def _w8a8_rows(packed: pack.KnQWeight, act: torch.Tensor) -> torch.Tensor:
@@ -1539,6 +1710,7 @@ _NATIVE: dict[str, OpFn] = {
     "delta_normed": delta_normed,
     "triangular_solve": triangular_solve,
     "moe_grouped": moe_grouped,
+    "moe_dispatch": moe_dispatch,
     "hyper_norm": hyper_norm,
     "hyper_down": hyper_down,
     "hyper_up": hyper_up,

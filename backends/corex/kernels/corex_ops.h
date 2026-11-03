@@ -568,8 +568,36 @@ torch::Tensor hyper_up(torch::Tensor normed, torch::Tensor up_wt, torch::Tensor 
 // @param offsets  ``[E+1]`` 前缀和，int32；空段表示该专家没有行。
 // @param out      ``[tokens, N]`` 连续，bf16 或 fp32。
 // @param group_size K 轴权重分组大小。
+// @param active   可选，``[n_active]`` int32 非空专家号；``None`` 表示按全量 E 开
+//                 z 维。decode 一个 token 只碰约 10 个专家而每卡持 128 个，
+//                 给了它网格的 z 维就从 128 降到 10，消掉 92% 的空转 block。
 // @return out。
 // @throws c10::Error 布局、设备、dtype、形状或前缀和不自洽。
 torch::Tensor moe_grouped(torch::Tensor a, torch::Tensor xs, torch::Tensor w,
                           torch::Tensor ws, torch::Tensor offsets,
-                          torch::Tensor out, int64_t group_size);
+                          torch::Tensor out, int64_t group_size,
+                          c10::optional<torch::Tensor> active);
+
+// 分派：把路由结果变成分组内核要的前缀和与行序，替掉纯 torch 的一串小算子。
+
+// @brief 单 block 完成「计数 → 前缀和 → 稳定算位置」。
+//
+// 一步 decode 里这段原本是 ``topk``/``div``/``nonzero``/``argsort``/``bincount``/
+// ``cumsum``/``chunk`` 等十来个 torch 算子 x 48 层 = 672 次内核。按本卡 5.76 us 的
+// 发射地板是 3.87 ms/步，而这些算术的输入只有 ``slots`` 个整数。
+//
+// @param expert_idx   ``[slots]`` 展平的全局专家号，int32 连续。
+// @param local_table  ``[num_experts]`` 全局号 → 本地号，int32，不属于本 rank 为 -1。
+// @param out_offsets  ``[local_experts + 1]`` int32 输出，前缀和。
+// @param out_slot_pos ``[slots]`` int32 输出，收拢后的行号，丢弃的为 -1。
+// @param out_tokens   ``[slots]`` int32 输出，收拢后每行的 token 下标。
+// @param out_slots    ``[slots]`` int32 输出，收拢后每行来自哪个槽位。
+// @param scratch      ``[local_experts]`` int32 暂存，调用方持有可复用。
+// @param slots, local_experts, num_experts, top_k 几何。
+// @return 无。
+// @throws c10::Error 布局、设备、dtype 或形状不自洽。
+void moe_dispatch(torch::Tensor expert_idx, torch::Tensor local_table,
+                  torch::Tensor out_offsets, torch::Tensor out_slot_pos,
+                  torch::Tensor out_tokens, torch::Tensor out_slots,
+                  torch::Tensor scratch, int64_t slots, int64_t local_experts,
+                  int64_t num_experts, int64_t top_k);
