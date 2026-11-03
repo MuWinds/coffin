@@ -149,6 +149,12 @@ class QSAIndexer(nn.Module):
             bias=False)
         self.q_layernorm = RMSNorm(self.index_head_dim, eps=config.rms_norm_eps)
         self.k_layernorm = RMSNorm(self.index_head_dim, eps=config.rms_norm_eps)
+        #: ``(kv_length, rows)`` → ``max_blocks`` 的缓存，见 :meth:`select`。
+        #:
+        #: ``max_blocks`` 由可见掩码唯一决定，而 decode 一步里 12 个 QSA 层的
+        #: ``kv_length`` 完全相同，所以它一层算一次就够。不加这个缓存的话每层都要
+        #: 做一次 ``int(num_blocks.max())``，那是**设备到主机的同步**，每步 12 次。
+        self._max_blocks_cache: dict = {}
 
     def project(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """把隐藏状态拆成索引器 query（已归一化）与原始 key。
@@ -254,7 +260,24 @@ class QSAIndexer(nn.Module):
         entry_rows, entry_cols = entries
         num_blocks = counts // ratio
         block_starts = num_blocks * ratio
-        max_blocks = int(num_blocks.max())
+        # ``max_blocks`` 决定后面所有张量的宽度，所以它必须是一个 Python int。
+        #
+        # **但不需要每次同步。** ``decode`` 时每层可见的 token 数只随位置 +1 增长，
+        # 而 ``num_blocks = floor(visible / ratio)`` —— 它每 ``ratio`` 步才变一次。
+        # 这里原来每层都 ``int(num_blocks.max())``，即一步 12 次设备到主机的同步，
+        # 每次都要等整条流跑到这里。改成「按 ``kv_length`` 缓存」：同一个
+        # ``kv_length`` 下 ``max_blocks`` 由可见掩码唯一决定，而 decode 一步里
+        # 各层的 ``kv_length`` 相同，所以一层算过一次之后其余 11 层直接命中。
+        #
+        # 键里带 ``rows``：prefill 的 batch/seq 可能与 decode 不同，混用会让宽度
+        # 取错。缓存条数上限是防御性的，形状随上下文增长会换键。
+        cache_key = (kv_length, rows)
+        max_blocks = self._max_blocks_cache.get(cache_key)
+        if max_blocks is None:
+            max_blocks = int(num_blocks.max())
+            if len(self._max_blocks_cache) >= 64:
+                self._max_blocks_cache.clear()
+            self._max_blocks_cache[cache_key] = max_blocks
         # 每个 query 能选中的块数受自己的块数与全局预算双重限制，批量版只能按
         # min(block_topk, max_blocks) 统一取，多出来的名额由 -inf 掩码滤掉。
         max_picked = min(self.block_topk, max_blocks)
