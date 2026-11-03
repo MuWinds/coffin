@@ -54,6 +54,18 @@ _ACTIVATIONS = {"silu": F.silu, "gelu": F.gelu}
 #: 不会因为跑的是哪条路径而变。
 _CHECK_DISPATCH = bool(os.environ.get("COFFIN_MOE_CHECK"))
 
+#: 行数达到它就用按专家分段的张量核 GEMM，否则用 GEMV 结构的分组内核。
+#:
+#: 判据是**总行数**（``tokens``），不是每专家行数：``offsets`` 在设备上，为了拿
+#: 「非空专家数」回主机读一次是不值的（那正是 :meth:`Experts.forward` 里刚删掉的
+#: 那类同步）。用总行数当代理即可——它在 decode 时是 10、prefill ``seq=512`` 时
+#: 是 5120，两者差了三个数量级，分界放在哪个量级都不影响判断。
+#:
+#: 64 这个值有两重依据：本后端 ``_PREFILL_MIN_M`` 是 64（同一个「大 M 走 GEMM」的
+#: 分界，那里是稠密投影），而 MoE 每专家在 ``seq=512`` 时已有约 40 行、``seq=2048``
+#: 时 160 行，跨过 64 就意味着段长普遍够喂满一个 64x128 tile。
+_GEMM_MIN_ROWS = 64
+
 
 class MLP(nn.Module):
     """标准 SwiGLU 前馈块：``down(act(gate(x)) * up(x))``。
@@ -317,20 +329,50 @@ class Experts(nn.Module):
     def _make_grouped(self):
         """返回一个 ``(x, offsets, down_proj=False) -> y`` 的分派函数。
 
+        按**行数**在两个入口之间选：行少（decode，每专家 1-2 行）走
+        ``moe_grouped`` 的 GEMV 结构；行多（prefill，每专家上百行）走
+        ``moe_grouped_gemm`` 的按专家分段张量核 GEMM。
+
+        分界取 :data:`_GEMM_MIN_ROWS`。这个数是按「每专家平均行数」定的，而不是
+        绝对 tokens——因为决定 GEMV 输赢的是每段有多长：段内只有 1-2 行时张量核的
+        64x128 tile 几乎全在做无效行，而段内有上百行时 GEMV 每行都要串行走完 K。
+        实测（``q4prebase3``，``seq=2048``、20480 行散在 128 个专家上、每专家约 160 行）
+        GEMV 结构 22.7 ms/次而同类 GEMM 2.30 ms/次，差 10 倍。
+
         Returns:
             闭包。``down_proj=True`` 时投影 ``[tokens, I] -> [tokens, H]``，
             否则 ``[tokens, H] -> [tokens, 2*I]``。
         """
+        from backends import caps as _caps
         from backends import ops as bops
 
         gate_up_weight, down_weight = self._quant_gate_up, self._quant_down
+        gemm_ok = ("moe_grouped_gemm" in _caps().native
+                   and getattr(bops, "moe_grouped_gemm", None) is not None)
 
         def grouped(x: torch.Tensor, offsets: torch.Tensor,
                     down_proj: bool = False) -> torch.Tensor:
-            # 形参不能叫 ``down``：那会遮蔽外层的 ``down_weight``，于是
-            # ``weight.k`` 变成对 ``bool`` 取属性（实测报
-            # ``'bool' object has no attribute 'k'``，而错误位置在内核入口）。
+            """按行数把一次分组投影派给 GEMV 或 GEMM 内核。
+
+            Args:
+                x: ``[tokens, K]`` 激活，已按专家号排序。
+                offsets: ``[E+1]`` 前缀和，设备侧。
+                down_proj: ``True`` 时投影 ``[tokens, I] -> [tokens, H]``，否则
+                    ``[tokens, H] -> [tokens, 2*I]``。
+
+            Returns:
+                ``[tokens, N]``，dtype 同 ``x``。
+
+            形参不能叫 ``down``：那会遮蔽外层的 ``down_weight``，于是 ``weight.k``
+            变成对 ``bool`` 取属性（实测报 ``'bool' object has no attribute 'k'``，
+            而错误位置在内核入口）。
+            """
             weight = down_weight if down_proj else gate_up_weight
+            rows = int(x.shape[0])
+            # 行数够大就用张量核 GEMM：那时段内行多，GEMV 的「每行串行走完 K」
+            # 会成为主成本（实测 seq=2048 下 22.7 ms/次 对 2.30 ms/次）。
+            if gemm_ok and rows >= _GEMM_MIN_ROWS:
+                return bops.moe_grouped_gemm(weight, x, offsets)
             return bops.moe_grouped(weight, x, offsets)
 
         return grouped

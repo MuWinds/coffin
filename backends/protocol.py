@@ -51,6 +51,7 @@ _OP_NAMES: tuple[str, ...] = (
     "linear_m",          # 小 M 的批，一次权重读取
     "linear_prefill",    # 预填充分块的 GEMM（大 M）
     "moe_grouped",       # 稀疏专家：并行维是"专家 × 行"，与上面三档切法不同
+    "moe_grouped_gemm",  # 同一件事的大 M 形态：按专家分段各做一次张量核 GEMM
     "moe_dispatch",      # 路由结果 → 前缀和 + 行序（替掉十来个 torch 小算子）
     # 归一化。
     "rms_norm",
@@ -212,6 +213,16 @@ class Ops:
     #: 权重读取被放大到 token 数的倍数。按专家分组后每个专家的权重在一个步里
     #: 只读一遍，这是 decode 期 MoE 唯一可行的形态。
     moe_grouped: OpFn | None = None
+    #: ``moe_grouped_gemm(w, x, offsets, out=None) -> y``：同一件事的**大 M 形态**，
+    #: 按专家分段各做一次张量核 GEMM。
+    #:
+    #: 为什么要有两个而不是一个：``moe_grouped`` 是「一列一线程、逐行串行」的 GEMV
+    #: 结构，decode 时每专家 1-2 行正合适；prefill 时每专家上百行，同一结构下每行都要
+    #: 串行走完整个 K，权重被按段重读。实测（``q4prebase3``，``seq=2048``）
+    #: ``moe_grouped`` 是 **2178 ms / 30.4%**、单次 22.7 ms，而同类工作的张量核 GEMM
+    #: 只要 2.30 ms/次。行数分档由模型侧按 ``tokens`` 决定。
+    #: ``None`` 表示后端只有一个入口，模型侧退回 ``moe_grouped``。
+    moe_grouped_gemm: OpFn | None = None
     #: ``moe_dispatch(expert_idx, local_table, slots, local_experts, num_experts,
     #: top_k) -> (offsets, slot_pos, token_of_pos)``：一次内核算出分组要的前缀和与行序。
     #:

@@ -171,6 +171,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("scratch"),
           pybind11::arg("slots"), pybind11::arg("local_experts"),
           pybind11::arg("num_experts"), pybind11::arg("top_k"));
+    m.def("moe_grouped_gemm", &moe_grouped_gemm,
+          "\u5206\u7ec4 MoE \u7684\u5927 M \u5f62\u6001\uff1a\u6309\u4e13\u5bb6\u5206\u6bb5\u5404\u505a\u4e00\u6b21\u5f20\u91cf\u6838 GEMM",
+          pybind11::arg("a"), pybind11::arg("xs"), pybind11::arg("w"),
+          pybind11::arg("ws"), pybind11::arg("offsets"), pybind11::arg("out"),
+          pybind11::arg("group_size"));
     m.def("hyper_up", &hyper_up,
           "Gated Residual 的 up 投影加读门塌缩与写门",
           pybind11::arg("normed"), pybind11::arg("up_wt"), pybind11::arg("low"),

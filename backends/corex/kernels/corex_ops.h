@@ -601,3 +601,25 @@ void moe_dispatch(torch::Tensor expert_idx, torch::Tensor local_table,
                   torch::Tensor out_tokens, torch::Tensor out_slots,
                   torch::Tensor scratch, int64_t slots, int64_t local_experts,
                   int64_t num_experts, int64_t top_k);
+
+// 分组 MoE 的大 M 形态：按专家分段各做一次张量核 GEMM（prefill 用）。
+
+// @brief 分组 W4A8 GEMM：``[tokens, K] -> [tokens, N]``，按专家分段。
+//
+// 与 :func:`moe_grouped` 的区别只在用哪类内核：那个是 GEMV 结构、适合 decode 时
+// 每专家 1-2 行；这个是每段一次张量核 GEMM、适合 prefill 时每专家上百行。
+// 实测 ``seq=2048`` 时 GEMV 结构 22.7 ms/次（占 prefill 30.4%），而同类工作的
+// GEMM 路径是 2.30 ms/次。
+//
+// @param a         已按专家号排序的 int8 激活，``[tokens, K]`` 连续。
+// @param xs        逐 token 激活 scale，``[tokens]`` fp32。
+// @param w         专家栈 packed W4，``[E, ceil(K/2), N]`` 连续 uint8。
+// @param ws        专家栈 scale，``[E, ceil(K/group), N]`` 连续 fp32。
+// @param offsets   ``[E+1]`` 前缀和，int32；**本函数在主机侧读它**。
+// @param out       ``[tokens, N]`` 连续输出，调用方负责先清零。
+// @param group_size K 轴分组，必须是 64 的倍数。
+// @return out。
+// @throws c10::Error 布局、设备、dtype、形状或对齐不自洽。
+void moe_grouped_gemm(torch::Tensor a, torch::Tensor xs, torch::Tensor w,
+                      torch::Tensor ws, torch::Tensor offsets,
+                      torch::Tensor out, int64_t group_size);

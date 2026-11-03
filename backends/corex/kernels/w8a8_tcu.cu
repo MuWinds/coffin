@@ -479,6 +479,114 @@ __global__ void w4_gemm_tcu(const uint8_t* W, const int8_t* A, const float* xs,
 
 }  // namespace
 
+// @brief 分组 MoE 的大 M 形态：按专家分段各做一次 W4A8 张量核 GEMM。
+//
+// ## 为什么需要第二个 MoE 内核
+//
+// ``moe_grouped.cu`` 是「一列一线程、逐行串行」的 GEMV 结构，对 decode 合适：那时
+// 每专家只有 1-2 行，权重读一遍就服务完了。但 **prefill 不是这个形状**。
+//
+// 作业 ``q4prebase3``（``seq=2048``，7.18 s）的账本：
+//
+//   moe_grouped_kernel   2178 ms / 96 次 = 22.7 ms/次   <- 30.4%，第一项
+//   w4_gemm_tcu          1173 ms / 509 次 = 2.30 ms/次   <- 同类工作的 GEMM 路径
+//
+// ``seq=2048`` 时 ``tokens = 2048 x top_k(10) = 20480`` 行散在 128 个本地专家上，
+// 每专家约 **160 行**。GEMV 结构下每行都要串行走完整个 ``K=2560``，权重被按段重读；
+// 同样这 160 行按段喂给张量核就是标准 ``[160, 2560] x [2560, 1024]``。
+//
+// ## 为什么按专家逐个启动
+//
+// 每段的行数是数据相关的（``offsets`` 决定），而张量核 tile 是 ``W4_TILE``，一块不能
+// 跨专家取激活与权重——跨了就要在 tile 内按行判断归属，那会把共享内存的装载逻辑
+// 整个重写。逐段启动的代价是最多 ``E`` 次启动，在 prefill 尺度上（单次 GEMM 上百
+// 微秒）可忽略；decode 走 ``moe_grouped``，不受这条影响。
+//
+// @param a         已按专家号排序的 int8 激活，``[tokens, K]`` 连续。
+// @param xs        逐 token 激活 scale，``[tokens]`` fp32。
+// @param w         专家栈 packed W4，``[E, ceil(K/2), N]`` 连续 uint8。
+// @param ws        专家栈 scale，``[E, ceil(K/group), N]`` 连续 fp32。
+// @param offsets   ``[E+1]`` 前缀和，int32；**本函数在主机侧读它**。
+// @param out       ``[tokens, N]`` 连续输出，调用方负责先清零。
+// @param group_size K 轴权重分组大小，必须是 64 的倍数。
+// @return out。
+// @throws c10::Error 布局、设备、dtype、形状或对齐不自洽。
+void moe_grouped_gemm(torch::Tensor a, torch::Tensor xs, torch::Tensor w,
+                      torch::Tensor ws, torch::Tensor offsets,
+                      torch::Tensor out, int64_t group_size) {
+    TORCH_CHECK(a.is_cuda() && a.dim() == 2 && a.scalar_type() == torch::kChar
+                && a.is_contiguous(),
+                "activation must be contiguous CUDA int8 [tokens, K]");
+    TORCH_CHECK(xs.is_cuda() && xs.dim() == 1 && xs.scalar_type() == torch::kFloat
+                && xs.is_contiguous() && xs.size(0) == a.size(0),
+                "activation scale must be contiguous fp32 [tokens]");
+    TORCH_CHECK(w.is_cuda() && w.dim() == 3 && w.scalar_type() == torch::kByte
+                && w.is_contiguous(),
+                "weight must be contiguous CUDA uint8 [E, K/2, N]");
+    TORCH_CHECK(ws.is_cuda() && ws.dim() == 3 && ws.scalar_type() == torch::kFloat
+                && ws.is_contiguous(),
+                "weight scale must be contiguous fp32 [E, groups, N]");
+    TORCH_CHECK(offsets.is_cuda() && offsets.dim() == 1
+                && offsets.scalar_type() == torch::kInt && offsets.is_contiguous(),
+                "offsets must be contiguous CUDA int32 [E+1]");
+    TORCH_CHECK(out.is_cuda() && out.dim() == 2 && out.is_contiguous()
+                && out.size(0) == a.size(0) && out.size(1) == ws.size(2),
+                "destination must be contiguous CUDA [tokens, N]");
+
+    const int tokens = (int)a.size(0);
+    const int K = (int)a.size(1);
+    const int N = (int)out.size(1);
+    const int experts = (int)w.size(0);
+    const int groups = (K + (int)group_size - 1) / (int)group_size;
+    TORCH_CHECK(K % 4 == 0, "K must align to four for the packed nibble path");
+    TORCH_CHECK(group_size > 0 && group_size % 64 == 0,
+                "group_size must be a multiple of 64 for the tensor-core path");
+    TORCH_CHECK((int)w.size(2) == N && (int)w.size(1) * 2 >= K,
+                "weight shape mismatch");
+    TORCH_CHECK((int)ws.size(0) == experts && (int)ws.size(1) == groups,
+                "weight scale must be [E, ceil(K/group), N]");
+    TORCH_CHECK((int)offsets.size(0) == experts + 1, "offsets must have E+1 entries");
+    TORCH_CHECK(out.scalar_type() == torch::kFloat
+                || out.scalar_type() == torch::kBFloat16,
+                "destination must be bf16 or fp32");
+    if (tokens == 0 || experts == 0) return;
+
+    // 读 offsets 到主机：只为了决定给哪些专家启动。这是本内核唯一的主机同步，
+    // 理由见上面——段内 GEMM 是百微秒级，一次同步换来跳过空段是划算的。
+    const auto bounds = offsets.to(torch::kCPU);
+    const int* bptr = bounds.data_ptr<int>();
+
+    const c10::cuda::CUDAGuard guard(a.device());
+    const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    // 每个专家的权重与 scale 在栈里是连续的一段，按专家下标直接算偏移。
+    const int64_t w_stride = (int64_t)((K + 1) / 2) * N;
+    const int64_t s_stride = (int64_t)groups * N;
+
+    for (int e = 0; e < experts; ++e) {
+        const int begin = bptr[e];
+        const int end = bptr[e + 1];
+        const int rows = end - begin;
+        if (rows <= 0) continue;
+        const int8_t* act = a.data_ptr<int8_t>() + (int64_t)begin * K;
+        const float* ascale = xs.data_ptr<float>() + begin;
+        const uint8_t* wexp = w.data_ptr<uint8_t>() + (int64_t)e * w_stride;
+        const float* sexp = ws.data_ptr<float>() + (int64_t)e * s_stride;
+        const dim3 grid((N + W4_TILE - 1) / W4_TILE,
+                        (rows + W4_TILE - 1) / W4_TILE);
+        if (out.scalar_type() == torch::kFloat) {
+            float* dst = out.data_ptr<float>() + (int64_t)begin * N;
+            w4_gemm_tcu<float><<<grid, W4_THREADS, 2 * W4_SHARED, stream>>>(
+                wexp, act, ascale, sexp, dst, rows, N, K, (int)group_size);
+        } else {
+            uint16_t* dst = reinterpret_cast<uint16_t*>(out.data_ptr())
+                + (int64_t)begin * N;
+            w4_gemm_tcu<uint16_t><<<grid, W4_THREADS, 2 * W4_SHARED, stream>>>(
+                wexp, act, ascale, sexp, dst, rows, N, K, (int)group_size);
+        }
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 // @brief 用张量核直接消费 packed W4；group 必须按 64 对齐，K 按 4 对齐。
 torch::Tensor w4a8_gemm_tcu(torch::Tensor a, torch::Tensor w, torch::Tensor xs,
                             torch::Tensor ws, torch::Tensor out, int64_t gs) {

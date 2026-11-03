@@ -639,6 +639,53 @@ def _disp_scratch(local_experts: int, device: torch.device) -> torch.Tensor:
     return buf
 
 
+def moe_grouped_gemm(w, x: torch.Tensor, offsets: torch.Tensor,
+                     out: torch.Tensor | None = None) -> torch.Tensor:
+    """按专家分段做**张量核 GEMM**，用于 prefill 的大 M。
+
+    与 :func:`moe_grouped` 的区别只在用哪类内核：那个是「一列一线程、逐行串行」的
+    GEMV 结构，适合 decode 时每专家 1-2 行；这里是每段一次 ``w4a8_gemm_tcu``，
+    适合 prefill 时每专家上百行。
+
+    **为什么需要它**：作业 ``q4prebase3`` 的 ``seq=2048`` 账本里
+    ``moe_grouped_kernel`` 是 **2178 ms / 30.4%**，第一项。那时
+    ``tokens = 2048 x top_k(10) = 20480`` 行散在 128 个本地专家上、每专家约 160 行，
+    而 GEMV 结构下每行都要串行走完整个 K —— 权重被按段重读，有效带宽只有几 GB/s。
+    同一批行按段喂给 ``w4a8_gemm_tcu`` 则是标准的 ``[160, 2560] x [2560, 1024]``，
+    那是本卡张量核最擅长的形状（实测 2.3 ms/次、算力受限档）。
+
+    Args:
+        w: 专家栈，:class:`W4A8MoEWeight`，``[E, N, K]``。
+        x: 激活，``[tokens, K]``，**已按专家号排好序**。
+        offsets: ``[E+1]`` int32 前缀和，设备侧。
+        out: 可选输出缓冲，``[tokens, N]``；不给则分配。
+
+    Returns:
+        ``[tokens, N]``，dtype 同 ``x``。
+
+    Raises:
+        ValueError: 形状不自洽，或 K/group 不满足张量核的对齐要求（此时调用方应当
+            继续用 :func:`moe_grouped`）。
+    """
+    module = _kernels()
+    tokens = x.shape[0]
+    dtype = x.dtype
+    if tokens == 0:
+        return torch.zeros((0, w.n), dtype=dtype, device=x.device)
+    act = _compute_dtype(x).reshape(tokens, w.k).contiguous()
+    xq = torch.zeros(act.shape, dtype=torch.int8, device=act.device)
+    xs = torch.zeros(tokens, dtype=torch.float32, device=act.device)
+    result = (torch.zeros((tokens, w.n), dtype=act.dtype, device=act.device)
+              if out is None else out)
+    if out is not None:
+        out.zero_()
+    bounds = offsets.to(dtype=torch.int32, device=act.device).contiguous()
+    module.quant_act_i8(act, xq, xs)
+    module.moe_grouped_gemm(xq, xs, w.packed, w.scale, bounds, result,
+                            w.group_size)
+    return _restore(result, dtype)
+
+
 def _w8a8_rows(packed: pack.KnQWeight, act: torch.Tensor) -> torch.Tensor:
     """用三个 W8A8 内核做一次预填充投影：量化激活、int8 GEMM、乘两个 scale。
 
@@ -1710,6 +1757,7 @@ _NATIVE: dict[str, OpFn] = {
     "delta_normed": delta_normed,
     "triangular_solve": triangular_solve,
     "moe_grouped": moe_grouped,
+    "moe_grouped_gemm": moe_grouped_gemm,
     "moe_dispatch": moe_dispatch,
     "hyper_norm": hyper_norm,
     "hyper_down": hyper_down,
