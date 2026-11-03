@@ -473,6 +473,46 @@ class QSAIndexer(nn.Module):
         flat_keys = raw_keys.reshape(batch * tokens, head_dim)
         flat_cos = full_cos.reshape(batch * tokens, -1)
         flat_sin = full_sin.reshape(batch * tokens, -1)
+
+        # 融合快路径：gather → 池化 → RMSNorm → partial RoPE 一次启动。
+        #
+        # 作业 ``q4blks4`` 量到生产 torch 链与融合内核的差距：
+        #
+        #     kv      torch 链   融合内核   加速
+        #     4096    0.328 ms   0.017 ms   18.9x
+        #     8192    0.404       0.024      17.1x
+        #     32768   1.071       0.055      19.6x
+        #
+        # 原链要读的数据只有 ``max_blocks * ratio * head_dim`` 个 bf16（kv=32768 时
+        # 8.4 MB，屋顶 0.015 ms），所以融合后基本就是屋顶本身。差在中间量上：
+        # gather 出的 ``[blk*max_blocks, ratio, head_dim]``、它的 fp32 副本、
+        # layernorm 的多次 elementwise、RoPE 的 ``cat`` —— 每一步都是一次全量读写。
+        #
+        # 这条**不走分块**：分块（``_POOL_ROW_CHUNK``）原本是为了压住那个 fp32
+        # 中间量的显存峰值（``seq=2048`` 会 OOM），而融合后那个中间量根本不存在。
+        #
+        # **真实入参与直觉不同的三处**（作业 ``q4bdtype2`` 实测，都是踩过的坑）：
+        #
+        #   1. ``raw_keys`` 是 bf16 但 ``contiguous=False``（它来自转置过的投影输出），
+        #      所以必须显式 ``contiguous()``，否则内核直接拒绝。
+        #   2. ``table`` 是 **int64**，不是 int32。内核按 int32 读，所以要转。
+        #   3. ``flat_cos``/``flat_sin`` 的最后一维是 **64**，而 ``index_head_dim`` 是
+        #      128 —— 这是 partial rotary，只有前 64 维旋转、其余原样输出。内核已经
+        #      支持（``rotary_dim`` 参数），接线时用 ``flat_cos.shape[-1]`` 传进去。
+        blk_keys_op = getattr(bops, "qsa_block_keys", None)
+        if blk_keys_op is not None and flat_keys.dtype == torch.bfloat16:
+            fused = blk_keys_op(
+                flat_keys.contiguous(),
+                table.to(torch.int32) if table.dtype != torch.int32 else table,
+                # 内核里的增益是 ``1 + weight``（与 ``norm.py`` 的零中心语义一致），
+                # 所以传零中心参数本身，而不是 ``_folded_gain()``。
+                self.k_layernorm.weight.detach().to(raw_keys.dtype).contiguous(),
+                flat_cos, flat_sin,
+                seq=seq, tokens=tokens, rotary_dim=flat_cos.shape[-1],
+                eps=self.k_layernorm.eps)
+            if fused is not None:
+                return fused.to(raw_keys.dtype)
+
         out = torch.empty((rows, max_blocks, head_dim), dtype=raw_keys.dtype,
                           device=raw_keys.device)
 

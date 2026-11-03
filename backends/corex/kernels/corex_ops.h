@@ -649,3 +649,37 @@ void moe_grouped_gemm(torch::Tensor a, torch::Tensor xs, torch::Tensor w,
 torch::Tensor attn_sparse(torch::Tensor q, torch::Tensor kcache, torch::Tensor vcache,
                           torch::Tensor sel_idx, torch::Tensor sel_len,
                           torch::Tensor ctx, torch::Tensor out, double scale);
+
+// QSA 索引器的块 key 融合。
+
+// @brief gather → 池化 → RMSNorm → partial RoPE，一次启动。
+//
+// 替掉 ``qsa.py`` 的 ``_batched_block_keys`` 那串 torch 算子。作业 ``q4sel1``
+// 量到这一段在 kv=32768 时是 1.067 ms/层/步（12 层 12.8 ms），而它要读的数据只有
+// ``max_blocks x ratio x head_dim`` 个 bf16 = 8.4 MB，按 575 GB/s 的屋顶应是
+// 0.015 ms —— 差 71 倍，差在那串中间量上（gather、fp32 池化、layernorm 的多次
+// elementwise、RoPE 的 cat），每一步都是一次全量读写。
+//
+// 三处容易写错的语义见 ``qsa_block_keys.cu`` 的文件头：RMSNorm 的增益是
+// ``1 + weight``（零中心）、均值在 fp32 里算再舍入到 bf16、RoPE 是半切分形式。
+//
+// @param flat_keys ``[batch * tokens, head_dim]`` bf16 连续。
+// @param table     ``[rows, max_blocks, ratio]`` int32 连续，``-1`` 是补位。
+// @param weight    ``[head_dim]`` bf16 连续，零中心增益。
+// @param flat_cos  ``[batch * tokens, rotary_dim]`` bf16 连续。
+// @param flat_sin  同 ``flat_cos``。
+// @param block_row ``[rows * max_blocks]`` int32，块行到 query 行的映射。
+// @param block_batch ``[rows * max_blocks]`` int32，块行到 batch 行的映射。
+// @param out       ``[rows, max_blocks, head_dim]`` bf16 连续。
+// @param seq       每个 batch 行的 query 数。
+// @param tokens    每行的总 token 数。
+// @param rotary_dim 参与旋转的维数。
+// @param eps       RMSNorm 的 epsilon。
+// @return out。
+// @throws c10::Error 布局、dtype、形状或 ``ratio`` 越界。
+torch::Tensor qsa_block_keys(torch::Tensor flat_keys, torch::Tensor table,
+                             torch::Tensor weight, torch::Tensor flat_cos,
+                             torch::Tensor flat_sin, torch::Tensor block_row,
+                             torch::Tensor block_batch, torch::Tensor out,
+                             int64_t seq, int64_t tokens, int64_t rotary_dim,
+                             double eps);

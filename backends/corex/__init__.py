@@ -793,6 +793,62 @@ def attn_sparse(q: torch.Tensor, kcache: torch.Tensor, vcache: torch.Tensor,
     return out
 
 
+def qsa_block_keys(flat_keys: torch.Tensor, table: torch.Tensor,
+                   weight: torch.Tensor, flat_cos: torch.Tensor,
+                   flat_sin: torch.Tensor, *, seq: int, tokens: int,
+                   rotary_dim: int, eps: float = 1e-6,
+                   out: torch.Tensor | None = None) -> torch.Tensor:
+    """QSA 块 key：gather → 池化 → RMSNorm → partial RoPE，一次启动。
+
+    替掉 ``qsa.py`` 的 ``_batched_block_keys`` 那串 torch 算子。作业 ``q4sel1``
+    量到那一段在 kv=32768 时是 1.067 ms/层/步（12 层 12.8 ms），而它要读的数据只有
+    ``max_blocks x ratio x head_dim`` 个 bf16 = 8.4 MB —— 按 575 GB/s 的屋顶应是
+    0.015 ms，差 71 倍。差在中间量上：gather、``.float()`` 的 fp32 池化、layernorm
+    的多次 elementwise、RoPE 的 ``cat``，每一步都是一次全量读写。
+
+    Meta 里那块 ``[blk * max_blocks, ratio, head_dim]`` 的 fp32 临时量也不再有，
+    所以 prefill 的显存峰值会跟着降（见 ``_POOL_ROW_CHUNK`` 的历史）。
+
+    Args:
+        flat_keys: ``[batch * tokens, head_dim]`` bf16。
+        table: ``[rows, max_blocks, ratio]`` int32，``-1`` 是补位槽。
+        weight: ``[head_dim]`` bf16，**零中心**增益（内核会乘 ``1 + w``）。
+        flat_cos: ``[batch * tokens, rotary_dim]`` bf16。
+        flat_sin: 同 ``flat_cos``。
+        seq: 每个 batch 行的 query 数，用来把块行映射回 batch 行。
+        tokens: 每行的 token 数。
+        rotary_dim: 参与旋转的维数（前若干维），其余原样输出。
+        eps: RMSNorm 的 epsilon。
+        out: 可选输出缓冲；不给则分配。
+
+    Returns:
+        ``[rows, max_blocks, head_dim]`` bf16。
+
+    Raises:
+        ValueError: 形状不自洽或 ``ratio`` 超出内核上限。
+        RuntimeError: 扩展不可用。
+    """
+    module = _kernels()
+    if table.dim() != 3:
+        raise ValueError("table must be [rows, max_blocks, ratio]")
+    rows, max_blocks, _ratio = table.shape
+    head_dim = flat_keys.shape[1]
+    if out is None:
+        out = torch.empty((rows, max_blocks, head_dim), dtype=flat_keys.dtype,
+                          device=flat_keys.device)
+    if table.dtype != torch.int32:
+        table = table.to(torch.int32)
+    # 块行 → query 行 → batch 行。两条都只是 int32 除法，但内核要它们连续。
+    blk_total = rows * max_blocks
+    arange = torch.arange(blk_total, device=table.device, dtype=torch.int32)
+    block_row = torch.div(arange, max_blocks, rounding_mode="floor")
+    block_batch = torch.div(block_row, int(seq), rounding_mode="floor")
+    module.qsa_block_keys(flat_keys, table, weight, flat_cos, flat_sin,
+                          block_row, block_batch, out, int(seq), int(tokens),
+                          int(rotary_dim), float(eps))
+    return out
+
+
 def _w8a8_rows(packed: pack.KnQWeight, act: torch.Tensor) -> torch.Tensor:
     """用三个 W8A8 内核做一次预填充投影：量化激活、int8 GEMM、乘两个 scale。
 
@@ -1866,6 +1922,7 @@ _NATIVE: dict[str, OpFn] = {
     "moe_grouped": moe_grouped,
     "moe_grouped_gemm": moe_grouped_gemm,
     "attn_sparse": attn_sparse,
+    "qsa_block_keys": qsa_block_keys,
     "moe_dispatch": moe_dispatch,
     "hyper_norm": hyper_norm,
     "hyper_down": hyper_down,

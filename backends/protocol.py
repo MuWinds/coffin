@@ -66,6 +66,7 @@ _OP_NAMES: tuple[str, ...] = (
     "attn_paged_batch",
     "attn_paged_multi_q",
     "attn_sparse",       # QSA 稀疏注意力：只读索引器选中的位置
+    "qsa_block_keys",    # QSA 块 key：gather + 池化 + RMSNorm + partial RoPE
     # Gated DeltaNet：深度卷积 + SiLU，然后是循环。
     "conv1d_silu",
     "conv1d_silu_seq",
@@ -321,6 +322,17 @@ class Ops:
     #:
     #: ``None`` 表示后端没有这个算子，模型侧退回稠密的 torch 链。
     attn_sparse: OpFn | None = None
+    #: ``qsa_block_keys(flat_keys, table, weight, flat_cos, flat_sin, *,
+    #: seq, tokens, rotary_dim, eps=1e-6, out=None) -> out``：QSA 索引器的块 key，
+    #: 一次启动完成 gather → 池化 → RMSNorm → partial RoPE。
+    #:
+    #: 替掉 ``qsa.py`` 的 ``_batched_block_keys``。作业 ``q4sel1`` 量到那一段在
+    #: kv=32768 时是 1.067 ms/层/步（12 层 12.8 ms），而它要读的数据只有 8.4 MB，
+    #: 按 575 GB/s 的屋顶应是 0.015 ms —— 差 71 倍，差在中间量上。
+    #:
+    #: ``weight`` 是**零中心**增益（内核乘 ``1 + w``），与 ``norm.py`` 一致。
+    #: ``None`` 表示后端没有这个算子，模型侧退回 torch 链。
+    qsa_block_keys: OpFn | None = None
     #: ``conv1d_silu(conv_w, x, conv_state, out) -> out``：单 token 的深度因果卷积
     #: （卷积核 4）+ SiLU。``conv_w`` 是 ``[C, 4]`` fp32，当前 token 在最末；
     #: ``conv_state`` 是 ``[C, 3]`` fp32，被原地平移，所以它是混合器的短期记忆，
