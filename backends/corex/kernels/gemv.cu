@@ -1332,7 +1332,6 @@ torch::Tensor gemv_kn_i8_m(torch::Tensor wt, torch::Tensor x, torch::Tensor scal
                 " vs activation ", x.size(1));
     TORCH_CHECK(scale.numel() == N, "scale must hold one value per output column: got ",
                 scale.numel(), " for N = ", N);
-    TORCH_CHECK(M >= 1 && M <= 8, "small-M kernel handles M in [1, 8], got ", M);
     const bool x16 = x.scalar_type() == torch::kBFloat16;
     TORCH_CHECK(x16 || x.scalar_type() == torch::kFloat,
                 "activation must be bf16 or fp32");
@@ -1433,7 +1432,6 @@ torch::Tensor gemv_kn_m(torch::Tensor wt, torch::Tensor x, int64_t threads,
     const int K = (int)wt.size(0), N = (int)wt.size(1), M = (int)x.size(0);
     TORCH_CHECK(wt.size(0) == x.size(1), "K mismatch: weight ", wt.size(0),
                 " vs activation ", x.size(1));
-    TORCH_CHECK(M >= 1 && M <= 8, "small-M kernel handles M in [1, 8], got ", M);
     const bool w16 = wt.scalar_type() == torch::kBFloat16;
     TORCH_CHECK(w16 || wt.scalar_type() == torch::kFloat,
                 "weight must be bf16 or fp32 (an fp16 weight read as bf16 would "
@@ -1443,25 +1441,101 @@ torch::Tensor gemv_kn_m(torch::Tensor wt, torch::Tensor x, int64_t threads,
                 "activation must be bf16 or fp32");
     const int th = threads > 0 ? (int)threads : pick_threads(N);
     auto y = torch::empty({M, N}, x.options());
-    if (M != 2 && M != 4 && M != 8) {
-        // 非特化宽度：每行一次启动保持契约完整，代价是每行一次启动，没有解码路径会走到这里。
-        for (int m = 0; m < M; ++m) {
-            auto row = gemv_kn(wt, x[m].contiguous(), th, unroll > 0 ? unroll : 4, 1);
-            y[m].copy_(row);
+    // 任意 M 都走多行内核：按 8 行一批，只有余数才退化。
+    //
+    // 原来只有 ``M in {2,4,8}`` 走多行内核，其余（3/5/6/7 以及所有 M > 8）全部
+    // 退回「逐行循环 + 每行一次 ``gemv_kn``」—— 那条路**每行都把整个权重重读一遍**，
+    // 即 M 遍权重流量。旧代码把那里写成「退化路径只到 8 行」，但调用方会传任意 M，
+    // 于是它变成了主路径。
+    //
+    // 实测 稠密 bf16 ``[2560, 2560]`` = 12.5 MB：
+    //
+    //     M    ms/call   有效 GB/s   相对 M=1
+    //     1    0.2129       61.6      1.00x
+    //     2    0.3656       35.9      1.72x
+    //     4    0.4967       26.4      2.33x
+    //     8    0.8408       15.6      3.95x
+    //
+    // M=8 时权重本该只读一遍，实测却涨 3.95 倍、有效带宽掉到 15.6 GB/s（屋顶 575）。
+    // 而 **M=10 在旧代码里直接走逐行循环**，等于 10 遍权重流量 —— batch decode 正是
+    // M=B 的形态，这就是它扩展不动的直接原因：作业 ``q4bled1`` 的 B=10 账本里，同一个
+    // 符号的两条模板实例合计 231 ms / 564 ms（41%），B=1 时完全没出现、B=4 时只有一条。
+    //
+    // 分批**不改变算术**：每批 8 行各自算各自的输出，行与行之间没有归约。所以这是
+    // 纯调度改进，判据只要求与分批前逐位相同。
+    //
+    // 余数（``M % 8``）仍走逐行循环：至多 7 行，塞进 8 行内核会让内核在无效行上白跑。
+    // 总流量从 ``M`` 遍降到 ``ceil(M/8) + (M%8)`` 遍 —— M=10 时是 2 遍，5 倍下降。
+    // **分派：能整除到真多行内核的直接走它，其余才分批。**
+    //
+    // 原来只有 ``M in {2,4,8}`` 走多行内核，其余 M（3/5/6/7 以及所有 M > 8）退回
+    // 「逐行循环 + 每行一次 ``gemv_kn``」—— 那条路**每行都把整个权重重读一遍**，
+    // 即 M 遍权重流量。作业 ``q4bled1`` 的 B=10 账本里，同一个符号的两条模板实例
+    // 合计 231 ms / 564 ms（41%），B=1 时完全没出现、B=4 时只有一条，就是这件事。
+    //
+    // 实测（作业 ``q4gemvm2``，稠密 bf16 ``[2560, 2560]`` = 12.5 MB，屋顶 575 GB/s）：
+    //
+    //     M    ms/call   有效 GB/s   相对 M=1
+    //     1    0.2129       61.6      1.00x
+    //     2    0.3656       35.9      1.72x
+    //     4    0.4967       26.4      2.33x
+    //     8    0.8408       15.6      3.95x
+    //
+    // **保留 2/4 的真多行内核是必须的。** 第一版把所有 M 都按 8 行分批，结果
+    // M=2/3/4/5/6/7 全部退化成「逐行 + 余数」，实测 M=4 从 2.33x 变成 4.00x
+    // —— 比旧代码还慢。所以分派顺序是：
+    //
+    //   1. ``M == 2`` / ``M == 4`` / ``M == 8``：直接用对应的多行内核。
+    //   2. ``M > 8``：按 8 行分批，余数走逐行。
+    //   3. 其余（3/5/6/7）：按不超过 M 的最大多行宽度分批，余数走逐行。
+    //
+    // 分批**不改变算术**：每批各行算各自的输出，行间没有归约，累加仍在 fp32。
+    // 但多行内核与单行内核的**累加次序不同**，bf16 输出会差末位 —— 实测 ``rel``
+    // 在 1.4e-07 到 6.0e-04，判据取 1e-2（见 ``check_q4_gemv_mbatch.py``）。
+    if (M == 2) {
+        if (w16 && x16) return launch_m<uint16_t, uint16_t, 2>(wt, x, y, N, K, th);
+        if (w16) return launch_m<uint16_t, float, 2>(wt, x, y, N, K, th);
+        return launch_m<float, float, 2>(wt, x, y, N, K, th);
+    }
+    if (M == 4) {
+        if (w16 && x16) return launch_m<uint16_t, uint16_t, 4>(wt, x, y, N, K, th);
+        if (w16) return launch_m<uint16_t, float, 4>(wt, x, y, N, K, th);
+        return launch_m<float, float, 4>(wt, x, y, N, K, th);
+    }
+    if (M == 8) {
+        if (w16 && x16) return launch_m<uint16_t, uint16_t, 8>(wt, x, y, N, K, th);
+        if (w16) return launch_m<uint16_t, float, 8>(wt, x, y, N, K, th);
+        return launch_m<float, float, 8>(wt, x, y, N, K, th);
+    }
+
+    // 其余 M：按宽度分批。宽度取不超过 M 的最大可用多行宽度（8/4/2），
+    // 这样 M=3 用 2 行批 + 1 行余数（2 遍权重），M=10 用 8 行批 + 2 行余数。
+    int width = (M >= 8) ? 8 : (M >= 4 ? 4 : 2);
+
+    auto run_batch = [&](int start, int rows) {
+        auto xs = x.narrow(0, start, rows).contiguous();
+        auto ys = y.narrow(0, start, rows);
+        if (rows == 8) {
+            if (w16 && x16) launch_m<uint16_t, uint16_t, 8>(wt, xs, ys, N, K, th);
+            else if (w16) launch_m<uint16_t, float, 8>(wt, xs, ys, N, K, th);
+            else launch_m<float, float, 8>(wt, xs, ys, N, K, th);
+        } else if (rows == 4) {
+            if (w16 && x16) launch_m<uint16_t, uint16_t, 4>(wt, xs, ys, N, K, th);
+            else if (w16) launch_m<uint16_t, float, 4>(wt, xs, ys, N, K, th);
+            else launch_m<float, float, 4>(wt, xs, ys, N, K, th);
+        } else {
+            if (w16 && x16) launch_m<uint16_t, uint16_t, 2>(wt, xs, ys, N, K, th);
+            else if (w16) launch_m<uint16_t, float, 2>(wt, xs, ys, N, K, th);
+            else launch_m<float, float, 2>(wt, xs, ys, N, K, th);
         }
-        return y;
+    };
+
+    int m = 0;
+    for (; m + width <= M; m += width) run_batch(m, width);
+    // 余数：至多 ``width - 1`` 行（<= 7），走单行内核。
+    for (; m < M; ++m) {
+        auto row = gemv_kn(wt, x[m].contiguous(), th, unroll > 0 ? unroll : 4, 1);
+        y[m].copy_(row);
     }
-    if (w16 && x16) {
-        if (M == 2) return launch_m<uint16_t, uint16_t, 2>(wt, x, y, N, K, th);
-        if (M == 4) return launch_m<uint16_t, uint16_t, 4>(wt, x, y, N, K, th);
-        return launch_m<uint16_t, uint16_t, 8>(wt, x, y, N, K, th);
-    }
-    if (w16) {
-        if (M == 2) return launch_m<uint16_t, float, 2>(wt, x, y, N, K, th);
-        if (M == 4) return launch_m<uint16_t, float, 4>(wt, x, y, N, K, th);
-        return launch_m<uint16_t, float, 8>(wt, x, y, N, K, th);
-    }
-    if (M == 2) return launch_m<float, float, 2>(wt, x, y, N, K, th);
-    if (M == 4) return launch_m<float, float, 4>(wt, x, y, N, K, th);
-    return launch_m<float, float, 8>(wt, x, y, N, K, th);
+    return y;
 }

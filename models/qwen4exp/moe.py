@@ -1,14 +1,14 @@
 """MoE：TopK 路由、512 个融合 3D 专家、共享专家。
 
-三层结构，逐条对应 ``ARCH_SPEC.md`` §5：
+三层结构如下：
 
-* **路由没有归一化输入**，也没把输入再过一遍 RMSNorm——它直接吃读门塌缩后的
+* 路由没有归一化输入，也没把输入再过一遍 RMSNorm，它直接吃读门塌缩后的
   2560 宽激活；softmax 在 fp32 上做完才 top-k，权重取自**概率**而不是 logits；
   ``norm_topk_prob`` 为真时权重是"top-k 概率再除以它们自己的和"。
-* **专家是 3D Parameter**：``gate_up_proj[e]`` 是 ``[2*I, H]``（前 I 行 gate、
+* 专家是 3D Parameter：``gate_up_proj[e]`` 是 ``[2*I, H]``（前 I 行 gate、
   后 I 行 up），``down_proj[e]`` 是 ``[H, I]``。checkpoint 里也是融合张量，
   不是 ``nn.Linear``。
-* **共享专家的融合是逐 token 的标量 sigmoid 门**（``[H] -> [1]``），不是逐通道；
+* 共享专家的融合是逐 token 的标量 sigmoid 门（``[H] -> [1]``），不是逐通道；
   融合就是相加，没有再归一化。
 
 数学上整块的输出是
@@ -369,9 +369,18 @@ class Experts(nn.Module):
             """
             weight = down_weight if down_proj else gate_up_weight
             rows = int(x.shape[0])
-            # 行数够大就用张量核 GEMM：那时段内行多，GEMV 的「每行串行走完 K」
-            # 会成为主成本（实测 seq=2048 下 22.7 ms/次 对 2.30 ms/次）。
-            if gemm_ok and rows >= _GEMM_MIN_ROWS:
+            # 分界按「每专家平均行数」判，不是按总行数。
+            #
+            # 决定 GEMV 输赢的是每段有多长：段内只有 1-2 行时，张量核的 64x128 tile
+            # 几乎全在做无效行；段内有上百行时，GEMV 每行都要串行走完 K。
+            #
+            # 旧写法只看 ``rows >= 64``，于是 **batch decode 掉进了 GEMM 分支**：
+            # B=10 时 ``rows = 80`` 跨过阈值，而每专家平均只有 ``80 / 48 = 1.7`` 行，
+            # GEMM 的 tile 里 97% 是空行。作业 ``q4bs1`` 量到那时每多一个 token 的
+            # 边际成本是 48.4 ms（B=1 147.95 ms -> B=10 584.01 ms），而权重本该在
+            # batch 内摊薄、单步耗时接近平坦。这一条正是那次扩展失败的怀疑点。
+            rows_per_expert = rows / float(max(1, self.num_local_experts))
+            if gemm_ok and rows_per_expert >= _GEMM_MIN_ROWS:
                 return bops.moe_grouped_gemm(weight, x, offsets)
             return bops.moe_grouped(weight, x, offsets)
 
