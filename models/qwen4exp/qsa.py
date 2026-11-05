@@ -1016,44 +1016,49 @@ class Attention(nn.Module):
             attn_sparse: 后端算子；``None`` 表示不可用。
 
         Returns:
-            ``[B, 1, num_heads, head_dim]`` 的注意力输出（未乘输出门），或 ``None``
-            表示这个情形不该走稀疏路径。
+            ``[B, num_heads, 1, head_dim]`` 的注意力输出（未乘输出门），或 ``None``
+            表示这个情形不该走稀疏路径。批量时逐行各调一次内核再按 batch 叠回，
+            每行的 ``kcache`` 与 ``sel_idx`` 都来自它自己那一行。
         """
         if attn_sparse is None or query_states.shape[2] != 1:
             return None
         batch = query_states.shape[0]
-        if batch != 1:
-            # 稀疏核的 ``sel_idx`` 是每行一条；批量 decode 需要行偏移，暂不支持。
+        if batch < 1:
             return None
         if merged_mask.dtype != torch.bool:
             # 加性掩码在这里要反推可见集合，容易出错；生产路径传的是 bool。
-            return None
-
-        # ``[1, 1, 1, kv]`` -> 每行的选中位置。升序由 ``nonzero`` 保证，
-        # 正是稀疏核要求的顺序。
-        visible = merged_mask.reshape(kv_length)
-        sel = torch.nonzero(visible, as_tuple=False).flatten().to(torch.int32)
-        if sel.numel() == 0:
             return None
         # 稀疏核按 ``rep`` 把查询头映射到 KV 头，所以 ``nkv`` 必须整除 ``nh``。
         keys = cache.keys
         values = cache.values
         if keys.shape[1] == 0 or query_states.shape[1] % keys.shape[1] != 0:
             return None
-        # 内核要求 ``[nkv, max_seq, hd]`` 头主序、连续；cache 是 ``[1, nkv, kv, hd]``。
-        kcache = keys[0].contiguous()
-        vcache = values[0].contiguous()
         # 内核要求 ``[rows, nh, hd]`` 三维。``query_states`` 是
         # ``[B, nh, 1, hd]``，所以按 ``[:, :, 0, :]`` 收紧**中间的 1** 保留 batch 轴；
         # 写成 ``[0, :, 0, :]`` 会把 batch 轴也去掉、退化成二维，内核直接拒绝。
         q_in = query_states[:, :, 0, :].contiguous()
-        out = attn_sparse(
-            q_in, kcache, vcache,
-            sel.unsqueeze(0), torch.tensor([sel.numel()], dtype=torch.int32,
-                                           device=sel.device),
-            torch.tensor([kv_length], dtype=torch.int32, device=sel.device),
-            scale=self.scaling)
-        return out.unsqueeze(2)
+        pieces: list[torch.Tensor] = []
+        for row in range(batch):
+            # 稀疏核的 ``kcache`` 是一个序列的 KV，``sel_idx`` 是每行一条。
+            # 批量 decode 没有「每行一份 KV 池」的内核接口，所以逐行各调一次：
+            # 每行只读自己缓存里被选中的位置，而不是让 B 行都乘一遍完整的
+            # ``[kv, hd]``。kv=32768 时稠密一层 7.5 ms，逐行稀疏 8 行也只有
+            # 8 × 0.9 ms，对现有内核最省事的正确接法，等批量稀疏核落地再
+            # 换成一次发射。
+            visible = merged_mask[row].reshape(kv_length)
+            sel = torch.nonzero(visible, as_tuple=False).flatten().to(torch.int32)
+            if sel.numel() == 0:
+                return None
+            kcache = keys[row].contiguous()
+            vcache = values[row].contiguous()
+            out = attn_sparse(
+                q_in[row:row + 1], kcache, vcache,
+                sel.unsqueeze(0), torch.tensor([sel.numel()], dtype=torch.int32,
+                                               device=sel.device),
+                torch.tensor([kv_length], dtype=torch.int32, device=sel.device),
+                scale=self.scaling)
+            pieces.append(out)
+        return torch.cat(pieces, dim=0).unsqueeze(2)
 
     def forward(self, hidden_states: torch.Tensor,
                 position_embeddings: tuple[torch.Tensor, torch.Tensor],

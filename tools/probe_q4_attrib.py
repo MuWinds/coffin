@@ -61,6 +61,12 @@ from models.qwen4exp.checkpoint import StreamingSource  # noqa: E402
 from models.qwen4exp.model import CausalLM, causal_mask  # noqa: E402
 from models.qwen4exp.weights import load_into, read_config, text_config_of  # noqa: E402
 
+#: 分页池的 token 容量；``0`` 表示走稠密缓存（每步 ``torch.cat`` 一次历史）。
+#: 放在模块级，是为了让统计/剖析那几个"只跑一遍"的函数不必各自加参数。
+_PAGED_CAPACITY = 0
+#: prefill 一次前向覆盖多少 token；``0`` 表示一整个 prompt 一次跑完。
+_PREFILL_CHUNK = 0
+
 
 def log(message: str) -> None:
     """打一行带时间戳的日志。
@@ -244,19 +250,32 @@ def prefill(model: CausalLM, tokens: list[int], device: torch.device,
             ple_tables: dict | None = None):
     """跑一段 prompt，返回末位 logits 与状态。
 
+    分页池与分块预填充由模块级的 ``_PAGED_CAPACITY`` / ``_PREFILL_CHUNK`` 控制：
+    统计与剖析那几个函数只是"跑一遍"，不看缓存怎么摆，所以开关放在模块级而不是
+    给每个调用点加参数。
+
     Args:
         model: 模型。
         tokens: prompt token。
         device: 设备。
+        ple_tables: host n-gram 表，``None`` 表示不用 PLE。
 
     Returns:
         ``(logits, states)``。
     """
-    ids = torch.tensor([tokens], dtype=torch.long, device=device)
-    mask = causal_mask(1, len(tokens), 0).to(device)
-    conv = torch.ones((1, len(tokens)), dtype=torch.bool, device=device)
-    logits, states = model(input_ids=ids, attention_mask=mask, conv_mask=conv,
-                           ple_tables=ple_tables, logits_to_keep=1)
+    if _PAGED_CAPACITY and model.model._paged_max_seq is None:
+        model.model.enable_paged_kv(_PAGED_CAPACITY)
+    states = None
+    logits = None
+    step = _PREFILL_CHUNK if _PREFILL_CHUNK > 0 else len(tokens)
+    for start in range(0, len(tokens), step):
+        chunk = tokens[start:start + step]
+        ids = torch.tensor([chunk], dtype=torch.long, device=device)
+        mask = causal_mask(1, len(chunk), start).to(device)
+        conv = torch.ones((1, len(chunk)), dtype=torch.bool, device=device)
+        logits, states = model(input_ids=ids, attention_mask=mask, conv_mask=conv,
+                               ple_tables=ple_tables, states=states,
+                               logits_to_keep=1)
     return logits, states
 
 
@@ -478,6 +497,40 @@ def synthetic_setup(layers: int, device: torch.device) -> tuple[CausalLM, dict]:
     return model, raw
 
 
+def compare_chunk_prefill(model: CausalLM, tokens: list[int], chunk: int,
+                          device: torch.device,
+                          ple_tables: dict | None = None) -> dict:
+    """同一段 prompt 用「一次跑完」与「分块跑完」两条路，比较末位 logits。
+
+    为什么不能只比 token：单进程只装了 1/4 的专家，logits 本身就是噪声，
+    argmax 会因为 1e-3 的数值差翻转，那种翻转说明不了任何事。比 logits 才能
+    区分「分块算错」（差到量级 1）和「fp 累加次序不同」（相对 1e-6）。
+
+    Args:
+        model: 模型。
+        tokens: prompt token。
+        chunk: 分块大小。
+        device: 设备。
+        ple_tables: host n-gram 表。
+
+    Returns:
+        ``{"oneshot_absmax", "chunked_absmax", "max_abs_diff", "rel"}``。
+    """
+    global _PREFILL_CHUNK
+    saved = _PREFILL_CHUNK
+    _PREFILL_CHUNK = 0
+    oneshot, _ = prefill(model, tokens, device, ple_tables)
+    _PREFILL_CHUNK = max(int(chunk), 1)
+    chunked, _ = prefill(model, tokens, device, ple_tables)
+    _PREFILL_CHUNK = saved
+    gap = float((oneshot - chunked).abs().max())
+    scale = float(oneshot.abs().max())
+    return {"oneshot_absmax": round(scale, 6),
+            "chunked_absmax": round(float(chunked.abs().max()), 6),
+            "max_abs_diff": gap,
+            "rel": gap / max(scale, 1e-12)}
+
+
 def run_generate(model: CausalLM, tokens: list[int], max_new: int,
                  device: torch.device, ple_tables: dict | None = None) -> dict:
     """贪心生成若干个 token，并报 prefill 与每步 decode 的毫秒。
@@ -516,6 +569,62 @@ def run_generate(model: CausalLM, tokens: list[int], max_new: int,
             "decode_ms": sum(steps) / len(steps) if steps else 0.0}
 
 
+def run_batched_generate(model: CausalLM, tokens: list[int], max_new: int,
+                         batch: int, device: torch.device,
+                         ple_tables: dict | None = None) -> dict:
+    """用引擎的静态批跑一段生成，报告每步毫秒与聚合吞吐。
+
+    为什么走 ``Qwen4Engine`` 而不是直接堆一个 ``[B, 1]`` 前向：批的收益必须能在
+    真实服务路径上兑现，否则测出来的是"探针能批处理"，不是"引擎能批处理"。
+
+    Args:
+        model: 已装载的模型。
+        tokens: 每行共用的 prompt（静态批要求等长）。
+        max_new: 生成多少个 token。
+        batch: 行数。
+        device: 设备。
+        ple_tables: host n-gram 表。
+
+    Returns:
+        ``{"tokens", "prefill_ms", "decode_ms", "tok_per_s", "batch"}``。
+    """
+    from models.qwen4exp.engine import Qwen4Engine
+
+    capacity = max(int(batch), 2)
+    span = len(tokens) + max_new + 8
+    engine = Qwen4Engine(model, max_seq=span, ple_tables=ple_tables)
+    engine.enable_paging(num_blocks=1, block_size=max(64, span))
+    engine.enable_batching(capacity)
+
+    class _Seq:
+        """``prefill_group`` 只读 ``token_ids``，所以最小形状就是这个。"""
+
+        def __init__(self, ids: list[int]) -> None:
+            self.token_ids = ids
+
+    seqs = [_Seq(list(tokens)) for _ in range(capacity)]
+    started = time.perf_counter()
+    rows, _ = engine.prefill_group(seqs)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    prefill_ms = (time.perf_counter() - started) * 1e3
+    picked = [int(row.argmax()) for row in rows]
+    steps: list[float] = []
+    for step in range(max(0, max_new - 1)):
+        t0 = time.perf_counter()
+        engine.set_rows(picked, [len(tokens) + step] * capacity,
+                        row_indices=list(range(capacity)))
+        out = engine.decode_batch_eager(capacity, capacity)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        steps.append((time.perf_counter() - t0) * 1e3)
+        picked = [int(out[i].argmax()) for i in range(capacity)]
+    mean_ms = sum(steps) / len(steps) if steps else 0.0
+    return {"tokens": picked, "prefill_ms": prefill_ms, "decode_ms": mean_ms,
+            "tok_per_s": capacity * 1000.0 / max(mean_ms, 1e-9),
+            "batch": capacity}
+
+
 def main(argv: list[str] | None = None) -> int:
     """跑归因并打印账本。
 
@@ -542,8 +651,20 @@ def main(argv: list[str] | None = None) -> int:
                         help="从 checkpoint 分片装 host n-gram 表并接进前向")
     parser.add_argument("--gen", type=int, default=0,
                         help="生成多少个 token 并报每步毫秒；0 表示只跑归因")
+    parser.add_argument("--paged", type=int, default=0,
+                        help="打开块粒度 KV 池，参数是池的 token 容量；0 表示走稠密缓存")
+    parser.add_argument("--prefill-chunk", type=int, default=0,
+                        help="prefill 按多少个 token 分块；0 表示一次跑完")
+    parser.add_argument("--compare-chunk", type=int, default=0,
+                        help="用这个分块大小与一次性 prefill 比末位 logits；0 表示不比")
+    parser.add_argument("--batch", type=int, default=0,
+                        help="用引擎静态批跑生成，参数是行数；0 表示单行")
     parser.add_argument("--json-out", default="", help="把结果写成 JSON")
     args = parser.parse_args(argv)
+
+    global _PAGED_CAPACITY, _PREFILL_CHUNK
+    _PAGED_CAPACITY = int(args.paged)
+    _PREFILL_CHUNK = int(args.prefill_chunk)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log(f"device={device} mode={args.mode} layers={args.layers} "
@@ -597,6 +718,22 @@ def main(argv: list[str] | None = None) -> int:
             log(f"host n-gram 表: 0 基层 {layers_with_ple} 装载 "
                 f"{time.perf_counter() - t0:.2f}s（mmap 惰性，不读数据）")
         tokens = list(range(2, 2 + args.prompt_len))
+
+    if args.batch > 1 and args.gen > 0:
+        batched = run_batched_generate(model, tokens, args.gen, args.batch, device,
+                                       ple_tables)
+        print(f"BATCHED {json.dumps(batched, ensure_ascii=False)}")
+        if not args.passes:
+            print("ATTRIB_DONE")
+            return 0
+
+    if args.compare_chunk > 0:
+        gap = compare_chunk_prefill(model, tokens, args.compare_chunk, device,
+                                    ple_tables)
+        print(f"CHUNK_CMP {json.dumps(gap, ensure_ascii=False)}")
+        if not args.passes and args.gen <= 0:
+            print("ATTRIB_DONE")
+            return 0
 
     if args.gen > 0:
         # 生成冒烟：只关心「能不能跑、一步多少毫秒、出不出有限 token」。

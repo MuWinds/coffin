@@ -374,22 +374,23 @@ class RefusalTest(unittest.TestCase):
         with self.assertRaises(NotImplementedError):
             Qwen4Engine(self.model, max_seq=MAX_SEQ, paged=True)
 
-    def test_batching_and_paging_entries_refuse(self):
-        """批处理的四个入口仍然拒绝：没有第二行、没有块表。"""
-        with self.assertRaises(NotImplementedError):
+    def test_batching_entries_refuse_without_paging(self):
+        """没挂分页池时多行批必须拒绝：多行共用游标，稠密缓存没有行。"""
+        with self.assertRaises(RuntimeError):
             self.engine.enable_batching(2)
-        with self.assertRaises(NotImplementedError):
+        with self.assertRaises(RuntimeError):
             self.engine.set_rows([1], [0], [[0]])
-        with self.assertRaises(NotImplementedError):
+        with self.assertRaises(RuntimeError):
             self.engine.decode_batch_eager(1, 1)
-        with self.assertRaises(NotImplementedError):
+        with self.assertRaises(RuntimeError):
             self.engine.prefill_group([object()])
 
     def test_paging_attaches_a_pool(self):
-        """分页池现在能挂上了：返回容量描述，重复挂载要拒绝。"""
+        """分页池现在能挂上了：返回块记账池，重复挂载要拒绝。"""
         pool = self.engine.enable_paging(4, 8)
-        self.assertEqual(pool["capacity"], 32)
-        self.assertEqual(self.engine._paged["block_size"], 8)
+        self.assertEqual(pool.max_seq, 32)
+        self.assertEqual(pool.bs, 8)
+        self.assertEqual(pool.num_free, 4)
         with self.assertRaises(RuntimeError):
             self.engine.enable_paging(4, 8)
 

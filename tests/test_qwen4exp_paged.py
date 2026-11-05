@@ -205,7 +205,7 @@ class PagedEngineTest(unittest.TestCase):
         model = build_model()
         engine = Qwen4Engine(model, max_seq=64)
         pool = engine.enable_paging(num_blocks=1, block_size=64)
-        self.assertEqual(pool["capacity"], 64)
+        self.assertEqual(pool.max_seq, 64)
         with self.assertRaises(RuntimeError):
             engine.enable_paging(num_blocks=1, block_size=64)
 
@@ -226,6 +226,164 @@ class PagedEngineTest(unittest.TestCase):
 
         engine = Qwen4Engine(build_model(), max_seq=64)
         self.assertIsNone(engine.snapshot_linear_states())
+
+
+class BatchedSparseDecodeTest(unittest.TestCase):
+    """批量 decode 的稀疏路径：逐行各调一次现有内核，不退回稠密。
+
+    真机上的 ``attn_sparse`` 需要 CoreX，CPU 单测用同签名的替身，验的是**派发逻辑**：
+    每一行拿到自己的 KV 与自己的选中集合，输出按 batch 叠回去。
+    """
+
+    def _run(self, batch: int):
+        """造一个 ``Attention`` 与逐行不同的掩码，返回输出与替身记录。
+
+        Args:
+            batch: 批大小。
+
+        Returns:
+            ``(输出, 调用记录)``。
+        """
+        from models.qwen4exp.qsa import Attention, AttentionCache
+
+        config = tiny_config()
+        torch.manual_seed(5)
+        attn = Attention(config, layer_idx=3).float()
+        nh = config.num_attention_heads
+        nkv = config.num_key_value_heads
+        hd = config.head_dim
+        kv = 16
+        query = torch.randn(batch, nh, 1, hd)
+        keys = torch.randn(batch, nkv, kv, hd)
+        values = torch.randn(batch, nkv, kv, hd)
+        index_keys = torch.randn(batch, kv, config.indexer_head_dim)
+        cache = AttentionCache(keys=keys, values=values, index_keys=index_keys)
+        # 逐行不同的可见集合：第 r 行只留 [r, kv) 里每隔 3 个的位置。
+        mask = torch.zeros(batch, 1, 1, kv, dtype=torch.bool)
+        for row in range(batch):
+            mask[row, 0, 0, row::3] = True
+        calls: list[dict] = []
+
+        def fake(q, kcache, vcache, sel_idx, sel_len, kv_len, scale):
+            calls.append({
+                "q_shape": tuple(q.shape),
+                "kcache": kcache.clone(),
+                "sel": sel_idx[0].clone(),
+                "sel_len": int(sel_len[0]),
+                "kv_len": int(kv_len[0]),
+                "scale": scale,
+            })
+            # 让输出带上"这一行选中了哪些位置"的痕迹，便于验证没有串号。
+            out = q.clone()
+            out[0, 0, 0] += float(sel_idx[0].sum())
+            return out
+
+        out = attn._sparse_attention(query, cache, mask, kv, fake)
+        return out, calls, cache, mask, query
+
+    def test_batched_rows_get_their_own_kv_and_selection(self) -> None:
+        """B=3 时调 3 次，每行拿到自己的 KV 与 sel，输出形状正确。"""
+        out, calls, cache, mask, query = self._run(3)
+        self.assertIsNotNone(out)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(tuple(out.shape), (3, 4, 1, 64))
+        for row, call in enumerate(calls):
+            self.assertEqual(call["q_shape"], (1, 4, 64))
+            self.assertTrue(torch.equal(call["kcache"], cache.keys[row]),
+                            f"第 {row} 行拿到了别人的 KV")
+            want = torch.nonzero(mask[row].reshape(-1), as_tuple=False).flatten().to(
+                torch.int32)
+            self.assertTrue(torch.equal(call["sel"], want),
+                            f"第 {row} 行的选中集合不对")
+            self.assertEqual(call["kv_len"], 16)
+            # 替身给每行加上自己的 sel 之和：输出必须逐行等于 query + 该行的和，
+            # 串号的行会立刻对不上。
+            expected = float(query[row, 0, 0, 0]) + float(want.sum())
+            self.assertAlmostEqual(float(out[row, 0, 0, 0]), expected, places=5,
+                                   msg=f"第 {row} 行的输出串到了别的行")
+
+    def test_single_row_still_uses_one_call(self) -> None:
+        """B=1 仍然只调一次，没有因为批量改动多出发射。"""
+        out, calls, _, _, _ = self._run(1)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(tuple(out.shape), (1, 4, 1, 64))
+
+
+class BatchedDecodeEngineTest(unittest.TestCase):
+    """引擎的静态批：两行一起解码 == 两行各自单行解码。"""
+
+    def test_rows_do_not_share_kv(self) -> None:
+        """两行喂不同 token 后，各自下一个 token 的 logits 与单行路径一致。
+
+        行是状态张量的一维切片，池子的 K/V 也按行存，所以批里各行互不串扰是可判
+        的；串扰会让差直接到量级 1。容差取 2e-2 是因为批与单行走的 GEMM M 不同
+        （``linear_m`` 与 ``linear``），累加次序本来就会差一点点。
+        """
+        from models.qwen4exp.engine import Qwen4Engine
+
+        def fresh() -> Qwen4Engine:
+            engine = Qwen4Engine(build_model(), max_seq=64)
+            engine.enable_paging(num_blocks=1, block_size=64)
+            return engine
+
+        left_tokens = [5, 7]
+        right_tokens = [9, 11]
+        batched = fresh()
+        batched.enable_batching(2)
+        rows_out = []
+        for step in range(2):
+            batched.set_rows([left_tokens[step], right_tokens[step]],
+                             [step, step], row_indices=[0, 1])
+            rows_out.append(batched.decode_batch_eager(2, 2))
+        singles = []
+        for tokens in (left_tokens, right_tokens):
+            one = fresh()
+            one.prefill([tokens[0]], chunk=1)
+            singles.append(one.decode_step(tokens[1]))
+        for row, want in enumerate(singles):
+            gap = float((rows_out[-1][row] - want).abs().max())
+            scale = float(want.abs().max())
+            self.assertLess(gap / max(scale, 1e-12), 2e-2,
+                            f"第 {row} 行与单行路径差 {gap:.3e}")
+
+    def test_row_ops_are_slices(self) -> None:
+        """``move_linear_states`` / ``snapshot`` / ``zero`` 都在行切片上生效。"""
+        from models.qwen4exp.engine import Qwen4Engine
+
+        engine = Qwen4Engine(build_model(), max_seq=64)
+        engine.enable_paging(num_blocks=1, block_size=64)
+        engine.enable_batching(2)
+        engine.set_rows([5, 9], [0, 0], row_indices=[0, 1])
+        engine.decode_batch_eager(2, 2)
+        snap0 = engine.snapshot_linear_states(row=0)
+        snap1 = engine.snapshot_linear_states(row=1)
+        self.assertIsNotNone(snap0)
+        self.assertIsNotNone(snap1)
+        # 快照是单行切片：批维必须是 1，不能把整批带出来。
+        for layer in snap0.layers:
+            for name in ("conv_state", "recurrent_state", "ple_context",
+                         "ple_conv_state"):
+                tensor = getattr(layer, name)
+                if tensor is not None:
+                    self.assertEqual(int(tensor.shape[0]), 1,
+                                     f"{name} 的快照不是单行切片")
+        engine.move_linear_states(0, 1)
+        moved = engine.snapshot_linear_states(row=1)
+        for got, want in zip(moved.layers, snap0.layers):
+            for name in ("conv_state", "recurrent_state", "ple_context",
+                         "ple_conv_state"):
+                a, b = getattr(got, name), getattr(want, name)
+                if a is not None and b is not None:
+                    self.assertTrue(torch.equal(a, b), f"{name} 没有搬到目标行")
+        engine.zero_linear_states(0)
+        zeroed = engine.snapshot_linear_states(row=0)
+        for layer in zeroed.layers:
+            for name in ("conv_state", "recurrent_state", "ple_context",
+                         "ple_conv_state"):
+                tensor = getattr(layer, name)
+                if tensor is not None:
+                    self.assertEqual(float(tensor.abs().max()), 0.0,
+                                     f"{name} 没有清零")
 
 
 if __name__ == "__main__":

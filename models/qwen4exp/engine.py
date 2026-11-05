@@ -31,7 +31,8 @@ import torch
 from backends import device as _device
 from models.qwen4exp.checkpoint import StreamingSource
 from models.qwen4exp.config import TextConfig
-from models.qwen4exp.model import CausalLM, ModelStates, causal_mask
+from models.qwen4exp.model import (CausalLM, ModelStates, causal_mask,
+                                   paged_layer_states)
 from models.qwen4exp.weights import load_into, read_config
 
 
@@ -82,6 +83,80 @@ def load_weights(model_dir, quant: bool = False, weight_dtype=None,
             f"收到 weight_dtype={weight_dtype!r}。")
     return {"source": StreamingSource(model_dir), "config": read_config(model_dir),
             "model_dir": str(model_dir)}
+
+
+def _slice_rows(states: ModelStates, index: int) -> ModelStates:
+    """把多行状态里的一行切出来，做成批维为 1 的独立快照。
+
+    批解码的行是状态张量的一维切片，所以「某一行的快照」就是把每个张量的第
+    ``index`` 行 clone 出来。QSA 的池子也一样，只在 ``cursor`` 之内拷。
+
+    Args:
+        states: 多行状态。
+        index: 要切的行号。
+
+    Returns:
+        批维为 1 的 ``ModelStates``；``position_ids`` 一并切。
+    """
+    from models.qwen4exp.model import LayerStates
+    from models.qwen4exp.qsa import PagedAttentionCache
+
+    layers: list[LayerStates] = []
+    for layer in states.layers:
+        cache = layer.attn_cache
+        if cache is not None:
+            one = PagedAttentionCache(1, cache.capacity, cache.kpool.shape[1],
+                                      cache.kpool.shape[3], cache.ipool.shape[2],
+                                      dtype=cache.kpool.dtype,
+                                      device=cache.kpool.device,
+                                      block_size=cache.block_size)
+            if cache.cursor:
+                one.kpool[:, :, :cache.cursor] = cache.kpool[index:index + 1,
+                                                             :, :cache.cursor]
+                one.vpool[:, :, :cache.cursor] = cache.vpool[index:index + 1,
+                                                             :, :cache.cursor]
+                one.ipool[:, :cache.cursor] = cache.ipool[index:index + 1,
+                                                          :cache.cursor]
+            one.cursor = cache.cursor
+            cache = one
+        layers.append(LayerStates(
+            attn_cache=cache,
+            conv_state=None if layer.conv_state is None
+            else layer.conv_state[index:index + 1].clone(),
+            recurrent_state=None if layer.recurrent_state is None
+            else layer.recurrent_state[index:index + 1].clone(),
+            ple_context=None if layer.ple_context is None
+            else layer.ple_context[index:index + 1].clone(),
+            ple_conv_state=None if layer.ple_conv_state is None
+            else layer.ple_conv_state[index:index + 1].clone(),
+        ))
+    positions = (None if states.position_ids is None
+                 else states.position_ids[:, index:index + 1].clone())
+    return ModelStates(layers=layers, position_ids=positions)
+
+
+def _put_rows(dst: ModelStates, src: ModelStates, index: int) -> None:
+    """把一份批维为 1 的状态写回 ``dst`` 的第 ``index`` 行。
+
+    Args:
+        dst: 目标多行状态（原地改）。
+        src: 批维为 1 的源状态。
+        index: 目标行号。
+    """
+    for target, source in zip(dst.layers, src.layers):
+        for name in ("conv_state", "recurrent_state", "ple_context",
+                     "ple_conv_state"):
+            got = getattr(target, name)
+            want = getattr(source, name)
+            if got is not None and want is not None:
+                got[index:index + 1].copy_(want[:1])
+        if target.attn_cache is not None and source.attn_cache is not None:
+            target.attn_cache.kpool[index:index + 1] = source.attn_cache.kpool[:1]
+            target.attn_cache.vpool[index:index + 1] = source.attn_cache.vpool[:1]
+            target.attn_cache.ipool[index:index + 1] = source.attn_cache.ipool[:1]
+            target.attn_cache.cursor = source.attn_cache.cursor
+    if dst.position_ids is not None and src.position_ids is not None:
+        dst.position_ids[:, index:index + 1] = src.position_ids[:, :1]
 
 
 class Qwen4Engine:
@@ -169,8 +244,12 @@ class Qwen4Engine:
             raise ValueError("注入的模型没有参数，推不出它所在的设备") from None
         self._states = None
         self._pos = 0
-        #: :meth:`enable_paging` 挂上的池子描述；``None`` 表示走稠密缓存。
-        self._paged: dict | None = None
+        #: :meth:`enable_paging` 挂上的块记账池；``None`` 表示走稠密缓存。
+        self._paged = None
+        #: :meth:`enable_batching` 开出来的批容量；``1`` 表示单流（状态按输入行数懒建）。
+        self._capacity = 1
+        self._row_tokens: list[int] = []
+        self._row_pos: list[int] = []
         self.pos = torch.zeros(1, dtype=torch.long, device=device)
         self.pos1 = self.pos[:1]
 
@@ -399,24 +478,52 @@ class Qwen4Engine:
         return False
 
     def enable_batching(self, capacity: int) -> None:
-        """接受 ``capacity == 1``，其余一律拒绝。
+        """把引擎切成静态批：状态一次开成 ``capacity`` 行，最后一行为预填充行。
+
+        为什么是静态批：分页池的 K/V/索引池是 ``[B, kv_heads, T, hd]``，行是第一
+        维，一次前向就推进所有行。批里各行的上下文必须等长（同一个 cursor），
+        这正是「同一步解码」的天性——调度器本来也只把正在解码的序列放进同一批。
+        变长批需要逐行块表与按行偏移的内核，那是另一条路。
+
+        行是**状态张量的一维切片**，所以 :meth:`move_linear_states` /
+        :meth:`snapshot_linear_states` 都是切片拷贝，不需要另存一套按行的结构。
 
         Args:
-            capacity: 要分配的行数。单流引擎恒为 1（一行就是预填充那一行）。
+            capacity: 批容量（含预填充那一行）。``1`` 是单流，不分配任何东西。
 
         Raises:
             ValueError: ``capacity < 1``。
-            NotImplementedError: ``capacity > 1``。批解码要逐行的 KV 块表、哨兵行
-                和一次多行前向，本 lane 只有一行状态。
+            RuntimeError: 没挂分页池。多行状态没有池就无法共享同一份 KV 位置。
         """
         capacity = int(capacity)
         if capacity < 1:
             raise ValueError(f"批容量必须 >= 1，收到 {capacity}")
-        if capacity > 1:
-            raise NotImplementedError(
-                f"qwen4exp 还没有批解码：要 {capacity} 行意味着逐行 KV 块表、哨兵行"
-                "和一次多行前向，而这条路的 KV 仍是稠密的 torch.cat 缓存"
-                "（qsa.AttentionCache）。先做分页池（M3），批处理再谈。")
+        if capacity == 1:
+            self.prefill_row = 0
+            return
+        if self._paged is None:
+            raise RuntimeError(
+                "批解码要先 enable_paging()：多行共用同一个 KV 位置游标，"
+                "稠密缓存（每步 torch.cat）没有行这个概念")
+        config = self._live().config
+        self._capacity = capacity
+        self._paged.set_rows(capacity)
+        self.prefill_row = capacity - 1
+        # 池子的 dtype 必须跟激活一致。不能读 ``embed_tokens.weight``：量化装载会把
+        # 稠密占位权重摘掉，那里是 ``None``（job q4b48 就是这么炸的）。也不能只取
+        # "第一个浮点参数"——模型里留着 fp32 的归一化/门控参数，取到它们会让池子
+        # 变成 fp32，然后在第一次前向报 "expected scalar type Float but found
+        # BFloat16"（job q4b48b）。激活的 dtype 就是权重的主体 dtype，所以优先 bf16。
+        floats = [param.dtype for param in self._live().model.parameters()
+                  if param.is_floating_point()]
+        dtype = torch.bfloat16 if torch.bfloat16 in floats else (
+            floats[0] if floats else torch.bfloat16)
+        # 状态一上来就是 capacity 行：第一次前向会把批维定成输入的行数，之后再
+        # 想换行数就得整份重建（KV 池的容量按行分配，改行数是另一笔承诺）。
+        self._states = paged_layer_states(config, capacity, self._paged.max_seq,
+                                          self.pos1.device, dtype)
+        self._row_tokens = [0] * capacity
+        self._row_pos = [0] * capacity
 
     def enable_paging(self, num_blocks: int = 512, block_size: int = 64):
         """挂上块粒度的 QSA KV 池（K、V、indexer keys 三块一起）。
@@ -430,8 +537,10 @@ class Qwen4Engine:
             block_size: 每块的 token 数。
 
         Returns:
-            池子的描述字典（``num_blocks`` / ``block_size`` / ``capacity``），
-            供调用方记账。
+            :class:`~models.qwen4exp.kv_pool.Qwen4KVPool` —— ``BlockManager`` /
+            ``RadixCache`` / ``PrefixCacheEngine`` 需要的块记账池。它不是
+            ``PagedKVCache``：qwen4exp 的 KV 张量仍由模型自己的池持有，这里只管
+            块的引用计数与槽位表兼容视图，见那个模块的文件头。
 
         Raises:
             ValueError: 参数非正。
@@ -443,43 +552,101 @@ class Qwen4Engine:
                 f"block_size={block_size}")
         if getattr(self, "_paged", None) is not None:
             raise RuntimeError("分页池已经挂过了；重复挂载会让已有状态对不上新池")
+        from models.qwen4exp.kv_pool import Qwen4KVPool
+
         capacity = int(num_blocks) * int(block_size)
         self._live().model.enable_paged_kv(capacity)
-        self._paged = {"num_blocks": int(num_blocks),
-                       "block_size": int(block_size),
-                       "capacity": capacity}
-        return self._paged
+        pool = Qwen4KVPool(int(num_blocks), int(block_size),
+                           device=self.pos1.device)
+        self._paged = pool
+        return pool
 
     def set_rows(self, tokens, positions, slot_rows=None, row_indices=None) -> None:
-        """批解码的铺行入口；本 lane 只有一行。
+        """铺行：把每一步要写进哪一行的 token 与位置记下来。
+
+        块表（``slot_rows``）不在这里用：模型自己的池按共享游标顺序写，注意力读的
+        是 ``[B, kv_heads, T, hd]`` 的行切片。``slot_rows`` 仍由调用方用于记账。
 
         Args:
-            tokens: 逐行 token id。
-            positions: 逐行绝对位置。
-            slot_rows: 逐行块表。
-            row_indices: 每个条目对应的解码行。
+            tokens: 逐行的 token id，与 ``row_indices`` 一一对应。
+            positions: 逐行的绝对位置。
+            slot_rows: 逐行的块表；本实现不使用。
+            row_indices: 每个条目对应的解码行；``None`` 表示按顺序从 0 开始。
 
         Raises:
-            NotImplementedError: 无条件；见 :meth:`enable_batching`。
+            RuntimeError: 没开批（:meth:`enable_batching`）。
+            ValueError: 行号越界，或长度不一致。
         """
-        raise NotImplementedError(
-            "set_rows() 是批解码的铺行入口；本引擎只有第 0 行、没有块表，"
-            "先做 enable_batching（M3 之后）。")
+        del slot_rows
+        if self._capacity <= 1:
+            raise RuntimeError("set_rows() 需要先 enable_batching(capacity>1)")
+        rows = (list(range(len(tokens))) if row_indices is None
+                else [int(r) for r in row_indices])
+        if len(rows) != len(tokens) or len(positions) != len(tokens):
+            raise ValueError(
+                f"set_rows 的三个列表长度不一致：tokens={len(tokens)} "
+                f"positions={len(positions)} rows={len(rows)}")
+        for token, pos, row in zip(tokens, positions, rows):
+            if row < 0 or row >= self._capacity:
+                raise ValueError(f"行号 {row} 越界（批容量 {self._capacity}）")
+            self._row_tokens[row] = int(token)
+            self._row_pos[row] = int(pos)
 
     def decode_batch_eager(self, rows: int, bucket: int, pad_rows=()) -> torch.Tensor:
-        """多行 eager 批解码；本 lane 没有多行。
+        """跑一趟多行 eager 解码前向，返回 ``[bucket, vocab]`` 的 logits。
+
+        空行（``pad_rows``）照样参与前向：行是状态张量的一维切片，跳过它们就得
+        把状态重排成一次新分配，比多算几行贵。它们的 KV 写在自己那一行，谁也不读。
 
         Args:
-            rows: 活行数。
-            bucket: 本次跑的行数（桶宽）。
-            pad_rows: 桶内部的空行。
+            rows: 活行数（本实现不靠它裁剪，前向恒定按 ``bucket`` 跑）。
+            bucket: 本次前向的行数，必须等于 :meth:`enable_batching` 的容量。
+            pad_rows: 桶内部的空行；同样照跑。
+
+        Returns:
+            ``[bucket, vocab]``。调用方按 ``seq.row`` 取自己那一行。
 
         Raises:
-            NotImplementedError: 无条件；见 :meth:`enable_batching`。
+            RuntimeError: 没开批。
+            ValueError: ``bucket`` 与批容量不一致。
         """
-        raise NotImplementedError(
-            "decode_batch_eager() 要逐行的 logits 缓冲区和哨兵行；本引擎只有一行，"
-            "先做 enable_batching（M3 之后）。")
+        del rows, pad_rows
+        if self._capacity <= 1:
+            raise RuntimeError("decode_batch_eager() 需要先 enable_batching(capacity>1)")
+        if int(bucket) != self._capacity:
+            raise ValueError(
+                f"桶宽 {bucket} 与批容量 {self._capacity} 不一致；行数是池开出来的"
+                "承诺，不能在步中换")
+        ids = torch.tensor([[tok] for tok in self._row_tokens], dtype=torch.long,
+                           device=self.pos1.device)
+        # 静态批：各行的位置必须相同，否则共用游标的池会把它们写到彼此的位置上。
+        past = int(self._row_pos[0])
+        logits, self._states = self._forward_batch(ids, past)
+        self._row_pos = [pos + 1 for pos in self._row_pos]
+        self._pos = past + 1
+        self.pos1.fill_(self._pos)
+        return logits[:, -1]
+
+    def _forward_batch(self, ids: torch.Tensor, past: int):
+        """跑一段 ``[B, n]`` 的多行前向。
+
+        Args:
+            ids: ``[B, n]`` 的 token id。
+            past: 这些 token 的第一个的绝对位置（各行相同）。
+
+        Returns:
+            ``(logits, states)``；``logits`` 是 ``[B, n, vocab]``。
+        """
+        batch, seq = int(ids.shape[0]), int(ids.shape[1])
+        device = ids.device
+        mask = causal_mask(batch, seq, past).to(device)
+        conv_mask = torch.ones(batch, seq, dtype=torch.bool, device=device)
+        positions = torch.arange(past, past + seq, dtype=torch.long,
+                                 device=device).view(1, 1, -1).expand(3, batch, -1)
+        return self._live()(input_ids=ids, attention_mask=mask,
+                            conv_mask=conv_mask, position_ids=positions,
+                            states=self._states, ple_tables=self._ple_tables,
+                            logits_to_keep=0)
 
     def capture_batch(self, buckets: tuple[int, ...] = (1, 2, 4, 8),
                       warmup: int = 3) -> None:
@@ -513,19 +680,46 @@ class Qwen4Engine:
             "本引擎也只有一行，先做 enable_batching（M3 之后）。")
 
     def prefill_group(self, seqs: list, snapshot_interval: int | None = None):
-        """一次前向预填充多个 prompt；本 lane 只有一条序列。
+        """一次前向预填充多行 prompt（等长），返回逐行 logits。
+
+        ``model_runner.prefill_group`` 的契约是 ``(logits, snaps)``，``snaps`` 是每条
+        序列一个 ``{位置: 状态}`` 字典。这里不做中间快照：块边界的快照要多跑几趟
+        前向才能拿到，而这一步的用处是"把批开起来看吞吐"，快照留给前缀缓存那条单流
+        路径。返回空字典意味着这套批不走前缀复用——对吞吐没有影响。
 
         Args:
-            seqs: 序列对象列表。
-            snapshot_interval: 状态快照的间隔。
+            seqs: 序列对象列表；它们的 prompt 必须等长（静态批共用一个位置游标）。
+            snapshot_interval: 本实现忽略。
+
+        Returns:
+            ``([logits...], [{}, ...])``。
 
         Raises:
-            NotImplementedError: 无条件。分组预填充需要逐行块表与可复用的状态快照，
-                本 lane 两者都没有。
+            RuntimeError: 没开批，或者状态还没建（先 enable_batching）。
+            ValueError: prompt 不等长，或序列数超过批容量。
         """
-        raise NotImplementedError(
-            "分组预填充要逐行的块表（pool.assign_table）和块边界的循环状态快照；"
-            "本 lane 既没有分页池也没有快照，先做 M3。")
+        del snapshot_interval
+        if self._capacity <= 1 or self._states is None:
+            raise RuntimeError("prefill_group() 需要先 enable_batching(capacity>1)")
+        if len(seqs) > self._capacity:
+            raise ValueError(
+                f"{len(seqs)} 条序列超过批容量 {self._capacity}")
+        lengths = {len(seq.token_ids) for seq in seqs}
+        if len(lengths) != 1:
+            raise ValueError(
+                f"静态批要求等长 prompt，收到 {sorted(lengths)}；变长批要逐行块表")
+        n = lengths.pop()
+        ids = torch.zeros(self._capacity, n, dtype=torch.long,
+                          device=self.pos1.device)
+        for index, seq in enumerate(seqs):
+            ids[index] = torch.tensor(seq.token_ids, dtype=torch.long,
+                                      device=self.pos1.device)
+        logits, self._states = self._forward_batch(ids, past=0)
+        self._row_pos = [n] * self._capacity
+        self._pos = n
+        self.pos1.fill_(n)
+        rows = [logits[index, -1] for index in range(len(seqs))]
+        return rows, [{} for _ in seqs]
 
     def snapshot_linear_states(self, row: int = 0):
         """整份状态快照：GDN 递推/卷积 + PLE 上下文/卷积 + QSA 的 KV 与索引 key。
@@ -542,19 +736,27 @@ class Qwen4Engine:
         qwen35 那个字典；真正需要的是"存进去什么、装回来什么"。
 
         Args:
-            row: 要打快照的行；单序列引擎只有第 0 行。
+            row: 要打快照的行。单流引擎只接受 0；批模式下取该行的切片（批维 1 行），
+                与 :meth:`restore_linear_states` 对称。
 
         Returns:
             ``ModelStates`` 快照（张量是拷贝），或者 ``None``——还没跑过前向时没有
             可快照的状态。
 
         Raises:
-            NotImplementedError: ``row != 0``。
+            NotImplementedError: 单流引擎传了非 0 的行号。
+            IndexError: 行号超出批容量。
         """
-        self._require_row(row)
+        if self._capacity <= 1:
+            self._require_row(row)
         if self._states is None:
             return None
-        return self._states.snapshot()
+        if self._capacity <= 1:
+            return self._states.snapshot()
+        index = int(row)
+        if not 0 <= index < self._capacity:
+            raise IndexError(f"行号 {index} 越界（批容量 {self._capacity}）")
+        return _slice_rows(self._states, index)
 
     def restore_linear_states(self, states, row: int = 0) -> None:
         """把一份状态快照装回来（前缀命中 / 投机回滚）。
@@ -578,6 +780,19 @@ class Qwen4Engine:
             raise RuntimeError(
                 "restore_linear_states() 需要先有一次前向产出的 ModelStates："
                 "空上下文没有任何层状态可以接收这份快照。")
+        if hasattr(states, "layers") and self._capacity > 1:
+            # 批模式：快照是某一行的切片，装回同一行，别的行不动。
+            index = int(row)
+            if not 0 <= index < self._capacity:
+                raise IndexError(f"行号 {index} 越界（批容量 {self._capacity}）")
+            if len(states.layers) != len(self._states.layers):
+                raise RuntimeError(
+                    f"快照有 {len(states.layers)} 层，本模型有 "
+                    f"{len(self._states.layers)} 层；这份快照来自另一套架构")
+            _put_rows(self._states, states, index)
+            self._row_pos[index] = (0 if states.position_ids is None
+                                    else int(states.position_ids.shape[-1]))
+            return
         if hasattr(states, "layers"):                    # ModelStates
             if len(states.layers) != len(self._states.layers):
                 raise RuntimeError(
@@ -604,37 +819,75 @@ class Qwen4Engine:
             layers[index].conv_state.copy_(conv)
 
     def move_linear_states(self, src_row: int, dst_row: int) -> None:
-        """把一行状态搬到另一行。
+        """把一行状态搬到另一行（行是状态张量的一维切片）。
 
         Args:
             src_row: 源行。
             dst_row: 目标行。两者相等时是空操作，也就是单流的情形。
 
         Raises:
-            NotImplementedError: 两行不同。搬移是批处理把暂存行的状态交给解码行
-                用的手段，单序列引擎没有第二行。
+            NotImplementedError: 没开批却要求跨行搬移。
+            IndexError: 行号超出批容量。
         """
-        if int(src_row) == int(dst_row):
+        src, dst = int(src_row), int(dst_row)
+        if src == dst:
             return
-        raise NotImplementedError(
-            f"move_linear_states({src_row}, {dst_row}): 本引擎只有第 0 行，"
-            "搬移属于批处理路径（enable_batching）。")
+        if self._capacity <= 1:
+            raise NotImplementedError(
+                f"move_linear_states({src}, {dst}): 单流引擎只有第 0 行，"
+                "跨行搬移要先 enable_batching()")
+        if self._states is None:
+            raise RuntimeError("move_linear_states() 需要先有一次前向产出的状态")
+        if not 0 <= src < self._capacity or not 0 <= dst < self._capacity:
+            raise IndexError(f"行号越界：src={src} dst={dst} 容量={self._capacity}")
+        for layer in self._states.layers:
+            for name in ("conv_state", "recurrent_state", "ple_context",
+                         "ple_conv_state"):
+                tensor = getattr(layer, name)
+                if tensor is not None:
+                    tensor[dst].copy_(tensor[src])
+            cache = layer.attn_cache
+            if cache is not None:
+                # 分页池的行切片；cursor 是共享的，所以只搬行内容。
+                cache.kpool[dst].copy_(cache.kpool[src])
+                cache.vpool[dst].copy_(cache.vpool[src])
+                cache.ipool[dst].copy_(cache.ipool[src])
 
     def zero_linear_states(self, row: int) -> None:
         """把 ``row`` 那一行交给新请求：整份状态丢掉。
 
-        比契约字面上的「清零」更彻底——单序列引擎里这一行就是全部状态，丢掉它连同
-        KV、indexer 池和全位置表一起回到空上下文，正是新请求需要的起点。只把递推
-        状态清零而留着 KV，会让新请求读到上一个 prompt 的前缀。
+        单流（容量 1）时这就是「整份状态清空」——连同 KV、indexer 池和全位置表一起
+        回到空上下文，正是新请求需要的起点。批模式下只清这一行，别的行还在解码。
 
         Args:
-            row: 要交出去的行；单序列引擎只有第 0 行。
+            row: 要交出去的行。
 
         Raises:
-            NotImplementedError: ``row != 0``。
+            NotImplementedError: 行号不是 0 而引擎又是单流。
         """
-        self._require_row(row)
-        self._states = None
+        if self._capacity <= 1:
+            self._require_row(row)
+            self._states = None
+            return
+        if not 0 <= int(row) < self._capacity:
+            raise IndexError(f"行号 {row} 越界（批容量 {self._capacity}）")
+        if self._states is None:
+            return
+        index = int(row)
+        for layer in self._states.layers:
+            for name in ("conv_state", "recurrent_state", "ple_context",
+                         "ple_conv_state"):
+                tensor = getattr(layer, name)
+                if tensor is not None:
+                    tensor[index].zero_()
+            cache = layer.attn_cache
+            if cache is not None:
+                cache.cursor = 0
+                cache.kpool[index].zero_()
+                cache.vpool[index].zero_()
+                cache.ipool[index].zero_()
+        self._row_tokens[index] = 0
+        self._row_pos[index] = 0
 
     def enable_spec_batch(self, K: int, buckets: tuple[int, ...] = (1, 2, 4, 8),
                           **kwargs) -> None:
