@@ -475,6 +475,11 @@ class Experts(nn.Module):
         # ``local_table`` 是缓存好的全局号→本地号表；非分片时它恒等（见
         # :meth:`_local_table` 与 ``local_experts is None`` 的分支），所以这里
         # 统一走内核、不再分两条路：分派内核在非分片时就是「不减任何槽位」。
+        #
+        # 分片（EP）下曾经怀疑过这个内核把非本地槽位全丢了（四进程实测里 rank 1–3
+        # 的 ``combine`` 输入恒为 0）。**已用「EP 时退回下面的 torch 归组」做过对照：
+        # 结果完全一样**，所以嫌疑人不在这个内核，撤回那条守卫，不留一条只为绕开
+        # 误判的慢路径。
         if self._dispatch is not None and self._grouped is not None:
             slots = int(flat_index.numel())
             local_table = self._local_or_identity(flat_index.device)

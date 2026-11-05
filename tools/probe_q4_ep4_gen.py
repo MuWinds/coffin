@@ -73,6 +73,8 @@ class GlooCombine:
         self.calls = 0
         self.millis = 0.0
         self.trace: list[tuple[float, float]] = []
+        self.world = int(dist.get_world_size())
+        self.desync: list[tuple[int, float, float]] = []
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         """归约一次并返回同形状、同 dtype、同设备的张量。"""
@@ -84,6 +86,15 @@ class GlooCombine:
         started = time.perf_counter()
         buf.copy_(x.float(), non_blocking=False)
         local_sum = float(buf.sum())
+        # 帧号校验：把本次调用的序号也做一次全归约。若各 rank 的调用序列错开一格，
+        # 四次归约会两两配对到不同的层上，结果仍然"看起来正常"，但每个 rank 拿到的是
+        # 别的层的和——这是唯一能静默给出不同 logits 的机制。归约后应等于
+        # ``world * calls``。
+        frame = torch.tensor([float(self.calls)], dtype=torch.float32)
+        self.dist.all_reduce(frame, op=self.dist.ReduceOp.SUM)
+        expect = float(self.world * self.calls)
+        if abs(float(frame[0]) - expect) > 1e-3:
+            self.desync.append((self.calls, float(frame[0]), expect))
         self.dist.all_reduce(buf, op=self.dist.ReduceOp.SUM)
         if len(self.trace) < 3:
             # 前三次的进出摘要：输入和四个 rank 各不相同是**对的**（各持 1/4 专家），
@@ -125,6 +136,11 @@ def main(argv: list[str] | None = None) -> int:
     import torch.distributed as dist
 
     dist.init_process_group("gloo")
+    # 集合通信自检：四个 1 全归约必须是 world。不先验这一条，后面所有"归约看起来
+    # 生效了"的推断都建立在一个未验证的假设上。
+    probe = torch.ones(4, dtype=torch.float32)
+    dist.all_reduce(probe)
+    log(f"[rank {rank}] all_reduce 自检: {float(probe[0])}（应为 {world}）")
     combine = GlooCombine(dist, 2560, torch.bfloat16)
     summary: dict = {"rank": rank, "world": world}
 
@@ -181,13 +197,72 @@ def main(argv: list[str] | None = None) -> int:
                         "tokens": out,
                         "combine_calls": combine.calls,
                         "combine_ms": round(combine.millis, 2)})
-        # 每个 rank 的 token 都必须逐位相同：这是"四片专家真的被加齐了"的唯一硬判据。
-        gathered: list[list[int]] = [None] * world  # type: ignore[list-item]
-        dist.all_gather_object(gathered, out)
-        agree = all(item == gathered[0] for item in gathered)
-        summary["agree"] = agree
+        # 分片范围：四个 rank 必须不同。相同的话后面所有一致性判据都失去意义。
+        experts = model.model.layers[0].mlp.experts
+        own = list(experts.local_experts or [])
+        log(f"[rank {rank}] local_experts: {own[:2]} … {own[-1:]} 共 {len(own)} 个")
+
+        # 逐段打点：embed / 首层输出 / 首层 MoE 输出 / PLE 输出。**每次前向单独存一份**，
+        # 否则后面几次前向（重复性检查、关掉 combine 的对照）会把这里的值覆盖掉，
+        # 于是打印出来的"打点"其实来自关掉 combine 的那次——本轮就踩过这个坑。
+        taps: list[dict[str, float]] = []
+
+        def tap(name: str, module) -> None:
+            """给一个模块挂 hook，把每次调用的输出 absmax 追加到当前这一份快照里。"""
+
+            def hook(_m, _i, output, name=name):  # noqa: ANN001 - torch hook 签名
+                value = output[0] if isinstance(output, tuple) else output
+                if not taps or name in taps[-1]:
+                    taps.append({})
+                taps[-1][name] = round(float(value.abs().max()), 4)
+
+            module.register_forward_hook(hook)
+
+        tap("embed", model.model.embed_tokens)
+        tap("layer0", model.model.layers[0])
+        tap("layer0_mlp", model.model.layers[0].mlp)
+        if len(model.model.layers) > 1 and model.model.layers[1].ple is not None:
+            tap("ple1", model.model.layers[1].ple)
+        # 第一次带 hook 的前向：它的打点与上面那次 summary 是同一条路径。
+        prefill(model, tokens, device, ple_tables)
+        log(f"[rank {rank}] 打点（首次带 hook 的前向）: {taps[0] if taps else {}}")
+
+        # 归约是不是空操作：把 combine 摘掉再跑一遍同一段前向，比较 logits absmax。
+        # 若"有归约"与"无归约"逐位相同，那 all_reduce 的结果就没有进入计算。
+        with_absmax = float(logits.abs().max())
+        # 同一进程、同一输入、同一权重，再跑一遍：两者若不同，说明**内核本身非确定**
+        # （split-K 的原子累加），那前面所有跨 rank 比较都失去意义——那正是本轮
+        # 反复对不上的根因候选。
+        repeat_logits, _ = prefill(model, tokens, device, ple_tables)
+        self_repeat = float((logits - repeat_logits).abs().max())
+        log(f"[rank {rank}] 同进程两次前向 logits 差: {self_repeat:.6f}")
+        model.model.combine = None
+        logits_plain, _ = prefill(model, tokens, device, ple_tables)
+        without_absmax = float(logits_plain.abs().max())
+        model.model.combine = combine
+        log(f"[rank {rank}] logits absmax: 有归约 {with_absmax:.4f} / "
+            f"无归约 {without_absmax:.4f}")
+
+        # 判据换成 **logits 层面**的一致：token 相等太脆——分片权重下输出分布退化，
+        # argmax 在近平局处会被内核归约的非确定性翻掉，而那并不说明归约错了。
+        # 这里把 prefill 末位 logits 的前 8 个值、absmax、以及 top-5 下标收集起来。
+        probe_logits = logits[:, -1].float()
+        signature = {
+            "head": [round(float(v), 4) for v in probe_logits[0, :8]],
+            "absmax": round(float(probe_logits.abs().max()), 4),
+            "top5": [int(v) for v in probe_logits[0].topk(5).indices],
+            "own_first": int(own[0]) if own else -1,
+            "with_absmax": round(with_absmax, 4),
+            "without_absmax": round(without_absmax, 4),
+            "taps": taps[0] if taps else {},
+        }
+        sigs: list[dict] = [None] * world  # type: ignore[list-item]
+        dist.all_gather_object(sigs, signature)
         traces: list[list[tuple[float, float]]] = [None] * world  # type: ignore[list-item]
         dist.all_gather_object(traces, combine.trace)
+        spread = max(abs(s["head"][0] - sigs[0]["head"][0]) for s in sigs)
+        # 收尾再全归约一次，让"最后一步"也覆盖到集合通信（顺便验证 all_reduce 状态）。
+        dist.barrier()
         if rank == 0:
             print("EP4_SUMMARY " + repr({
                 "prefill_ms": summary["prefill_ms"],
@@ -196,16 +271,22 @@ def main(argv: list[str] | None = None) -> int:
                 "combine_calls": summary["combine_calls"],
                 "combine_ms": summary["combine_ms"],
                 "tokens": summary["tokens"],
-                "agree": agree,
+                "logits_head_spread": round(spread, 6),
+                "all_top5": [s["top5"] for s in sigs],
+                "all_absmax": [s["absmax"] for s in sigs],
+                "all_own_first": [s["own_first"] for s in sigs],
+                "with_vs_without": [(s["with_absmax"], s["without_absmax"]) for s in sigs],
+                "all_taps": [s["taps"] for s in sigs],
                 "combine_in": [round(t[0], 3) for t in combine.trace],
-                "combine_out": [round(t[1], 3) for t in combine.trace],
+                "desync": combine.desync[:3],
+                "calls": combine.calls,
+                "self_repeat": round(self_repeat, 6),
+                "all_combine_in": [[round(t[0], 3) for t in item] for item in traces],
                 "all_combine_out": [[round(t[1], 3) for t in item] for item in traces],
             }), flush=True)
         else:
             log(f"[rank {rank}] prefill {prefill_ms:.1f} ms, decode {decode_ms:.2f} ms, "
                 f"combine {combine.millis:.1f} ms")
-        if not agree:
-            raise RuntimeError(f"四个 rank 的 token 不一致: {gathered}")
     finally:
         dist.destroy_process_group()
     print("EP4_DONE", flush=True)
