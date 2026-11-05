@@ -89,6 +89,181 @@ class AttentionCache:
             index_keys=torch.cat([self.index_keys, index_keys], dim=1),
         )
 
+    def clone(self) -> "AttentionCache":
+        """拷一份，供前缀快照 / 投机回滚用。
+
+        稠密缓存本来就是不可变的（``append`` 返回新对象），但**快照必须拷张量**：
+        与前进共享同一份 K/V 时，回滚之后长度对、内容已经被写过。
+
+        Returns:
+            与 ``self`` 内容相同的新对象，张量是拷贝。
+        """
+        return AttentionCache(keys=self.keys.clone(), values=self.values.clone(),
+                              index_keys=self.index_keys.clone())
+
+    def truncate(self, length: int) -> "AttentionCache":
+        """截到前 ``length`` 个位置。
+
+        Args:
+            length: 要保留的位置数。
+
+        Returns:
+            新的稠密缓存，张量已 ``contiguous``。
+        """
+        return AttentionCache(keys=self.keys[:, :, :length].contiguous(),
+                              values=self.values[:, :, :length].contiguous(),
+                              index_keys=self.index_keys[:, :length].contiguous())
+
+
+class PagedAttentionCache:
+    """块粒度预分配的 QSA 缓存：追加是**写入**而不是 ``torch.cat``。
+
+    为什么需要它：稠密实现对每一步都 ``torch.cat`` 一次历史，长度为 ``T`` 的序列
+    生成 ``L`` 个 token 就累计 ``O(L^2)`` 的键值拷贝——上下文一长，光这次拷贝就能
+    盖过注意力本身。这里改成预分配一块按块对齐的池子，追加只写新位置（``O(S)``），
+    没有历史拷贝。
+
+    **当前的分配是顺序的**：一个序列占池子里连续的一段，因此 ``keys`` 仍能返回
+    ``[B, :cursor]`` 的连续视图，注意力路径与稠密实现完全一样（数值逐位相同，有单测）。
+    真正的「按块表跳着放」要配合分页注意力内核（``attn_paged`` 收 slot map），以及
+    前缀复用时按块引用计数与写时复制——那一步等这里的顺序版站住再做，因为分页内核
+    的接口要求先有「每行一张块表」这个对象。
+
+    Attributes:
+        block_size: 分配粒度（token 数），与 ``cache/block_manager`` 的块同义。
+        capacity: 池子能装多少个 token（按 ``block_size`` 向上取整）。
+        cursor: 已经写了多少个 token；也是有效前缀的长度。
+    """
+
+    def __init__(self, batch: int, max_seq: int, num_kv_heads: int, head_dim: int,
+                 indexer_dim: int, *, dtype: torch.dtype, device: torch.device,
+                 block_size: int = 64) -> None:
+        """按 ``max_seq`` 预分配三块池子（K、V、索引 key）。
+
+        Args:
+            batch: 批大小。批维放在最前面，静态批的每行各占一段。
+            max_seq: 这个池子要能装下的最长上下文。
+            num_kv_heads: KV 头数。
+            head_dim: 主注意力头宽。
+            indexer_dim: 索引器 key 的宽度（``indexer_head_dim``）。
+            dtype: 池子的 dtype，与激活一致。
+            device: 设备。
+            block_size: 分配粒度。
+
+        Raises:
+            ValueError: ``max_seq``、``batch`` 或 ``block_size`` 非正。池子大小是
+                显存承诺，形状不合法必须在分配之前就拒绝。
+        """
+        if batch <= 0 or max_seq <= 0 or block_size <= 0:
+            raise ValueError(
+                f"paged cache needs positive sizes, got batch={batch} "
+                f"max_seq={max_seq} block_size={block_size}")
+        self.block_size = int(block_size)
+        self.capacity = ((int(max_seq) + self.block_size - 1) // self.block_size
+                         ) * self.block_size
+        self.cursor = 0
+        # 池子按 [B, kv_heads, T, head_dim] 排：这样 `keys` 视图的形状与稠密
+        # 实现完全一致，注意力路径走同一批内核，数值才能逐位相同。
+        shape = (int(batch), int(num_kv_heads), self.capacity, int(head_dim))
+        self.kpool = torch.zeros(shape, dtype=dtype, device=device)
+        self.vpool = torch.zeros(shape, dtype=dtype, device=device)
+        self.ipool = torch.zeros((int(batch), self.capacity, int(indexer_dim)),
+                                 dtype=dtype, device=device)
+
+    @property
+    def keys(self) -> torch.Tensor:
+        """有效前缀的 K 视图，``[B, cursor, kv_heads, head_dim]``（无拷贝）。"""
+        return self.kpool[:, :, :self.cursor]
+
+    @property
+    def values(self) -> torch.Tensor:
+        """有效前缀的 V 视图，形状同 :attr:`keys`。"""
+        return self.vpool[:, :, :self.cursor]
+
+    @property
+    def index_keys(self) -> torch.Tensor:
+        """有效前缀的索引器 key 视图，``[B, cursor, indexer_dim]``。"""
+        return self.ipool[:, :self.cursor]
+
+    def append(self, keys: torch.Tensor, values: torch.Tensor,
+               index_keys: torch.Tensor) -> "PagedAttentionCache":
+        """把本步的 K/V/索引 key 写进池子，返回自身。
+
+        与稠密实现不同，这里**原地写并返回 self**：池子已经是一份独立的显存，
+        再返回一个新对象只会让调用方误以为拿到的是一份可以并存的快照——而快照要
+        拷贝（见 :meth:`clone`）。
+
+        Args:
+            keys: 本步旋转后的 K，``[B, kv_heads, S, head_dim]``。
+            values: 本步 V，形状同 ``keys``。
+            index_keys: 本步原始 key，``[B, S, indexer_dim]``。
+
+        Returns:
+            ``self``。
+
+        Raises:
+            ValueError: 写不下（超过 ``max_seq``）或形状与池子不符。越界写会静默
+                覆盖池子尾部之外的内存，报在别处。
+        """
+        step = int(keys.shape[2])
+        if step <= 0:
+            return self
+        end = self.cursor + step
+        if end > self.capacity:
+            raise ValueError(
+                f"paged cache overflow: cursor {self.cursor} + {step} > "
+                f"capacity {self.capacity}（把 max_seq 调大或换一行）")
+        if keys.device != self.kpool.device:
+            keys = keys.to(self.kpool.device)
+            values = values.to(self.vpool.device)
+            index_keys = index_keys.to(self.ipool.device)
+        self.kpool[:, :, self.cursor:end].copy_(keys)
+        self.vpool[:, :, self.cursor:end].copy_(values)
+        self.ipool[:, self.cursor:end].copy_(index_keys)
+        self.cursor = end
+        return self
+
+    def clone(self) -> "PagedAttentionCache":
+        """整份快照：只拷有效前缀，不改 ``self``。
+
+        用于前缀复用与投机回滚。代价是一次 ``O(T)`` 拷贝，但只发生在快照边界上，
+        而稠密实现是**每一步**都付这个代价。
+
+        Returns:
+            新的池子，``cursor`` 与 ``self`` 相同。
+        """
+        out = PagedAttentionCache(self.kpool.shape[0], self.capacity,
+                                  self.kpool.shape[1], self.kpool.shape[3],
+                                  self.ipool.shape[2], dtype=self.kpool.dtype,
+                                  device=self.kpool.device,
+                                  block_size=self.block_size)
+        if self.cursor:
+            out.kpool[:, :, :self.cursor].copy_(self.kpool[:, :, :self.cursor])
+            out.vpool[:, :, :self.cursor].copy_(self.vpool[:, :, :self.cursor])
+            out.ipool[:, :self.cursor].copy_(self.ipool[:, :self.cursor])
+        out.cursor = self.cursor
+        return out
+
+    def truncate(self, length: int) -> "PagedAttentionCache":
+        """截到前 ``length`` 个位置（只移动 ``cursor``，不搬运数据）。
+
+        Args:
+            length: 要保留的位置数。
+
+        Returns:
+            新的池子，``cursor == length``。
+
+        Raises:
+            ValueError: ``length`` 超过已经写入的长度。截断到更长的位置会把池子里
+                没写过的零当成历史，形状合法、内容全错。
+        """
+        if length < 0 or length > self.cursor:
+            raise ValueError(
+                f"cannot truncate paged cache to {length}; it holds {self.cursor}.")
+        out = self.clone()
+        out.cursor = int(length)
+        return out
+
 
 @dataclass
 class IndexReuse:

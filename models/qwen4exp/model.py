@@ -34,7 +34,7 @@ import torch
 from torch import nn
 
 from models.qwen4exp.blocks import DecoderLayer
-from models.qwen4exp.config import TextConfig
+from models.qwen4exp.config import INDEXED_ATTENTION, TextConfig
 from models.qwen4exp.gated_residual import GatedResidual
 from models.qwen4exp.mtp import DraftIndexPlan, MTP
 from models.qwen4exp.ngram import prefetch_ple_tables
@@ -147,11 +147,7 @@ class ModelStates:
             # 干净路径差一点点，而前缀 token 全都对。
             cache = layer.attn_cache
             if cache is not None:
-                cache = type(cache)(
-                    keys=cache.keys.clone(),
-                    values=cache.values.clone(),
-                    index_keys=cache.index_keys.clone(),
-                )
+                cache = cache.clone()
             layers.append(LayerStates(
                 attn_cache=cache,
                 conv_state=None if layer.conv_state is None
@@ -202,9 +198,7 @@ class ModelStates:
                 if length < 0 or length > have:
                     raise ValueError(
                         f"cannot truncate layer {index} KV to {length}; it holds {have}.")
-                cache = type(cache)(keys=cache.keys[:, :, :length].contiguous(),
-                                    values=cache.values[:, :, :length].contiguous(),
-                                    index_keys=cache.index_keys[:, :length].contiguous())
+                cache = cache.truncate(int(length))
             new_layers.append(LayerStates(
                 attn_cache=cache,
                 conv_state=layer.conv_state,
@@ -220,6 +214,37 @@ class ModelStates:
                     f"{positions.shape[-1]}.")
             positions = positions[..., :length]
         return ModelStates(layers=new_layers, position_ids=positions)
+
+
+def paged_layer_states(config: TextConfig, batch: int, max_seq: int,
+                       device: torch.device, dtype: torch.dtype
+                       ) -> "ModelStates":
+    """建一份按块预分配 QSA 缓存的初始状态。
+
+    GDN 的递推/卷积状态、PLE 的上下文与卷积窗口仍然按步推进（它们本来就是定长
+    递推量，没有「历史越长越贵」的问题），只有 QSA 的三块池子换成分页实现。
+
+    Args:
+        config: 文本配置。
+        batch: 批大小。
+        max_seq: 池子要装下的最长上下文。
+        device: 设备。
+        dtype: 池子的 dtype，与激活一致。
+
+    Returns:
+        逐层状态：QSA 层持有 :class:`~qsa.PagedAttentionCache`，其余为 ``None``。
+    """
+    from models.qwen4exp.qsa import PagedAttentionCache
+
+    layers: list[LayerStates] = []
+    for layer_idx in range(config.num_hidden_layers):
+        cache = None
+        if config.layer_types[layer_idx] == INDEXED_ATTENTION:
+            cache = PagedAttentionCache(batch, max_seq, config.num_key_value_heads,
+                                        config.head_dim, config.indexer_head_dim,
+                                        dtype=dtype, device=device)
+        layers.append(LayerStates(attn_cache=cache))
+    return ModelStates(layers=layers)
 
 
 class TextModel(nn.Module):
@@ -268,8 +293,27 @@ class TextModel(nn.Module):
         self.rotary_emb = RotaryEmbedding(config)
         # 末端没有 final RMSNorm，塌缩由这个 use_combine=False 的 mixer 完成。
         self.hyper_connection_mixer = GatedResidual(config, use_combine=False)
+        #: 打开块粒度 KV 池时记下容量；``None`` 表示走稠密缓存。
+        self._paged_max_seq: int | None = None
         if quantized:
             self.release_quantized_placeholders()
+
+    def enable_paged_kv(self, max_seq: int) -> None:
+        """把 QSA 的 KV / 索引 key 换成分页池，必须在第一次前向之前调用。
+
+        为什么值得换：稠密实现每步 ``torch.cat`` 一次历史，生成长度为 ``L`` 的序列
+        累计 ``O(L^2)`` 的拷贝；分页实现追加只写新位置。两者数值逐位相同（单测按
+        ``torch.equal`` 判），所以换路不影响任何判据。
+
+        Args:
+            max_seq: 池子要装下的最长上下文，按 64 token 一块向上取整。
+
+        Raises:
+            ValueError: ``max_seq`` 非正。这是一笔显存承诺，不该静默接受 0。
+        """
+        if max_seq <= 0:
+            raise ValueError(f"enable_paged_kv needs max_seq > 0, got {max_seq}")
+        self._paged_max_seq = int(max_seq)
 
     def release_quantized_placeholders(self) -> int:
         """摘掉本子树里所有稠密投影的 bf16 占位权重，交给量化产物供货。
@@ -374,7 +418,13 @@ class TextModel(nn.Module):
             ple_input_ids = input_ids
 
         batch, seq, _ = inputs_embeds.shape
-        states = ModelStates.empty(len(self.layers)) if states is None else states
+        if states is None:
+            # ``enable_paged_kv`` 之后，QSA 层一上来就拿到块粒度的池子；否则还是
+            # 稠密缓存（``torch.cat`` 追加）。两条路数值逐位相同，差别只在追加成本。
+            states = (paged_layer_states(self.config, batch, self._paged_max_seq,
+                                         inputs_embeds.device, inputs_embeds.dtype)
+                      if self._paged_max_seq
+                      else ModelStates.empty(len(self.layers)))
         # n-gram 行的 H2D 必须在第 0 层之前发出：PLE 挂在第 2 层，中间两层就是重叠
         # 窗口。放进层里再取等于放弃重叠，而 decode 一步的传输就在关键路径上。
         prefetch_ple_tables(self.layers, ple_input_ids, states, ple_tables)

@@ -169,6 +169,8 @@ class Qwen4Engine:
             raise ValueError("注入的模型没有参数，推不出它所在的设备") from None
         self._states = None
         self._pos = 0
+        #: :meth:`enable_paging` 挂上的池子描述；``None`` 表示走稠密缓存。
+        self._paged: dict | None = None
         self.pos = torch.zeros(1, dtype=torch.long, device=device)
         self.pos1 = self.pos[:1]
 
@@ -417,21 +419,36 @@ class Qwen4Engine:
                 "（qsa.AttentionCache）。先做分页池（M3），批处理再谈。")
 
     def enable_paging(self, num_blocks: int = 512, block_size: int = 64):
-        """分页池的挂载点；本 lane 还没有池。
+        """挂上块粒度的 QSA KV 池（K、V、indexer keys 三块一起）。
+
+        池子按 ``num_blocks * block_size`` 预分配，也就是"所有活请求合起来的上下文
+        预算"。当前分配是**顺序**的（一个序列占连续一段），所以注意力路径与稠密实现
+        完全一样、数值逐位相同；按块表跳着放的版本要等分页注意力内核接进来。
 
         Args:
             num_blocks: 池里的块数。
             block_size: 每块的 token 数。
 
+        Returns:
+            池子的描述字典（``num_blocks`` / ``block_size`` / ``capacity``），
+            供调用方记账。
+
         Raises:
-            NotImplementedError: 无条件。QSA 的 KV 与 indexer 池现在按位置
-                ``torch.cat`` 增长，没有 ``[blocks, block_size, ...]`` 的池可挂；
-                伪造一个池会让所有注意力读错地方而形状合法。
+            ValueError: 参数非正。
+            RuntimeError: 已经挂过池子。再挂一个会让第一份状态永远对不上。
         """
-        raise NotImplementedError(
-            "qwen4exp 还没有分页 KV 池（qsa.AttentionCache 仍是 dense）。下一步："
-            "把 KV 与 indexer keys 改成 [blocks, block_size, ...] 池、按 block_table "
-            "寻址，见 Q4EXP-SERVING-PLAN §3.2；在那之前前缀缓存与批处理都没有落点。")
+        if num_blocks <= 0 or block_size <= 0:
+            raise ValueError(
+                f"enable_paging needs positive sizes, got num_blocks={num_blocks} "
+                f"block_size={block_size}")
+        if getattr(self, "_paged", None) is not None:
+            raise RuntimeError("分页池已经挂过了；重复挂载会让已有状态对不上新池")
+        capacity = int(num_blocks) * int(block_size)
+        self._live().model.enable_paged_kv(capacity)
+        self._paged = {"num_blocks": int(num_blocks),
+                       "block_size": int(block_size),
+                       "capacity": capacity}
+        return self._paged
 
     def set_rows(self, tokens, positions, slot_rows=None, row_indices=None) -> None:
         """批解码的铺行入口；本 lane 只有一行。
@@ -510,66 +527,71 @@ class Qwen4Engine:
             "分组预填充要逐行的块表（pool.assign_table）和块边界的循环状态快照；"
             "本 lane 既没有分页池也没有快照，先做 M3。")
 
-    def snapshot_linear_states(self, row: int = 0) -> dict[int, tuple[torch.Tensor,
-                                                                     torch.Tensor]]:
-        """克隆当前状态下每个线性注意力层的 (递推状态, 卷积状态)。
+    def snapshot_linear_states(self, row: int = 0):
+        """整份状态快照：GDN 递推/卷积 + PLE 上下文/卷积 + QSA 的 KV 与索引 key。
+
+        ``engine_api.PagedModel`` 的注释写的是 ``{层: (递推状态, conv 状态)}``，那是
+        qwen35 的形状。qwen4exp 多了两样东西，装不进两元组：
+
+        * PLE 的 ``ple_context`` / ``ple_conv_state``——只拷 GDN 那两份会让前缀复用
+          拿一个从没见过这些 n-gram 历史的状态继续，形状全对、数值错；
+        * QSA 的 KV 与 indexer 池——混合模型的前缀命中必须三者同时对上。
+
+        所以这里返回的是 :class:`~models.qwen4exp.model.ModelStates` 的整份快照。
+        runner 与 ``PrefixCacheEngine`` 只把它当不透明对象存回来，所以形状不必是
+        qwen35 那个字典；真正需要的是"存进去什么、装回来什么"。
 
         Args:
             row: 要打快照的行；单序列引擎只有第 0 行。
 
         Returns:
-            ``{层下标: (recurrent_state, conv_state)}``，只含 GDN 层，克隆脱离
-            计算图。模型里没有 GDN 层（全 QSA 配置）时是空字典。还没有跑过前向时
-            也是空字典——空上下文没有可快照的东西。
+            ``ModelStates`` 快照（张量是拷贝），或者 ``None``——还没跑过前向时没有
+            可快照的状态。
 
         Raises:
-            NotImplementedError: ``row != 0``，或者模型带 PLE 层。``engine_api``
-                给的是两元组，装不下 ``ple_context`` / ``ple_conv_state``，而只拷
-                一半会让前缀复用拿一个从没见过这些 n-gram 历史的 PLE 状态继续——
-                形状全对、数值错。
+            NotImplementedError: ``row != 0``。
         """
         self._require_row(row)
-        states = self._states
-        if states is None:
-            return {}
-        layers = self._live().model.layers
-        if any(layer.ple is not None for layer in layers):
-            raise NotImplementedError(
-                "qwen4exp 的 PLE 状态（ple_context / ple_conv_state）装不进 "
-                "engine_api.PagedModel 的 {层: (循环状态, conv 状态)} 两元组；"
-                "只拷 GDN 那两份会静默丢掉 n-gram 历史。等状态快照扩成整份 "
-                "ModelStates（M3）再谈前缀复用。")
-        out: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-        for index, layer in enumerate(layers):
-            layer_state = states.layers[index]
-            if layer_state.recurrent_state is None:
-                continue
-            out[index] = (layer_state.recurrent_state.clone(),
-                          layer_state.conv_state.clone())
-        return out
+        if self._states is None:
+            return None
+        return self._states.snapshot()
 
     def restore_linear_states(self, states, row: int = 0) -> None:
-        """把一份快照装进当前状态里对应的线性注意力层。
+        """把一份状态快照装回来（前缀命中 / 投机回滚）。
 
-        只还原 GDN 那两份递推状态：KV、indexer 池和全位置表由调用方负责，而这个
-        方法存在的场合（前缀复用）在本 lane 还不可达——那条路上的 ``model.prefill``
-        会先撞上 ``enable_paging`` 的拒绝。
+        接受两种形状：:meth:`snapshot_linear_states` 产出的整份 ``ModelStates``
+        （本引擎现在的返回），以及 qwen35 那个 ``{层: (递推, conv)}`` 字典——后者
+        只为兼容老的测试/调用方，只还原 GDN 两份，不动 KV 与 PLE 历史。
 
         Args:
-            states: :meth:`snapshot_linear_states` 的返回值，键是本模型的层下标。
+            states: 快照。整份 ``ModelStates`` 会**替换**当前状态；字典则逐层就地拷。
             row: 要装入状态的行；单序列引擎只有第 0 行。
 
         Raises:
             NotImplementedError: ``row != 0``。
-            RuntimeError: 还没有任何状态可以装入（没跑过前向）。
-            KeyError: ``states`` 里出现了本模型没有的层下标——来自另一套架构的快照。
-                宁可拒绝，也不要恢复一份残缺状态。
+            RuntimeError: 还没有任何状态可以装入（没跑过前向），或者快照的层数与
+                本模型不符。
+            KeyError: 字典形状的快照里出现了本模型没有的层下标。
         """
         self._require_row(row)
         if self._states is None:
             raise RuntimeError(
                 "restore_linear_states() 需要先有一次前向产出的 ModelStates："
                 "空上下文没有任何层状态可以接收这份快照。")
+        if hasattr(states, "layers"):                    # ModelStates
+            if len(states.layers) != len(self._states.layers):
+                raise RuntimeError(
+                    f"快照有 {len(states.layers)} 层，本模型有 "
+                    f"{len(self._states.layers)} 层；这份快照来自另一套架构")
+            self._states = states
+            # 位置必须跟着快照一起回滚。只换状态而不改 ``pos1``，下一次前向会用
+            # 「恢复后的缓存 + 回滚前的位置」拼出比缓存更宽的掩码——索引器当场报
+            # 「pool has N tokens but mask covers M」，而看起来像缓存的错。
+            length = (0 if states.position_ids is None
+                      else int(states.position_ids.shape[-1]))
+            self.pos.fill_(length)
+            self._pos = int(self.pos1)
+            return
         layers = self._states.layers
         for index, (recurrent, conv) in states.items():
             if index < 0 or index >= len(layers):

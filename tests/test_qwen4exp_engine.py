@@ -375,9 +375,7 @@ class RefusalTest(unittest.TestCase):
             Qwen4Engine(self.model, max_seq=MAX_SEQ, paged=True)
 
     def test_batching_and_paging_entries_refuse(self):
-        """批处理与分页的四个入口：没有池、没有第二行，就只能拒绝。"""
-        with self.assertRaises(NotImplementedError):
-            self.engine.enable_paging(4, 8)
+        """批处理的四个入口仍然拒绝：没有第二行、没有块表。"""
         with self.assertRaises(NotImplementedError):
             self.engine.enable_batching(2)
         with self.assertRaises(NotImplementedError):
@@ -386,6 +384,14 @@ class RefusalTest(unittest.TestCase):
             self.engine.decode_batch_eager(1, 1)
         with self.assertRaises(NotImplementedError):
             self.engine.prefill_group([object()])
+
+    def test_paging_attaches_a_pool(self):
+        """分页池现在能挂上了：返回容量描述，重复挂载要拒绝。"""
+        pool = self.engine.enable_paging(4, 8)
+        self.assertEqual(pool["capacity"], 32)
+        self.assertEqual(self.engine._paged["block_size"], 8)
+        with self.assertRaises(RuntimeError):
+            self.engine.enable_paging(4, 8)
 
     def test_enable_batching_one_is_a_no_op(self):
         """``capacity == 1`` 就是单流本身；runner 只在批处理时才传更大的值。"""
@@ -413,15 +419,17 @@ class RefusalTest(unittest.TestCase):
         with self.assertRaises(NotImplementedError):
             self.engine.prefill(PROMPT, spec_row=0)
 
-    def test_snapshot_refuses_on_a_ple_model(self):
-        """PLE 的两份状态装不进 ``(循环状态, conv 状态)`` 两元组，只能拒绝。
+    def test_snapshot_covers_a_ple_model(self):
+        """带 PLE 的模型现在也能快照：整份状态里含 n-gram 历史与卷积窗口。
 
-        只拷 GDN 那两半会让前缀复用拿一个从没见过这些 n-gram 历史的 PLE 状态继续，
-        形状全对而数值错——契约里那条「宁可拒绝」说的就是这件事。
+        契约从 ``{层: (循环状态, conv 状态)}`` 扩成整份 ``ModelStates`` 之后，
+        PLE 的 ``ple_context`` / ``ple_conv_state`` 有地方放了，不再需要拒绝。
         """
         self.engine.prefill(PROMPT)
-        with self.assertRaises(NotImplementedError):
-            self.engine.snapshot_linear_states()
+        snap = self.engine.snapshot_linear_states()
+        self.assertIsNotNone(snap)
+        carriers = [state for state in snap.layers if state.ple_context is not None]
+        self.assertTrue(carriers, "PLE 层的 n-gram 历史没有被装进快照")
 
     def test_foreign_row_refuses(self):
         """单序列引擎只有第 0 行：任何按行的入口都不能假装有第二行。"""
@@ -457,41 +465,21 @@ class SnapshotTest(unittest.TestCase):
         self.engine.reset()
 
     def test_snapshot_and_restore_round_trip(self):
-        """打快照、走一步、还回来：线性状态必须逐位回到快照那一刻。
+        """打快照、走一步、还回来：重放同一步必须给出同一组 logits。
 
-        这是状态快照唯一有意义的判据。GDN 的递推状态不进 KV，所以「还回来」如果只
-        还了一半（比如漏了 conv 窗口），它不会报错，只会在下一步里悄悄用错状态。
-        注意这里不比较两次前向的 logits：KV 与全位置表不在快照里（本 lane 还没有
-        池化 KV），重放同一步需要连它们一起还，那要等 M3。
+        快照现在是整份 ``ModelStates``（GDN 两半 + PLE 历史 + QSA 的 KV/索引池），
+        所以判据从"字典里的张量相等"换成"装回之后重放同一步的 logits 逐位相同"
+        ——那才是前缀复用真正依赖的性质，也顺带把「位置有没有一起回滚」测进去。
         """
         engine = self.engine
         engine.prefill(PROMPT)
         snap = engine.snapshot_linear_states()
-        self.assertTrue(snap)
-        config = self.model.config
-        for index, (recurrent, conv) in snap.items():
-            self.assertNotEqual(index, 3, "layer 3 is QSA and has no linear state")
-            self.assertEqual(tuple(recurrent.shape),
-                             (1, config.linear_num_value_heads,
-                              config.linear_key_head_dim, config.linear_value_head_dim))
-            self.assertEqual(recurrent.dtype, torch.float32,
-                             "递推状态必须 fp32，bf16 在几千 token 后会发散")
-            self.assertEqual(tuple(conv.shape),
-                             (1, config.linear_conv_dim, config.linear_conv_kernel_dim - 1))
-
-        engine.decode_step(STEPS[0])
-        moved = engine.snapshot_linear_states()
-        self.assertFalse(
-            all(torch.equal(a, b) for index in snap
-                for a, b in zip(snap[index], moved[index])),
-            "one decode step did not advance the linear state; the snapshot is vacuous")
-
+        self.assertIsNotNone(snap)
+        first = engine.decode_step(STEPS[0])
         engine.restore_linear_states(snap)
-        back = engine.snapshot_linear_states()
-        self.assertEqual(sorted(back), sorted(snap))
-        for index in snap:
-            for got, want in zip(back[index], snap[index]):
-                self.assertTrue(torch.equal(got, want), f"layer {index} was not restored")
+        again = engine.decode_step(STEPS[0])
+        self.assertTrue(torch.equal(first, again),
+                        "装回快照后重放同一步的 logits 不同")
 
     def test_foreign_layer_index_raises_key_error(self):
         """来自另一套架构的快照必须报 ``KeyError``，不能恢复一份残缺状态。"""
@@ -504,7 +492,7 @@ class SnapshotTest(unittest.TestCase):
         self.engine.prefill(PROMPT)
         self.engine.zero_linear_states(0)
         self.assertIsNone(self.engine._states)
-        self.assertEqual(self.engine.snapshot_linear_states(), {})
+        self.assertIsNone(self.engine.snapshot_linear_states())
 
 
 class CheckpointBuildTest(unittest.TestCase):
