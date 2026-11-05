@@ -46,7 +46,7 @@ def modules() -> tuple[str, ...]:
     """列出可 import 的厂商模块名，已排序。
 
     Returns:
-        形如 ``"backends.vendors.iluvatar"`` 的点分模块名，每个厂商文件或包一条，
+        形如 ``"backends.vendors.foo"`` 的点分模块名，每个厂商文件或包一条，
         已排序以保证扫描结果确定。目录不存在时返回空元组——对于没有任何厂商
         后端的构建，这是合法状态。
     """

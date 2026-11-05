@@ -1,4 +1,4 @@
-# CoreX 移植工作简报（共用状态板）
+# CoreX 移植工作简报
 
 > 本文件是多 agent 协作的唯一事实来源。**先读完再动手**；做完自己那格就更新它。
 > 目标：让 coffin 的生产代码在同一套源码下同时跑 gfx906（海光 DCU/HIP）和
@@ -22,17 +22,10 @@
 
 **四个会静默出错的坑：**
 
-1. **设备不支持 fp64**：`torch.tensor([1.5,2.5], dtype=float64, device='cuda')*2`
-   得到 `[0.0, 0.0]`（只有 "Limited support" 警告）。所以任何比较都必须
-   **先 `.cpu()` 再 `.double()`**；内核里不要用 fp64。
-2. **cuBLAS 在宽 N 上返回 NaN**：bf16 `[K,N]` 在 `N=248320`（`lm_head`）实测
-   `max|y| == 0` / NaN。参考引擎的 `MAX_GEMV_N=131072` 就是这条。
-   **`lm_head` 必须走自写内核或分块**，不能交给库。
-3. **cuBLAS 无法被 capture**：`torch.cuda.graph` 里做 `x @ w` 报
-   `CUBLAS_STATUS_ALLOC_FAILED`。**但自写内核可以正常 capture + replay**
-   （已实测：replay 后重新读了激活，rel err 2e-6）。所以 decode 的 graph
-   路径只有在我们自己的内核上才成立。
-4. **`F.rms_norm` / `torch.compile` / `scaled_dot_product_attention` 等 2.4+ API 全不存在**。
+1. **设备不支持 fp64**：`torch.tensor([1.5,2.5], dtype=float64, device='cuda')*2`得到 `[0.0, 0.0]`（只有 "Limited support" 警告）。所以任何比较都必须**先 `.cpu()` 再 `.double()`**；内核里不要用 fp64。
+2. **cuBLAS 在宽 N 上返回 NaN**：bf16 `[K,N]` 在 `N=248320`（`lm_head`）实测`max|y| == 0` / NaN。参考引擎的 `MAX_GEMV_N=131072` 就是这条。**`lm_head` 必须走自写内核或分块**，不能交给库。
+3. **`F.rms_norm` / `torch.compile` / `scaled_dot_product_attention` 等 2.4+ API 全不存在**。
+4. **不要使用 cuda graph** 计算卡对 cuda graph 等特性支持很有限，直接 capture 再 graph 会导致卡 hang 住且无法恢复
 
 **实测性能（决定内核怎么写）：**
 
@@ -45,25 +38,21 @@
 | prefill GEMM（库，M=2048） | bf16 与 fp16 **同为 32.6 TFLOP/s**（所以 `weight_dtype` 不必为算力选 fp16） |
 | graph capture | 会把卡给搞坏 |
 
-带宽与形状强相关（同一内核）：`N=9728,K=2560` 168 GB/s、`N=248320` 361 GB/s、
-`N=2560,K=9728` 47 GB/s、`N=2560,K=4096` 63 GB/s。**按首维 N 分档**：
-N 越大越接近上限，小 N 受 launch/占用率限制 → 需要按形状分档或合并投影
-（`GEMVGroup` 的意义在这里）。
+带宽与形状强相关（同一内核）：`N=9728,K=2560` 168 GB/s、`N=248320` 361 GB/s、`N=2560,K=9728` 47 GB/s、`N=2560,K=4096` 63 GB/s。**按首维 N 分档**：N 越大越接近上限，小 N 受 launch/占用率限制 → 需要按形状分档或合并投影（`GEMVGroup` 的意义在这里）。
 
 ---
 
-## 1. 已经定下的设计决定（不要再讨论）
+## 1. 已经定下的设计决定
 
 1. **生产代码不许出现 `hip_ops` / `"cuda"` / `D` / `WF` / `ATTN_SPLIT`**。
    全部改走 `backends.ops`、`backends.device`、`caps.act_dtype`、
    `caps.weight_dtype`、`caps.attn_split`。这是**一切的前置条件**：
-   不改这条，CoreX 后端写了也用不上。
-2. **CoreX 是 `backends/corex/` 手写后端**（不是 `vendors/` 声明），
-   在 `registry.BUILTIN` 里登记。理由：它要带 `kernels/` 和编译路径，
-   声明式 spec 表达不了。
-3. **`vendors/iluvatar.py` 删掉**：真实后端落地后，占位声明就是重复且会误导
-   （它 `has_kernels=False`，探测到卡却不肯用）。`vendors/enflame.py` /
-   `moorethreads.py` 保留。
+2. **CoreX 是 `backends/corex/` 手写后端**（不是 `vendors/` 声明），在 `registry.BUILTIN` 里登记。理由：它要带 `kernels/` 和编译路径，声明式 spec 表达不了。
+3. **`vendors/` 下的占位声明全删**（依次是 `iluvatar.py`、`enflame.py`、
+   `moorethreads.py`）：真实后端落地后，占位声明就是重复且会误导（它
+   `has_kernels=False`，探测到卡却不肯用）；没有内核、也没有一手证据的声明留着，
+   只会让一段读起来很笃定的文档冒充设计约束。目录机制不变：新平台还是丢一个
+   `vendors/<name>.py` 进来。
 4. **权重布局走 `caps.weight_layout`**：CoreX 是 `"kn"`（`[K,N]`，加载时转置一次），
    HIP 是 `"nk"`。契约保持 checkpoint 的 `[N,K]`，转置成本由后端承担。
 5. **`caps.graph`**：CoreX 可以为 `True`（自写内核可 capture），

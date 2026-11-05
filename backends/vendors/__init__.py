@@ -1,6 +1,6 @@
 """厂商后端声明：一个平台一个模块，按文件名发现。
 
-Module: ``coffin/backends/vendors``。这里是一堆声明而不是代码：每个模块定义一份
+Module: ``coffin/backends/vendors``。这里是声明而不是代码：每个模块定义一份
 ``SPEC``，且只 import ``backends.vendor``。加载器是
 :mod:`coffin.backends.discovery`，使用方是 :mod:`coffin.backends.registry`。厂商模块
 永远不得 import ``coffin/ops``、``models``、``engine``、``serving`` 或 ``cache``。
@@ -21,17 +21,16 @@ Module: ``coffin/backends/vendors``。这里是一堆声明而不是代码：每
   照样会被发现、照样能按名字解析、照样由 ``describe_all`` 报出来——只是永远不会被
   自动选中。
 
-本引擎瞄准的平台
+本引擎已经接入的平台
 
-它们的差异是这条接缝必须吸收的，所以检测返回的是认领强度而不是布尔值：
+两家都经由 ``torch.cuda`` 应答，差异只在构建标记和设备名，所以检测返回的是认领强度
+而不是布尔值：
 
 ================  ==============  ==========================================
 平台              torch 命名空间  后端如何识别它
 ================  ==============  ==========================================
 Hygon DCU         cuda            ROCm 构建标记（手写，backends/hip）
 Iluvatar          cuda            设备名——命名空间共享，名字是唯一区别依据
-Enflame           gcu             命名空间本身就为该厂商独有
-Moore Threads     musa            命名空间本身就为该厂商独有
 ================  ==============  ==========================================
 
 Constraints:

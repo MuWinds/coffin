@@ -169,13 +169,6 @@ class Caps:
     #: checkpoint 就是那样；``"kn"`` 后端自己在加载时转置一次，自行承担成本和
     #: 额外缓冲区。
     weight_layout: str = "nk"
-    #: 后端可以传给内核用于位置、槽位表和块索引的整型 dtype。
-    #:
-    #: 默认 ``int64``，因为本引擎的索引张量就是这个类型。有些平台没有 64 位整型
-    #: 通路——Enflame 的 torch_gcu 会静默降级成 32 位并告警，对 ``data_ptr`` 而言
-    #: 这还让报出的地址不可信——所以它们必须声明 ``torch.int32``，由调用方把索引
-    #: 控制在那个范围内，而不是事后才发现被截断。
-    index_dtype: torch.dtype = torch.int64
 
 
 @dataclass(frozen=True, slots=True)

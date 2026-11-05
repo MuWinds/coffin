@@ -12,11 +12,11 @@
 所以加一个平台就是加一个文件，这里一个字都不用改。:func:`candidates` 把两者合并
 成唯一的有序序列，选择、日志和错误文案都读它。
 
-检测用的是**认领强度**而不是布尔值，因为同一个设备可能被多个厂商应答。Iluvatar 的
+检测用的是认领强度而不是布尔值，因为同一个设备可能被多个厂商应答。Iluvatar 的
 CoreX 与 Hygon DCU 一样经由 ``torch.cuda`` 应答，两者都可能看到「存在一个 CUDA
 设备」；匹配到设备*名字*的厂商排在只匹配到命名空间的前面，于是 Iluvatar 的 spec
-胜出。Enflame 和 Moore Threads 上命名空间本身就是唯一的（``gcu``、``musa``），所以
-命名空间认领就够了。这一条规则覆盖两种情形，registry 不必知道有哪些厂商。
+胜出。反过来，命名空间只属于一家厂商时，命名空间认领就够了。这一条规则覆盖两种
+情形，registry 不必知道有哪些厂商。
 
 Module: ``coffin/backends``。与 ``protocol`` 一起位于依赖图底部：它可以 import
 ``torch``、``protocol``、``vendor``、``discovery`` 以及内置后端模块，不得 import

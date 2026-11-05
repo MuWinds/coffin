@@ -4,7 +4,7 @@
 
 * 选择是确定的、可读的：``COFFIN_BACKEND`` 优先，未知或不可用的名字直接报错而
   不是悄悄降级，纯 torch 的参考实现永远是最后一个候选；
-* 参考后端实现了全部 23 个算子，因为 ``hip_ops.available()`` 分支删掉之后，引擎
+* 参考后端实现了全部算子，因为 ``hip_ops.available()`` 分支删掉之后，引擎
   其余部分就靠它兜底。这里留一个 ``None``，就是一个只会在不支持的平台上以请求
   中途崩溃的形式出现的洞。
 
@@ -222,22 +222,6 @@ class RegistryTest(unittest.TestCase):
         self.assertIn("hip", msg)
         self.assertIn("reference", msg)
 
-    def test_every_discovered_placeholder_is_registered_and_explains_itself(self):
-        """能按名字解析出来的厂商文件，正是这个目录存在的意义。
-
-        占位实现仍要回答 ``reason()``：运维刚插上的真实硬件上回一句「未知后端」，
-        会让他们去查部署失误，而不是去查「这个集成还没做」。
-        """
-        for module_name in backends.discovery.modules():
-            vendor = module_name.rsplit(".", 1)[-1]
-            spec, backend = backends.discovery.load(module_name)
-            self.assertEqual(spec.name, vendor)
-            self.assertEqual(backend.name, vendor)
-            self.assertFalse(backend.usable(),
-                             f"{vendor} claims usable with no kernels")
-            self.assertNotEqual(backend.reason(), "",
-                                f"{vendor} is unusable but explains nothing")
-
     def test_hip_probe_rejects_a_cuda_namespace_that_is_not_rocm(self):
         """需要 ROCm 构建标记：光看命名空间认不出这张卡。
 
@@ -280,7 +264,7 @@ class RegistryTest(unittest.TestCase):
 
 
 class ReferenceTotalityTest(unittest.TestCase):
-    """参考后端必须答满 23 个名字：迁移完成后它是唯一的兜底。"""
+    """参考后端必须答满整个算子表：迁移完成后它是唯一的兜底。"""
 
     def test_reference_table_has_no_gaps(self):
         """这里留一个 ``None``，会在每个不支持的平台上以请求中途的形式撞进模型代码。"""
@@ -289,25 +273,6 @@ class ReferenceTotalityTest(unittest.TestCase):
         self.assertEqual(table.implemented(), Ops.NAMES)
         for name in Ops.NAMES:
             self.assertTrue(callable(getattr(table, name)), name)
-
-    def test_every_vendor_table_resolves_to_reference_for_every_op(self):
-        """占位实现今天就得答满 23 个名字：模型那边已经没有回退分支了。
-
-        这条不变量让厂商可以从一个内核起步：它返回的部分表由参考实现补齐，硬件到位
-        的第一天模型就能原样跑起来。
-        """
-        ref = backends.reference.ops()
-        w = torch.randn(4, 3)
-        x = torch.randn(3)
-        for module_name in backends.discovery.modules():
-            _spec, backend = backends.discovery.load(module_name)
-            table = backend.ops()
-            self.assertEqual(table.missing(), (), f"{backend.name} has gaps")
-            for name in Ops.NAMES:
-                self.assertTrue(callable(getattr(table, name)), f"{backend.name}.{name}")
-            # 抽查补齐的确实是参考实现。
-            self.assertTrue(torch.allclose(table.linear(w, x), ref.linear(w, x)),
-                            f"{backend.name}.linear is not the reference op")
 
     def test_fill_keeps_native_entries_and_completes_the_rest(self):
         """解析器是「此处没有内核」变成「跑参考实现」的唯一一处；它坏了就处处都坏。"""
@@ -397,33 +362,13 @@ class NativeRegistrationTest(unittest.TestCase):
             f"bindings.cpp, so calling them raises AttributeError on the card: {missing}"))
 
 
-class VendorExtensionTest(unittest.TestCase):
-    """新增平台必须只是丢一个文件进去，别的都不用改。
+class VendorSpecTest(unittest.TestCase):
+    """声明机制本身：认领强度有序，坏声明在发现阶段就被拒。
 
-    整个层就是按这条性质来评判的：最早两个厂商是靠改三处中央清单接进来的，而平台层
-    随厂商增多而腐化，走的正是这条路。
+    「丢一个厂商文件进去它就是一个后端」那条性质今天没有实测对象——``vendors/``
+    是空的。要测回来就往临时目录造一个文件、把 ``discovery.VENDOR_DIR`` 指过去，
+    不要再为此在树里留一份不起作用的声明。
     """
-
-    def test_a_vendor_file_is_a_complete_backend(self):
-        """声明式路径必须只凭数据造出一个能用的后端。
-
-        在仓库下的临时目录里造一个并把发现过程指过去，这样测的是真实的发现代码而不是
-        桩。哪天这条要改注册表才能通过，就说明这个层退回成了中央清单。
-
-        被测厂商是发现出来的，不是写死的：写死会把这条测试钉到 ``iluvatar`` 上，而那个
-        平台拿到真内核、变成手写后端之后，就不再是声明了。「任意厂商文件」这种性质不
-        应该因为某个厂商毕业而失效。
-        """
-        module_names = backends.discovery.modules()
-        self.assertTrue(module_names, "no vendor declarations found to test with")
-        spec, backend = backends.discovery.load(module_names[0])
-        self.assertIsInstance(spec, backends.VendorSpec)
-        self.assertIsInstance(backend, backends.SpecBackend)
-        # 声明就是完整的后端：协议成员齐全，没有胶水代码。
-        for member in ("probe", "usable", "reason", "ops", "caps", "device"):
-            self.assertTrue(hasattr(backend, member), member)
-        self.assertEqual(backend.ops().missing(), ())
-        self.assertIn(backend.name, backends.available_names())
 
     def test_detection_yields_a_claim_strength_not_a_boolean(self):
         """认领强度是让共享命名空间能被正确解析的东西。
@@ -444,18 +389,6 @@ class VendorExtensionTest(unittest.TestCase):
         tie_b = backends.registry.Candidate("b", backends.reference, claim=1, priority=5)
         self.assertLess(tie_a.rank(), tie_b.rank(),
                         "an exact tie must still order deterministically, by name")
-
-    def test_a_broken_vendor_file_is_reported_not_silently_dropped(self):
-        """导入失败的厂商必须出现在诊断转储里。
-
-        这里守的失效：有人加了一个平台，它的模块一导入就抛，而唯一的症状是
-        ``COFFIN_BACKEND=<name>`` 回一句「未知后端」。
-        """
-        lines = backends.describe_all()
-        joined = "\n".join(lines)
-        for module_name in backends.discovery.modules():
-            vendor = module_name.rsplit(".", 1)[-1]
-            self.assertIn(vendor, joined, f"{vendor} missing from describe_all")
 
     def test_spec_rejects_a_declaration_that_cannot_work(self):
         """校验在发现时跑，不拖到没主硬件上的第一个请求。"""

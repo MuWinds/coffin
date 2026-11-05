@@ -9,9 +9,9 @@
 
 实测目标厂商时冒出一个设计必须吸收的分叉：
 
-* **独立命名空间。** Enflame 暴露 ``torch.gcu``，Moore Threads 暴露 ``torch.musa``
-  ——各自是 ``torch`` 上的属性，都不改写 ``torch.cuda``。这类平台光凭命名空间就能
-  识别厂商。
+* **独立命名空间。** 厂商把设备挂在自己的命名空间上（``torch.gcu``、``torch.musa``
+  这类只为该厂商存在的属性），不改写 ``torch.cuda``。这类平台光凭命名空间就能识别
+  厂商。
 * **共享命名空间。** Iluvatar 的 CoreX 实现的是 CUDA API，所以一张 Iluvatar 卡
   经由 ``torch.cuda`` 应答的方式与本引擎原生的 Hygon DCU 完全一样：
   ``torch.cuda.is_available()`` 为 True，``get_device_name()`` 返回芯片名（已在本
@@ -189,9 +189,6 @@ class VendorSpec:
             达到 362-410 GB/s。契约保持 ``[N, K]``（那是 checkpoint 的布局）；``"kn"``
             后端在加载时转置一次并自担成本，这也是它属于 spec 字段而不属于契约变更的
             原因。
-        index_dtype: 后端可以传给内核用于位置和槽位表的整型 dtype。Enflame 的
-            torch_gcu 没有 I64：它会静默降级到 32 位并告警，所以那里的后端必须声明
-            ``torch.int32``，由调用方把索引控制在范围内。
         priority: 认领强度相等的厂商之间的平局裁决，越小越优。平局算错误而不是靠 import
             顺序解决，因为哪块卡被哪个后端认领不能取决于文件系统顺序。
         notes: 该平台上*未实测*的东西。它会被抄进选择错误的原因里，好让一个声明出来的
@@ -212,7 +209,6 @@ class VendorSpec:
     batch_attn: bool = False
     attn_split: int = 1
     weight_layout: str = "nk"
-    index_dtype: torch.dtype = torch.int64
     priority: int = 100
     notes: str = ""
     has_kernels: bool = False
@@ -340,7 +336,6 @@ class SpecBackend:
             int8_weights=self.spec.int8_weights,
             recurrent_state=True,
             weight_layout=self.spec.weight_layout,
-            index_dtype=self.spec.index_dtype,
         )
 
     def _native_table(self) -> Ops:
