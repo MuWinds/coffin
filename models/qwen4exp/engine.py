@@ -509,6 +509,10 @@ class Qwen4Engine:
         self._capacity = capacity
         self._paged.set_rows(capacity)
         self.prefill_row = capacity - 1
+        # 最后一行是预填充暂存行，不参与解码；``model_runner._claim_row`` 读这个数
+        # 决定能把几条序列放进批里，写死成 1 会让第二个请求直接报
+        # "no free decode row (capacity 1)"，而现场看起来像调度器越界准入。
+        self.decode_capacity = capacity - 1
         # 池子的 dtype 必须跟激活一致。不能读 ``embed_tokens.weight``：量化装载会把
         # 稠密占位权重摘掉，那里是 ``None``（job q4b48 就是这么炸的）。也不能只取
         # "第一个浮点参数"——模型里留着 fp32 的归一化/门控参数，取到它们会让池子
@@ -608,15 +612,18 @@ class Qwen4Engine:
 
         Raises:
             RuntimeError: 没开批。
-            ValueError: ``bucket`` 与批容量不一致。
+            ValueError: ``bucket`` 大于解码行数。
         """
         del rows, pad_rows
         if self._capacity <= 1:
             raise RuntimeError("decode_batch_eager() 需要先 enable_batching(capacity>1)")
-        if int(bucket) != self._capacity:
+        if int(bucket) > self.decode_capacity:
             raise ValueError(
-                f"桶宽 {bucket} 与批容量 {self._capacity} 不一致；行数是池开出来的"
-                "承诺，不能在步中换")
+                f"桶宽 {bucket} 超过解码行数 {self.decode_capacity}；行数是池开出来"
+                "的承诺，不能在步中换")
+        # 按**容量**跑而不是按桶宽跑：状态一次开成 capacity 行，缩到 bucket 行就得
+        # 把状态重排成一次新分配。多出来的行（含预填充暂存行）各自写自己那一行，
+        # 谁也不读；共用游标因此仍然只前进一步。
         ids = torch.tensor([[tok] for tok in self._row_tokens], dtype=torch.long,
                            device=self.pos1.device)
         # 静态批：各行的位置必须相同，否则共用游标的池会把它们写到彼此的位置上。
@@ -625,7 +632,7 @@ class Qwen4Engine:
         self._row_pos = [pos + 1 for pos in self._row_pos]
         self._pos = past + 1
         self.pos1.fill_(self._pos)
-        return logits[:, -1]
+        return logits[:int(bucket), -1]
 
     def _forward_batch(self, ids: torch.Tensor, past: int):
         """跑一段 ``[B, n]`` 的多行前向。

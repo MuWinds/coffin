@@ -329,7 +329,7 @@ class BatchedDecodeEngineTest(unittest.TestCase):
         left_tokens = [5, 7]
         right_tokens = [9, 11]
         batched = fresh()
-        batched.enable_batching(2)
+        batched.enable_batching(3)   # 2 解码行 + 1 预填充暂存行
         rows_out = []
         for step in range(2):
             batched.set_rows([left_tokens[step], right_tokens[step]],
@@ -352,7 +352,7 @@ class BatchedDecodeEngineTest(unittest.TestCase):
 
         engine = Qwen4Engine(build_model(), max_seq=64)
         engine.enable_paging(num_blocks=1, block_size=64)
-        engine.enable_batching(2)
+        engine.enable_batching(3)   # 2 解码行 + 1 预填充暂存行
         engine.set_rows([5, 9], [0, 0], row_indices=[0, 1])
         engine.decode_batch_eager(2, 2)
         snap0 = engine.snapshot_linear_states(row=0)
