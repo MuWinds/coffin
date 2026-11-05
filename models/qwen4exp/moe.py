@@ -336,7 +336,7 @@ class Experts(nn.Module):
         分界取 :data:`_GEMM_MIN_ROWS`。这个数是按「每专家平均行数」定的，而不是
         绝对 tokens——因为决定 GEMV 输赢的是每段有多长：段内只有 1-2 行时张量核的
         64x128 tile 几乎全在做无效行，而段内有上百行时 GEMV 每行都要串行走完 K。
-        实测（``q4prebase3``，``seq=2048``、20480 行散在 128 个专家上、每专家约 160 行）
+        实测 ``seq=2048``、20480 行散在 128 个专家上、每专家约 160 行
         GEMV 结构 22.7 ms/次而同类 GEMM 2.30 ms/次，差 10 倍。
 
         Returns:
@@ -405,9 +405,9 @@ class Experts(nn.Module):
         return table[global_index]
 
     def _local_table(self, device: torch.device) -> torch.Tensor:
-        """取（必要时建一次）全局号到本地下标的查找表。
+        """取全局号到本地下标的查找表。
 
-        这张表只由 ``local_experts`` 与设备决定，**一步 decode 里却是 48 层各调一次**。
+        这张表只由 ``local_experts`` 与设备决定，一步 decode 里却是 48 层各调一次。
         原写法每次 ``torch.full`` + 两次 index_put，就是每层两次分配加两次内核启动；
         实测一步 decode 有 7025 次内核发射、主机侧 227 ms 中有相当比例是这类
         「每层重建一份常量」的胶水（``q4budget2`` / ``q4host1``）。

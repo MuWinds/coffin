@@ -24,7 +24,7 @@
 | `entrypoints/cli/` | 命令行入口：`runtime.py` 启动/控制引擎，`openai.py` 启动 HTTP 适配器 |
 | `utils/tool_call.py` / `agent.py` / `run_chat.py` | tool-call 解析、工具循环、单机入口 |
 | `diag/` | 归因 / 带宽探针与 benchmark（profile、AB、数值对比、`bench_batch.py` 批吞吐） |
-| `tests/` | 功能回归（unittest）：结构、算子、注意力、量化、投机、MTP、分页、批 decode、引擎、OpenAI 协议 |
+| `tests/` | 引擎自身要素的功能回归（unittest）：包结构与模型族注册、分块预填与抢占调度、基数前缀与分页块生命周期、OpenAI 协议、后端选择与后端纯度门禁 |
 
 ## 依赖方向
 
@@ -80,17 +80,17 @@ cache / utils ←  engine/*  ←  serving/ ← entrypoints/cli/
 ## 改完怎么验
 
 ```sh
-# 容器里：结构用例，不读权重、不建图，几秒钟
+# 容器里：整套引擎回归。不读权重、不建图、不要求加速卡，十几秒
 cd /root/private_data/engine
-MKL_THREADING_LAYER=GNU PYTHONPATH=$PWD \
-    python3 -m unittest discover -s tests -p test_structure.py -v
-
-# 整套功能回归（会读权重、建图，约 3~5 分钟）
 MKL_THREADING_LAYER=GNU PYTHONPATH=$PWD python3 -m unittest discover -s tests -v
 
 # 再跑一次真实请求
 python3 run_chat.py --bench -n 32
 ```
+
+`tests/` 只守引擎自身、与具体模型和硬件都无关的要素。接入的模型和硬件会一直
+增加，模型级数值、算子级等价、量化格式、视觉塔这类回归按 `AGENTS.md` 第 10 条
+写在临时目录里跑，不回到这个目录——写在这里的用例会随着模型和硬件的替换一起过时。
 
 推文件：`python tools/push_engine.py --verify`（整个 `coffin/` 的代码，不含
 `diag/` 与权重；要连 diag 一起推就加 `--with-diag`；推到自己的目录用
@@ -119,5 +119,6 @@ python3 run_chat.py --bench -n 32
 2. **`TORCH_EXTENSIONS_DIR` 按部署目录隔离**（如 `/root/private_data/torch_ext_canon`）。
    共享目录时每个新目录都会触发 HIP 全量重编译并抢同一个构建锁，多人并发即死等。
 
-视觉相关的回归：`test_vision.py` / `test_mrope.py` / `test_radix_mm.py` / `test_openai_mm.py`。
-整树一次性跑会因多用例重载 9 GB 权重而 OOM（CUDA 缓存未归还），**逐模块跑全绿**。
+引擎侧与模型无关的那一半：`test_radix_mm.py`（带媒体签名的基数键）与
+`test_openai_mm.py`（OpenAI 图片入口）。视觉塔本身的数值回归按 `AGENTS.md`
+第 10 条写在临时目录，跟着模型一起换。

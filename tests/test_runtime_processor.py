@@ -8,8 +8,8 @@ Constraints:
 """
 
 import json
+import shutil
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,13 +18,19 @@ from unittest.mock import Mock, patch
 from serving.runtime_parts import RuntimeChatMixin
 from serving.runtime_support import MMError
 
+#: 临时配置目录。不用 ``tempfile``：Windows 上 ``mkdtemp`` 建的目录带沙箱令牌的
+#: DACL，写不进也删不掉，整个模块会在 ``setUp`` 里直接报 ``PermissionError``。
+TMP_ROOT = Path(__file__).resolve().parent / ".tmp_runtime_processor"
+
 
 class RuntimeProcessorTest(unittest.TestCase):
     """处理器能力校验必须在发布缓存之前完成。"""
 
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
+        shutil.rmtree(TMP_ROOT, ignore_errors=True)
+        TMP_ROOT.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(shutil.rmtree, TMP_ROOT, ignore_errors=True)
+        self.temp = SimpleNamespace(name=TMP_ROOT)
         self.server = SimpleNamespace(
             model_dir=self.temp.name, processor=None, _processor_failed=None,
             tok=object(), image_min_pixels=65536, image_max_pixels=1048576)

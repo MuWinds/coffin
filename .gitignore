@@ -19,6 +19,12 @@ __pycache__/
 # synthetic trees built by tests/test_backends_purity.py
 .tmp_purity/
 
+# tests/test_structure.py 运行时写出的配置目录
+.tmp_structure/
+
+# tests/test_runtime_processor.py 的临时配置目录
+.tmp_runtime_processor/
+
 # scratch trees from kernel syntax checks and probe runs
 .tmp_cusyn/
 

@@ -414,13 +414,8 @@ ALLOWLISTS: dict[str, dict[str, dict[str, int]]] = {
     },
     "R3_cuda_literal": {
         "probe": {
-            "tests/support.py": 8,
-            "tests/test_attention.py": 3,
             "tests/test_backends.py": 4,
-            "tests/test_mtp.py": 4,
             "tests/test_openai_mm.py": 2,
-            "tests/test_ops.py": 37,
-            "tests/test_vision.py": 18,
             # 归因探针必须按设备计时：夹住设备的唯一手段就是设备侧同步，而 CoreX
             # 把整张卡塞进 torch.cuda 命名空间，写法上没有第二条路。
             "tools/probe_q4_attrib.py": 13,
@@ -434,7 +429,6 @@ ALLOWLISTS: dict[str, dict[str, dict[str, int]]] = {
     },
     "R4_kernels_path": {
         "probe": {
-            "tests/test_attention.py": 1,
         },
         "prod": {
         },
