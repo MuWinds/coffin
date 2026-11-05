@@ -55,6 +55,13 @@ EXPERT_TENSORS = (".mlp.experts.gate_up_proj", ".mlp.experts.down_proj")
 #: 分片名是 ``...ngram_embedding.shard_{k}.weight``，必须按 ``k`` 拼。
 NGRAM_SHARD_MARKER = ".ngram_embedding.shard_"
 
+#: MTP 子树在引擎侧的根前缀。
+#:
+#: checkpoint 与引擎用同一个名字（``mtp.``），因为 ``CausalLM.mtp`` 就挂在顶层；
+#: 这里单独出成常量的理由是装载器要按它做「装不装」的判据，而那个判据出现在
+#: 不止一处（``plan`` 的过滤器、``load_into`` 的账目），散成字面量迟早会有一处漏改。
+MTP_PREFIX = "mtp."
+
 
 class TensorSource(Protocol):
     """一个能按 checkpoint 名取张量的只读源。
@@ -116,11 +123,18 @@ def engine_key(checkpoint_key: str) -> str | None:
     """把 checkpoint 的键名映射成引擎模型的键名。
 
     ``model.language_model.layers.0...`` -> ``model.layers.0...``；
-    ``lm_head.weight`` 原样保留（它在 ``CausalLM`` 顶层）。
-    ``mtp.*`` 与 ``model.visual.*`` 不属于文本塔，返回 ``None``。
+    ``lm_head.weight`` 原样保留（它在 ``CausalLM`` 顶层）；
+    ``mtp.*`` 原样保留（``CausalLM.mtp`` 子树，同样在顶层）；
+    ``model.visual.*`` 不属于文本塔，返回 ``None``。
 
     前缀按**最长匹配**去掉：``model.language_model.`` 必须在 ``model.`` 之前试，
     否则会映射成 ``language_model.layers...``。
+
+    ``mtp.*`` 原样返回是必须的：checkpoint 里就叫 ``mtp.``，而引擎侧 ``CausalLM.mtp``
+    的子树前缀也正是 ``mtp.``。加 ``model.`` 会让它落进 ``TextModel`` 的子树，而
+    它不在那里（``TextModel`` 只有 ``embed_tokens`` / ``layers`` / ``rotary_emb`` /
+    ``hyper_connection_mixer``）。这个映射本身不知道模型有没有建 MTP——「要不要装」
+    由 :func:`plan` 的 ``with_mtp`` 决定。
 
     Args:
         checkpoint_key: checkpoint 里的完整键名。
@@ -135,8 +149,10 @@ def engine_key(checkpoint_key: str) -> str | None:
     if NGRAM_SHARD_MARKER in checkpoint_key:
         raise ValueError(
             f"{checkpoint_key} is an n-gram shard; aggregate the shards before mapping.")
-    if checkpoint_key.startswith("mtp.") or checkpoint_key.startswith("model.visual."):
+    if checkpoint_key.startswith("model.visual."):
         return None
+    if checkpoint_key.startswith("mtp."):
+        return checkpoint_key
     if checkpoint_key.startswith("model.language_model."):
         return ENGINE_PREFIX + checkpoint_key[len("model.language_model."):]
     if checkpoint_key.startswith("model."):
@@ -195,7 +211,8 @@ def plan(source: TensorSource, config: TextConfig,
          with_lm_head: bool = True,
          subtree: str | None = None,
          max_layers: int | None = None,
-         skip_experts: bool = False) -> LoadPlan:
+         skip_experts: bool = False,
+         with_mtp: bool = False) -> LoadPlan:
     """算出每个引擎参数该从源里取哪个张量。
 
     纯规划，不读张量内容——所以本机（没有 safetensors、放不下真实权重）也能验证
@@ -212,6 +229,9 @@ def plan(source: TensorSource, config: TextConfig,
             仍有 48 层，不限制会让规划范围大过模型，校验报"计划张量不是模型参数"。
         skip_experts: 跳过专家栈。量化路径下模型里的专家是 ``W4A8MoEWeight`` 而不
             是 ``nn.Parameter``，bf16 的那两个张量根本不存在，装它只会白读 60 GB。
+        with_mtp: 是否规划 ``mtp.*``。默认 ``False``：主模型不建 MTP 头时那 31 个
+            张量无处安放，规划进来会让校验报「计划张量不是模型参数」。只有
+            ``CausalLM(with_mtp=True)`` 才传 ``True``。
 
     Returns:
         该装什么、切什么、跳过什么的账目。
@@ -228,9 +248,10 @@ def plan(source: TensorSource, config: TextConfig,
     def wanted(target: str) -> bool:
         """这个引擎参数是否在本次规划范围内。
 
-        三条过滤按代价从低到高排：先按层号砍掉裁层剩下的层（省掉最多），再砍
-        专家栈（量化路径下模型里没有这些参数），最后按 ``subtree`` 收窄到单层。
-        顺序不影响结果，只影响每次调用少做几次字符串比较。
+        四条过滤按代价从低到高排：先按层号砍掉裁层剩下的层（省掉最多），再砍
+        专家栈（量化路径下模型里没有这些参数），再砍 MTP 子树（主模型不建时那 31
+        个张量无处安放），最后按 ``subtree`` 收窄到单层。顺序不影响结果，只影响
+        每次调用少做几次字符串比较。
 
         Args:
             target: 引擎侧的参数名。
@@ -240,7 +261,8 @@ def plan(source: TensorSource, config: TextConfig,
         """
         if max_layers is not None:
             # 层号从 ``model.layers.<n>.`` 里取；非层参数（嵌入、末端 mixer、
-            # lm_head）总是要。
+            # lm_head）总是要。MTP 层不走这条判据：它的层号是 48，比任何
+            # ``max_layers`` 都大，但那不代表「裁掉」——它是独立子树。
             marker = "model.layers."
             if marker in target:
                 rest = target.split(marker, 1)[1]
@@ -248,6 +270,8 @@ def plan(source: TensorSource, config: TextConfig,
                 if digits.isdigit() and int(digits) >= max_layers:
                     return False
         if skip_experts and any(target.endswith(marker) for marker in EXPERT_TENSORS):
+            return False
+        if not with_mtp and target.startswith(MTP_PREFIX):
             return False
         if subtree is not None and not target.startswith(subtree):
             return False
@@ -402,7 +426,8 @@ def load_into(model: torch.nn.Module, source: TensorSource, config: TextConfig,
               with_lm_head: bool = True,
               subtree: str | None = None,
               max_layers: int | None = None,
-              skip_experts: bool = False) -> dict:
+              skip_experts: bool = False,
+              with_mtp: bool = False) -> dict:
     """把源里的张量装进模型，并返回加载账目。
 
     Args:
@@ -417,6 +442,8 @@ def load_into(model: torch.nn.Module, source: TensorSource, config: TextConfig,
             给，否则会拿全模型的账目去核对单层的 ``state_dict``。
         max_layers: 只装前 N 层；裁层跑通时用，见 :func:`plan`。
         skip_experts: 不装专家栈；量化路径下见 :func:`plan`。
+        with_mtp: 是否装 ``mtp.*``；见 :func:`plan`。模型必须是用
+            ``CausalLM(with_mtp=True)`` 建的，否则校验会报「计划张量不是模型参数」。
 
     Returns:
         一个字典，含 ``loaded`` / ``skipped`` / ``ngram`` / ``quantized`` 四个计数，
@@ -428,7 +455,8 @@ def load_into(model: torch.nn.Module, source: TensorSource, config: TextConfig,
         ValueError: 形状不符、映射冲突，或计划外的参数名。
     """
     plan_result = plan(source, config, local_experts, with_lm_head, subtree=subtree,
-                       max_layers=max_layers, skip_experts=skip_experts)
+                       max_layers=max_layers, skip_experts=skip_experts,
+                       with_mtp=with_mtp)
     # 量化路径下稠密投影没有 bf16 参数可以 ``copy_``，它们的源张量是 ``W4A8Weight``，
     # 由调用方在装载完成之后交给 ``proj.set_quantized``。这一条必须在 ``verify``
     # 之前算出来：计划里留着这些键，两边都会报错（模型侧说没有源，计划侧说不是参数）。

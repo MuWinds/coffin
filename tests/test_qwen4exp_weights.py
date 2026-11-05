@@ -123,10 +123,26 @@ class TestNameMapping(unittest.TestCase):
         """``lm_head`` 在 ``CausalLM`` 顶层，不属于 ``TextModel``。"""
         self.assertEqual(engine_key("lm_head.weight"), "lm_head.weight")
 
-    def test_non_text_tensors_are_skipped(self):
-        """MTP 与视觉塔不由文本塔持有，映射为 ``None`` 而不是瞎猜一个名字。"""
-        self.assertIsNone(engine_key("mtp.layers.0.mlp.experts.gate_up_proj"))
-        self.assertIsNone(engine_key("mtp.hyper_connection_mixer.hc_norm.weight"))
+    def test_mtp_tensors_map_verbatim(self):
+        """``mtp.*`` 原样返回：引擎侧 ``CausalLM.mtp`` 的子树前缀正是 ``mtp.``。
+
+        加 ``model.`` 会让它落进 ``TextModel`` 的子树，而 ``TextModel`` 只有
+        ``embed_tokens`` / ``layers`` / ``rotary_emb`` / ``hyper_connection_mixer``
+        ——那 31 个张量会在那里**没有归属**，而 ``verify`` 只会报「计划张量不是模型
+        参数」，看不出是前缀的事。
+        """
+        self.assertEqual(engine_key("mtp.fc_embedding.weight"), "mtp.fc_embedding.weight")
+        self.assertEqual(engine_key("mtp.hyper_connection_mixer.hc_norm.weight"),
+                         "mtp.hyper_connection_mixer.hc_norm.weight")
+        # 引擎里 MTP 的专家张量仍然命中 ``EXPERT_TENSORS`` 后缀，所以 EP 切片规则
+        # 对它自动生效、不需要另写一条。
+        self.assertEqual(engine_key("mtp.layers.0.mlp.experts.gate_up_proj"),
+                         "mtp.layers.0.mlp.experts.gate_up_proj")
+        self.assertTrue(engine_key("mtp.layers.0.mlp.experts.gate_up_proj").endswith(
+            ".mlp.experts.gate_up_proj"))
+
+    def test_vision_tensors_are_skipped(self):
+        """视觉塔不由文本塔持有，映射为 ``None`` 而不是瞎猜一个名字。"""
         self.assertIsNone(engine_key("model.visual.patch_embed.proj.weight"))
         self.assertIsNone(engine_key("model.visual.merger.linear_fc1.weight"))
 

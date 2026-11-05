@@ -153,6 +153,29 @@ class TextConfig:
 
     output_gate_type: str | None = None
 
+    #: MTP（多 token 预测）头的层数；``0`` 表示这个 checkpoint 没有 MTP 头。
+    #:
+    #: 真实 checkpoint 是 ``1``（``config.json`` 的 ``mtp_num_hidden_layers``），对应
+    #: 权重里的 31 个 ``mtp.*`` 张量。它**不是** ``num_hidden_layers`` 的一部分：MTP
+    #: 层在草稿模型里被当成第 ``num_hidden_layers`` 号层单独注册，有自己的 KV 缓存，
+    #: 而主干那 48 层不含它。
+    mtp_num_hidden_layers: int = 0
+
+    #: MTP 头是否带自己的词表嵌入表。
+    #:
+    #: 真实 checkpoint 是 ``false``，也就是草稿器**共享**主干的 ``embed_tokens``
+    #: 与 ``lm_head``（``mtp.*`` 里确实没有任何 ``embed_tokens`` / ``lm_head`` 张量，
+    #: 31 个里最接近的只有 ``fc_embedding`` / ``fc_hidden``）。为 ``true`` 时权重里
+    #: 会出现 ``mtp.embed_tokens.weight``，装载器按名字区分，不靠这个开关分支。
+    mtp_use_dedicated_embeddings: bool = False
+
+    #: MTP 各层的 mixer 类型，来自 ``config.json`` 的 ``mtp.layer_types``。
+    #:
+    #: 单独一支字段而不是复用 :attr:`layer_types`：后者的长度被钉死成
+    #: ``num_hidden_layers``，而 MTP 只有 1 层。混在一起会让「48 层主干 + 1 层 MTP」
+    #: 的层表长度校验直接失败。
+    mtp_layer_types: list[str] = field(default_factory=lambda: ["full_attention"])
+
     layer_types: list[str] | None = None
     full_attention_interval: int = 4
 
@@ -393,6 +416,36 @@ class TextConfig:
             return None
         return self.ple_layer_ids.index(one_based)
 
+    @property
+    def mtp_layer_type(self) -> str:
+        """MTP 层自己的 mixer 类型（与主干层表无关）。
+
+        checkpoint 的 ``mtp.layer_types`` 是 ``["full_attention"]``，也就是
+        ``indexed_attention`` 的旧名（见 :data:`_LAYER_TYPE_ALIASES`），所以 MTP 层
+        是**完整 QSA 层**：它带 indexer、会选块、有自己的 KV 与索引 key 池。
+
+        这个属性从 ``mtp.layer_types`` 读而不是写死 ``indexed_attention``：写死会让
+        一个「MTP 换成 GDN」的 checkpoint 静默按 QSA 跑，形状全对、数值全错。
+
+        Returns:
+            :data:`INDEXED_ATTENTION` 或 :data:`LINEAR_ATTENTION`。
+
+        Raises:
+            ValueError: ``mtp_layer_types`` 里有不认识的类型，或长度与
+                ``mtp_num_hidden_layers`` 不符。
+        """
+        if not self.mtp_num_hidden_layers:
+            return INDEXED_ATTENTION
+        types = [_LAYER_TYPE_ALIASES.get(item, item) for item in self.mtp_layer_types]
+        if len(types) != self.mtp_num_hidden_layers:
+            raise ValueError(
+                f"mtp.layer_types has {len(types)} entries but mtp_num_hidden_layers is "
+                f"{self.mtp_num_hidden_layers}.")
+        unsupported = sorted(set(types) - set(LAYER_TYPES))
+        if unsupported:
+            raise ValueError(f"Unsupported MTP layer types: {unsupported}.")
+        return types[0]
+
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "TextConfig":
         """从 ``text_config`` 字典构造。
@@ -420,6 +473,16 @@ class TextConfig:
                 kwargs["ple_layer_ids"] = sorted(set(_as_int_list(value)))
             elif key == "layer_types" and value is not None:
                 kwargs["layer_types"] = list(value)
+            elif key == "mtp" and isinstance(value, dict):
+                # checkpoint 把 MTP 的几何塞在一个嵌套对象里：
+                # ``{"hybrid": true, "layer_types": ["full_attention"],
+                #   "mtp_use_hidden_state_from_layer": null, "num_hidden_layers": 1,
+                #   "rope_theta": 10000000}``。只取它的层类型，其余字段在这里没有
+                # 意思——``num_hidden_layers`` 已经由顶层的 ``mtp_num_hidden_layers``
+                # 给了，而 ``rope_theta`` 与主干同值（都是 1e7）。
+                layers = value.get("layer_types")
+                if layers is not None:
+                    kwargs["mtp_layer_types"] = list(layers)
             elif key == "mrope_section" and value is not None:
                 kwargs["mrope_section"] = _as_int_list(value)
             elif key in known:

@@ -141,6 +141,157 @@ def find_nth_prime_after(start: int, count: int) -> int:
     return prime
 
 
+class HostNGramTable:
+    """常驻 host 内存的 PLE 融合表，按行取到 device。
+
+    ``ngram_embedding`` 是 ``[320001536, 160]`` 的 bf16 张量 = 95.37 GiB。单卡只有
+    31.72 GiB，所以它不可能和权重一起进显存；官方设计就是让它常驻 host RAM（本节点
+    515 GiB 总量、502 GiB 可用）。但 ``F.embedding`` 要求表和下标在**同一个 device**
+    上，因此 :meth:`NGramEmbedding.forward` 的 ``table`` 参数不能直接收 host 张量
+    ——必须先把用到的那几行搬过去。这个类就是那一层。
+
+    为什么不「每步同步查一次」就够：``S=1`` 的 decode 一步只要 ``16`` 行、5120 字节，
+    阻塞式 H2D 大约几微秒，确实是噪声。真正让它值得写成两阶段的是 **prefill**：
+    ``S=2048`` 时是 32768 行、10.5 MB，一次 ``index_select`` 加一次异步拷贝，比按步
+    拆开查快两个数量级，而且能和前面几层的计算重叠。
+
+    Attributes:
+        weight: host 侧的融合表，``[padded_vocab_size, head_dim]``。
+        device: 目标设备。
+    """
+
+    def __init__(self, weight: torch.Tensor, device: torch.device | str,
+                 pin_memory: bool = True) -> None:
+        """接管一张已经在 host 上的表。
+
+        Args:
+            weight: ``[padded_vocab_size, head_dim]``，必须在 CPU 上。
+            device: 目标设备。
+            pin_memory: 用锁页内存做中转缓冲。这一条不是优化：普通页上的
+                ``non_blocking=True`` 会被驱动退化成同步拷贝（``is_pinned()``
+                为假时 pytorch 直接忽略 non_blocking），那时 prefetch 只是
+                多绕一圈、并不会重叠，很难从耗时上看出来。
+
+        Raises:
+            ValueError: ``weight`` 不在 CPU 上，或不是二维。
+        """
+        if weight.dim() != 2:
+            raise ValueError(f"n-gram table must be 2-D, got shape {tuple(weight.shape)}.")
+        if weight.device.type != "cpu":
+            raise ValueError(
+                "HostNGramTable 的 weight 必须在 CPU 上；它之所以存在就是因为"
+                f"这张表进不了显存，收到 {weight.device} 说明调用方放错了地方。")
+        self.weight = weight
+        self.device = torch.device(device)
+        self.head_dim = int(weight.shape[1])
+        want_pin = pin_memory and self.device.type != "cpu"
+        self._pin = want_pin
+        self._stage: torch.Tensor | None = None
+        self._pending: torch.Tensor | None = None
+        self._pending_shape: torch.Size | None = None
+
+    def _check_ids(self, ids: torch.Tensor) -> torch.Tensor:
+        """把下标规整成 ``[N]`` 的 int64，并检查上下界。
+
+        Args:
+            ids: 任意形状的 int64 下标。
+
+        Returns:
+            拉平后的 ``[N]`` int64 张量。
+
+        Raises:
+            ValueError: 下标为负或越界。``index_select`` 自己会抛 ``IndexError``，
+                但它报的是「index out of bounds」，而真正的原因通常是头偏移没加，
+                所以这里把两端的边界都写进消息。
+        """
+        flat = ids.reshape(-1).to(torch.long)
+        if flat.numel():
+            low = int(flat.min())
+            high = int(flat.max())
+            if low < 0 or high >= self.weight.shape[0]:
+                raise ValueError(
+                    f"n-gram 下标越界: [{low}, {high}] 不在 "
+                    f"[0, {self.weight.shape[0]})；请检查 ngram_heads_offsets 是否"
+                    " 已经加到下标上。")
+        return flat
+
+    def gather(self, ids: torch.Tensor) -> torch.Tensor:
+        """按 ``ids`` 取行，返回 device 上的结果。
+
+        Args:
+            ids: ``[..., ngram_heads]`` 的 int64 表行下标（已加头偏移）。
+
+        Returns:
+            ``[..., ngram_heads * head_dim]``，与 :meth:`NGramEmbedding.forward`
+            的返回同形。
+
+        Raises:
+            ValueError: 下标越界。
+        """
+        flat = self._check_ids(ids)
+        rows = torch.index_select(self.weight, 0, flat)
+        return rows.to(self.device).reshape(*ids.shape[:-1], -1)
+
+    def prefetch(self, ids: torch.Tensor) -> None:
+        """把 ``ids`` 对应的行异步拷到 device，结果由 :meth:`wait` 取。
+
+        两阶段之所以成立：``ids`` 只依赖 token 历史、不依赖隐藏状态，所以可以在
+        前向一开始就算出来并开始拷贝，让 H2D 与前面几层的计算重叠。
+
+        Args:
+            ids: ``[..., ngram_heads]`` 的下标。
+
+        Raises:
+            ValueError: 下标越界。
+            RuntimeError: 上一次 :meth:`prefetch` 的结果还没被 :meth:`wait` 取走。
+                中转缓冲会被覆盖，而覆盖发生在拷贝还在飞的时候会静默读到别的行
+                ——那种错只表现为 PLE 注入的数值偏一点。
+        """
+        if self._pending is not None:
+            raise RuntimeError(
+                "上一次 prefetch 的结果还没被 wait 取走；中转缓冲只有一个，"
+                "连续两次 prefetch 会让第一次的拷贝读到被覆盖的行。")
+        flat = self._check_ids(ids)
+        rows = int(flat.numel())
+        # 容量按 4096 行起跳、之后只增不减：decode 只要 16 行，prefill 的 chunk
+        # 会到几万行，按需扩容比每步申请一次锁页内存便宜。
+        cap = 4096 if self._stage is None else int(self._stage.shape[0])
+        if rows > cap:
+            cap = rows
+        if self._stage is None or self._stage.shape[0] != cap:
+            self._stage = torch.empty((cap, self.head_dim), dtype=self.weight.dtype,
+                                      pin_memory=self._pin)
+        stage = self._stage[:rows]
+        torch.index_select(self.weight, 0, flat, out=stage)
+        self._pending = stage.to(self.device, non_blocking=True)
+        self._pending_shape = ids.shape
+
+    def wait(self) -> torch.Tensor:
+        """取回 :meth:`prefetch` 拷过来的行。
+
+        Returns:
+            ``[..., ngram_heads * head_dim]``。
+
+        Raises:
+            RuntimeError: 没有在飞的 prefetch。
+        """
+        if self._pending is None:
+            raise RuntimeError("wait() 之前必须先 prefetch()。")
+        pending = self._pending
+        shape = self._pending_shape
+        self._pending = None
+        self._pending_shape = None
+        return pending.reshape(*shape[:-1], -1)
+
+    def has_pending(self) -> bool:
+        """是否有还没取回的 prefetch。
+
+        Returns:
+            ``True`` 表示 :meth:`wait` 还能取到结果。
+        """
+        return self._pending is not None
+
+
 class NGramEmbedding(nn.Module):
     """哈希短 n-gram 并查一张融合的嵌入表。
 
@@ -332,7 +483,7 @@ class NGramEmbedding(nn.Module):
         return torch.cat(blocks, dim=-1)[:, -input_ids.shape[1]:]
 
     def forward(self, input_ids: torch.Tensor, previous_context: torch.Tensor | None = None,
-                table: torch.Tensor | None = None) -> torch.Tensor:
+                table: torch.Tensor | HostNGramTable | None = None) -> torch.Tensor:
         """查表并把所有头拼回 ``embedding_dim`` 宽。
 
         Args:
@@ -341,7 +492,9 @@ class NGramEmbedding(nn.Module):
             table: 覆盖用的嵌入权重；``None`` 时用模块自己的
                 ``ngram_embedding.weight``。流式模式下必须给：真实表
                 320001536×160 bf16 约 95 GiB，任何单机都放不下，它由调用方按
-                分片取出对应行再传进来。
+                分片取出对应行再传进来。传 :class:`HostNGramTable` 时按行搬到
+                目标 device 后再查——host 张量不能直接喂给 ``F.embedding``，
+                它要求表和下标在同一个 device 上。
 
         Returns:
             ``[B, S, embedding_dim]``。
@@ -351,6 +504,8 @@ class NGramEmbedding(nn.Module):
                 噪声，而形状完全正确。
         """
         ids = self.ngram_ids(input_ids, previous_context)
+        if isinstance(table, HostNGramTable):
+            return table.gather(ids)
         if table is None:
             if self.ngram_embedding is None:
                 raise ValueError(
@@ -542,6 +697,7 @@ class PLELayer(nn.Module):
 
 
 __all__ = [
+    "HostNGramTable",
     "NGramEmbedding",
     "PLELayer",
     "find_nth_prime_after",
@@ -549,3 +705,4 @@ __all__ = [
     "layer_multipliers",
     "splitmix64",
 ]
+

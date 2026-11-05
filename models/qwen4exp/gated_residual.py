@@ -346,9 +346,56 @@ class GatedResidual(nn.Module):
         inject_act.copy_(buf["inject"])
         return buf["mixed"], hyper_input, inject_act
 
+    def combine_and_mix(self, hyper_input: torch.Tensor,
+                        block_output: torch.Tensor,
+                        injection_weights: torch.Tensor | None
+                        ) -> tuple[torch.Tensor, torch.Tensor]:
+        """一次算出「未塌缩的 4 路状态」与「塌缩后的单路」，给 MTP 头收口。
+
+        MTP 头每步要吐两样东西：塌缩后的 ``[B, S, H]`` 喂 lm_head，未塌缩的
+        ``[B, S, hc*H]`` 喂下一个 draft step。这两样是**同一次写回**的两个视角，
+        分开算会把 ``apply_injection`` 的 ``[B,S,hc,H]`` 中间量做两遍。
+
+        Args:
+            hyper_input: 写回前的 4 路状态，``[B, S, hc_count * hidden_size]``。
+            block_output: 末段 MoE 的输出，``[B, S, hidden_size]``。
+            injection_weights: 逐流写门，``[B, S, hc_count]``；``None`` 表示**单位
+                权重**（每路都乘 1）。MTP 的嵌入残差就走这一支。
+
+        Returns:
+            ``(mixed, multi)``：``mixed`` 是读门塌缩后的 ``[B, S, hidden_size]``，
+            ``multi`` 是写回后的 4 路状态 ``[B, S, hc_count * hidden_size]``。
+
+        Raises:
+            ValueError: 前导形状对不上；或本模块带写门（``use_combine=True``）却收到
+                ``None``。层内的两个 mixer 必须用学到的写门，把 ``None`` 当单位权重
+                会静默丢掉那 96 套参数。
+
+        ``hyper_input`` 必须连续，理由与 :meth:`_fused_forward` 相同：融合核按
+        ``ptr + row * width`` 寻址。
+        """
+        if self.block_inject_weight is not None and injection_weights is None:
+            raise ValueError(
+                "combine_and_mix() with injection_weights=None is only for the "
+                "use_combine=False mixer (no learned write gate to apply)")
+        if block_output.shape[:2] != hyper_input.shape[:2]:
+            raise ValueError(
+                "combine_and_mix shape mismatch: "
+                f"block {tuple(block_output.shape)}, hyper {tuple(hyper_input.shape)}.")
+        if injection_weights is None:
+            # 单位权重：块输出复制到每一路、不乘门。拓扑与 apply_injection 相同
+            # （hc 外、H 内），只是那个乘子恒为 1。
+            injection = block_output.unsqueeze(-2).expand(
+                *block_output.shape[:-1], self.hc_count, self.hidden_size)
+            multi = hyper_input + injection.flatten(-2)
+        else:
+            multi = apply_injection(block_output, hyper_input, injection_weights)
+        return self(multi), multi
+
     def forward(
         self, hyper_input: torch.Tensor
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+
         """读门塌缩，可写门时一并给出 4 路状态与逐流写门。
 
         后端原生提供 ``hyper_norm`` / ``hyper_down`` / ``hyper_up`` 且

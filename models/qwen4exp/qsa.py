@@ -90,6 +90,65 @@ class AttentionCache:
         )
 
 
+@dataclass
+class IndexReuse:
+    """一次可复用的**块选择结果**：只存块号，不存「选中了哪些 token」。
+
+    技术报告 §Implementation Details：*"multi-step MTP reuses top-k indices across
+    prediction steps to further reduce draft-model inference costs"*，照的是 GLM 的
+    做法。vLLM 的 ``QSAIndexer.skip_topk`` 把它实现成「整个选择行原样返回」，而
+    **coffin 不能照抄**，两条例由都是本仓的既有事实：
+
+    1. coffin 的 QSA 掩码是**当步 kv_length 宽的稠密 bool**（:meth:`QSAIndexer.select`
+       返回 ``[B, 1, S, kv_length]``），而草稿链上每一步的 ``kv_length`` 都不同。
+       复用一个旧宽度的掩码形状直接对不上。
+    2. :meth:`QSAIndexer.select` 在 ``max_blocks <= block_topk`` 时有一条整段快路径，
+       结果**逐位等于 visible**。``block_topk = 2048/4 = 512``，所以短上下文全部落在
+       这条路径上——那里「复用选择」等于复用整个可见掩码，必错。
+
+    所以只复用**段 A**（块打分 + top-k 得到的块号），**段 B**（尾部槽位）永远按当步
+    ``visible`` 重算。于是：
+
+    * 尾部恒包含当前位置，最新 token 不会掉出可见集（上游整行复用会让
+      ``p+1`` 的 query 看不到它自己）；
+    * 因果性严格成立：段 A 的块集合来自 ``[0, p]``、段 B 的尾部来自当步可见集，
+      两者都 ⊆ 当步可见集，只会少看、不会多看；
+    * 近似只剩「``[p+1, p+k]`` 区间里新凑满的那几个块没被选中」，占比
+      ``k / (kv_length / ratio)``。
+
+    Attributes:
+        picked: 段 A 选出的块号，``[rows, max_picked]``。
+        max_blocks: 产出这份块表时的 ``max_blocks``。下一次调用必须一致——不一致
+            说明上下文长度跨了一整块，块号的含义已经变了。
+        ratio: 产出时的 ``compress_ratio``。块宽是块号含义的一部分，也必须一致。
+    """
+
+    picked: torch.Tensor
+    max_blocks: int
+    ratio: int
+
+    def check(self, max_blocks: int, ratio: int) -> None:
+        """确认这份块表还能用在这一次选块上。
+
+        Args:
+            max_blocks: 本次的块数上界。
+            ratio: 本次的压缩比。
+
+        Raises:
+            ValueError: 块数或压缩比与产出时不一致。静默沿用会让块号指到别的
+                位置——形状合法、选出来的 token 全错。
+        """
+        if ratio != self.ratio:
+            raise ValueError(
+                f"reusable block table used compress_ratio={self.ratio} but this call "
+                f"needs {ratio}; block ids are not comparable across ratios.")
+        if max_blocks != self.max_blocks:
+            raise ValueError(
+                f"reusable block table was built for max_blocks={self.max_blocks} but "
+                f"this call has {max_blocks}; the context crossed a block boundary and "
+                "the block ids no longer address the same tokens.")
+
+
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """把 KV 头复制成 Q 头的份数。
 
@@ -234,7 +293,9 @@ class QSAIndexer(nn.Module):
     def select(self, query: torch.Tensor, raw_keys: torch.Tensor,
                visible: torch.Tensor,
                full_cos: torch.Tensor, full_sin: torch.Tensor,
-               kv_length: int) -> torch.Tensor:
+               kv_length: int,
+               reuse: "IndexReuse | None" = None,
+               out_reuse: list | None = None) -> torch.Tensor:
         """批量选块：所有 query 的块打分拼成一次 matmul、一次 top-k。
 
         参考实现是 ``B * S`` 次 Python 循环，每次都是 nonzero / index_select /
@@ -258,10 +319,20 @@ class QSAIndexer(nn.Module):
             full_cos: 全表余弦 ``[B, T, rotary_dim]``。
             full_sin: 全表正弦，同形状。
             kv_length: 掩码的最后一维宽度。
+            reuse: 跨投机步复用来的**块选择结果**（:class:`IndexReuse`）。给了就
+                跳过段 A（块池化 + 打分 + top-k），**但段 B 照常按当步 ``visible``
+                重算**。理由见 :class:`IndexReuse`。
+            out_reuse: 非空列表时，本函数把段 A 的结果（一个 :class:`IndexReuse`）
+                append 进去。草稿链的步 0 用它留下 step 1+ 要复用的块表；主干层传
+                ``None``，不产生任何额外对象。
 
         Returns:
             ``[B, 1, S, kv_length]`` 的 bool 掩码：选中块的全部 token、加上不足
             一整块的尾部。
+
+        Raises:
+            ValueError: ``reuse`` 的块表宽度与本次 ``max_blocks`` 不符。那说明两次
+                调用的上下文长度差得太多，复用的块号已经失去意义。
         """
         batch, seq = query.shape[:2]
         rows = batch * seq
@@ -307,6 +378,12 @@ class QSAIndexer(nn.Module):
         # 覆盖范围很大：``block_topk = budget / ratio = 2048 / 4 = 512``，而
         # ``max_blocks = floor(kv_length / ratio)``，所以 ``kv_length <= 2048`` 都走这里
         # —— 短上下文 decode 与中小 prefill 全包含在内。
+        #
+        # **这条路径下复用是无害的**（值得写下来，因为 ``IndexReuse`` 的注里点名了
+        # 它）：既然全部块都被选中，正确答案就是 ``visible`` 本身，而 ``visible``
+        # 本来就是当步算的。所以草稿链从短上下文跨进长上下文时，``reuse`` 会被
+        # 忽略、结果仍然正确；反过来从长上下文退回短上下文时同理。真正需要
+        # 「复用块、重算尾」的只有下面那条慢路径。
         if max_blocks <= self.block_topk:
             if visible.dtype == torch.bool:
                 return visible
@@ -334,19 +411,25 @@ class QSAIndexer(nn.Module):
         if max_blocks > 0:
             table = self._block_table(entry_rows, entry_cols, entry_rank, block_part,
                                       rows, max_blocks, ratio)
-            keys = self._batched_block_keys(raw_keys, table, rows, seq, tokens,
-                                            full_cos, full_sin, batch)
-            scores = torch.matmul(
-                query.reshape(rows, -1, head_dim).float(),
-                keys.float().transpose(1, 2)).transpose(1, 2)
-            # relu 逐头施加、在求和之前；除数是 sqrt(index_head_dim)。
-            scores = torch.relu(scores).sum(dim=-1) / math.sqrt(head_dim)
-            # 够不着 max_blocks 的槽位是补出来的 -1 块，必须先压成 -inf 再 top-k，
-            # 否则它们会被选进结果、再散写成越界的 token 下标。
-            block_rank = torch.arange(max_blocks, device=query.device)
-            scores = scores.masked_fill(
-                block_rank.unsqueeze(0) >= num_blocks.unsqueeze(1), float("-inf"))
-            picked = scores.topk(max_picked, dim=1).indices
+            if reuse is not None:
+                # 段 A 复用：块池化、打分、top-k 全部跳过，只把块号搬过来。这就是
+                # 上游 ``skip_topk`` 省下的那一整串。
+                reuse.check(max_blocks, ratio)
+                picked = reuse.picked
+            else:
+                keys = self._batched_block_keys(raw_keys, table, rows, seq, tokens,
+                                                full_cos, full_sin, batch)
+                scores = torch.matmul(
+                    query.reshape(rows, -1, head_dim).float(),
+                    keys.float().transpose(1, 2)).transpose(1, 2)
+                # relu 逐头施加、在求和之前；除数是 sqrt(index_head_dim)。
+                scores = torch.relu(scores).sum(dim=-1) / math.sqrt(head_dim)
+                # 够不着 max_blocks 的槽位是补出来的 -1 块，必须先压成 -inf 再
+                # top-k，否则它们会被选进结果、再散写成越界的 token 下标。
+                block_rank = torch.arange(max_blocks, device=query.device)
+                scores = scores.masked_fill(
+                    block_rank.unsqueeze(0) >= num_blocks.unsqueeze(1), float("-inf"))
+                picked = scores.topk(max_picked, dim=1).indices
             offsets = torch.arange(ratio, device=query.device)
             slot = torch.arange(rows, device=query.device).unsqueeze(1)
             # 选中块的 token 在规整表里是连续的一段，一次 index_select 就展平回
@@ -354,6 +437,9 @@ class QSAIndexer(nn.Module):
             picked_tokens = table.reshape(-1).index_select(
                 0, ((slot * (max_blocks * ratio) + picked * ratio).unsqueeze(-1)
                     + offsets).reshape(-1)).view(rows, max_picked * ratio)
+            # 段 B **永远按当步 visible 重算**：尾部不看复用来的任何东西。这就是
+            # coffin 与上游必须分开的那一处——上游整行复用会把过期尾部一起搬过来，
+            # 于是位置 ``p+1`` 的 query 看不到它自己。
             tail_rows = entry_rows[tail_part]
             tail_tokens = entry_cols[tail_part]
         else:
@@ -370,6 +456,11 @@ class QSAIndexer(nn.Module):
             selected[:, :max_picked * ratio] = picked_tokens
         if tail_rows.numel():
             selected.view(-1)[tail_rows * width + tail_slot[tail_part]] = tail_tokens
+        if out_reuse is not None:
+            # 把段 A 的结果交出去，供草稿链后续步复用。只在真的做了选择时才有
+            # 意义：``reuse is not None`` 时 ``picked`` 就是搬过来的那一份，再存一次
+            # 没有坏处，但调用方不该期待它变成新的来源。
+            out_reuse.append(IndexReuse(picked=picked, max_blocks=max_blocks, ratio=ratio))
         return self.dense_mask(selected.view(batch, seq, width), kv_length)
 
     def _flatten_visible(self, visible: torch.Tensor, rows: int,
@@ -620,7 +711,9 @@ class QSAIndexer(nn.Module):
     def forward(self, hidden_states: torch.Tensor,
                 position_embeddings: tuple[torch.Tensor, torch.Tensor],
                 attention_mask: torch.Tensor,
-                past_index_keys: torch.Tensor | None = None
+                past_index_keys: torch.Tensor | None = None,
+                reuse: "IndexReuse | None" = None,
+                out_reuse: list | None = None
                 ) -> tuple[torch.Tensor, torch.Tensor]:
         """算索引器掩码，同时把本步的原始 key 交还给调用方去缓存。
 
@@ -633,7 +726,17 @@ class QSAIndexer(nn.Module):
                 ``None`` 表示这是第一步。块池化必须看到**全部**历史 key——只拿
                 当前 chunk 的 key 去索引绝对下标会越界，而就算不越界，选出来的块
                 也不是模型训练时选的那些。
+            reuse: 跨投机步复用的**块选择结果**（:class:`IndexReuse`），或 ``None``
+                表示本步自己选块。
 
+                MTP 的跨投机步复用走这一支：技术报告明确写了 *"multi-step MTP
+                reuses top-k indices across prediction steps"*，vLLM 的
+                ``Qwen4ExpMultiTokenPredictor.set_skip_topk`` /
+                ``compact_topk_indices`` 就是这件事。coffin 只复用**段 A（块号）**、
+                段 B（尾部）按当步可见集重算——理由见 :class:`IndexReuse`，那里也
+                写了为什么不能照抄上游的整行复用。
+            out_reuse: 非空列表时把本步段 A 的结果 append 进去，供草稿链后续步
+                复用。主干层传 ``None``。
         Returns:
             ``(selected_token_mask, raw_keys)``。掩码的语义**跟随入参**：
             bool 掩码进、bool 掩码出；加性浮点掩码进，则出"选中=0 / 未选中=
@@ -669,7 +772,8 @@ class QSAIndexer(nn.Module):
             raise ValueError(
                 f"indexer pool has {all_keys.shape[1]} tokens but the mask covers "
                 f"{kv_length}; pass past_index_keys for cached steps.")
-        mask = self.select(query, all_keys, visible, full_cos, full_sin, kv_length)
+        mask = self.select(query, all_keys, visible, full_cos, full_sin, kv_length,
+                           reuse=reuse, out_reuse=out_reuse)
         if attention_mask.is_floating_point():
             # 浮点掩码路径下参考实现也返回加性掩码：选中 0、未选中 finfo.min。
             mask = _additive_mask(mask, attention_mask.dtype)
@@ -779,7 +883,9 @@ class Attention(nn.Module):
     def forward(self, hidden_states: torch.Tensor,
                 position_embeddings: tuple[torch.Tensor, torch.Tensor],
                 attention_mask: torch.Tensor,
-                cache: AttentionCache | None = None
+                cache: AttentionCache | None = None,
+                reuse: "IndexReuse | None" = None,
+                out_reuse: list | None = None,
                 ) -> tuple[torch.Tensor, AttentionCache]:
         """跑一次 QSA 前向。
 
@@ -788,6 +894,9 @@ class Attention(nn.Module):
             position_embeddings: 全表 ``(cos, sin)``，``[B, T, rotary_dim]``。
             attention_mask: 4 维因果掩码。
             cache: 之前的 KV 与索引器池；``None`` 表示从空上下文开始。
+            reuse: 选块复用结果（:class:`IndexReuse`），只给草稿链的步 1+ 用。
+            out_reuse: 非空列表时把本步的块选择结果 append 进去；草稿链的步 0 靠
+                它把结果留给后续步。
 
         Returns:
             ``(attn_output, cache)``。``cache`` 是新的一份，调用方决定要不要保留。
@@ -798,7 +907,7 @@ class Attention(nn.Module):
         past_index_keys = None if cache is None else cache.index_keys
         selected_token_mask, raw_index_keys = self.indexer(
             hidden_states, position_embeddings, attention_mask,
-            past_index_keys=past_index_keys)
+            past_index_keys=past_index_keys, reuse=reuse, out_reuse=out_reuse)
         # 交集，不是并集：索引器只能从因果集合里**删**，写成并集会泄露未来 token。
         # 两种掩码的语义在这里对齐：bool 走 `&`，加性浮点走相加。
         if attention_mask.dtype == torch.bool:
