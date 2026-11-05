@@ -98,7 +98,7 @@ def build_config(raw: dict, layers: int, keep_ple: bool = False) -> object:
 
 
 def build_model(config, quantized: bool, rank: int | None, world: int,
-                device: torch.device) -> CausalLM:
+                device: torch.device, combine: "callable | None" = None) -> CausalLM:
     """建一个裁层后的 ``CausalLM``。
 
     量化路径**不**在这里落设备：``Experts`` 的专家栈在 ``quantized=True`` 下是 meta
@@ -112,6 +112,7 @@ def build_model(config, quantized: bool, rank: int | None, world: int,
         rank: EP 分片的本 rank 编号；``None`` 表示单卡全量。
         world: EP 进程数。
         device: 目标设备。
+        combine: 路由专家输出的跨 rank 归约闭包；``None`` 表示单卡。
 
     Returns:
         空权重的模型；量化路径下它的专家栈仍是 meta，需要调用方接着挂产物。
@@ -121,7 +122,7 @@ def build_model(config, quantized: bool, rank: int | None, world: int,
         per = config.num_experts // world
         local_experts = list(range(rank * per, (rank + 1) * per))
     model = CausalLM(config, local_experts=local_experts, stream_ngram=True,
-                     quantized=quantized, combine=None, with_mtp=False)
+                     quantized=quantized, combine=combine, with_mtp=False)
     return model if quantized else model.to(device)
 
 
