@@ -16,7 +16,8 @@
    切得动），所以这里按**参数名**决定切哪一维，不看形状。
 3. **n-gram 分片拼接**：checkpoint 把那张 320001536 行的表切成 128 个
    ``shard_k.weight``，必须按 ``k`` 的顺序拼成一张。拼错顺序不会报错——哈希查到的
-   是另一行，检索质量下降而已。
+   是另一行，检索质量下降而已。常驻 host RAM 的路径不拼：:func:`load_host_ngram_table`
+   保持 128 个映射视图，行号按整除落片，那 102.4 GB 从头到尾只有一份。
 
 Module: ``coffin/models/qwen4exp``。族内的 I/O 边界：它 import ``config`` 和
 ``model``，但反过来不被它们 import。不 import ``transformers``。
@@ -28,19 +29,27 @@ Constraints:
     * 大表（n-gram 95 GiB）不加载，只校验几何。见 ``stream_ngram``。
     * 这个模块不允许出现设备假设：源返回什么就装什么，转 dtype 与转设备由调用方
       通过 ``prepare`` 决定。
+    * 这个模块的顶层 import 里不能出现 ``checkpoint`` / ``ngram``：前者要
+      ``safetensors``、后者会顺着 ``proj`` 把 ``backends`` 拉进来，而 ``plan`` /
+      ``verify`` 那条纯规划路径不该为一次不会发生的装载付这份代价。所以
+      :func:`load_host_ngram_table` 在函数体内 import。
 """
 
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import torch
 
 from models.qwen4exp.config import TextConfig
+
+if TYPE_CHECKING:
+    from models.qwen4exp.checkpoint import ShardIndex
+    from models.qwen4exp.ngram import ShardedHostNGramTable
 
 #: 多模态 checkpoint 里文本塔的前缀（``Qwen4ExpForConditionalGeneration`` 的布局）。
 TEXT_PREFIXES = ("model.language_model.", "model.")
@@ -549,6 +558,103 @@ def _gather_ngram(source: TensorSource,
     return torch.cat(parts, dim=0)
 
 
+def load_host_ngram_table(model_dir: str | Path, config: TextConfig,
+                          device: torch.device | str = "cpu",
+                          pin_memory: bool = True,
+                          index: ShardIndex | None = None,
+                          opener: Callable[..., Any] | None = None
+                          ) -> ShardedHostNGramTable:
+    """把 PLE 的 n-gram 表按 checkpoint 的 128 个分片装进 host RAM，**不复制、不拼表**。
+
+    为什么保持分片而不是 ``torch.cat`` 成一张：拼表要多占一份 102.4 GB 的匿名页，
+    启动还要多走一遍 102 GB 的 ``memcpy``（分钟级），而这张表一步只被读到几十行。
+    分片视图由 ``safetensors`` 的文件映射提供，占的是 page cache，不是常驻匿名页。
+
+    几何按 checkpoint 自己的层号反推：分片名里带着 PLE 在第几层，用它算
+    ``ple_layer_index`` 才能得到与模型一致的行数——``ple_layer_index`` 参与头偏移，
+    用 0 去算别的层会得到另一组质数、另一个总行数。
+
+    Args:
+        model_dir: 权重目录（含 ``*.safetensors``）。
+        config: 文本配置；表的总行数与宽度由它的 PLE 几何决定。
+        device: 目标设备。表本身永远在 host 上，这只是后面按行取到哪去。
+        pin_memory: 用锁页内存做中转，见 ``ngram.HostNGramTable``。
+        index: 复用调用方已经建好的 header 索引，省掉重扫 131 个分片；``None``
+            表示现建一份。多 rank 或多张表共用同一份索引时用它。
+        opener: 打开分片的方式，``(名字, 路径)`` 列表 -> 视图集合；``None`` 用
+            ``checkpoint.open_shard_tensors``（safetensors 的文件映射）。
+            开发机上没有 ``safetensors``，测试靠它注入一个纯 torch 的读取器，
+            装载与寻址走的仍然是下面这一条路径。
+
+    Returns:
+        分片视图拼成的表；行号 ``r`` 落在第 ``r // rows_per_shard`` 片的第
+        ``r % rows_per_shard`` 行。
+
+    Raises:
+        ValueError: 找不到 n-gram 分片、分片号不连续、行数/宽度与配置不符，或那张
+            表挂在非 PLE 层上。
+        FileNotFoundError: 目录里没有 ``*.safetensors``。
+        ImportError: 环境里没有 ``safetensors`` 且没给 ``opener``。
+    """
+    from models.qwen4exp import checkpoint
+    from models.qwen4exp.ngram import NGramEmbedding, ShardedHostNGramTable
+
+    # 这两个 import 放在函数体内：纯规划路径（`plan` / `verify`）不该为了它们把
+    # safetensors 和 backends 拉进来，见文件头的 Constraints。
+    if opener is None:
+        opener = checkpoint.open_shard_tensors
+    if index is None:
+        index = checkpoint.build_index(model_dir)
+    groups = _ngram_groups(index.locations.keys())
+    if len(groups) != 1:
+        raise ValueError(
+            f"{model_dir} 里有 {len(groups)} 张 n-gram 表，预期的是一张"
+            f"（{', '.join(sorted(groups)) or '没有'}）；多张表的行号空间互不相通。")
+    stem, shards = next(iter(groups.items()))
+    for expected, (_, shard_index) in enumerate(shards):
+        if shard_index != expected:
+            raise ValueError(
+                f"n-gram 分片号不是从 0 开始的连续整数：缺第 {expected} 片"
+                f"（已有 {[item[1] for item in shards][:5]}...）。少一片会让"
+                "所有行号的整除映射整体错位。")
+    engine_name = engine_key(stem + ".weight") or ""
+    stem_prefix = ENGINE_PREFIX + "layers."
+    if not engine_name.startswith(stem_prefix):
+        raise ValueError(f"n-gram 表不在层栈里: {engine_name}；它必须以 layers.<n>. 开头。")
+    layer_idx = int(engine_name[len(stem_prefix):].split(".", 1)[0])
+    ple_layer_index = config.ple_layer_index(layer_idx)
+    if ple_layer_index is None:
+        raise ValueError(
+            f"{engine_name} 挂在第 {layer_idx} 层上，而 config.ple_layer_ids="
+            f"{config.ple_layer_ids} 里没有对应的 PLE 层。")
+    geometry = NGramEmbedding(config, int(config.ple_embed_dim), layer_idx,
+                              ple_layer_index, stream=True)
+
+    mapped = opener([(key, index.locations[key]) for key, _ in shards])
+    try:
+        views = mapped.tensors
+        rows_per_shard = int(views[0].shape[0])
+        total_rows = rows_per_shard * len(views)
+        # 128 × 2500012 必须恰好等于 320001536：行号用的是整除映射，行数对不上时
+        # 每一片都会从错误的位置开始读，而形状完全合法。
+        if total_rows != geometry.padded_vocab_size:
+            raise ValueError(
+                f"n-gram 分片共 {len(views)} × {rows_per_shard} = {total_rows} 行，"
+                f"与配置算出的 {geometry.padded_vocab_size} 行不符"
+                f"（每片应为 {geometry.padded_vocab_size // len(views)} 行）。")
+        width = int(views[0].shape[1])
+        if width != geometry.head_dim_per_ngram:
+            raise ValueError(
+                f"n-gram 分片每行 {width} 个元素，模型要的是 "
+                f"{geometry.head_dim_per_ngram}。")
+        table = ShardedHostNGramTable(views, device=device, pin_memory=pin_memory,
+                                      mapped=mapped)
+    except BaseException:
+        mapped.close()
+        raise
+    return table
+
+
 def read_config(model_dir: str | Path) -> dict:
     """读 checkpoint 目录里的 ``config.json``。
 
@@ -634,6 +740,7 @@ __all__ = [
     "TensorSource",
     "engine_key",
     "iter_checkpoint_keys",
+    "load_host_ngram_table",
     "load_into",
     "plan",
     "read_config",

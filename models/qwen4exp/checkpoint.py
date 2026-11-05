@@ -12,6 +12,7 @@
 * **n-gram 表不预读**：单张表 95 GiB，任何路径下都不许整个 load 起来。它的 128 个
   分片由 :class:`StreamingSource` 按需一次读一片，``weights.load_into`` 负责拼接；
   真要装进一张表就要求调用方有对应内存，所以默认路径是 ``stream_ngram=True``。
+  常驻 host RAM 的那条路走 :func:`open_shard_tensors`：拿到的是文件映射视图，不复制。
 
 Module: ``coffin/models/qwen4exp``。族内的 I/O 边界；依赖 ``safetensors``，
 **只在集群上有**，所以导入放在方法内部——本机 import 本模块不应该失败。
@@ -23,11 +24,14 @@ Constraints:
       非连续视图，后续 ``copy_`` 到参数上会慢一个数量级。
     * 不在这里做 dtype 转换：目标参数什么 dtype 由 ``load_into`` 的 ``prepare``
       决定，多转一次就多一份峰值内存。
+    * 文件映射视图**不许** ``.contiguous()``：那会把整片复制成匿名页，128 片就是
+      102.4 GB。要保活的是句柄，见 :class:`MappedShards`。
 """
 
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -92,6 +96,73 @@ def build_index(model_dir: str | Path) -> ShardIndex:
                 index.dtypes[name] = str(slice_info.get_dtype())
                 index.shapes[name] = list(slice_info.get_shape())
     return index
+
+
+@dataclass
+class MappedShards:
+    """一组指向 safetensors 文件映射的张量视图，连同让映射保持有效的句柄。
+
+    ``safe_open(...).get_slice(name).get_tensor()`` 返回的是**文件映射上的视图**，
+    不是拷贝。102.4 GB 的 n-gram 表因此可以"装进 host RAM"而不真占 102.4 GB 匿名页
+    ——它占的是 page cache，随用随换出。代价是句柄必须活到视图被用完：句柄关掉之后
+    那块映射不再保证有效，读到的是未定义内存，而且不会报错。
+
+    Attributes:
+        tensors: 张量视图，顺序与打开时传入的 ``(名字, 路径)`` 一致。
+        handles: 保住映射的对象（``safe_open`` 的句柄），由 :meth:`close` 释放。
+    """
+
+    tensors: list[torch.Tensor] = field(default_factory=list)
+    handles: list[Any] = field(default_factory=list, repr=False)
+
+    def close(self) -> None:
+        """释放句柄。之后任何指向这些映射的视图都不再有效。"""
+        for handle in self.handles:
+            release = getattr(handle, "close", None)
+            if release is not None:
+                release()
+        self.handles.clear()
+        self.tensors.clear()
+
+
+def open_shard_tensors(names_and_paths: Sequence[tuple[str, Path]]) -> MappedShards:
+    """按 ``(张量名, 分片路径)`` 打开 safetensors 里的张量，返回映射视图。
+
+    用 ``get_slice`` 而不是 ``StreamingSource.get``：后者会 ``.contiguous()``，等于
+    把整个分片复制成匿名页，128 片就是 102.4 GB 的额外内存；这里要的恰恰是不复制。
+
+    Args:
+        names_and_paths: 分片内的完整张量名与它所在的文件，按分片号升序。
+
+    Returns:
+        与输入同序的视图集合，连同保住映射的句柄。调用方负责在释放表之后调
+        :meth:`MappedShards.close`。
+
+    Raises:
+        ImportError: 环境里没有 ``safetensors``（本机就是这样）。
+        KeyError: 名字不在那个分片里。
+    """
+    from safetensors import safe_open
+
+    mapped = MappedShards()
+    try:
+        for name, path in names_and_paths:
+            handle = safe_open(str(path), framework="pt")
+            mapped.handles.append(handle)
+            view = handle.get_slice(name)
+            # ``safetensors`` 0.8 的 ``PySafeSlice`` 没有 ``get_tensor()``（只有
+            # ``__getitem__`` 与 ``get_shape``/``get_dtype``），整表取用 ``view[:]``。
+            # 两条路返回的都是 mmap 上的视图而不是拷贝——实测同形 445 MiB 张量
+            # ``view[:]`` 0.57 ms、``get_tensor`` 0.10 ms，而真拷贝要 100 ms 量级，
+            # 且两者 ``data_ptr`` 相同。这一点是本函数存在的全部理由，退回
+            # ``StreamingSource.get`` 就等于把 102.4 GB 复制成匿名页。
+            getter = getattr(view, "get_tensor", None)
+            mapped.tensors.append(getter() if getter is not None else view[:])
+    except BaseException:
+        # 中途失败时已经打开的句柄不能让它们悬着：Windows 上会连带锁住目录。
+        mapped.close()
+        raise
+    return mapped
 
 
 class StreamingSource:
@@ -211,9 +282,11 @@ def assert_inventory_matches(model_dir: str | Path, inventory_path: str | Path) 
 
 
 __all__ = [
+    "MappedShards",
     "SHARD_SUFFIX",
     "ShardIndex",
     "StreamingSource",
     "assert_inventory_matches",
     "build_index",
+    "open_shard_tensors",
 ]

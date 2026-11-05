@@ -304,7 +304,7 @@ def chunk_gated_delta_rule(query: torch.Tensor, key: torch.Tensor, value: torch.
     #
     # 求解**不能**用 ``torch.linalg.solve_triangular``：本卡 torch wheel 会去
     # ``dlopen`` 一个不存在的 ``libcusolver.so``，每条 ``torch.linalg`` 求解路径都
-    # 直接抛错。``backends/corex/kernels/solve.cu`` 就是为这件事写的，所以这里走
+    # 直接抛错。CoreX 后端的 ``solve.cu`` 就是为这件事写的，所以这里走
     # :func:`solve_triangular`——它在没有 CoreX 时回退到 torch，在卡上走内核。
     new_values = solve_triangular(ut_system, v_beta, unitriangular=True)
     k_cumdecay = solve_triangular(ut_system, decayed_k_beta, unitriangular=True)

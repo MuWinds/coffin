@@ -85,7 +85,11 @@ class Group:
 
 
 PROD = Group("prod", ())
-PROBE = Group("probe", ("tests/",))
+#: ``tools/`` 与 ``tests/`` 同档：两边都是诊断与工具代码，不是被引擎 import 的运行时，
+#: 也就没有「不点名某一家设备栈」这条义务。算进 ``prod`` 会把只能在 CoreX 上跑的
+#: 探针判成违规，而唯一能过门的写法是让探针不做 ``synchronize``——那样量到的设备
+#: 时间就是错的。区分仍然有意义：``prod`` 的允许列表必须恒为空。
+PROBE = Group("probe", ("tests/", "tools/"))
 SHIPPED = (PROD,)
 WITH_PROBES = (PROBE, PROD)
 
@@ -417,6 +421,9 @@ ALLOWLISTS: dict[str, dict[str, dict[str, int]]] = {
             "tests/test_openai_mm.py": 2,
             "tests/test_ops.py": 37,
             "tests/test_vision.py": 18,
+            # 归因探针必须按设备计时：夹住设备的唯一手段就是设备侧同步，而 CoreX
+            # 把整张卡塞进 torch.cuda 命名空间，写法上没有第二条路。
+            "tools/probe_q4_attrib.py": 9,
         },
         "prod": {
         },
@@ -626,10 +633,12 @@ class PurityGateTest(unittest.TestCase):
             self.assertIn(expected, walked)
 
     def test_production_is_separated_from_probe_directories(self):
-        """规则 3 必须把随代码发布的代码与 ``tests/`` 分开报告。
+        """规则 3 必须把随代码发布的代码与探针目录分开报告。
 
         否则一条只对测试放宽的许可会把回归的生产文件遮过去，而迁移要压到零的
-        正是生产那个数。
+        正是生产那个数。探针目录是 ``tests/`` 与 ``tools/``：后者装的是诊断脚本，
+        引擎不 import 它们，`synchronize`、``torch.cuda`` 这类计时手段在那里是
+        必需项而不是违规项。
 
         生产现在已经是零，所以断言换成：拆分还在，且 ``prod`` 组里没有任何路径
         落在探针目录下。以前还要求 ``prod`` 非空，那等于钉住迁移自己的进度，
@@ -638,9 +647,9 @@ class PurityGateTest(unittest.TestCase):
         report = self.scan.reports["R3_cuda_literal"]
         groups = {group.group.name: group for group in report.groups}
         self.assertEqual(set(groups), {"prod", "probe"})
-        self.assertTrue(all(not path.startswith("tests/")
+        self.assertTrue(all(not path.startswith(("tests/", "tools/"))
                             for path in groups["prod"].per_file))
-        self.assertTrue(all(path.startswith("tests/")
+        self.assertTrue(all(path.startswith(("tests/", "tools/"))
                             for path in groups["probe"].per_file))
         # v3 规则同名的性质：已发布的文件一律不许再写出厂商的设备 API。探针
         # 可以，而且确实还在写。

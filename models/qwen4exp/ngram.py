@@ -19,11 +19,16 @@ Constraints:
       序列开头那几个 token 的 n-gram 就变成"假前缀 + 真 token"。
     * PLE 短卷积的状态长度是 ``(k-1) * dilation = 9``，不是 3：dilation 复用了
       ``ngram_size``，改它同时改感受野（``ARCH_SPEC.md`` §12 第 12 条）。
+    * 那张 102.4 GB 的表**只在 host 上**，且保持 checkpoint 的 128 个分片视图：拼成
+      一张连续张量要多一份 102.4 GB 的匿名页、启动多走一遍 102 GB 的拷贝，而这张表
+      一辈子只会被读到极少数行。
 """
 
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
@@ -33,6 +38,9 @@ from models.qwen4exp.config import TextConfig
 from models.qwen4exp.norm import RMSNorm
 from models.qwen4exp.proj import Proj
 from models.qwen4exp.util import apply_padding_mask, causal_depthwise_conv
+
+if TYPE_CHECKING:
+    from models.qwen4exp.checkpoint import MappedShards
 
 _MASK64 = (1 << 64) - 1
 _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
@@ -158,6 +166,8 @@ class HostNGramTable:
     Attributes:
         weight: host 侧的融合表，``[padded_vocab_size, head_dim]``。
         device: 目标设备。
+        total_rows: 表的总行数，也是下标的上界。
+        dtype: 表的 dtype；中转缓冲跟着它走，混了会等到 H2D 才报错。
     """
 
     def __init__(self, weight: torch.Tensor, device: torch.device | str,
@@ -182,13 +192,37 @@ class HostNGramTable:
                 "HostNGramTable 的 weight 必须在 CPU 上；它之所以存在就是因为"
                 f"这张表进不了显存，收到 {weight.device} 说明调用方放错了地方。")
         self.weight = weight
+        self.total_rows = int(weight.shape[0])
+        self.dtype = weight.dtype
+        self._init_host_state(int(weight.shape[1]), device, pin_memory)
+
+    def _init_host_state(self, head_dim: int, device: torch.device | str,
+                         pin_memory: bool) -> None:
+        """记录几何并清空中转缓冲。
+
+        分片版复用这一份：两阶段协议、锁页中转、容量策略完全一样，唯一不同的是
+        「从哪几块内存里取行」，那一件事由 :meth:`_fill_rows` 决定。
+
+        Args:
+            head_dim: 每行的宽度。
+            device: 目标设备。
+            pin_memory: 是否用锁页中转；CPU 目标上无论如何都不锁页。
+        """
+        self.head_dim = head_dim
         self.device = torch.device(device)
-        self.head_dim = int(weight.shape[1])
-        want_pin = pin_memory and self.device.type != "cpu"
-        self._pin = want_pin
+        self._pin = pin_memory and self.device.type != "cpu"
         self._stage: torch.Tensor | None = None
         self._pending: torch.Tensor | None = None
         self._pending_shape: torch.Size | None = None
+
+    def _fill_rows(self, flat: torch.Tensor, out: torch.Tensor) -> None:
+        """把 ``flat`` 里的行**按顺序**写进 host 侧的连续缓冲。
+
+        Args:
+            flat: ``[N]`` 的 int64 行号，已经过 :meth:`_check_ids` 的上下界检查。
+            out: ``[N, head_dim]`` 的 host 缓冲，连续、dtype 与表一致。
+        """
+        torch.index_select(self.weight, 0, flat, out=out)
 
     def _check_ids(self, ids: torch.Tensor) -> torch.Tensor:
         """把下标规整成 ``[N]`` 的 int64，并检查上下界。
@@ -208,11 +242,10 @@ class HostNGramTable:
         if flat.numel():
             low = int(flat.min())
             high = int(flat.max())
-            if low < 0 or high >= self.weight.shape[0]:
+            if low < 0 or high >= self.total_rows:
                 raise ValueError(
-                    f"n-gram 下标越界: [{low}, {high}] 不在 "
-                    f"[0, {self.weight.shape[0]})；请检查 ngram_heads_offsets 是否"
-                    " 已经加到下标上。")
+                    f"n-gram 下标越界: [{low}, {high}] 不在 [0, {self.total_rows})；"
+                    "请检查 ngram_heads_offsets 是否已经加到下标上。")
         return flat
 
     def gather(self, ids: torch.Tensor) -> torch.Tensor:
@@ -229,7 +262,8 @@ class HostNGramTable:
             ValueError: 下标越界。
         """
         flat = self._check_ids(ids)
-        rows = torch.index_select(self.weight, 0, flat)
+        rows = torch.empty((flat.numel(), self.head_dim), dtype=self.dtype)
+        self._fill_rows(flat, rows)
         return rows.to(self.device).reshape(*ids.shape[:-1], -1)
 
     def prefetch(self, ids: torch.Tensor) -> None:
@@ -250,7 +284,8 @@ class HostNGramTable:
         if self._pending is not None:
             raise RuntimeError(
                 "上一次 prefetch 的结果还没被 wait 取走；中转缓冲只有一个，"
-                "连续两次 prefetch 会让第一次的拷贝读到被覆盖的行。")
+                "连续两次 prefetch 会让第一次的拷贝读到被覆盖的行。上一次前向如果"
+                "在中途抛过异常，先 wait() 把那批行丢掉再继续。")
         flat = self._check_ids(ids)
         rows = int(flat.numel())
         # 容量按 4096 行起跳、之后只增不减：decode 只要 16 行，prefill 的 chunk
@@ -259,10 +294,10 @@ class HostNGramTable:
         if rows > cap:
             cap = rows
         if self._stage is None or self._stage.shape[0] != cap:
-            self._stage = torch.empty((cap, self.head_dim), dtype=self.weight.dtype,
+            self._stage = torch.empty((cap, self.head_dim), dtype=self.dtype,
                                       pin_memory=self._pin)
         stage = self._stage[:rows]
-        torch.index_select(self.weight, 0, flat, out=stage)
+        self._fill_rows(flat, stage)
         self._pending = stage.to(self.device, non_blocking=True)
         self._pending_shape = ids.shape
 
@@ -290,6 +325,206 @@ class HostNGramTable:
             ``True`` 表示 :meth:`wait` 还能取到结果。
         """
         return self._pending is not None
+
+    def take(self, ids: torch.Tensor) -> torch.Tensor:
+        """取回在飞的 prefetch 结果；没有在飞时退回同步 :meth:`gather`。
+
+        这是 PLE 层消费流水的地方：``TextModel.forward`` 开头已经按**同一组**
+        ``ids`` 发出了拷贝，层里再算一遍同样的 ``ids`` 只是为了对形状。形状对不上
+        说明那次 prefetch 不是为这一层、这一段发的，取回来的就是别人的行——形状
+        合法的错值，所以宁可报错。
+
+        Args:
+            ids: ``[..., ngram_heads]`` 的下标，必须与 prefetch 时同形。
+
+        Returns:
+            ``[..., ngram_heads * head_dim]``。
+
+        Raises:
+            RuntimeError: 在飞的 prefetch 与 ``ids`` 形状不符。
+            ValueError: 没有在飞、且 ``ids`` 越界。
+        """
+        if self._pending is None:
+            # 单层直调（调试、fixture）不会走 ``TextModel`` 的流水，此时没有覆盖
+            # 风险，同步取比报错有用。
+            return self.gather(ids)
+        pending_shape = self._pending_shape
+        if pending_shape is None or tuple(ids.shape) != tuple(pending_shape):
+            raise RuntimeError(
+                f"在飞的 prefetch 是按 {tuple(pending_shape or ())} 发的，这一层要 "
+                f"{tuple(ids.shape)}；两处下标不同源，取回来的是别的行。")
+        return self.wait()
+
+    def close(self) -> None:
+        """释放表占用的 host 资源；基类没有要释放的东西。"""
+        return None
+
+
+class ShardedHostNGramTable(HostNGramTable):
+    """把 checkpoint 的分片表按**视图**常驻 host RAM，并按行取到 device。
+
+    真实表在 checkpoint 里是 128 个 ``[2500012, 160]`` 的 bf16 分片，合计
+    320001536 行 = 102.4 GB。拼成一张连续张量要多占一份 102.4 GB 的匿名页、启动
+    还要多走一遍 102 GB 的拷贝；而这张表一步只被读到几十行。所以这里保持分片视图
+    （通常是 safetensors 的文件映射），行号用 ``divmod`` 落到 (分片, 片内行)，取行时
+    按分片分组做 ``index_select``，再按原顺序写回。
+
+    ``128 × 2500012 = 320001536`` 是整除映射成立的前提：分片行数必须一致，否则
+    边界会整体错位——形状仍然合法，查到的却是别的行。
+
+    Attributes:
+        shards: 每个分片的 host 视图，``[rows_per_shard, head_dim]``，第 ``k`` 个
+            元素对应行号 ``[k * rows_per_shard, (k + 1) * rows_per_shard)``。
+        num_shards: 分片数。
+        rows_per_shard: 每个分片的行数。
+        mapped: 持有这些视图背后文件句柄的对象，:meth:`close` 会一起释放。
+    """
+
+    def __init__(self, shards: Sequence[torch.Tensor], device: torch.device | str,
+                 pin_memory: bool = True, mapped: MappedShards | None = None) -> None:
+        """接管一组分片视图。
+
+        Args:
+            shards: 分片视图，顺序必须与 checkpoint 里的 ``shard_<k>`` 一致。
+            device: 目标设备。
+            pin_memory: 用锁页中转，理由见 :class:`HostNGramTable`。
+            mapped: 分片视图的来源句柄，见 :class:`~checkpoint.MappedShards`。
+                传 ``None`` 表示视图由调用方自己负责保活。
+
+        Raises:
+            ValueError: 分片为空、不是二维、dtype/宽度/行数不一致，或不在 CPU 上。
+                行数不一致时整除映射整张错位，而形状看上去完全合法。
+        """
+        if not shards:
+            raise ValueError("n-gram 分片表至少要有一个分片。")
+        first = shards[0]
+        if first.dim() != 2:
+            raise ValueError(
+                f"n-gram 分片必须是二维的，第 0 片是 {tuple(first.shape)}。")
+        rows_per_shard = int(first.shape[0])
+        width = int(first.shape[1])
+        for index, shard in enumerate(shards):
+            if (shard.dim() != 2 or int(shard.shape[0]) != rows_per_shard
+                    or int(shard.shape[1]) != width or shard.dtype != first.dtype):
+                raise ValueError(
+                    f"第 {index} 片是 {tuple(shard.shape)}/{shard.dtype}，与第 0 片的 "
+                    f"{tuple(first.shape)}/{first.dtype} 不一致；行数不等会让行号的"
+                    "整除映射整张错位。")
+            if shard.device.type != "cpu":
+                raise ValueError(
+                    f"第 {index} 片在 {shard.device} 上；分片表的意义就是不进显存。")
+        self.shards = list(shards)
+        self.num_shards = len(self.shards)
+        self.rows_per_shard = rows_per_shard
+        self.total_rows = self.num_shards * rows_per_shard
+        self.dtype = first.dtype
+        self.mapped = mapped
+        self._init_host_state(width, device, pin_memory)
+
+    def _fill_rows(self, flat: torch.Tensor, out: torch.Tensor) -> None:
+        """按分片分组取行，再按 ``flat`` 的原顺序写回 ``out``。
+
+        分组而不是逐行查：prefill 一个 chunk 几万行，逐行等于几万次小拷贝；分组之后
+        每片恰好一次 ``index_select``，片内行是连续的，读放大最小。写回必须按原顺序，
+        否则 PLE 拿到的行与 token 错配——形状完全合法。
+
+        排序与片内行号都先整批算一次，之后每组只剩一次取行。128 组里每组再各算一遍
+        是 256 次小算子，而单次算子的固定开销（本机实测 20–35 us）比它搬的那几十行
+        还大：实测 16 行 0.27 ms、32768 行 8.1 ms，逐组重算是 0.99 / 25.8 ms。
+
+        Args:
+            flat: ``[N]`` 的 int64 行号，已经过上下界检查。
+            out: ``[N, head_dim]`` 的 host 缓冲，连续。
+        """
+        rows = int(flat.numel())
+        if rows == 0:
+            return
+        # 行号通常是照着 token id 在卡上算出来的（n-gram 哈希是设备侧一串整型算子），
+        # 而表和写回缓冲都在 host 上：这里必须搬一次。decode 只有 16 个 int64
+        # （128 字节），prefill 一个 chunk 32768 个（256 KB），都不在关键路径的量级上；
+        # 不搬的后果是 ``index_select`` 报 "found at least two devices"。
+        if flat.device.type != "cpu":
+            flat = flat.to("cpu")
+        shard_of = torch.div(flat, self.rows_per_shard, rounding_mode="floor")
+        order = torch.argsort(shard_of, stable=True)
+        # 排序之后片内行号也已经是「按片分组」的顺序，可以直接切片，不必每组再索引一次。
+        local = (flat - shard_of * self.rows_per_shard)[order]
+        bounds = torch.cumsum(torch.bincount(shard_of, minlength=self.num_shards),
+                              0).tolist()
+        # 先写进「按分片排好」的缓冲，再用一次 index_copy_ 摆回原顺序：直接在
+        # ``out[positions]`` 上做 out= 是不行的，那是一次高级索引，写进去的是副本。
+        ordered = torch.empty_like(out)
+        start = 0
+        for shard_index, stop in enumerate(bounds):
+            if stop == start:
+                continue
+            torch.index_select(self.shards[shard_index], 0, local[start:stop],
+                               out=ordered[start:stop])
+            start = stop
+        out.index_copy_(0, order, ordered)
+
+    def close(self) -> None:
+        """释放文件映射；之后这张表不能再被读取。"""
+        if self.mapped is not None:
+            self.mapped.close()
+            self.mapped = None
+
+
+def prefetch_ple_tables(layers: Sequence[nn.Module], ple_input_ids: torch.Tensor | None,
+                        states: object, tables: dict | None) -> int:
+    """在前向开头为 PLE 层发出 n-gram 行的 H2D，供层内 :meth:`HostNGramTable.take` 取。
+
+    这一步的位置就是全部意义：``ids`` 只依赖 token 历史、不依赖隐藏状态，所以能
+    在第 0 层之前算完并发起拷贝；PLE 挂在第 1 层（checkpoint 里的一基层号 2），中间
+    隔着两层的计算就是重叠窗口。放到层里再发出等于放弃重叠——decode 一步只有 16 行
+    也要等一次 H2D，而它在关键路径上。
+
+    只处理 :class:`HostNGramTable`：普通 host 张量走原来的同步查表，不能被这里拦下。
+
+    Args:
+        layers: decoder 层序列，按层号索引；只有带 ``ple`` 子模块的层会被发。
+        ple_input_ids: 本次 chunk 的 PLE token id，``[B, S]``；``None`` 时不发。
+        states: 上一步的 :class:`~model.ModelStates`，用来取 ``ple_context``；
+            ``None`` 表示从空上下文开始。
+        tables: 按层号给出的 n-gram 表，与 ``TextModel.forward`` 的 ``ple_tables``
+            是同一个字典。
+
+    Returns:
+        发出的 prefetch 个数。``0`` 表示这次前向没有需要预取的表。
+
+    Raises:
+        ValueError: 给一个没有 PLE 的层配了 host 表，或把同一张 host 表挂到多个层上。
+            前者是配置错误，静默跳过会让那张表永远不被取用而前向照跑；后者会让两层的
+            行挤进同一个中转缓冲，而它只有一个槽位。
+        RuntimeError: 同一次前向里重复发 prefetch（上一轮的结果没被取走）。
+    """
+    if ple_input_ids is None or not tables:
+        return 0
+    # 先把配置校验全部做完再发拷贝：校验失败时不能在表上留下一个没人取的 pending，
+    # 那会让下一次前向在 prefetch 里再炸一次，错误信息还指向别处。
+    targets: list[tuple[int, HostNGramTable, object]] = []
+    for layer_idx, table in tables.items():
+        if not isinstance(table, HostNGramTable):
+            continue
+        layer = layers[layer_idx] if 0 <= layer_idx < len(layers) else None
+        ple = getattr(layer, "ple", None)
+        if ple is None:
+            raise ValueError(
+                f"layer {layer_idx} 没有 PLE，却收到了一张 host n-gram 表；"
+                "这张表不会被任何一层取用。")
+        if any(table is other[1] for other in targets):
+            raise ValueError(
+                f"同一张 host n-gram 表同时挂在包括 layer {layer_idx} 在内的多个层上；"
+                "中转缓冲只有一个槽位，两层的行会互相覆盖。真实 checkpoint 只有一层"
+                "（layers.1）带 PLE，出现这种情况说明 ple_layer_ids 配错了。")
+        targets.append((layer_idx, table, ple))
+    layer_states = getattr(states, "layers", None)
+    for layer_idx, table, ple in targets:
+        previous = None
+        if layer_states is not None and layer_idx < len(layer_states):
+            previous = layer_states[layer_idx].ple_context
+        table.prefetch(ple.ple_embedding.ngram_ids(ple_input_ids, previous))
+    return len(targets)
 
 
 class NGramEmbedding(nn.Module):
@@ -494,7 +729,9 @@ class NGramEmbedding(nn.Module):
                 320001536×160 bf16 约 95 GiB，任何单机都放不下，它由调用方按
                 分片取出对应行再传进来。传 :class:`HostNGramTable` 时按行搬到
                 目标 device 后再查——host 张量不能直接喂给 ``F.embedding``，
-                它要求表和下标在同一个 device 上。
+                它要求表和下标在同一个 device 上。传 host 表时优先消费
+                ``TextModel.forward`` 开头发出的那次 prefetch，见
+                :meth:`HostNGramTable.take`。
 
         Returns:
             ``[B, S, embedding_dim]``。
@@ -502,10 +739,12 @@ class NGramEmbedding(nn.Module):
         Raises:
             ValueError: 既没建表也没传 ``table``。静默返回零会让 PLE 注入变成
                 噪声，而形状完全正确。
+            RuntimeError: 在飞的 prefetch 与本次下标不同形，见
+                :meth:`HostNGramTable.take`。
         """
         ids = self.ngram_ids(input_ids, previous_context)
         if isinstance(table, HostNGramTable):
-            return table.gather(ids)
+            return table.take(ids)
         if table is None:
             if self.ngram_embedding is None:
                 raise ValueError(
@@ -700,9 +939,11 @@ __all__ = [
     "HostNGramTable",
     "NGramEmbedding",
     "PLELayer",
+    "ShardedHostNGramTable",
     "find_nth_prime_after",
     "is_prime",
     "layer_multipliers",
+    "prefetch_ple_tables",
     "splitmix64",
 ]
 

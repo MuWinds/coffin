@@ -37,6 +37,7 @@ from models.qwen4exp.blocks import DecoderLayer
 from models.qwen4exp.config import TextConfig
 from models.qwen4exp.gated_residual import GatedResidual
 from models.qwen4exp.mtp import DraftIndexPlan, MTP
+from models.qwen4exp.ngram import prefetch_ple_tables
 from models.qwen4exp.proj import Proj, QuantizedEmbedding, release_quantized_placeholders
 from models.qwen4exp.rope import RotaryEmbedding
 
@@ -374,6 +375,9 @@ class TextModel(nn.Module):
 
         batch, seq, _ = inputs_embeds.shape
         states = ModelStates.empty(len(self.layers)) if states is None else states
+        # n-gram 行的 H2D 必须在第 0 层之前发出：PLE 挂在第 2 层，中间两层就是重叠
+        # 窗口。放进层里再取等于放弃重叠，而 decode 一步的传输就在关键路径上。
+        prefetch_ple_tables(self.layers, ple_input_ids, states, ple_tables)
         past_len = 0 if states.position_ids is None else states.position_ids.shape[-1]
         text_positions, mrope_positions = self.prepare_position_ids(
             position_ids, batch, seq, past_len, inputs_embeds.device)

@@ -189,7 +189,8 @@ def _check_q8(key: str, wt: torch.Tensor, scale: torch.Tensor, meta: dict) -> QW
 
 def load(model_dir: str | Path, *, device: torch.device, quant: bool = True,
          prefix: str = DEFAULT_PREFIX, weight_dtype: torch.dtype | None = None,
-         vision: bool | None = None, vision_quant: bool = False) -> dict:
+         vision: bool | None = None, vision_quant: bool = False,
+         keep: "callable | None" = None) -> dict:
     """把预量化目录里的张量读成 state dict。
 
     Args:
@@ -208,6 +209,9 @@ def load(model_dir: str | Path, *, device: torch.device, quant: bool = True,
             没写、调用方又显式要，是错误，因为这里没有能凭空变出来的塔。
         vision_quant: 把塔的 GEMM 权重按 int8 存。本格式不量化视觉塔，所以这个组合
             被拒绝，而不是悄悄返回一份稠密的塔。
+        keep: 额外的一层键过滤，``(checkpoint_key) -> bool``；``None`` 表示全要。
+            裁层探针与「只装本 rank 需要的前缀」的调用方用它避免把 20 GB 分片读进来
+            再扔掉——那不是省一次判断，是省一次 20 GB 的读盘与显存占用。
 
     Returns:
         按 checkpoint 参数名索引的 state dict。``quant`` 为真时投影是
@@ -226,7 +230,7 @@ def load(model_dir: str | Path, *, device: torch.device, quant: bool = True,
     if index["format"] == W4A8_FORMAT:
         return _load_w4a8(model_dir, index, device=device, quant=quant,
                           prefix=prefix, weight_dtype=weight_dtype,
-                          vision=vision, vision_quant=vision_quant)
+                          vision=vision, vision_quant=vision_quant, keep=keep)
     _require_kn_backend()
 
     stored_dtype = index.get("weight_dtype")
@@ -290,7 +294,8 @@ def load(model_dir: str | Path, *, device: torch.device, quant: bool = True,
 
 def _load_w4a8(model_dir: Path, index: dict, *, device: torch.device,
                quant: bool, prefix: str, weight_dtype: torch.dtype | None,
-               vision: bool | None, vision_quant: bool) -> dict:
+               vision: bool | None, vision_quant: bool,
+               keep: "callable | None" = None) -> dict:
     """读取 W4A8 分组权重；非量化调用显式反量化到目标 dtype。"""
     from safetensors import safe_open
 
@@ -310,8 +315,9 @@ def _load_w4a8(model_dir: Path, index: dict, *, device: torch.device,
 
     prefixes = (prefix, "mtp.", "lm_head.")
     wanted = {key: meta for key, meta in index["tensors"].items()
-              if key.startswith(prefixes)
-              or (take_vision and key.startswith(VISUAL_PREFIX))}
+              if (key.startswith(prefixes)
+                  or (take_vision and key.startswith(VISUAL_PREFIX)))
+              and (keep is None or keep(key))}
     if not wanted:
         raise ValueError(f"{model_dir}: index holds no tensor under {prefixes}")
 

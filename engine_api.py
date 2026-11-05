@@ -438,7 +438,17 @@ _RELOAD_ORDER = (
     "models.qwen35.parallel",
     "models.qwen35.linear_attn",
     "models.qwen35.full_attn", "models.qwen35.blocks", "models.qwen35.mtp",
-    "models.qwen35.model", "models.qwen35", "models",
+    "models.qwen35.model", "models.qwen35",
+    # qwen4exp 一族：先叶子（配置、几何、投影）再层，最后才是组装点与引擎包装。
+    # 顺序错一位，reload 之后某个模块顶部拿到的就还是旧类对象。
+    "models.qwen4exp.config", "models.qwen4exp.util", "models.qwen4exp.rope",
+    "models.qwen4exp.norm", "models.qwen4exp.proj", "models.qwen4exp.checkpoint",
+    "models.qwen4exp.parallel", "models.qwen4exp.weights",
+    "models.qwen4exp.qsa", "models.qwen4exp.gdn", "models.qwen4exp.gated_residual",
+    "models.qwen4exp.moe", "models.qwen4exp.ngram", "models.qwen4exp.vision",
+    "models.qwen4exp.blocks", "models.qwen4exp.mtp", "models.qwen4exp.model",
+    "models.qwen4exp.prefill_check", "models.qwen4exp.engine", "models.qwen4exp",
+    "models",
     "utils.mm_input", "utils.tool_call", "utils",
     "cache.paged_cache", "cache.radix_cache", "cache",
     "engine.config", "engine.sequence", "engine.block_manager",
@@ -495,4 +505,9 @@ def reload() -> None:
 # 需要 ``register`` 和 ``_Entry`` 已存在。这一行以下的文件都会触发 ``# noqa: E402``。
 from models.qwen35 import Qwen35, load_weights as _qwen35_load_weights  # noqa: E402
 
+# qwen4exp 是参考实现那一族：它的装载器常驻的是分片索引而不是张量（360 GB 装不进
+# 任何单机内存），所以这一族的两条边都指向它自己的模块，不复用 qwen35 的加载器。
+from models.qwen4exp import Qwen4Engine, load_weights as _qwen4exp_load_weights  # noqa: E402
+
 register(("qwen3_5", "qwen35"), Qwen35, _qwen35_load_weights)
+register(("qwen4_exp", "qwen4exp"), Qwen4Engine, _qwen4exp_load_weights)
