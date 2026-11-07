@@ -14,7 +14,7 @@ Module: ``coffin/backends``。与 ``backends.protocol`` 一起位于依赖图底
 
 Constraints:
     * 选择只做一次，在首次用到 ``ops`` 属性时确定，此后不再变化：没有运行时
-      热切换（PLATFORMS.md §8）。捕获了某个 backend 引用的代码会在进程整个
+      热切换。捕获了某个 backend 引用的代码会在进程整个
       生命周期里持有它。
     * ``ops`` 是一张表，不是一个模块：一次读进模块级别名（``ops = backends.ops``）
       再调用表里的条目。每个条目都可调用——参考实现会补齐所选 backend 缺的

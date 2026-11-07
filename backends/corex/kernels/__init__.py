@@ -40,7 +40,7 @@ _SOURCES = ("bindings.cpp", "gemv.cu", "w8a8.cu", "norm.cu", "attn.cu", "attn_sp
             "w4a8.cu", "hyper.cu", "moe_grouped.cu", "moe_dispatch.cu")
 
 #: 驱动不报告 ISA 时的回退值。``ivcore10`` 是 BI-V100 的架构
-#: （``COREX_PORT.md`` §0）；报告了别的值的卡就用那个值，所以加载器把 ``arch``
+#: （``docs/qwen4/COREX-PLATFORM.md``）；报告了别的值的卡就用那个值，所以加载器把 ``arch``
 #: 作为参数接收。
 DEFAULT_ARCH = "ivcore10"
 

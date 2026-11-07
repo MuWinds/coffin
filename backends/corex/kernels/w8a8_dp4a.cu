@@ -4,7 +4,7 @@
 //
 // Module: coffin/backends/corex/kernels。绑定成 ``w8a8_dp4a`` / ``w8a8_dp4a_nk`` /
 // ``w8a8_dp4a_groups`` / ``w8a8_dp4a_read`` / ``w8a8_dp4a_rate``。只被
-// ``diag/corex/`` 的探针调用；定稿之后才由 ``backends/corex/__init__.py`` 当作
+// 探针调用；定稿之后才由 ``backends/corex/__init__.py`` 当作
 // ``w8a8_gemm`` 的一条后端。
 //
 // 为什么手写：厂商库的 tile、lane 宽度和 grid 全都改不了，而三条方向里有两条（4 字节
@@ -37,7 +37,7 @@
 //     GEMM 与 GEMV 走同一套宽加载，两处各写一份就量不出同一件事。
 //   * 每次启动都在 ``c10::cuda::getCurrentCUDAStream()`` 上。
 //   * 内核不做边界检查：形状、dtype、连续性、对齐条件全部在主机侧判掉。
-//   * 全程不用 fp64：本设备对它返回 0（COREX_PORT.md §0），设备侧 fp64 参考等于零。
+//   * 全程不用 fp64：本设备对它返回 0（docs/qwen4/COREX-PLATFORM.md），设备侧 fp64 参考等于零。
 
 #include "corex_i8.h"
 #include "corex_scalar.h"

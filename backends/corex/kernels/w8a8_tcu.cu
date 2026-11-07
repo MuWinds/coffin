@@ -258,7 +258,7 @@ __device__ __forceinline__ void stage_act(int8_t* sb, const int8_t* __restrict__
 //
 // **两个轴的归属容易写反，而写反的症状是几乎全错、看起来像「内核彻底不对」。**
 //
-// 实测过的判据（`diag/corex/ixb_tile.sh`，单位脉冲激活）：库的输出里
+// 实测过的判据（单位脉冲激活）：库的输出里
 // ``out[m, n] = wt[m % K, n]``，**每一行都相同**；而错误的版本是「每一列都相同」。
 // 一句话：**MMA-M（累加器的 ``rt``）产出的是输出的 M 方向，MMA-N（``ct``）产出 N**。
 // 这里的 M/N 是**互换后的 MMA 视角**——MMA-M 是权重的 N，MMA-N 是激活的 M，所以

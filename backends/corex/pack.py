@@ -3,7 +3,7 @@
 ``Caps.weight_layout == "kn"`` 是后端替加载器兑现的一句承诺：算子契约仍然是
 checkpoint 的 ``[N, K]`` 布局，唯一一次转置挪到这里做，而不是每次调用都做。
 在 BI-V100 上这个布局对解码值 14-22 倍（``[N, K]`` 实测 19-30 GB/s，
-``[K, N]`` 是 362-410 GB/s，COREX_PORT.md §0），所以本文件是后端的性能关键
+``[K, N]`` 是 362-410 GB/s，docs/qwen4/COREX-PLATFORM.md），所以本文件是后端的性能关键
 部分，不是一个整理形状的辅助工具。
 
 Module: ``coffin/backends/corex``。只 import ``torch`` 和叶子模块
@@ -61,7 +61,7 @@ class KnQWeight:
 
     这是 :class:``KnWeight`` 的 int8 对应物，存在的理由只有一个：解码受带宽
     限制，把每个权重读的字节数减半是投影上仅剩的杠杆，而投影占了这个步骤的
-    大头（``../../../PERF_COREX.md`` §8）。
+    大头（``docs/qwen4/QWEN4-PERF.md``）。
 
     scale 按 *输出列* 给，和 checkpoint 的按行 scale 是一回事——``[N, K]`` 的
     行就是 ``[K, N]`` 的列。它存在矩阵旁边而不是预先乘进去：在 ``K`` 求和之后
@@ -130,7 +130,7 @@ class KnQWeight:
         ``(wt.float() * scale).to(dtype)`` 会实体化一个 ``[K, N]`` 的 fp32 临时
         张量，是它马上要被窄化成的结果的两倍大；在这个模型的 128 个投影上，那是
         每个预填充请求 *固定的* 174.8 ms，在 n=128 时是整个预填充的 3.1 倍
-        （``../../../PERF_COREX.md`` §13.2b）。
+        （``docs/qwen4/QWEN4-PERF.md``）。
 
         在 bf16 目标上用 fp32 scale 做 ``mul_`` 以 fp32 计算、只舍入一次，和旧
         写法是同一次舍入，权重保持逐位相同。先窄化 scale

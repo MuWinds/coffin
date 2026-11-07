@@ -43,7 +43,7 @@ import torch
 OpFn = Callable[..., Any]
 
 
-#: 规范算子名，按 :class:`Ops` 字段顺序排列，分组方式与 PLATFORMS.md §3.2 的
+#: 规范算子名，按 :class:`Ops` 字段顺序排列，分组方式与 :class:`Ops` 的
 #: 表格一致。有测试保证它与 dataclass 同步。
 _OP_NAMES: tuple[str, ...] = (
     # 投影：按激活行数的档位命名，不是按内核命名。

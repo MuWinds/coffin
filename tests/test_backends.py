@@ -428,7 +428,7 @@ class VendorSpecTest(unittest.TestCase):
 class ReferenceOracleTest(unittest.TestCase):
     """每个参考算子都必须复现本文件独立写出的那份数学。
 
-    这些数字是新平台必须对齐的（PLATFORMS.md §6），所以对照实现是第二份实现，而不是
+    这些数字是新平台必须对齐的，所以对照实现是第二份实现，而不是
     调回后端。
     """
 
@@ -917,10 +917,10 @@ class Int8BatchKernelTest(unittest.TestCase):
     这里守的失效在两个方向上都不出声。没有批量入口时，``linear_m`` 会循环调用单行
     GEMV，而那是*正确*的——功能测试看不见——但它每读一行就把整份权重读一遍，让每次
     投机校验都要多付 ``c`` 个普通步。这就是实测到投机后缀解码在这张卡上打不平的原
-    因（../../PERF_COREX.md 第 14 节），而只要有人把分派改回循环，它立刻会回来。
+    因（docs/qwen4/QWEN4-PERF.md），而只要有人把分派改回循环，它立刻会回来。
 
     调内核需要卡，所以这些检查是结构性的：钉住必须同时存在的那几块，因为它们各自都
-    在这个移植过程中当过缺失的那一块（../../PERF_COREX.md 12.5）。
+    在这个移植过程中当过缺失的那一块（docs/qwen4/QWEN4-PERF.md）。
     """
 
     def _sources(self) -> dict:

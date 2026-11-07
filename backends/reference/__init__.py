@@ -4,9 +4,8 @@ This backend is the safety net that makes the platform abstraction total. Every
 op in :class:`~coffin.backends.protocol.Ops` has a plain-torch implementation
 here, so a platform with no native kernel still runs the model -- slower, but
 with no `if backend.available()` fork anywhere in the model code. New platforms
-are required to match these numbers before they are tuned for speed
-(PLATFORMS.md §6), so this file is the specification, not a fallback of last
-resort.
+are required to match these numbers before they are tuned for speed, so this
+file is the specification, not a fallback of last resort.
 
 The maths is lifted from the eager branches that are currently spread over
 ``models/qwen35/{full_attn,linear_attn}.py``, ``ops/gemv.py`` and

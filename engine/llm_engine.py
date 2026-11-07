@@ -141,7 +141,7 @@ class LLMEngine:
                     "step is a captured replay, so it needs caps.graph")
             # 上面已经拒掉了投机，所以这次预填充写下的草稿模型 KV 永远不会被读到。
             # 喂它是整个 prompt 上一层全注意力加五个投影：实测的这块卡上 n=2048 时
-            # 962.5 ms 的预填充里有 214.8 ms 花在这（../../PERF_COREX.md §13.2a）。
+            # 962.5 ms 的预填充里有 214.8 ms 花在这（docs/qwen4/QWEN4-PERF.md）。
             # 在这里清而不是在 ``Qwen35.__init__`` 里清，是因为调用方也可以直接驱动
             # ``spec_generate``，那条路会回放 eager 的替代 capture，确实会读那份 KV。
             if self.model.mtp is not None:

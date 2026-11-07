@@ -584,7 +584,7 @@ class GatedDeltaNet(nn.Module):
         # 输出就是 fp32，下一层的 ``b = in_proj_b(fp32)`` 变 fp32，于是
         # ``delta_prologue_batch`` 抛 ``beta logits must be bf16``。
         #
-        # 这也是 ``FUSION_PLAN.md`` §9 那条「递推的 fp32 输出必须在归一化前先舍入到
+        # 这也是 ``corex-kernel-check/docs/FUSION.md`` 那条「递推的 fp32 输出必须在归一化前先舍入到
         # bf16」——当时的理由是逐位一致，现在多一条：它还决定 dtype 契约。
         return buf["out"].to(dtype).unsqueeze(1), state
 

@@ -1,11 +1,7 @@
 # coffin/ — 推理引擎本体
 
-设计取舍见 `NOTES.md`（逐项优化流水账），契约见 `ARCH_BATCH.md`。
-这里只记**目录约定**，方便以后接第二个模型。
-
-> 说明：本目录是从仓库根目录整体搬进来的引擎代码（`git mv`，历史保留）。
-> 旧文档 `ENGINE.md` / `NOTES.md` / `ARCH_BATCH.md` 早前被误放到仓库根目录后丢失，
-> 需要时可按 `coffin/README.md` 的布局表重建。
+这里只记**目录约定**，方便以后接第二个模型。设计取舍与契约写在代码里：
+每个模块的文件头讲清职责与硬约束，`AGENTS.md` 规定注释与 docstring 的格式。
 
 ## 布局
 
@@ -92,13 +88,13 @@ python3 run_chat.py --bench -n 32
 增加，模型级数值、算子级等价、量化格式、视觉塔这类回归按 `AGENTS.md` 第 10 条
 写在临时目录里跑，不回到这个目录——写在这里的用例会随着模型和硬件的替换一起过时。
 
-推文件：`python tools/push_engine.py --verify`（整个 `coffin/` 的代码，不含
-`diag/` 与权重；要连 diag 一起推就加 `--with-diag`；推到自己的目录用
-`--remote /root/private_data/<你的目录>`）。
+推文件：`python platform/scow/tools/sync.py push -d coffin --root-name coffin`
+（增量 tar，只传改动的文件；远端常驻检出是 `~/coffin-work/base/coffin`）。
+不传权重、不传 `diag/`。原来那个 `coffin/tools/push_engine.py` 已经不在仓库里。
 
 ## 多模态（图片）
 
-设计见仓库根的 [`../VISION.md`](../VISION.md) §11。落地位置：
+设计见仓库根的 [`docs/VISION.md`](../docs/VISION.md) §2。落地位置：
 
 | 文件 | 职责 |
 | --- | --- |

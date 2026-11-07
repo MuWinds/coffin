@@ -43,7 +43,7 @@ PREFILL_ATTN_TILE = int(os.environ.get("PREFILL_ATTN_TILE", "512"))
 #: 负担得起：按实际使用的 512 token 查询块算，活跃 score 块多占 128 MB，对照的是
 #: 32 GB 的卡和约 4.5 GB 的 int8 权重。n=8192 时每一步上调都值——512 -> 2048
 #: 快 10.5%，2048 -> 4096 再快 4.9%——而且这个方向在每个块宽、两轮独立扫描里都
-#: 成立（``diag/corex/probe_prefill_sweep.py``、../../../PERF_COREX.md §13.7）。
+#: 成立（该扫描脚本已随 diag/ 清理删除，结论保留）。
 #: 2048 token 的 prompt 毫无收益（720.0 -> 720.2 ms），因为它只有一个查询块，块
 #: 循环几乎不跑；收益在长 prompt 上。
 PREFILL_ATTN_KB = int(os.environ.get("PREFILL_ATTN_KB", "4096"))

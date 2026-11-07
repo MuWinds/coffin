@@ -2,7 +2,7 @@
 
 这是 ``coffin`` 里第二个原生后端。同一份生产代码在 Hygon DCU 和这张卡上跑；变的
 是算子表、权重布局和 dtype 策略，三者都属于本包。两个实测事实决定了这里的一切
-（COREX_PORT.md §0）：这张卡按 ``[K, N]`` 流式读权重是 168-361 GB/s，而
+（docs/qwen4/COREX-PLATFORM.md）：这张卡按 ``[K, N]`` 流式读权重是 168-361 GB/s，而
 checkpoint 的 ``[N, K]`` 形式只有 19-30 GB/s；另外它的 ``cuBLAS`` 在
 ``lm_head`` 的宽度上返回 NaN。
 
@@ -56,7 +56,7 @@ NAME = "corex"
 name = NAME
 
 #: 驱动报告不出可用的 ISA 时，扩展按这个架构编译。``ivcore10`` 是 BI-V100 的
-#: 目标（COREX_PORT.md §0）；报告了不同架构串的卡就用那个值，所以换新部件时构建
+#: 目标（docs/qwen4/COREX-PLATFORM.md）；报告了不同架构串的卡就用那个值，所以换新部件时构建
 #: 选项永远不必改。
 DEFAULT_ARCH = "ivcore10"
 
@@ -199,7 +199,7 @@ def _arch() -> str:
     架构是构建选项，所以编造一个值比用实测的默认值更糟：编译器不认识的串会让构建
     失败，而它默默接受的串会指向错误的 ISA。因此只有驱动交回 CoreX 形状的名字时
     才用它；否则返回 :data:`DEFAULT_ARCH`，也就是这张卡被实测时用的值
-    （COREX_PORT.md §0）。
+    （docs/qwen4/COREX-PLATFORM.md）。
 
     **必须记忆化。** :func:`_kernels` 每次调用都问它，而一次 decode 里有几千次算子
     调用（``q4budget2`` 实测 7025 次内核发射）。这里的 ``torch.cuda.get_device_properties``
@@ -405,7 +405,7 @@ def _gemv_rows(w: torch.Tensor | QWeight | pack.KnWeight,
         # 每个分块只读一遍权重。在 gemv_kn_i8_m 出现之前，这个循环走的是单行内核，
         # 于是一批行每行都把整个权重读一遍：实测 M=8 是 M=1 的 8.19 倍
         # （probe_row_cost.py，五个解码形状），这就是为什么一次 c-token 投机校验要付
-        # c 遍完整权重读取，在任何草稿深度都无法打平（../../../PERF_COREX.md 第 14 节）。
+        # c 遍完整权重读取，在任何草稿深度都无法打平（docs/qwen4/QWEN4-PERF.md）。
         #
         # 内核只接受它有实例化的宽度，而本辅助函数会被以不超过 _ROW_CHUNK 的任意行数
         # 调用（比如某个退回这里的分块预填充），所以下面 bf16 分支做的分块这里也必须
@@ -1962,10 +1962,10 @@ NATIVE: frozenset[str] = frozenset(_NATIVE)
 #: ``capture()``，而它开头会重置模型并跑自己的预填充。那会把 prompt 的 KV 缓存和
 #: 循环状态抹掉，于是重放驱动注意力看过一个从未写过的窗口。
 #: ``run_chat.generate`` 的顺序反过来——``reset()``、``capture()``、``reset()``，
-#: 然后 ``prefill()``——``diag/corex/probe_chat.py`` 也一样。
+#: 然后 ``prefill()``——当时的 ``probe_chat.py`` 也是这样（该探针已随 ``diag/`` 删除）。
 #:
-#: 顺序修正之后，整个解码步被完整测量过。验收跑是 2026-10-26 在 gpu-node-07 上的
-#: 历史 graph 验收探针——一个进程里六轮 capture+prefill+replay，每一轮都以 *相同*
+#: 顺序修正之后，整个解码步被完整测量过。验收跑是一个进程里六轮
+#: capture+prefill+replay 的探针——每一轮都以 *相同*
 #: 的 token ``[5, 6, 24218, 10]`` 和有限 logits 完成：
 #:
 #:   backend=corex native=18/18 graph=1, loaded in 35.1 s
@@ -1978,11 +1978,11 @@ NATIVE: frozenset[str] = frozenset(_NATIVE)
 #: 一次侥幸。同一 prompt 上对 eager 路径的速度：52.41 ms/step 对 77.09 ms/step，即
 #: **1.47x**。
 #:
-#: **观察到过一次挂死，而那不是图的问题。** gpu-node-06 上一次运行在
-#: ``graph replay`` 之后停住且没有 traceback，几分钟后 *同一个节点* 连 8x8 矩阵乘都
-#: 做不完——它的 context 早就在自旋了。node-06 承载过先前那次失败的捕获。所以操作
-#: 规则是：先在一个节点上跑个 8x8 矩阵乘，再怀疑某次运行，因为卡住的 context 和卡住
-#: 的内核产生同样的日志，而日志里没有任何东西能区分它们。``diag/corex/`` 下的每个
+#: **观察到过一次挂死，而那不是图的问题。** 一次运行在
+#: ``graph replay`` 之后停住且没有 traceback，几分钟后 *同一台节点* 连 8x8 矩阵乘都
+#: 做不完——它的 context 早就在自旋了。所以操作
+#: 规则是：先在一台节点上跑个 8x8 矩阵乘，再怀疑某次运行，因为卡住的 context 和卡住
+#: 的内核产生同样的日志，而日志里没有任何东西能区分它们。每个
 #: 启动器现在都先做这项检查，检查不过就以退出码 64 结束，连模型都不碰。
 #:
 #: ``check_graph.py`` 仍然只覆盖两个算子，它的文件头也这么写；它是廉价的回归检查，
@@ -2001,7 +2001,7 @@ NATIVE: frozenset[str] = frozenset(_NATIVE)
 #:    实测 46.97 ms——**0.93x，是退化**。图消除的是启动开销；内核变快之后，剩下的那点
 #:    开销已经小于重放本身的代价。
 #: 3. *它针对的开销在别处消除更合适。* ``launch`` 次数和主机时间在
-#:    ``../../../PERF_COREX.md`` §8 里直接在 eager 路径上攻，那里出 bug 会报错，而
+#:    ``docs/qwen4/QWEN4-PERF.md`` 里直接在 eager 路径上攻，那里出 bug 会报错，而
 #:    不是把设备吃掉。
 #:
 #: 不要为了追那个旧的 1.47x 重新打开它。上面的重复运行证据表明图的 *机制* 在这个驱动

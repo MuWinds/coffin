@@ -1,7 +1,9 @@
 # 把残差相加折进 RMSNorm
 
 > 2026-10-28，`gpu-node-05`，Iluvatar BI-V100，`COFFIN_BACKEND=corex`。
-> `../../../PERF_COREX.md` 的 Workstream D。**部分落地：补丁 A 已进，补丁 B 未进。**
+> 这一层的收益量级：省掉一次相加就是每步省 32 次 kernel 启动、约 0.5 ms，占
+> **Qwen3.5-4B 单卡 eager decode 一步 23.5 ms（2026-10-28 实测）** 的 2%。
+> **部分落地：补丁 A 已进，补丁 B 未进。**
 
 ## 已落地的部分
 
@@ -51,7 +53,8 @@ return x + self.mlp(self.post_ln(x))   # 相加 #2
 
 把每层的相加 #2 折进*后一个* norm，这意味着在循环迭代之间携带归一化后的流，而不
 是重算它。在 `models/qwen35/model.py` 的 `_forward` 里（也只在那里——`prefill` /
-`verify` / `batch` 各自带自己的残差链，不在 23.5 ms 的解码路径上）：
+`verify` / `batch` 各自带自己的残差链，不在这条 23.5 ms/步（Qwen3.5-4B 单卡 eager
+decode）的解码路径上）：
 
 ```python
 normed = self.layers[0].in_ln(x)
@@ -69,7 +72,7 @@ for i, layer in enumerate(self.layers):
 那个函数。在那里改动缓冲区拓扑会改变被捕获的图所寻址的内容，而这个驱动上的捕获
 曾经卡死过卡（`backends/corex/__init__.py`，`_GRAPH_VERIFIED`）。按策略
 `caps.graph` 是 `False`，所以今天服务的是 eager 路径，但这个改动仍无法在不冒丢卡
-风险的情况下在卡上测。23.5 ms 的步里约 0.5 ms 不值得冒这个险，补丁 B 只有在同时
+风险的情况下在卡上测。23.5 ms/步（同上口径）里约 0.5 ms 不值得冒这个险，补丁 B 只有在同时
 做出重新审视捕获的明确决定时才应捡起来。
 
 ## 数值：折算是逐位相同，而不只是接近
@@ -108,13 +111,7 @@ for i, layer in enumerate(self.layers):
 
 ## 复现这些检查
 
-用到的主机侧 harness 在 `.tmp_cusyn/` 里，已随工作流一起删除；如果要重新审视，值得
-重建两样东西，都不需要卡：
-
-- 把 `norm.cu` 当主机 C++ 编译（`.tmp_cusyn/rewrite.py` 加 `cuda_stub.h`），用
-  `blockDim.x = 1` 调 `add_rms_norm_kernel`，让共享树归约正确退化成单通道，然后和
-  跑在预先相加的和上的 `rms_norm_kernel` 比较。对残差（逐元素）来说
-  `blockDim.x = 64/128` 是成立的，但对 norm 不成立。
-- `COFFIN_BACKEND=reference python` 跑一条层形状的链，两种写法都跑；用
-  `torch.equal` 比较，不要用 `allclose`。这才是能抓住局部折叠加相 #2 的检查，因为
-  它保持有限，只是不一样。
+主机侧 harness 已删除；重新审视只需两样，都不需要卡：把 `norm.cu` 当主机 C++ 编译、
+`blockDim.x = 1` 让共享树归约退化成单通道，与跑在预先相加的和上的 `rms_norm_kernel` 逐字节
+比较；再用 `COFFIN_BACKEND=reference` 跑一条层形状的链，两种写法都用 `torch.equal` 比
+（`allclose` 抓不住——折叠加相 #2 的结果仍然有限，只是不一样）。

@@ -35,7 +35,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("threads") = 0, pybind11::arg("unroll") = 0,
           pybind11::arg("split") = 0, pybind11::arg("width") = 0);
     // 和单行入口分开绑定：这里漏了注册在卡上没人调用之前是看不见的，一旦调用就显示
-    // 为 AttributeError，而且离真正发起分派的地方很远（PERF_COREX 第 12.5 节记录的
+    // 为 AttributeError，而且离真正发起分派的地方很远（docs/qwen4/QWEN4-PERF.md 记录的
     // 那个坑）。
     m.def("gemv_kn_i8_m", &gemv_kn_i8_m,
           "batched W8A16 GEMV: int8 [K, N] weights, x [M, K] -> y [M, N]",

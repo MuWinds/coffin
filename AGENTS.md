@@ -220,28 +220,14 @@ cd coffin
 
 # 每个文件仍然能编译
 python -m py_compile $(find . -name '*.py' -not -path './__pycache__/*')
-
-# 只改了注释：AST 等价（docstring 以外的代码）
-python ../diag/check_style.py --ast .
-
-# CUDA/C/C++：剥掉注释后 token 流等价
-python ../diag/check_style.py --c-comments .
-
-# 规范：中文、空格、分隔线、Sphinx 字段、缺失小节
-python ../diag/check_style.py --style .
-
-# 只看某个文件
-python ../diag/check_style.py --style path/to/file.py --verbose
 ```
 
-`--ast` 和 `--c-comments` 是硬门禁：任何代码改动都是重构引入的 bug，
-必须把 token 原样改回去，不能靠 `git checkout` 覆盖（多人共用工作区时那会
-冲掉别人的改动）。
+只改了注释时，按 §7 的纪律要求「代码 token 一字不动」，但**目前没有自动门禁**：
+原先做 AST 等价、剥注释 token 流等价和风格检查的 `diag/check_style.py` 已随
+`diag/` 目录一起删除，仓库里没有替代品。所以这一段靠 `git diff` 人工确认——
+改动只允许落在注释与 docstring 上，`+`/`-` 行里出现代码 token 就是改错了。
 
-`--style` 分两级。**错误**是硬性的：散文不是中文、标记后缺空格、ASCII
-分隔线、Sphinx 字段列表、缺文件头、公开函数没有 docstring。**警告**是提示：
-缺 `Args`/`Returns`/`Raises` 小节、缺 `Module:`/`Constraints:` 行、简单
-辅助函数没有 docstring。把警告当作阅读清单，不要当勾选清单。
+要恢复自动门禁就得先把那个检查器写回来；在那之前，别在文档里把它当成能跑的命令。
 
 单文件检查清单：
 
@@ -292,9 +278,7 @@ python ../diag/check_style.py --style path/to/file.py --verbose
 docs: 把引擎注释统一改写为中文
 
 术语按 GLOSSARY.md 统一，结构标记（Args:/@brief 等）保持英文，
-代码 token 一字未动，AST 与剥注释后的 token 流均与基线一致。
-
-检查：--ast / --c-comments / --style 全部通过。
+代码 token 一字未动，diff 里只有注释行。
 ```
 
 ```

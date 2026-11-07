@@ -324,7 +324,7 @@ class LinearAttn:
         # 每步 48 次 launch，但它仍然更慢：在卡上实测，单测时每层多 5.3 us 设备时间，
         # 真实步骤里每层多 13.1 us（24 层累计 20.285 -> 20.615 ms），因为一个内核要同时
         # 伺候递推的寄存器循环几何和两次块内归约。它省下的 launch 名额不值这个价。
-        # 见 ../../../PERF_COREX.md §12。
+        # 见 docs/qwen4/QWEN4-PERF.md。
         q_pro, k_pro, v_pro = self.q_pro[pr], self.k_pro[pr], self.v_pro[pr]
         beta, g = self.beta[pr], self.g[pr]
         bops.delta_prologue(q, k, v, b, a, self.neg_expA, self.dt_bias,

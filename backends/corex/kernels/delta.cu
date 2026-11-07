@@ -151,7 +151,7 @@ __global__ void delta_kernel(const float* __restrict__ q, const float* __restric
 // 共用这同一种启动形状，解码路径是靠构造保持不变，而不是靠另一条代码路径。
 //
 // 网格故意取行轴而不是主机循环：本部件每个在飞的 block 跑得动约 3.0 GB/s
-// （``docs/DESIGN.md`` §2.2），这里一行只有 ``heads`` = 32 个 block，所以循环不管多少行
+// （``corex-kernel-check/docs/DEVICE.md``），这里一行只有 ``heads`` = 32 个 block，所以循环不管多少行
 // 都只能以 32-block 的带宽跑每一行。
 //
 // @param q,k [rows, heads, dk] fp32。

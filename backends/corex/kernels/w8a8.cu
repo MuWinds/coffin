@@ -20,7 +20,7 @@
 //     而结果要穿过 32 层。
 //   * 每次启动都在 ``c10::cuda::getCurrentCUDAStream()`` 上。legacy 默认流上启动的
 //     内核不属于捕获范围。
-//   * 全程不用 fp64：本设备对它返回 0（COREX_PORT.md §0）。
+//   * 全程不用 fp64：本设备对它返回 0（docs/qwen4/COREX-PLATFORM.md）。
 
 #include "corex_i8.h"
 #include "corex_ops.h"

@@ -78,7 +78,7 @@ torch::Tensor gemv_kn_i8(torch::Tensor wt, torch::Tensor x, torch::Tensor scale,
 //
 // 没有这个入口，``linear_m`` 的 int8 分支就没有内核可调，只能循环单行 GEMV，每行付
 // 一次完整权重读取——在本部件上 M=8 是 M=1 的 8.19 倍（实测，五个解码形状）。这就是
-// 一次 c-token 投机校验打不过 c 个普通步的原因；见 ``PERF_COREX.md`` 第 14 节。
+// 一次 c-token 投机校验打不过 c 个普通步的原因；见 ``docs/qwen4/QWEN4-PERF.md``。
 //
 // @param wt [K, N] int8 权重，连续存放。
 // @param x [M, K] 激活，bf16 或 fp32。输出的 dtype 跟随它。
