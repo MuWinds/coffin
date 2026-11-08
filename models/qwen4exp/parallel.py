@@ -278,7 +278,7 @@ class DecodeShmCombine:
     """
 
     def __init__(self, path: str, rank: int, world: int, dist,
-                 dtype: torch.dtype = torch.bfloat16, shm_rows: int = 1,
+                 dtype: torch.dtype = torch.bfloat16, shm_rows: int = 0,
                  trace_limit: int = 0, spin_limit: float = 20.0,
                  timing_limit: int = 0) -> None:
         """建共享板缓存与锁页中转缓冲，暂不打开任何板。
@@ -302,14 +302,24 @@ class DecodeShmCombine:
         Raises:
             ValueError: ``world`` 或 ``shm_rows`` 非正。
         """
-        if world <= 0 or shm_rows <= 0:
-            raise ValueError("world and shm_rows must be positive")
+        # ``shm_rows == 0`` 是合法值，表示**永远不开共享板**（全部走 gloo）。
+        # 它现在是 decode 的默认：作业 421/422 vs 423/416 两次对照给出
+        # gloo 135.54/135.98 对共享板 142.51/141.15（均值 135.76 vs 141.83，**快 4.28%**）。
+        # 共享板原本的 32.9 us/次是在「只计归约本身」的口径下测的；端到端它的阻塞 D2H
+        # 会打断流水线，实测真实代价 37.98 ms（COFFIN_COMBINE_NOOP 对照），比 gloo 贵。
+        if world <= 0 or shm_rows < 0:
+            raise ValueError("world must be positive and shm_rows must be non-negative")
         self.path = path
         self.rank = int(rank)
         self.world = int(world)
         self.dist = dist
         self.dtype = dtype
-        self.shm_rows = int(shm_rows)
+        # env 覆盖：``COFFIN_COMBINE_FORCE_GLOO=1`` 把 ``shm_rows`` 压到 0，让**所有**行数
+        # （含 decode 的 rows=1）都走 gloo 路径。用途是 A/B：模块头记着共享内存 32.9 us/次、
+        # gloo 0.4-0.7 ms/次，但那是在「只计归约本身」的口径下测的；端到端（含阻塞 D2H
+        # 打断流水线）实测 combine 值 37.98 ms。若 gloo 端到端更快，就直接换过去。
+        forced = os.environ.get("COFFIN_COMBINE_FORCE_GLOO", "").strip() == "1"
+        self.shm_rows = 0 if forced else int(shm_rows)
         self.trace_limit = int(trace_limit)
         self.spin_limit = float(spin_limit)
         self.timing_limit = int(timing_limit)
@@ -465,3 +475,4 @@ class DecodeShmCombine:
         for board in self._boards.values():
             board.close()
         self._boards.clear()
+

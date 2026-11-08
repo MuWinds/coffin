@@ -614,7 +614,7 @@ def main(argv: list[str] | None = None) -> int:
         log(f"[rank 0] 共享板: {boards}")
     dist.barrier()
     combine = DecodeShmCombine(shm_path, rank, world, dist,
-                              dtype=torch.bfloat16, shm_rows=boards_max,
+                              dtype=torch.bfloat16, shm_rows=0,
                               # 上限取层数：一次 prefill 正好 48 次调用把它填满，于是
                               # decode 那 48 次**一次都不会被记录**。记录本身要在主机上
                               # 做一次求和，摊在 33 µs 的单次读数上是 10% 量级的假象，
@@ -1037,3 +1037,4 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
