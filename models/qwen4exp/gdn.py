@@ -335,7 +335,16 @@ def chunk_gated_delta_rule(query: torch.Tensor, key: torch.Tensor, value: torch.
                             dtype=new_values.dtype, device=new_values.device)
     else:
         state = initial_state.to(new_values)
-    out = torch.zeros_like(new_values)
+    # ``empty_like`` 而不是 ``zeros_like``：下面那个 ``for index in range(num_chunks)``
+    # 会把 ``out[:, :, index]`` **每一块都整块赋值**，第 3 维由循环完整覆盖，
+    # 之后 ``reshape(...)[:, :, :seq]`` 只是截掉分块填充的尾巴。所以零初始化是纯浪费
+    # —— ``new_values`` 是 ``[B, heads, chunks, chunk, hd]``，6.3 MB/次 × 36 层 = 226 MB
+    # 的 memset。实测占 prefill 512 的 **0.2%**（低于 0.5% 门槛，按清理而非收益记账）。
+    #
+    # 安全前提是「只写不读」：本函数里 ``out`` 在循环之后才被读取，且读的是 ``[:seq]``
+    # 前缀，而前缀所在的块也已被赋值。若将来有人在循环里插入对 ``out`` 的读，
+    # 必须改回 ``zeros_like``。
+    out = torch.empty_like(new_values)
 
     # 衰减只应用一次，而不是每块各乘一遍；这两步必须在 intra_chunk_attn 之后，
     # 否则块内注意力会"提前衰减一次"。
