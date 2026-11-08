@@ -221,5 +221,28 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "\u63a2\u6d4b\u6620\u5c04\u9501\u9875\u5185\u5b58\u662f\u5426\u53ef\u7528\uff1a"
           "\u8fd4\u56de (1/0, \u7ed3\u8bba\u6587\u672c)",
           pybind11::arg("detail_len") = 256);
+    m.def("mapped_register",
+          [](int64_t host_ptr, int64_t bytes) {
+              std::string detail(256, '\0');
+              const int64_t dev = mapped_register(
+                  reinterpret_cast<void*>(static_cast<uintptr_t>(host_ptr)), bytes,
+                  detail.data(), static_cast<int>(detail.size()));
+              detail.resize(std::strlen(detail.c_str()));
+              return std::make_tuple(dev, detail);
+          },
+          "\u6ce8\u518c mmap \u533a\u4e3a\u53ef\u6620\u5c04\u9501\u9875\u5185\u5b58\uff0c"
+          "\u8fd4\u56de (dev_ptr, \u7ed3\u8bba\u6587\u672c)",
+          pybind11::arg("host_ptr"), pybind11::arg("bytes"));
+    m.def("mapped_release", &mapped_release,
+          "\u89e3\u6ce8\u518c\u6620\u5c04\uff0c\u5fc5\u987b\u5728 munmap \u4e4b\u524d\u8c03\u7528",
+          pybind11::arg("host_ptr"));
+    m.def("mapped_stage", &mapped_stage,
+          "\u672c rank \u5c40\u90e8\u548c\u5199\u8fdb\u5171\u4eab\u69fd\u5e76\u7f6e\u5230\u8fbe\u8ba1\u6570",
+          pybind11::arg("x"), pybind11::arg("dev_base"), pybind11::arg("world"),
+          pybind11::arg("rank"), pybind11::arg("threads"), pybind11::arg("round"));
+    m.def("mapped_finish", &mapped_finish,
+          "\u4ece\u6240\u6709 rank \u7684\u69fd\u6c42\u548c\u5230\u8bbe\u5907 out",
+          pybind11::arg("out"), pybind11::arg("dev_base"), pybind11::arg("world"),
+          pybind11::arg("blocks"), pybind11::arg("threads"));
 }
 

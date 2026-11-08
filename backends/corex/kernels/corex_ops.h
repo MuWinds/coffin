@@ -739,3 +739,42 @@ void moe_router(torch::Tensor logits, torch::Tensor out_idx, torch::Tensor out_w
 // @param detail_len ``detail`` 的字节数。
 // @return ``1`` 支持且往返成功；``0`` 不支持或往返失败。
 int mapped_pinned_probe(char* detail, int detail_len);
+
+// @brief 把主机 mmap 区域注册成 CUDA 可映射锁页内存，返回设备指针（``0`` 为失败）。
+//
+// ``cudaHostAlloc`` 的内存无法跨进程映射，而共享板是文件 mmap；所以必须先 mmap，
+// 再由每个进程各自注册，多进程才能拿到指向同一物理页的设备指针。
+//
+// @param host_ptr 共享区主机地址（各进程可不同）。
+// @param bytes    字节数。
+// @param detail   结论文本输出。
+// @param detail_len ``detail`` 字节数。
+// @return 设备指针；``0`` 表示失败。
+int64_t mapped_register(void* host_ptr, int64_t bytes, char* detail, int detail_len);
+
+// @brief 解注册 ``mapped_register`` 建过的映射，必须在 munmap 之前调用。
+//
+// @param host_ptr ``mapped_register`` 收到的同一个地址。
+// @return ``0`` 成功，负值为 CUDA 错误码。
+int mapped_release(int64_t host_ptr);
+
+// @brief 本 rank 的局部和写进共享槽并置到达计数（必须单 block 启动）。
+//
+// @param x        ``[rows, hidden]`` bf16 设备张量。
+// @param dev_base 共享区设备指针。
+// @param world    进程数。
+// @param rank     本进程下标。
+// @param threads  单 block 线程数。
+// @param round    本轮轮次值。
+void mapped_stage(torch::Tensor x, int64_t dev_base, int64_t world, int64_t rank,
+                  int64_t threads, int64_t round);
+
+// @brief 从所有 rank 的槽求和到设备 ``out``（fp32）。
+//
+// @param out      ``[rows, hidden]`` fp32 设备张量。
+// @param dev_base 共享区设备指针。
+// @param world    进程数。
+// @param blocks   网格块数。
+// @param threads  每块线程数。
+void mapped_finish(torch::Tensor out, int64_t dev_base, int64_t world, int64_t blocks,
+                   int64_t threads);
