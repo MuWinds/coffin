@@ -54,6 +54,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+import ctypes
 import mmap
 import os
 import struct
@@ -320,6 +321,27 @@ class DecodeShmCombine:
         # 打断流水线）实测 combine 值 37.98 ms。若 gloo 端到端更快，就直接换过去。
         forced = os.environ.get("COFFIN_COMBINE_FORCE_GLOO", "").strip() == "1"
         self.shm_rows = 0 if forced else int(shm_rows)
+
+        # 设备侧归约：核直接读写一块被四个进程共享、且被 CUDA 映射过的锁页区，
+        # 主机只轮询到达计数、**不调任何同步 API**。
+        #
+        # 为什么要它：主机侧交换每层阻塞一次 D2H 等本层算完，队列排空、流水线断裂。
+        # 实测 combine 端到端代价 37.98 ms（48 层，COFFIN_COMBINE_NOOP 对照），
+        # 换 gloo 后仍有 31.0 ms。这条路径把「等」的对象从设备算完换成计数到达，
+        # 主机不再需要等设备。
+        #
+        # 只在 ``rows <= self.mapped_rows``（默认 1，即 decode）时启用：prefill 的
+        # rows 从 80 起，映射区按最大行数开一次就够，但那条路本来就走 gloo 且够快。
+        # 默认 **0 = 关闭**。作业 432 实测打开后四卡 decode 从 135.76 劣化到 963.35 ms
+        # （7.1 倍）。**成因未逐项拆解**，最可能是 ``finish_kernel`` 从主机内存读四个槽：
+        # 每层 4x2560 个 fp32 全走 PCIe 读，单次 cache line 往返是微秒级，48 层即吃掉全部收益。
+        # 内核本身数值正确（MR_MAXERR 0.0），所以问题在**访存方向**而不是算法：
+        # 该让核写进设备显存再做设备内归约，而不是让核去读主机内存。
+        # 保留为 opt-in（COFFIN_COMBINE_MAPPED_ROWS=1），下一步按这个方向改。
+        self.mapped_rows = int(os.environ.get("COFFIN_COMBINE_MAPPED_ROWS", "0"))
+        self._mapped = None
+        self._mapped_round = 0
+        self._mapped_out = None
         self.trace_limit = int(trace_limit)
         self.spin_limit = float(spin_limit)
         self.timing_limit = int(timing_limit)
@@ -335,6 +357,40 @@ class DecodeShmCombine:
         self._boards: dict[int, ShmAllReduce] = {}
         self._pairs: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         self._host = torch.empty((0, HIDDEN), dtype=torch.float32, pin_memory=True)
+
+    def _setup_mapped(self, rows: int):
+        """建（必要时扩容）设备侧归约的共享映射区。
+
+        区域布局：前 ``world * rows * HIDDEN`` 个 fp32 是各 rank 的槽，紧接
+        ``world`` 个 int64 是到达计数。**这个布局必须与 ``mapped_reduce.cu`` 里的
+        寻址一致**，改一边就得改另一边。
+
+        为什么用文件 mmap 而不是 ``cudaHostAlloc``：后者分配的内存**无法跨进程映射**，
+        四个进程必须看到同一份物理页，只能先 mmap 共享、再各自 ``cudaHostRegister``。
+
+        Args:
+            rows: 行数。只处理不超过 ``mapped_rows`` 的情形，更大的行数由调用方回落。
+
+        Returns:
+            ``(host_base, dev_base, total_bytes)``；``dev_base == 0`` 表示这张卡
+            不支持映射锁页内存，调用方应回落到 gloo。
+        """
+        from backends.corex import _kernels
+        total = self.world * rows * HIDDEN * 4 + self.world * 8
+        total = (total + 4095) // 4096 * 4096
+        path = f"{self.path}-mapped"
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            os.ftruncate(fd, total)
+            mm = mmap.mmap(fd, total, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+        finally:
+            os.close(fd)
+        # ``mmap`` 对象本身要留着：它被回收时页会失效，而设备指针还指着那里。
+        host_base = ctypes.addressof(ctypes.c_char.from_buffer(mm))
+        dev_base, detail = _kernels().mapped_register(host_base, total)
+        self._mapped = {"mm": mm, "host": host_base, "dev": int(dev_base),
+                        "rows": rows, "bytes": total, "detail": detail}
+        return host_base, int(dev_base), total
 
     def _pinned(self, rows: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """取（必要时分配）这一档行数的锁页中转：``(stage, out, act)``。
@@ -424,6 +480,37 @@ class DecodeShmCombine:
         tracing = len(self.trace) < self.trace_limit
         timing = len(self.timing) < self.timing_limit
         started = time.perf_counter()
+        # 设备侧归约优先：decode 的 rows=1 走这条。主机只轮询计数，不调同步 API。
+        if rows <= self.mapped_rows and os.environ.get(
+                "COFFIN_COMBINE_NO_MAPPED", "").strip() != "1":
+            if self._mapped is None or self._mapped["rows"] < rows:
+                self._setup_mapped(rows)
+            if self._mapped["dev"] != 0:
+                from backends.corex import _kernels
+                kern = _kernels()
+                if self._mapped_out is None or self._mapped_out.shape[0] < rows:
+                    self._mapped_out = torch.empty((rows, HIDDEN), dtype=torch.float32,
+                                                   device=x.device)
+                self._mapped_round += 1
+                kern.mapped_stage(x, self._mapped["dev"], self.world, self.rank,
+                                  256, self._mapped_round)
+                # 轮询到达计数：读的是普通共享内存，没有 CUDA 同步。
+                counts = torch.frombuffer(self._mapped["mm"], dtype=torch.int64,
+                                          count=self.world,
+                                          offset=self.world * rows * HIDDEN * 4)
+                deadline = time.perf_counter() + self.spin_limit
+                while True:
+                    if int(counts.min()) >= self._mapped_round:
+                        break
+                    if time.perf_counter() > deadline:
+                        raise TimeoutError(
+                            f"rank {self.rank} timed out at mapped round "
+                            f"{self._mapped_round}")
+                out_f = self._mapped_out[:rows]
+                kern.mapped_finish(out_f, self._mapped["dev"], self.world, 4, 256)
+                self.calls_shm += 1
+                return out_f.to(self.dtype)
+
         if rows <= self.shm_rows:
             stage, out, act = self._pinned(rows)
             # 一次阻塞的 D2H 同时完成 dtype 收口：``copy_`` 允许跨 dtype。
@@ -475,4 +562,6 @@ class DecodeShmCombine:
         for board in self._boards.values():
             board.close()
         self._boards.clear()
+
+
 
