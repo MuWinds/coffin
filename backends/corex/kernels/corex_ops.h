@@ -729,3 +729,13 @@ torch::Tensor qsa_block_keys(torch::Tensor flat_keys, torch::Tensor table,
 // @throws c10::Error 布局、设备、dtype、形状或 ``top_k`` 越界。
 void moe_router(torch::Tensor logits, torch::Tensor out_idx, torch::Tensor out_w,
                 int64_t top_k, bool normalize);
+
+// @brief 探测本设备是否支持映射锁页内存（零拷贝），并做一次核写-主机读的往返。
+//
+// 设备侧归约的前提：核能直接寻址锁页缓冲。若能，跨 rank 归约可以省掉每层一次
+// 阻塞 D2H（实测代价 37.98 ms，见 ``mapped_shm.cu`` 文件头）；若不能，那条路走不通。
+//
+// @param detail 输出缓冲，写入人类可读的结论（含失败原因或见过的魔数）。
+// @param detail_len ``detail`` 的字节数。
+// @return ``1`` 支持且往返成功；``0`` 不支持或往返失败。
+int mapped_pinned_probe(char* detail, int detail_len);

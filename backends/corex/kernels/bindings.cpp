@@ -18,6 +18,10 @@
 
 #include "corex_ops.h"
 
+#include <cstring>
+#include <string>
+#include <tuple>
+
 #include <torch/extension.h>
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -207,4 +211,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "\u4e00\u6b21\u53d1\u5c04\u5199\u51fa\u4e0b\u6807\u4e0e\u6743\u91cd",
           pybind11::arg("logits"), pybind11::arg("out_idx"), pybind11::arg("out_w"),
           pybind11::arg("top_k"), pybind11::arg("normalize"));
+    m.def("mapped_pinned_probe",
+          [](int64_t detail_len) {
+              std::string detail(static_cast<size_t>(detail_len > 0 ? detail_len : 256), '\0');
+              const int ok = mapped_pinned_probe(detail.data(), static_cast<int>(detail.size()));
+              detail.resize(std::strlen(detail.c_str()));
+              return std::make_tuple(ok, detail);
+          },
+          "\u63a2\u6d4b\u6620\u5c04\u9501\u9875\u5185\u5b58\u662f\u5426\u53ef\u7528\uff1a"
+          "\u8fd4\u56de (1/0, \u7ed3\u8bba\u6587\u672c)",
+          pybind11::arg("detail_len") = 256);
 }
+
