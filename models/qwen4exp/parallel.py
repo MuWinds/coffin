@@ -64,6 +64,15 @@ import torch
 #: 归约的宽度。qwen4_exp 的 ``hidden_size``，MoE 的 combine 归约的就是它。
 HIDDEN = 2560
 
+#: 诊断开关：``1`` 时把跨 rank 归约降级成恒等（**数值错误，只用于计时**）。
+#:
+#: 为什么要它：作业 416/417/418 量到「四卡 decode − 单卡 decode = 53.4 ms」，
+#: 而 ``combine`` 的墙钟是 50.2 ms，两者几乎相等；但它的内部分量里
+#: ``pre_us``（870 µs/层）是「等本层设备算完」——那段时间单卡也在算，不该算新增成本。
+#: 分量和总量对不上，所以**在改架构之前必须先量出 combine 的真实端到端代价**：
+#: 把它短路成 ``return x``，四卡 decode 的差分就是它真正的成本上限。
+_COMBINE_NOOP = os.environ.get("COFFIN_COMBINE_NOOP", "").strip() == "1"
+
 
 class ShmAllReduce:
     """若干 rank 通过一块 mmap 做全归约，语义同 ``dist.all_reduce(SUM)``。
@@ -396,6 +405,11 @@ class DecodeShmCombine:
         """
         if x.dim() != 2 or x.shape[-1] != HIDDEN:
             raise ValueError(f"combine expects [rows, {HIDDEN}], got {tuple(x.shape)}")
+        if _COMBINE_NOOP:
+            # 诊断：跳过跨 rank 归约与两次拷贝，只保留函数形状。数值是错的（少了三个 rank
+            # 的贡献），**只用于量 combine 的端到端代价**，不能进任何功能验证。
+            self.calls_shm += 1
+            return x
         rows = int(x.shape[0])
         tracing = len(self.trace) < self.trace_limit
         timing = len(self.timing) < self.timing_limit
