@@ -141,6 +141,20 @@ _HYPER_MODE = os.environ.get("COFFIN_HYPER_FUSED", "").strip().lower()
 #: 以上已经确定是 prefill 的领地。
 _HYPER_FUSED_MAX_ROWS = 16
 
+#: 读门用「逐路乘加」而不是 ``(w * x).mean(-2)`` 的最小行数（``B * S``）。
+#:
+#: 两种写法算术完全一样（都是 ``sum_c w_c * x_c / hc``），差在物化与归约路径上。
+#: 实测一次（作业 335，``[B=1, S=512, hc=4, H=2560]`` bf16，纯设备时间）：
+#:
+#:     (w * x).mean(-2)     279.46 us   ← 还要先物化 10 MB 的乘积，再走沿 dim=-2
+#:                                        的 4 元跨步归约；字节量只有 12.9 MB（屋顶 22 us）
+#:     逐路乘加              162.15 us   ← 同样的算术摊在 [B,S,H] 的 2.6 MB 连续张量上
+#:     转成 [B,S,H,4] 再 mean  853.17 us ← 布局转换那次拷贝把收益吃光
+#:
+#: 差额随行数线性缩小，而逐路乘加固定多 3 次发射（约 15 us），交叉点约 66 行，
+#: 所以取 64：decode（1 行）继续走 ``mean``，prefill 分块（512 行）走逐路乘加。
+_MEAN_CHAIN_MIN_ROWS = 64
+
 
 class GatedResidual(nn.Module):
     """一路读门（低秩 + swish）加一路标量写门。
@@ -440,10 +454,21 @@ class GatedResidual(nn.Module):
         input_mix_weight = input_mix_weight.unflatten(-1, (self.hc_count, self.hidden_size))
         # 门乘的是归一化后的 4 路状态，最后取均值：mean 让读门输出与 hc_count
         # 无关，换成 sum 会把尺度放大 4 倍。
-        mixed_input = (
-            input_mix_weight
-            * hyper_input_normed.unflatten(-1, (self.hc_count, self.hidden_size))
-        ).mean(dim=-2)
+        #
+        # 行数够多时逐路乘加：见 :data:`_MEAN_CHAIN_MIN_ROWS` 的实测（同一次
+        # ``[1,512,4,2560]`` 上 279.46 -> 162.15 us）。decode 只有 1 行，多出来的发射
+        # 比省下的带宽贵，所以那一档保持 ``.mean(-2)``。
+        streams = hyper_input_normed.unflatten(-1, (self.hc_count, self.hidden_size))
+        rows = streams.numel() // streams.shape[-1]
+        if rows >= _MEAN_CHAIN_MIN_ROWS:
+            # ``[..., c, :]`` 是 [B,S,H] 的连续视图，读得整齐；乘积不再单独物化。
+            mixed_input = input_mix_weight[..., 0, :] * streams[..., 0, :]
+            for channel in range(1, self.hc_count):
+                mixed_input.addcmul_(input_mix_weight[..., channel, :],
+                                     streams[..., channel, :])
+            mixed_input.mul_(1.0 / self.hc_count)
+        else:
+            mixed_input = (input_mix_weight * streams).mean(dim=-2)
         if self.block_inject_weight is None:
             return mixed_input
         # 乘 2 让零输入处 w = 2*sigmoid(0) = 1，于是初始化附近等价于原始残差相加。

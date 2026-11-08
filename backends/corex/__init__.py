@@ -69,6 +69,19 @@ _NAME_MARKERS: tuple[str, ...] = ("iluvatar", "bi-v100", "bi-v150", "corex")
 #: 权重读一遍，而 GEMM 要 *每个 tile* 读一遍，这就是两种情形被拆成两个算子的原因。
 _PREFILL_MIN_M = 64
 
+#: W4 权重走「反量化成 bf16 + 厂商 GEMM」的最小行数。低于它时反量化那 79 MB 的读写
+#: 摊不开（``w4_dequant`` 实测 198.4 us / 401.3 GB/s，是纯带宽的固定成本），而小 M 下
+#: ``_w4_rows`` 的 GEMV 只把权重读一遍就够。
+#:
+#: 起手取 256，实测再调：M=512 时「反量化 + matmul」935.9 us，对 ``w4_gemm_tcu`` 的
+#: 1934.8 us 是 2.07 倍（作业 371，q_proj 形状 512x12288x2560）。
+_W4_DEQUANT_MIN_M = int(os.environ.get("COFFIN_W4_DEQUANT_MIN_M", "256"))
+
+#: 反量化的显存闸门：``K * N * 2`` 字节超过它就放弃这条路、回退 ``_w4_rows``。
+#: 63 MB（q_proj）是正常量级；``lm_head`` 那类 248320 列的形状反量化要 1.27 GB，
+#: 虽然不会立刻 OOM，但没有理由为它付这个峰值 —— 判据 4 要求「per-call 只活一张权重」。
+_W4_DEQUANT_MAX_BYTES = int(os.environ.get("COFFIN_W4_DEQUANT_MAX_MB", "256")) << 20
+
 #: 为了避开库而必须分块时，每次内核启动处理的行数。:func:`_gemv_rows` 最多把这么
 #: 多行并进一次权重读取，正好对上小 M 内核的特化范围。
 #:
@@ -434,6 +447,29 @@ def _gemv_rows(w: torch.Tensor | QWeight | pack.KnWeight,
     return _restore(out, dtype)
 
 
+def _dequant_w4(w: W4A8Weight) -> torch.Tensor:
+    """把 packed W4 权重反量化成 ``[K, N]`` bf16。
+
+    每次调用**新建**输出，绝不缓存到 module 上：``q_proj`` 一份是 63 MB，128 个投影
+    常驻就是 4.5 GB，会在这个已经贴着显存上限的模型上直接 OOM。反量化的成本是
+    79.6 MB 的读写（实测 198.4 us / 401.3 GB/s），只有 ``M`` 足够大时才摊得薄，
+    所以这条路只在 :func:`linear_prefill` 的 ``rows >= _W4_DEQUANT_MIN_M`` 分支上用。
+
+    Args:
+        w: W4 权重，``packed`` 是 ``[ceil(K/2), N]`` uint8、``scale`` 是
+            ``[ceil(K/group), N]`` fp32（**K 在行、N 在列**）。
+
+    Returns:
+        ``[K, N]`` bf16 连续张量，可直接喂 ``torch.matmul(lhs, wt)``。
+
+    Raises:
+        RuntimeError: 扩展不可用，或形状不满足 ``w4_dequant`` 的向量化约束
+            （``N % 4 != 0``、``packed`` 不是 ``[ceil(K/2), N]``）。
+    """
+    module = _kernels()
+    return module.w4_dequant(w.packed, w.scale, w.k, w.n, w.group_size)
+
+
 def _w4_rows(w: W4A8Weight, x: torch.Tensor,
              activation_scale: torch.Tensor | None = None) -> torch.Tensor:
     """量化激活到 int8，再以逐组 int32 累加消费 packed W4 权重。
@@ -482,10 +518,19 @@ def _w4_rows(w: W4A8Weight, x: torch.Tensor,
     out = torch.empty((rows, w.n), dtype=act.dtype, device=act.device)
     if rows:
         # 分支提到循环外：这几个条件只由形状决定，而它每次调用都要判一遍。
-        if rows >= 32 and w.k % 4 == 0 and w.group_size % 64 == 0:
-            gemm = module.w4a8_gemm_tcu
-        else:
-            gemm = module.w4a8_gemv
+        #
+        # 分界 64 是实测的（作业 009，形状 ``[12288, 2560]``、单卡、bf16 输出）：
+        #
+        #     M=1    张量核 484.4 us / GEMV   59.3 us   -> GEMV 快 8.2 倍
+        #     M=32   张量核 510.6 us / GEMV  419.1 us   -> GEMV 快 18%
+        #     M=512  张量核 1998.2 us / GEMV 6734.7 us  -> 张量核快 3.4 倍
+        #
+        # 32 这一档必须走 GEMV：张量核的 warp tile 在 M 方向恒为 64 行，M=32 时一半是
+        # padding，而它还得付整套分块装载。从 64 起张量核领先。
+        use_gemm = rows >= 64 and w.k % 4 == 0 and w.group_size % 64 == 0
+        # M tile：从 256 行起用 256（实测 M=512 上比 128 快 11%，作业 259），
+        # 64-255 行仍用 128 —— 这一档用 256 会把行数补到 256，白算一倍。
+        m_tile = 256 if rows >= 256 else 0
         # **不套 ``torch.cuda.device(...)``**。那个上下文管理器每次都走一遍
         # ``c10::cuda::OptionalCUDAGuard``：读当前设备、比较、必要时切换、出块再
         # 恢复。而扩展自己的每个入口都已经有 ``CUDAGuard guard(t.device())``
@@ -496,7 +541,10 @@ def _w4_rows(w: W4A8Weight, x: torch.Tensor,
             module.quant_act_i8(act, xq, xs)
         else:
             module.quant_act_i8_scaled(act, xq, xs)
-        gemm(xq, w.packed, xs, w.scale, out, w.group_size)
+        if use_gemm:
+            module.w4a8_gemm_tcu(xq, w.packed, xs, w.scale, out, w.group_size, m_tile)
+        else:
+            module.w4a8_gemv(xq, w.packed, xs, w.scale, out, w.group_size)
     return _restore(out[0] if x.dim() == 1 else out, dtype)
 
 
@@ -548,6 +596,12 @@ def moe_grouped(w, x: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
 
     激活先整体量成 int8，再交给内核：量化是逐 token 的，与哪些 token 属于哪个专家
     无关，所以可以在分组之前一次做完，不必按段各量化一次。
+
+    内核侧按**每专家行数**分两档，调用方不需要知道：每专家 1 行时走「8 路展开 +
+    （K 够长才切）weight-group 分片」的那一档，实测 gate_up 203.3 -> 62.9 us、
+    down 58.5 -> 35.9 us（作业 213，逐位相同）；每专家多行时走单趟形态 —— 分片在
+    每专家 4 行以上反而慢 26%，因为部分和与归约是固定成本。判据与反例见
+    ``kernels/moe_grouped.cu`` 里那段启动注释。
 
     Args:
         w: 专家栈，:class:`W4A8MoEWeight`，``[E, N, K]``。
@@ -753,6 +807,68 @@ def moe_grouped_gemm(w, x: torch.Tensor, offsets: torch.Tensor,
     return _restore(result, dtype)
 
 
+def moe_router(logits: torch.Tensor, top_k: int,
+               normalize: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
+    """融合的 ``softmax -> top-k -> 归一化``，一次发射写完下标与权重。
+
+    替掉 ``models/qwen4exp/moe.py`` 里 ``TopKRouter`` 那条 torch 链
+    ``softmax -> topk -> div -> sum -> to``。作业 ``q4attrib3`` 量到它在 decode 一步里
+    是 48 层 × 5 个内核，其中 ``aten::topk`` 单次 38 us（``[1, 512]`` 取 top-10 在本卡上
+    走的是 bitonic 排序网络，45 轮比较交换）——挑最大的 10 个不需要排序，理由见
+    ``kernels/moe_grouped.cu`` 里那个内核上方的注释。
+
+    **返回的两个张量每次新建**，不做缓存复用：它们在本层结束后就被丢掉，但「返回值
+    不被别人持有」这件事没有写在契约里，而 ``moe_grouped`` 的 ``out`` 已经因为同一条
+    理由不复用。两次小分配比一次静默的别名事故便宜。
+
+    **近似在哪、影响多大**（这一轮的精度政策是「只要输出正常」，所以要能一眼看到边界）：
+    ``__expf`` 相对误差 ≤ 2e-6、softmax 分母的求和换序 ≤ 3e-5 最坏 / ~1e-6 典型、归一化
+    少一次除法 ≤ 1.2e-7 相对 —— 三者都远小于权重落地时的 bf16 量化步长 3.9e-3，不可观测。
+    唯一会改变最终选择的是**等值**：两个概率完全相等时这里取小下标，而 ``torch.topk``
+    的次序不保证；两个选择数学上都对（等值就是同一个数，权重逐位相同），换来的是同一输入
+    两次运行逐位相同。**这一档不是罕见情形**：实测 bf16 randn logits 上 ``tokens=512`` 时
+    340/512 行（66.4%）的 top-11 内有完全等值（top-10 挤在 2.5-3.5，而 bf16 在那里只有约
+    50 个位模式），fp32 对照 0/5120。所以**验收不能按位置比下标**，要比值（``w_set_diff``
+    非 0 才是真错误）；详见 ``kernels/moe_grouped.cu`` 里那段。
+
+    Args:
+        logits: ``[tokens, num_experts]`` 的 bf16 或 fp32 logits。
+        top_k: 每 token 选的专家数。
+        normalize: 是否把 top-k 概率再归一化（``norm_topk_prob``）。
+
+    Returns:
+        ``(index, weight)``：前者 ``[tokens, top_k]`` int64 按概率降序，后者同形、
+        dtype 同 ``logits``。
+
+    Raises:
+        ValueError: 激活不是二维，或 ``top_k`` / dtype 超出内核的实例化范围。此时没有
+            可用的融合路径，报错比悄悄换回慢路径好——后者会让「为什么这一步变慢了」
+            只能靠计时器发现。
+    """
+    if logits.dim() != 2:
+        raise ValueError(
+            f"router logits must be 2-D [tokens, experts], got {tuple(logits.shape)}.")
+    tokens, experts = int(logits.shape[0]), int(logits.shape[1])
+    # 内核的 top_k 上限是 32：一个 32-lane 组里每个 lane 只保存**自己那一槽**的结果，
+    # 超过它就得用动态下标的寄存器数组，那会掉进 local memory，反而更慢。
+    if top_k <= 0 or top_k > 32 or top_k > experts:
+        raise ValueError(
+            f"fused router needs 0 < top_k <= min(32, {experts}), got {top_k}.")
+    if logits.dtype not in (torch.bfloat16, torch.float32):
+        raise ValueError(f"fused router needs bf16 or fp32 logits, got {logits.dtype}.")
+    module = _kernels()
+    if not logits.is_contiguous():
+        logits = logits.contiguous()
+    index = torch.empty((tokens, top_k), dtype=torch.int64, device=logits.device)
+    weight = torch.empty((tokens, top_k), dtype=logits.dtype, device=logits.device)
+    if tokens == 0:
+        return index, weight
+    # 不套 ``torch.cuda.device(...)``：扩展入口自带 ``CUDAGuard``，而 decode 一步要发
+    # 48 次，每次都是一个纯开销的上下文管理器。
+    module.moe_router(logits, index, weight, top_k, normalize)
+    return index, weight
+
+
 def attn_sparse(q: torch.Tensor, kcache: torch.Tensor, vcache: torch.Tensor,
                 sel_idx: torch.Tensor, sel_len: torch.Tensor,
                 ctx: torch.Tensor, out: torch.Tensor | None = None,
@@ -934,6 +1050,23 @@ def linear_prefill(w: torch.Tensor | QWeight | pack.KnWeight,
         RuntimeError: 扩展不可用，而宽 ``N`` 形状需要它。
     """
     if isinstance(w, W4A8Weight):
+        rows_w4 = int(x.shape[0])
+        # 大 M：反量化成 bf16 走厂商 GEMM。**必须放在读 ``packed.wt`` 之前** ——
+        # ``W4A8Weight`` 没有 ``.wt`` 字段，激活 dtype 只能由这里自己定（bf16，与
+        # ``w4_dequant`` 的输出对齐）。
+        #
+        # 为什么 M=512 才值得（作业 371，q_proj 512x12288x2560）：
+        #   反量化 198.4 us（79.6 MB @ 401.3 GB/s）+ 厂商 bf16 GEMM 728.2 us
+        #   = 935.9 us，对 ``w4_gemm_tcu`` 的 1934.8 us 是 2.07 倍，且逐位可复原。
+        # 小 M 不走：反量化那 79 MB 是固定成本，摊不薄。
+        # `x.dim() != 2` 时交给 `_w4_rows`：它自己会 reshape，而这条分支只做二维。
+        if (x.dim() == 2 and rows_w4 >= _W4_DEQUANT_MIN_M and (w.n & 3) == 0
+                and w.k * w.n * 2 <= _W4_DEQUANT_MAX_BYTES):
+            act = _compute_dtype(x).reshape(rows_w4, w.k)
+            lhs = act if act.dtype == torch.bfloat16 else act.to(torch.bfloat16)
+            if not lhs.is_contiguous():
+                lhs = lhs.contiguous()
+            return _restore(torch.matmul(lhs, _dequant_w4(w)), x.dtype)
         return _w4_rows(w, x)
     packed = pack.as_kn(w)
     rows = x.shape[0]
@@ -951,6 +1084,27 @@ def linear_prefill(w: torch.Tensor | QWeight | pack.KnWeight,
     # GEMM 两个操作数必须同一 dtype，而本卡 bf16 和 fp16 的 TFLOP/s 一样（M=2048 时
     # 32.6），所以由权重自己的 dtype 决定，激活跟着它，而不是反过来。
     lhs = act.to(weight_dtype)
+    if packed.n < 8:
+        # **N < 8 一律补零到 8 列，取回前 ``n`` 列**：GEMM 的 N 方向 tile 是 8 的倍数，
+        # N 小于 8 时整 tile 里大部分通道在空转。实测同一个 ``[512, 2560] x [2560, 1]``：
+        # 直接乘 **853 us**（3.07 GFLOP/s），补零到 8 列再切回是 **63.6 us（13.4x）**，
+        # 且结果**逐位相同**（补的是 0，点积里多出来的项精确为 0）。补到 16/32 无进一步
+        # 收益（63.5 / 63.0 us），所以取 8。
+        #
+        # 覆盖到的真实形状（``COFFIN_MOE_SHAPE=1`` 与 ``record_shapes`` 都量过）：
+        #   * ``N = 1``：每层一次的标量投影（48 次/遍，曾 1.03 ms/次 = 49.3 ms）；
+        #   * ``N = 4``：``gated_residual`` 的 ``block_inject_weight``（``hc_count=4``，
+        #     96 次/遍，``[512, 10240] x [10240, 4]`` 曾 0.36 ms/次 = 34.5 ms）。
+        # 两者都是「无效 FLOPs 极便宜、tile 却大部分空转」的典型。
+        #
+        # 走过的弯路，别重试：``torch.mv`` 会让算子链变成 ``aten::mv -> aten::addmv_``，
+        # **仍是 1.04 ms/次**（端到端 1402.99 -> 1408.86，噪声内）。瓶颈不在 API 选择，
+        # 在**形状**——不换 API、只补零就能快 13 倍。归因见作业 315 / 380。
+        pad = 8
+        width = int(packed.n)
+        wp = torch.zeros((packed.k, pad), dtype=weight_dtype, device=lhs.device)
+        wp[:, :width] = packed.wt
+        return _restore(torch.matmul(lhs, wp)[:, :width], dtype)
     if packed.n <= pack.LIB_MAX_N:
         return _restore(torch.matmul(lhs, packed.wt), dtype)
     out = torch.empty((rows, packed.n), dtype=weight_dtype, device=x.device)
@@ -1930,6 +2084,9 @@ _NATIVE: dict[str, OpFn] = {
     "attn_sparse": attn_sparse,
     "qsa_block_keys": qsa_block_keys,
     "moe_dispatch": moe_dispatch,
+    # 路由的一条融合路径：替掉 softmax/topk/div/sum/to 五个内核，其中 topk 走的是
+    # 512 元素的 bitonic 排序网络。没有它这一层会退回参考实现（慢但对）。
+    "moe_router": moe_router,
     "hyper_norm": hyper_norm,
     "hyper_down": hyper_down,
     "hyper_up": hyper_up,

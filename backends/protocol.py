@@ -53,6 +53,7 @@ _OP_NAMES: tuple[str, ...] = (
     "moe_grouped",       # 稀疏专家：并行维是"专家 × 行"，与上面三档切法不同
     "moe_grouped_gemm",  # 同一件事的大 M 形态：按专家分段各做一次张量核 GEMM
     "moe_dispatch",      # 路由结果 → 前缀和 + 行序（替掉十来个 torch 小算子）
+    "moe_router",        # 路由自身：softmax -> top-k -> 归一化（替掉 512 元素的排序网络）
     # 归一化。
     "rms_norm",
     "add_rms_norm",
@@ -229,6 +230,17 @@ class Ops:
     #: ``index_add_`` 加回去，不再需要 ``nonzero``/``argsort``/``bincount``/``cumsum``。
     #: ``None`` 表示后端没有这个算子，模型侧退回纯 torch 的那条链。
     moe_dispatch: OpFn | None = None
+    #: ``moe_router(logits, top_k, normalize) -> (index, weight)``：一行 logits 选
+    #: ``top_k`` 个专家并给出（可归一化的）权重，一次发射。
+    #:
+    #: 单独成为一个算子，是因为那一族在 decode 一步里是 48 层 × 5 个内核，而其中最贵的
+    #: ``aten::topk`` 对 ``[1, 512]`` 取 top-10 走的是 bitonic 排序网络（45 轮比较交换，
+    #: 单次 38 us）——要的只是最大的 10 个，排序是白做的。``index`` 是
+    #: ``[tokens, top_k]`` int64 按概率降序，``weight`` dtype 跟 ``logits`` 走。
+    #:
+    #: 契约要求与参考实现同语义：fp32 softmax（先减行内最大值）、按概率降序、等值取
+    #: 小下标。``None`` 表示后端没有这个内核，模型侧走参考实现那条 torch 链。
+    moe_router: OpFn | None = None
     #: ``rms_norm(x, w, stride=0, eps=1e-6) -> y``：对 ``[M, N]`` 最后一轴做零中心
     #: RMSNorm（有效系数 ``1 + w``，由调用方折好）。``stride`` 是行与行之间的元素
     #: 间距，让指向更宽缓冲区的视图能原地归一化而不必拷贝；``0`` 表示「从 ``x`` 里
@@ -412,7 +424,12 @@ class Ops:
     #: -> mixed``：读门的升维投影、``sigmoid`` 门，再对 ``hc`` 路流做加权
     #: **mean**，同时一并算出写门。``up_wt`` 是 ``[hidden * hc, lowrank]``、
     #: ``inj_wt`` 是 ``[hc, hidden * hc]``，两者都是契约布局；``mixed`` 是
-    #: ``[rows, hidden]``，``inject`` 是 ``[rows, hc]`` 的 fp32。
+    #: ``[rows, hidden]``、``inject`` 是 ``[rows, hc]``，**两者都按激活 dtype 落盘**。
+    #:
+    #: ``inject`` 曾经要求 fp32、再由调用方窄化回激活 dtype。那次拷贝在 96 套/步上
+    #: 是 96 次发射（每步只有 4 个数要写），而模型侧真正需要的就是激活 dtype——
+    #: 写门要乘 ``[B, S, hidden]`` 的块输出并并回残差流，fp32 漏进那条流会让下一层的
+    #: 线性投影跟着变宽。所以收口交给内核自己做一次窄化，调用方不再有第二步。
     #:
     #: 三个语义点各自都能单独接错而形状不变：塌缩是 ``mean`` 不是 ``sum``（用 sum
     #: 会把读门尺度放大 ``hc`` 倍）；写门是 ``2 * sigmoid(dot / hc)``（漏掉 2 会让

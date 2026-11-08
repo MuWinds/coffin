@@ -135,7 +135,6 @@ def build_model(config, quantized: bool, rank: int | None, world: int,
 #: 形如 ``model.language_model.layers.<N>...`` 里的层号；不是分层张量时返回 ``-1``。
 _LAYER_RE = None
 
-
 def _layer_index(key: str) -> int:
     """从 checkpoint 键里取层号，供裁层过滤用。
 
@@ -218,6 +217,73 @@ def attach_quantized(model: CausalLM, rank_dir: Path, device: torch.device,
                 module.set_quantized(weight)
             attached += 1
     return {"attached": attached, "n_missing": len(missing), "missing": missing[:8]}
+
+
+class _NarrowSource:
+    """把 checkpoint 源收窄到「这个模型当前真的还缺的键」。
+
+    ``load_into`` 的账目核对是双向的：计划里有、模型里没有的键会报
+    「1056 个计划张量不是模型参数」。而量化模型的 ``state_dict`` 已经比 checkpoint
+    少了两大截——专家栈由 ``set_quantized`` 供货、``Proj`` 占位被 ``release_placeholder``
+    摘掉，裁层与 ``--skip-ple`` 又各少一批。所以源必须在 ``load_into`` 之前收窄，
+    否则补装一律失败，而失败的形态是「路由矩阵全零 → 生成物退化」，看着不像加载错。
+
+    ``keys()`` 直接返回模型 ``state_dict()`` 与源键的交集：交集之外的东西
+    （n-gram 分片、被裁掉的层、已量化的投影）本来就不该由这条路装。
+
+    Args:
+        source: 底层 :class:`StreamingSource`。
+        present: 模型当前 ``state_dict()`` 的键集合。
+
+    Constraints:
+        * 只做键的过滤，不改变任何张量的取值路径——``get`` / ``shape_of`` 直接转发。
+    """
+
+    def __init__(self, source, present: set[str]) -> None:
+        """记住底层源与允许的键集合。
+
+        Args:
+            source: 底层源。
+            present: 允许通过的键。
+        """
+        self._source = source
+        self._present = present
+
+    def keys(self) -> list[str]:
+        """返回模型还缺得了的那些**源**键。
+
+        过滤必须走 ``engine_key``：源键是 checkpoint 名（``model.language_model.layers.N...``），
+        而模型的 ``state_dict()`` 用的是引擎名（``model.layers.N...``），两者不是同一套命名。
+        直接拿源键去和引擎名求交会把**几乎所有键都滤掉**，然后 ``load_into`` 反过来报
+        「47 个模型参数没有源张量」——那个错误看着像 checkpoint 缺张量，其实是过滤器错了。
+
+        Returns:
+            源里存在、且映射后有对应模型参数的键。
+        """
+        out: list[str] = []
+        from models.qwen4exp.weights import engine_key
+
+        for key in self._source.keys():
+            # n-gram 分片键在 ``engine_key`` 里是**直接抛**的（它不是模型参数，
+            # 要先聚合 128 个分片才有意义）。不接住的话补装会在第一层 PLE 上崩，
+            # 而错误信息看着像 checkpoint 坏了。
+            try:
+                name = engine_key(key)
+            except ValueError:
+                continue
+            if name is None:
+                name = key
+            if name in self._present:
+                out.append(key)
+        return out
+
+    def get(self, name: str):
+        """按名取张量，语义同底层源。"""
+        return self._source.get(name)
+
+    def shape_of(self, name: str) -> list[int]:
+        """按名取形状，语义同底层源。"""
+        return self._source.shape_of(name)
 
 
 def decode_once(model: CausalLM, token: int, states, past: int,
@@ -371,11 +437,14 @@ def run_count_pass(model: CausalLM, tokens: list[int], steps: int,
                                          device, ple_tables)
             token = int(logits[0, -1].argmax())
     wall = (time.perf_counter() - started) * 1e3 / steps
-    rows = [(key, ms, mode.count[key]) for key, ms in mode.millis.most_common(40)]
-    by_count = [(key, mode.millis[key], count)
+    # 次数一律除以 steps：与 ``run_profile_pass`` 同一条账。表头写的是「/步」，
+    # 而这里原来给的是整个窗口的累计，读表的人会照 3 倍去估收益。
+    rows = [(key, ms / steps, mode.count[key] / steps)
+            for key, ms in mode.millis.most_common(40)]
+    by_count = [(key, mode.millis[key] / steps, count / steps)
                 for key, count in mode.count.most_common(40)]
     return {"wall_ms": wall, "top_time": rows, "top_count": by_count,
-            "total_calls": sum(mode.count.values())}
+            "total_calls": sum(mode.count.values()) / steps}
 
 
 def run_profile_pass(model: CausalLM, tokens: list[int], steps: int,
@@ -418,13 +487,16 @@ def run_profile_pass(model: CausalLM, tokens: list[int], steps: int,
             continue
         name = event.key
         kernels[name] += device_us / 1e3 / steps
-        counts[name] += event.count
+        # 次数也要除以 steps：``event.count`` 是整个 profile 窗口（steps 步）的累计。
+        # 历史上这里只除了毫秒没除次数，于是表里的「次数」被读成每步的内核数，
+        # 直接大 steps 倍——四份不同的分析都据此估错过发射折扣（见 2026-11 那轮）。
+        counts[name] += event.count / steps
         total += device_us / 1e3 / steps
         stack = getattr(event, "stack", None) or []
         site = _stack_site(stack)
         if site is not None:
             sites[site] += device_us / 1e3 / steps
-            site_counts[site] += event.count
+            site_counts[site] += event.count / steps
     return {
         "total_ms": total,
         "by_kernel": [(name, ms, counts[name]) for name, ms in kernels.most_common(30)],
@@ -660,6 +732,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--batch", type=int, default=0,
                         help="用引擎静态批跑生成，参数是行数；0 表示单行")
     parser.add_argument("--json-out", default="", help="把结果写成 JSON")
+    parser.add_argument("--no-load-bf16", dest="load_bf16", action="store_false",
+                        default=True,
+                        help="w4a8 模式下不补装量化产物没覆盖的 bf16 参数（路由矩阵、"
+                             "各 RMSNorm）。只量算子时用它省装载时间；任何"
+                             "「生成物是否正常」的验收都不能用它")
     args = parser.parse_args(argv)
 
     global _PAGED_CAPACITY, _PREFILL_CHUNK
@@ -667,8 +744,17 @@ def main(argv: list[str] | None = None) -> int:
     _PREFILL_CHUNK = int(args.prefill_chunk)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # 关掉自动求导：**生产路径全部带 ``@torch.inference_mode()``**（``engine/model_runner.py``
+    # 8 处、``models/qwen4exp/engine.py:359`` 等），只有本探针原先裸调 ``model(...)``。
+    # 后果不是慢一点，而是量错量级：每个碰 ``nn.Parameter``（路由矩阵、各 RMSNorm 增益）
+    # 的算子都会把输入残差流存给反向，而残差流是 ``[B, S, hc*H]`` ≈ 20 KB/token，
+    # 每层十几个这样的算子 —— 48 层加起来就是 **0.53 MB/token/层**，与实测
+    # 「512 token prefill 多吃 12.2 GiB、逐层均匀、线性于 seq」逐项吻合。
+    # 所以那份「prefill 显存泄漏」是探针自己造的，生产路径没有它。
+    # 这里一次关掉，之后所有读数才是服务等价口径。
+    torch.set_grad_enabled(False)
     log(f"device={device} mode={args.mode} layers={args.layers} "
-        f"passes={args.passes} synthetic={args.synthetic}")
+        f"passes={args.passes} synthetic={args.synthetic} grad=off")
 
     if args.synthetic:
         model, raw = synthetic_setup(args.layers, device)
@@ -693,6 +779,20 @@ def main(argv: list[str] | None = None) -> int:
             log(f"量化挂载: {report}")
             # 量化挂载会摘掉 meta 专家栈，此后才可以把剩下的非量化参数搬上卡。
             model = model.to(device)
+            # 量化产物只覆盖 ``Proj`` / ``QuantizedEmbedding`` / ``Experts`` 三类模块，
+            # 路由矩阵与各 RMSNorm（含 hc_norm）不在里面。不补的话它们停在初始化值上：
+            # 路由矩阵是**全零**，于是 ``softmax(0)`` 在 512 个专家上完全相等、``topk``
+            # 恒定返回 0..9，MoE 只走前 10 个专家——性能数字看着正常，生成物是退化的。
+            # 所以默认补装；只有明确只想量算子时用 --no-load-bf16 关掉。
+            if args.load_bf16:
+                source = _NarrowSource(StreamingSource(model_dir, device="cpu"),
+                                       set(model.state_dict()))
+                t0 = time.perf_counter()
+                filled = load_into(model, source, config, max_layers=args.layers,
+                                   skip_experts=True,
+                                   prepare=lambda name, t: t.to(device=device,
+                                                                dtype=torch.bfloat16))
+                log(f"非量化参数装载 {filled} 用时 {time.perf_counter() - t0:.1f}s")
         else:
             source = StreamingSource(model_dir, device="cpu")
             t0 = time.perf_counter()

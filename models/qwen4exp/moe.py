@@ -18,8 +18,12 @@ Module: ``coffin/models/qwen4exp``。依赖 ``config`` 与 ``proj``（共享专�
 ``blocks`` 调用。
 
 Constraints:
-    * 聚合必须按专家分组做（``index_add_``），不能展开成"每 token 跑 10 次完整
-      GEMM"：真实配置下专家权重是 ``[512, 1280, 2560]``，展开会读 10 倍权重。
+    * 聚合必须按专家分组做，不能展开成"每 token 跑 10 次完整 GEMM"：真实配置下专家
+      权重是 ``[512, 1280, 2560]``，展开会读 10 倍权重。
+    * 融合路径的合并**不许用 ``index_add_``**：它在 CUDA 上走 ``atomicAdd``，浮点加法
+      不满足结合律，同一份输入两次前向结果不逐位相同（作业 287/288 实测同版本两次
+      greedy token 就不同）。改用「按槽位序 gather + 定序 ``sum(dim=1)``」。
+      只有非融合的兜底路径仍然用 ``index_add_``，它不参与服务路径。
     * int8 打包时必须逐 expert 保持 ``[K, N]`` 行主序，不能把 512 个专家摊平成
       一个 2D 矩阵——``grouped_gemm`` 用固定偏移寻址。
     * W4A8 分派路径上不许出现主机往返。``.tolist()`` / ``int(tensor)`` 每次都要
@@ -36,6 +40,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from backends import ops as bops
 from models.qwen4exp.config import TextConfig
 from models.qwen4exp.proj import dispatch_linear, proj_from_config
 
@@ -54,17 +59,37 @@ _ACTIVATIONS = {"silu": F.silu, "gelu": F.gelu}
 #: 不会因为跑的是哪条路径而变。
 _CHECK_DISPATCH = bool(os.environ.get("COFFIN_MOE_CHECK"))
 
-#: 行数达到它就用按专家分段的张量核 GEMM，否则用 GEMV 结构的分组内核。
+#: 打印分组投影的真实形状（`COFFIN_MOE_SHAPE=1`）。只用于测量，默认关闭。
 #:
-#: 判据是**总行数**（``tokens``），不是每专家行数：``offsets`` 在设备上，为了拿
-#: 「非空专家数」回主机读一次是不值的（那正是 :meth:`Experts.forward` 里刚删掉的
-#: 那类同步）。用总行数当代理即可——它在 decode 时是 10、prefill ``seq=512`` 时
-#: 是 5120，两者差了三个数量级，分界放在哪个量级都不影响判断。
+#: 存在理由：这条链上所有关于「每专家几行」的判断一直是**外推**出来的
+#: （总 token 数 ÷ 本地专家数），而外推忽略了「每 token 的 top_k 个专家可能落在
+#: 同一 rank」这件事，已经因此把 MoE 的 prefill 占比估成 17%（实测 55%）。
+#: 内核耗时对 rows 极敏感（rows=8 约 9 µs/专家、64 约 67 µs、160 约 517 µs），
+#: 所以这个数必须直接量，不能算。
+_SHAPE_TRACE = bool(os.environ.get("COFFIN_MOE_SHAPE"))
+
+#: 每专家行数达到它就用按专家分段的张量核 GEMM，否则用 GEMV 结构的分组内核。
 #:
-#: 64 这个值有两重依据：本后端 ``_PREFILL_MIN_M`` 是 64（同一个「大 M 走 GEMM」的
-#: 分界，那里是稠密投影），而 MoE 每专家在 ``seq=512`` 时已有约 40 行、``seq=2048``
-#: 时 160 行，跨过 64 就意味着段长普遍够喂满一个 64x128 tile。
-_GEMM_MIN_ROWS = 64
+#: 判据是**每专家平均行数**（``rows / num_local_experts``），不是总行数：``offsets``
+#: 在设备上，为了拿「非空专家数」回主机读一次是不值的（那正是
+#: :meth:`Experts.forward` 里刚删掉的那类同步）。用平均值当代理即可——它把
+#: 「EP 分片后本 rank 只有 1/world 的专家」这件事算进去了，而总行数没有。
+#:
+#: **128 是实测的交叉点，不是经验值**（作业 221 的 ``PFB2``，真几何 E=128、
+#: ``gate_up`` K=2560→N=1280，同一份 17.4 MB 权重，只换行数）：
+#:
+#:     rows/专家   1      8      32     64     128
+#:     GEMV µs     1282   4240   14960  29783  59452
+#:     GEMM µs     34642  34968  36717  39659  45503
+#:     GEMM/GEMV   27x慢  8x慢   2.5x慢 1.3x慢 1.3x**快**
+#:
+#: 关键在 GEMM 那列**几乎不随行数变**：128 次专家发射共约 35 ms，摊到每次
+#: **274 µs**，而同样的活按带宽只要几微秒——成本是「每次专家发射的固定开销」，
+#: 不是算术。所以分界必须放在它终于能用工作摊薄的地方，64 那一档 GEMM 仍然慢 1.3 倍。
+#:
+#: 旧值 64 的依据（``_PREFILL_MIN_M`` 也是 64）只在稠密投影上成立，那里一次调用
+#: 只有一次发射；这里一次调用是 `num_local_experts` 次发射，固定开销被乘了 128。
+_GEMM_MIN_ROWS = int(os.environ.get("COFFIN_MOE_GEMM_MIN_ROWS", "128"))
 
 
 class MLP(nn.Module):
@@ -166,13 +191,21 @@ class TopKRouter(nn.Module):
         # 它请不到 ``Proj.forward`` 那套派发，但必须走同一条规则：两处分开写，某天调
         # ``_SMALL_ROWS`` 就会只生效一半。
         router_logits = dispatch_linear(self.weight, hidden_states, self.num_experts)
-        # softmax 在 fp32 上做再 top-k：低精度下 top-k 的顺序会抖动，而顺序决定
-        # 选中哪个专家。
-        router_probs = F.softmax(router_logits, dtype=torch.float, dim=-1)
-        router_top_value, router_indices = torch.topk(router_probs, self.top_k, dim=-1)
-        if self.norm_topk_prob:
-            router_top_value = router_top_value / router_top_value.sum(dim=-1, keepdim=True)
-        return router_logits, router_top_value.to(router_logits.dtype), router_indices
+        # 一次发射算完 ``softmax(fp32) -> top-k -> 归一化``。这条链原本是 5 个 torch 内核
+        # （softmax / topk / div / sum / to），decode 一步在 48 层各来一遍，其中
+        # ``aten::topk`` 单次 38 us —— 因为它对 ``[1, 512]`` 取 top-10 时走的是 512 元素的
+        # bitonic 排序网络（45 轮比较交换），而挑最大的 10 个不需要排序。
+        #
+        # 语义与原写法逐项对齐：softmax 仍在 fp32 上做且先减行内最大值（低精度下 top-k
+        # 的顺序会抖动，而顺序决定选中哪个专家）、仍按概率降序、``norm_topk_prob`` 为真
+        # 时仍除以 top-k 概率自己的和。内核只在 ``__expf`` 与两处归约的求和次序上不同，
+        # 量级末位 1-2 ulp，而权重接着要窄化成 bf16。
+        #
+        # 权重仍是 ``router_logits.dtype``（bf16）：下游 ``Experts`` 拿它乘专家输出，
+        # 所以这里不做任何 dtype 变化，只少了那次 ``.to()`` 内核。
+        router_indices, router_top_value = bops.moe_router(
+            router_logits, self.top_k, self.norm_topk_prob)
+        return router_logits, router_top_value, router_indices
 
 
 class Experts(nn.Module):
@@ -483,32 +516,105 @@ class Experts(nn.Module):
         if self._dispatch is not None and self._grouped is not None:
             slots = int(flat_index.numel())
             local_table = self._local_or_identity(flat_index.device)
-            offsets, _slot_pos, token_of_pos, slot_of_pos = self._dispatch(
+            offsets, slot_pos, token_of_pos, slot_of_pos = self._dispatch(
                 flat_index, local_table, slots, self.num_local_experts,
                 self.num_experts, top_k)
-            # 收拢激活：一行一个 (token, 槽位)。内核把有效行之外的尾部
-            # ``token_of_pos`` 清成 0，所以这张表可以整块索引，不会越界。
+            # 有效行是**前缀**：分派内核按「每专家前缀和 + 游标」把槽位紧密排进
+            # ``[0, valid)``，尾部 ``[valid, slots)`` 保持 0（见 ``moe_dispatch.cu``
+            # 的前缀和与打包循环）。所以按 ``valid`` 切开只碰有效行。
+            #
+            # 这笔账是实测的（作业 284，prefill 512 token）：``slots = tokens x top_k
+            # = 5120``，而真正落到本 rank 的只有 ``valid ≈ 1700``（每专家 11-16 行）。
+            # 也就是说 gather、``torch.zeros`` 出来的输出、权重乘法、``index_add_``
+            # **全都按 slots 缩放，白做 2.8 倍**。
+            #
+            # 代价是一次 D2H 同步（``.item()``）。原来这里刻意不读 ``offsets[-1]``
+            # 是为了避开同步（decode 一步 48 次，实测主机侧被拖到 227 ms），但那是
+            # decode 的形状；prefill 里一次这样的同步实测 24 us，96 次共 2.3 ms，
+            # 换的是按 slots 缩放的几百毫秒。取舍在 prefill 形状上是反过来的。
+            #
+            # **但 decode 上这个取舍仍然是反的**（作业 285 实测）：四卡 EP4
+            # 141.11 -> 157.65 ms/步（+11.7%），而 prefill 512 token
+            # 2153.68 -> 2039.56 ms（−5.3%）。亏的根因不是 96x24us = 2.3 ms，而是
+            # **阻塞**：decode 的 CPU 本来跑在 GPU 前面（一步发 9742 个内核），每层插
+            # 两次阻塞同步就打断一次主机预取，实测代价比 2.3 ms 大 7 倍。
+            #
+            # 所以按 **``tokens``** 加门 —— 它是 host 已知的，零同步；不能用 ``valid``
+            # 当门限（那正是"要同步才知道"的那个数）。decode 时 tokens 是个位数、
+            # prefill 时是几百，量级差两个数量级，64 这个门两边都不踩线。
+            #
+            # **注意**：分组内核本身只扫 ``offsets[e+1] - offsets[e]`` 行（见
+            # ``moe_grouped`` 的内核），尾部它本来就不碰 —— 所以这里省的是**主机侧**
+            # 那几项，不是内核时间。
+            if int(hidden_states.shape[0]) >= 64:
+                valid = int(offsets[-1].item())
+                token_of_pos = token_of_pos[:valid]
+                slot_of_pos = slot_of_pos[:valid]
+            else:
+                # 不切：三个张量保持 slots 长度，下游行为与切片前逐位一致。
+                valid = int(token_of_pos.shape[0])
+            # 收拢激活：一行一个 (token, 槽位)，现在恰好是 ``valid`` 行。
             packed_state = hidden_states[token_of_pos.long()]
+            if _SHAPE_TRACE:
+                # 分组投影的内核耗时对「每专家行数」极敏感（rows=8 约 9 µs/专家、
+                # rows=64 约 67 µs、rows=160 约 517 µs），而这条路径上一直只能靠
+                # 「总 token 数 ÷ 本地专家数」去外推，已经因此误判过三次。
+                # 这里直接把真实形状打出来：`rows` 是收拢后的行数、`offsets[-1]`
+                # 是有效行数（内核只扫到它）、`per` 是平均每专家行数。
+                _rows = int(packed_state.shape[0])
+                _per = valid / max(1, self.num_local_experts)
+                # 偏斜三项。``offsets.diff()`` 就是每专家行数（前缀和的差，逐元素，
+                # 不走原子累加，所以这几次读数是确定的）。
+                _cnt = offsets.diff()
+                _maxp = int(_cnt.max().item()) if _cnt.numel() else 0
+                _nz = _cnt[_cnt > 0]
+                _minnz = int(_nz.min().item()) if _nz.numel() else 0
+                _k = min(5, int(_cnt.numel()))
+                _top5 = int(torch.topk(_cnt, _k).values.sum().item()) if _k else 0
+                _top5_share = _top5 / max(1, valid)
+                print(f"[moe] shape rows={_rows} valid={valid} "
+                      f"per_expert={_per:.1f} max_per_expert={_maxp} "
+                      f"min_nonzero={_minnz} top5_share={_top5_share:.2f} "
+                      f"tokens={int(hidden_states.shape[0])} "
+                      f"top_k={top_k} local_experts={self.num_local_experts}", flush=True)
             up_gate = self._grouped(packed_state, offsets)
             gate, up = up_gate.chunk(2, dim=-1)
             current_hidden = self.act_fn(gate) * up
             current_hidden = self._grouped(current_hidden, offsets, down_proj=True)
-            # 路由权重按**槽位**取：同一 token 的 top_k 个专家各有各的权重。
-            # ``slot_of_pos`` 已经把「收拢后第 p 行来自哪个槽位」算好了 ——
-            # 无效尾部是 -1，clamp 后取第 0 个槽位的权重再乘 0，等于丢弃。
+            if _SHAPE_TRACE:
+                # `n`（输出宽度）必须一起打：009 的探针在「128 专家各 40 行」上量到
+                # 3.56 ms/次，而生产路径在「每专家 14.3 行」上量到 10.1 ms/次 ——
+                # **行少 2.8 倍、时间反多 2.8 倍**。除了每专家行数偏斜，另一个没排除的
+                # 混杂项就是 `n` 与探针不同（探针用 gate_up=1280 / down=2560）。
+                # 它是 host 已知量，打出来零成本。
+                print(f"[moe] out_shape up_gate={tuple(up_gate.shape)} "
+                      f"down={tuple(current_hidden.shape)} "
+                      f"n_gate_up={int(up_gate.shape[-1])} "
+                      f"n_down={int(current_hidden.shape[-1])}", flush=True)
+            # 确定性合并：按**槽位序** gather 回来，再对每个 token 的 top_k 项做一次
+            # 固定顺序求和。取代原来的 ``index_add_`` —— 那个在 CUDA 上走 atomicAdd，
+            # 浮点加法不满足结合律 ⇒ 同一份输入两次前向结果不逐位相同（作业 287/288
+            # 实测同版本两次 greedy token 就不同，self_repeat 的根因也是它）。
+            # 换成定序求和之后「同一 prompt 两次结果相同」这个承诺可以重新给出。
             #
-            # **不读 ``offsets[-1]`` 回主机**：那是一次设备到主机的同步，而这一步
-            # 正是本轮在 ``bool(keep.any())`` 那里删掉的东西（48 层 × 1 次同步）。
-            # 用掩码乘 0 代替切片，代价是两个逐元素算子和一次 ``index_select``，
-            # 而且分组内核写出的无效行必须是**确定的 0**（见 ``moe_grouped`` 的
-            # ``torch.zeros``），否则 0 乘上未初始化显存里的 nan 还是 nan。
-            valid_pos = slot_of_pos >= 0
-            scale = flat_weights.index_select(
-                0, slot_of_pos.clamp(min=0).long()).to(current_hidden.dtype)
-            scale = scale * valid_pos.to(scale.dtype)
-            current_hidden = current_hidden * scale[:, None]
-            final.index_add_(0, token_of_pos.long(), current_hidden.to(final.dtype))
-            return final
+            # ``slot_pos[t]`` 是「原本第 t 个槽位收拢后的行号」，被丢弃的为 -1
+            # （见 ``moe_dispatch.cu`` 的契约）；槽位序是 token-major，所以
+            # ``reshape(tokens, top_k, -1).sum(1)`` 正好是每个 token 的归并。
+            if current_hidden.shape[0] == 0:
+                return final
+            pos = slot_pos.long()
+            keep = pos >= 0
+            # 高级索引而不是 ``index_select``：同形状同 dtype 实测 130.67 vs 244.39 us
+            # （作业 307，1.87 倍）。反过来**不要**把这个理由套到上面那个
+            # ``hidden_states[token_of_pos]`` 上再改一次，它已经是高级索引了。
+            rows = current_hidden[pos.clamp(min=0)]
+            # 丢弃槽位**替换成 0**而不是乘 0：若 gather 到的行含 inf/nan，``0 * inf``
+            # 会变 nan 并污染该 token 的结果，而 ``torch.where`` 是丢弃、不是相乘。
+            rows = torch.where(keep[:, None], rows,
+                               torch.zeros((), dtype=rows.dtype, device=rows.device))
+            # 累加用 fp32：top_k 项的和在 bf16 下每一步都舍入，fp32 既更准也仍然是定序的。
+            merged = (rows * flat_weights.to(rows.dtype)[:, None]).view(tokens, top_k, -1)
+            return merged.sum(dim=1, dtype=torch.float32).to(hidden_states.dtype)
 
         # 分片时先扔掉不归本 rank 的槽位：它们要用 all-to-all 发出去，在这里算
         # 只会白读权重。

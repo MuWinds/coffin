@@ -368,9 +368,12 @@ constexpr int W4_THREADS = 256;
 constexpr int W4_SHARED = 2 * (BK / 16) * 1024;
 
 // @brief 一次读取四列 packed 字节，分别把低、高 nibble 放进相邻 K 行。
+//
+// @tparam KB 本段的 k 步长（64 为单位置，32 为双缓冲档）。
+template <int KB>
 __device__ __forceinline__ void stage_w4(int8_t* sa, const uint8_t* W,
                                          int n0, int k0, int N, int K) {
-    for (int t = threadIdx.x; t < BK / 2 * (W4_TILE / 4); t += W4_THREADS) {
+    for (int t = threadIdx.x; t < KB / 2 * (W4_TILE / 4); t += blockDim.x) {
         const int k = (t / (W4_TILE / 4)) * 2;
         const int j = t % (W4_TILE / 4);
         const int n = n0 + j * 4;
@@ -396,57 +399,68 @@ __device__ __forceinline__ void stage_w4(int8_t* sa, const uint8_t* W,
                 word |= ((unsigned)q & 255) << (8 * c);
             }
             const int kk = k + half;
-            *reinterpret_cast<unsigned*>(sa + warp_row * (BK / 16) * 1024
+            *reinterpret_cast<unsigned*>(sa + warp_row * (KB / 16) * 1024
                 + (kk >> 4) * 1024 + off_a(n4, kk & 15)) = word;
         }
     }
 }
 
-// @brief 激活只暂存本块的 128 行，不生成全矩阵解包副本。
+// @brief 激活只暂存本块的 ``MT`` 行，不生成全矩阵解包副本。
+//
+// @tparam MT 本块在 M 方向的 tile 行数，只能是 64 的整数倍（warp 输出 tile 的 M 恒为 64）。
+template <int MT, int KB>
 __device__ __forceinline__ void stage_w4_act(int8_t* sb, const int8_t* A,
                                              int m0, int k0, int M, int K) {
-    for (int t = threadIdx.x; t < W4_TILE * (BK / 4); t += W4_THREADS) {
-        const int m = t / (BK / 4);
-        const int k = (t % (BK / 4)) * 4;
+    for (int t = threadIdx.x; t < MT * (KB / 4); t += blockDim.x) {
+        const int m = t / (KB / 4);
+        const int k = (t % (KB / 4)) * 4;
         unsigned word = 0;
         if (m0 + m < M && k0 + k + 3 < K)
             word = *reinterpret_cast<const unsigned*>(A + (size_t)(m0 + m) * K + k0 + k);
-        *reinterpret_cast<unsigned*>(sb + (m >> 6) * (BK / 16) * 1024
+        *reinterpret_cast<unsigned*>(sb + (m >> 6) * (KB / 16) * 1024
             + (k >> 4) * 1024 + off_b(k & 15, m & 63)) = word;
     }
 }
 
-// @brief 每组清空整数累加器，施加该组 scale 后再加入 fp32 跨组和。
-template <typename XT>
+// @brief 分组 W4A8 张量核 GEMM 内核，M tile 与 k 步长都是模板参数。
+//
+// @tparam MT 本块在 M 方向的 tile 行数（64 / 128 / 256）。它只改「块盖多少行」，
+//            不改每个 warp 的输出 tile（恒为 64x64），所以每 lane 的累加器数不变；
+//            改它换的是**每块的行数与权重读次数**，不是寄存器压力。
+// @tparam KB 本段的 k 步长。``KB == BK`` 是单缓冲基线；``KB == 32`` 时自动走双缓冲
+//            （两段 32 的共享内存合计等于单段 64，占用率不变）。
+template <typename XT, int MT, int KB>
 __global__ void w4_gemm_tcu(const uint8_t* W, const int8_t* A, const float* xs,
                              const float* ws, XT* out, int M, int N, int K, int gs) {
+    //: 单段权重字节数；双缓冲时有两段。
+    constexpr int kSegW = 2 * (KB / 16) * 1024;
+    //: 单段激活字节数（MT/64 个 64 行小段）。
+    constexpr int kSegA = (MT / 64) * (KB / 16) * 1024;
+    //: KB != BK 即双缓冲档。
+    constexpr bool kDB = (KB != BK);
+    constexpr int kStages = kDB ? 2 : 1;
     extern __shared__ int8_t shared[];
     int8_t* sa = shared;
-    int8_t* sb = shared + W4_SHARED;
+    int8_t* sb = shared + kStages * kSegW;
+    //: M 方向铺几个 warp。MT=128 时 2 个（4 warp、256 线程），MT=64 时 1 个（2 warp、128 线程）。
+    constexpr int kWarpsM = MT / 64;
     const int warp = threadIdx.x >> 6;
-    const int wm = warp / 2, wn = warp % 2;
-    const int n0 = blockIdx.x * W4_TILE, m0 = blockIdx.y * W4_TILE;
+    const int wm = warp / kWarpsM, wn = warp % kWarpsM;
+    const int n0 = blockIdx.x * W4_TILE, m0 = blockIdx.y * MT;
     const int lane = __ivcorex_lane_id();
+    const int groups = (K + gs - 1) / gs;
+    //: 一个组跨几个 KB 段；``gs`` 是 64 的倍数，KB 取 64 或 32，所以整除。
+    const int per_group = gs / KB;
+
     float total[64] = {};
-    for (int g = 0; g < (K + gs - 1) / gs; ++g) {
-        v4i32 acc[16];
+    v4i32 acc[16];
+    auto reset_acc = [&]() {
 #pragma unroll
         for (int i = 0; i < 16; ++i) acc[i] = {0, 0, 0, 0};
-        for (int k0 = g * gs; k0 < min(K, (g + 1) * gs); k0 += BK) {
-            stage_w4(sa, W, n0, k0, N, K);
-            stage_w4_act(sb, A, m0, k0, M, K);
-            __syncthreads();
-            const int8_t* wa = sa + wm * (BK / 16) * 1024;
-            const int8_t* wb = sb + wn * (BK / 16) * 1024;
-            unsigned a0[4], a1[4], b0[4], b1[4];
-#pragma unroll
-            for (int t = 0; t < BK / 32; ++t) {
-                ld_a(a0, wa + t * 2048); ld_a(a1, wa + t * 2048 + 1024);
-                ld_b(b0, wb + t * 2048); ld_b(b1, wb + t * 2048 + 1024);
-                mma_tile(a0, a1, b0, b1, acc);
-            }
-            __syncthreads();
-        }
+    };
+    // 一组的 int32 累加收口：乘该组 scale 后加进 fp32 跨组和。两个分支共用同一段代码，
+    // 否则「双缓冲」与「单缓冲」两条路的算术就不再逐位可比。
+    auto flush = [&](int g) {
 #pragma unroll
         for (int rt = 0; rt < 4; ++rt) {
 #pragma unroll
@@ -461,7 +475,68 @@ __global__ void w4_gemm_tcu(const uint8_t* W, const int8_t* A, const float* xs,
                 }
             }
         }
+    };
+    reset_acc();
+
+    if (kDB) {
+        // 双缓冲：k 方向拍平成一维 chunk 序列，第 c+1 段的全局读与第 c 段的 mma 重叠；
+        // 每段只有一次 __syncthreads（单缓冲是两次）。
+        const int nchunks = groups * per_group;
+        stage_w4<KB>(sa, W, n0, 0, N, K);
+        stage_w4_act<MT, KB>(sb, A, m0, 0, M, K);
+        __syncthreads();
+        int cur = 0, group = 0;
+        for (int c = 0; c < nchunks; ++c) {
+            const int g = c / per_group;
+            if (g != group) {
+                flush(group);
+                reset_acc();
+                group = g;
+            }
+            const int next = c + 1;
+            if (next < nchunks) {
+                const int k_next = (next / per_group) * gs + (next % per_group) * KB;
+                stage_w4<KB>(sa + (cur ^ 1) * kSegW, W, n0, k_next, N, K);
+                stage_w4_act<MT, KB>(sb + (cur ^ 1) * kSegA, A, m0, k_next, M, K);
+            }
+            const int8_t* wa = sa + cur * kSegW + wm * (KB / 16) * 1024;
+            const int8_t* wb = sb + cur * kSegA + wn * (KB / 16) * 1024;
+            unsigned a0[4], a1[4], b0[4], b1[4];
+#pragma unroll
+            for (int t = 0; t < KB / 32; ++t) {
+                ld_a(a0, wa + t * 2048); ld_a(a1, wa + t * 2048 + 1024);
+                ld_b(b0, wb + t * 2048); ld_b(b1, wb + t * 2048 + 1024);
+                mma_tile(a0, a1, b0, b1, acc);
+            }
+            // 一次同步同时保证：下一轮不会覆盖别人还在读的那段，且下一轮数据已就绪。
+            __syncthreads();
+            cur ^= 1;
+        }
+    } else {
+        for (int g = 0; g < groups; ++g) {
+            for (int k0 = g * gs; k0 < min(K, (g + 1) * gs); k0 += KB) {
+                stage_w4<KB>(sa, W, n0, k0, N, K);
+                stage_w4_act<MT, KB>(sb, A, m0, k0, M, K);
+                __syncthreads();
+                const int8_t* wa = sa + wm * (KB / 16) * 1024;
+                const int8_t* wb = sb + wn * (KB / 16) * 1024;
+                unsigned a0[4], a1[4], b0[4], b1[4];
+#pragma unroll
+                for (int t = 0; t < KB / 32; ++t) {
+                    ld_a(a0, wa + t * 2048); ld_a(a1, wa + t * 2048 + 1024);
+                    ld_b(b0, wb + t * 2048); ld_b(b1, wb + t * 2048 + 1024);
+                    mma_tile(a0, a1, b0, b1, acc);
+                }
+                __syncthreads();
+            }
+            if (g + 1 < groups) {
+                flush(g);
+                reset_acc();
+            }
+        }
     }
+    flush(groups - 1);
+
 #pragma unroll
     for (int rt = 0; rt < 4; ++rt) {
 #pragma unroll
@@ -575,12 +650,12 @@ void moe_grouped_gemm(torch::Tensor a, torch::Tensor xs, torch::Tensor w,
                         (rows + W4_TILE - 1) / W4_TILE);
         if (out.scalar_type() == torch::kFloat) {
             float* dst = out.data_ptr<float>() + (int64_t)begin * N;
-            w4_gemm_tcu<float><<<grid, W4_THREADS, 2 * W4_SHARED, stream>>>(
+            w4_gemm_tcu<float, W4_TILE, BK><<<grid, W4_THREADS, 2 * W4_SHARED, stream>>>(
                 wexp, act, ascale, sexp, dst, rows, N, K, (int)group_size);
         } else {
             uint16_t* dst = reinterpret_cast<uint16_t*>(out.data_ptr())
                 + (int64_t)begin * N;
-            w4_gemm_tcu<uint16_t><<<grid, W4_THREADS, 2 * W4_SHARED, stream>>>(
+            w4_gemm_tcu<uint16_t, W4_TILE, BK><<<grid, W4_THREADS, 2 * W4_SHARED, stream>>>(
                 wexp, act, ascale, sexp, dst, rows, N, K, (int)group_size);
         }
     }
@@ -589,7 +664,8 @@ void moe_grouped_gemm(torch::Tensor a, torch::Tensor xs, torch::Tensor w,
 
 // @brief 用张量核直接消费 packed W4；group 必须按 64 对齐，K 按 4 对齐。
 torch::Tensor w4a8_gemm_tcu(torch::Tensor a, torch::Tensor w, torch::Tensor xs,
-                            torch::Tensor ws, torch::Tensor out, int64_t gs) {
+                            torch::Tensor ws, torch::Tensor out, int64_t gs,
+                            int64_t m_tile, int64_t db) {
     TORCH_CHECK(a.is_cuda() && a.dim() == 2 && w.dim() == 2 && out.dim() == 2,
                 "CUDA 2-D activation, weight and output required");
     const int64_t M = a.size(0), K = a.size(1), N = w.size(1);
@@ -609,13 +685,47 @@ torch::Tensor w4a8_gemm_tcu(torch::Tensor a, torch::Tensor w, torch::Tensor xs,
                     "all tensors must be contiguous on the same device");
     if (!M) return out;
     const c10::cuda::CUDAGuard guard(a.device());
-    const dim3 grid((N + W4_TILE - 1) / W4_TILE, (M + W4_TILE - 1) / W4_TILE);
+    // M 方向 tile：64 / 128（默认）/ 256。只有 64 的整数倍可表达，因为 warp 的输出
+    // tile 在 M 恒为 64；见内核的 @tparam MT。这个参数只用于扫参，生产路径不传。
+    //
+    // MT=256 的账：512 线程 x 128 个累加器寄存器已经顶到每 SM 寄存器文件的上限附近，
+    // 所以这一档**注定溢出或掉占用率**。量它就是为了分开「权重读次数」与「寄存器压力」
+    // 两个变量 —— MT=64（读双倍、压力一半）实测慢 16-29%，说明读次数是主导；
+    // 若 MT=256（读一半、压力双倍）更快，就再往 512 试。
+    const int mt = (m_tile == 64) ? 64 : (m_tile == 256) ? 256 : W4_TILE;
+    TORCH_CHECK(mt == 64 || mt == 128 || mt == 256, "m_tile must be 0/128, 64 or 256");
+    const dim3 grid((N + W4_TILE - 1) / W4_TILE, (M + mt - 1) / mt);
+    // 动态共享内存：单缓冲 = 权重 2*(BK/16)*1024 + 激活 (MT/64)*(BK/16)*1024（MT=128 时
+    // 正好 16 KB，与 MoE 那两处启动传的 ``2 * W4_SHARED`` 一致）；双缓冲（KB=32）两段合计
+    // 与它相等，所以占用率不变 —— 这是这一档的立身之本。
+    const bool use_db = (db != 0);
+    const int kb = use_db ? 32 : BK;
+    const int shmem = (use_db ? 2 : 1)
+        * (2 * (kb / 16) * 1024 + (mt / 64) * (kb / 16) * 1024);
     const auto stream = c10::cuda::getCurrentCUDAStream();
     auto run = [&](auto tag) {
         using XT = decltype(tag);
-        w4_gemm_tcu<XT><<<grid, W4_THREADS, 2 * W4_SHARED, stream>>>(
-            w.data_ptr<uint8_t>(), a.data_ptr<int8_t>(), xs.data_ptr<float>(),
-            ws.data_ptr<float>(), reinterpret_cast<XT*>(out.data_ptr()), M, N, K, gs);
+        if (mt == 256 && use_db) {
+            w4_gemm_tcu<XT, 256, 32><<<grid, 512, shmem, stream>>>(
+                w.data_ptr<uint8_t>(), a.data_ptr<int8_t>(), xs.data_ptr<float>(),
+                ws.data_ptr<float>(), reinterpret_cast<XT*>(out.data_ptr()), M, N, K, gs);
+        } else if (mt == 256) {
+            w4_gemm_tcu<XT, 256, BK><<<grid, 512, shmem, stream>>>(
+                w.data_ptr<uint8_t>(), a.data_ptr<int8_t>(), xs.data_ptr<float>(),
+                ws.data_ptr<float>(), reinterpret_cast<XT*>(out.data_ptr()), M, N, K, gs);
+        } else if (mt == 64) {
+            w4_gemm_tcu<XT, 64, BK><<<grid, 128, shmem, stream>>>(
+                w.data_ptr<uint8_t>(), a.data_ptr<int8_t>(), xs.data_ptr<float>(),
+                ws.data_ptr<float>(), reinterpret_cast<XT*>(out.data_ptr()), M, N, K, gs);
+        } else if (use_db) {
+            w4_gemm_tcu<XT, W4_TILE, 32><<<grid, W4_THREADS, shmem, stream>>>(
+                w.data_ptr<uint8_t>(), a.data_ptr<int8_t>(), xs.data_ptr<float>(),
+                ws.data_ptr<float>(), reinterpret_cast<XT*>(out.data_ptr()), M, N, K, gs);
+        } else {
+            w4_gemm_tcu<XT, W4_TILE, BK><<<grid, W4_THREADS, shmem, stream>>>(
+                w.data_ptr<uint8_t>(), a.data_ptr<int8_t>(), xs.data_ptr<float>(),
+                ws.data_ptr<float>(), reinterpret_cast<XT*>(out.data_ptr()), M, N, K, gs);
+        }
     };
     if (out.scalar_type() == torch::kFloat) run(float{});
     else run(uint16_t{});

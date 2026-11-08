@@ -148,6 +148,27 @@ def solve_triangular(lower: torch.Tensor, rhs: torch.Tensor,
                                          unitriangular=unitriangular)
 
 
+def _expand_heads(x: torch.Tensor, rep: int) -> torch.Tensor:
+    """把 ``[B, S, H, D]`` 的每个头连续复制 ``rep`` 份，得到 ``[B, S, H*rep, D]``。
+
+    与 ``torch.repeat_interleave(x, rep, dim=2)`` 的输出逐位相同，但走一次连续的
+    ``memcpy`` 而不是通用 gather：后者实测 **368 us/次**（作业 314，6 MB 输出），
+    是这次拷贝按带宽该有的 20 倍以上，而 GDN 有 36 层、每层两次。
+
+    Args:
+        x: 头维在第 2 轴上的激活，``[B, S, H, D]``。
+        rep: 每个 K 头要被多少个 V 头共用。
+
+    Returns:
+        ``[B, S, H*rep, D]``。``rep == 1`` 时原样返回，不拷贝。
+    """
+    if rep == 1:
+        return x
+    batch, seq, heads, dim = x.shape
+    return x[:, :, :, None, :].expand(batch, seq, heads, rep, dim).reshape(
+        batch, seq, heads * rep, dim)
+
+
 def l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
     """L2 归一化。
 
@@ -334,6 +355,43 @@ def chunk_gated_delta_rule(query: torch.Tensor, key: torch.Tensor, value: torch.
     return out, state
 
 
+#: ``_fused_in_proj`` 的失效原因只打一次。
+#:
+#: 真机产物里 ``in_proj_a/b``（``N=48``）没有 ``scale_key``，装载器于是走 ``set_bf16``，
+#: 而四路拼接要求四个成员都是 :class:`W4A8Weight` —— 也就是说这条「4 次投影 + 4 次
+#: 量化压成 1 次」的路径在 artifact 上**从来没有跑过**，退回的是四次独立调用。这个
+#: 事实在账本上只表现为「每层投影次数比设计值多」，所以必须留一行日志；36 个 GDN 层
+#: 各打一次只会把别的信号淹掉，所以每进程只打一次。
+_IN_PROJ_SKIP_LOGGED = False
+
+
+def _log_in_proj_skip(module: nn.Module, weight) -> None:
+    """报告一次 in_proj 四路融合为什么没启用，每进程一次。
+
+    Args:
+        module: 没能进组的那一个成员。
+        weight: 它当时的权重对象；``None`` 表示还没挂上，非 :class:`W4A8Weight`
+            表示是 bf16 回填的。
+    """
+    global _IN_PROJ_SKIP_LOGGED
+    if _IN_PROJ_SKIP_LOGGED:
+        return
+    _IN_PROJ_SKIP_LOGGED = True
+    if module.bias is not None:
+        reason = "带 bias"
+    elif weight is not None:
+        reason = f"权重是 {type(weight).__name__}"
+    elif getattr(module, "weight", None) is not None:
+        # 真机就是这一档：``in_proj_a/b`` 在量化产物里没有 ``scale_key``，装载器走
+        # ``set_bf16``，于是 ``_quantized`` 是 ``None`` 但 ``weight`` 是一份 bf16
+        # 参数。把它写成「没有权重」会误导下一个读日志的人。
+        reason = "未量化（bf16 回填）"
+    else:
+        reason = "没有权重"
+    print(f"[gdn] in_proj 融合未启用：{module.out_features}x{module.in_features} "
+          f"{reason}；退回四次独立投影", flush=True)
+
+
 class GatedDeltaNet(nn.Module):
     """线性注意力 mixer：投影 → 因果卷积 → delta 规则 → 门控归一化 → 输出投影。
 
@@ -370,6 +428,8 @@ class GatedDeltaNet(nn.Module):
             kernel_size=self.conv_kernel_size, groups=self.conv_dim,
             padding=self.conv_kernel_size - 1,
         )
+        #: ``((版本号, 设备, dtype), 该 dtype 的卷积权重)``，见 :meth:`_conv_weight`。
+        self._conv_cache: tuple | None = None
         # dt_bias 初始化为 1、A_log = log(uniform(0.01, 16))：下限远离 0 是为了
         # 让 log(A) 永远不变 -inf。两者都保持 fp32，被逐元素内核消费。
         self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads))
@@ -446,6 +506,7 @@ class GatedDeltaNet(nn.Module):
                 # 非量化路径（bf16 ``[K,N]``）也能拼，但那条路不是 decode 的热路径，
                 # 而拼接会让 ``pack.as_kn`` 的身份记忆化失效。所以只在 W4A8 上做。
                 # 有 bias 的站点同样跳过：``W4A8Weight`` 里没有 bias。
+                _log_in_proj_skip(module, weight)
                 self._fused_in_cache = ((), None)
                 return None
             weights.append(weight)
@@ -615,6 +676,31 @@ class GatedDeltaNet(nn.Module):
         self._decay_cache = (version, neg_expA, dt_bias)
         return neg_expA, dt_bias
 
+    def _conv_weight(self, dtype: torch.dtype) -> torch.Tensor:
+        """给出 ``dtype`` 版本的卷积抽头，权重变了就重取。
+
+        `causal_depthwise_conv` 第一件事是 ``x.to(weight.dtype)``。权重是 fp32 时那一步
+        会把 10 MB 的 bf16 输入整块转成 20 MB 的 fp32，卷积本身也在 fp32 上跑 ——
+        作业 353 把内核账里 ``copy_ [1,10240,512]`` 108 次 24.24 ms 归因到这里。
+        换成激活 dtype 后这一步消失，卷积的读写各减一半。
+
+        精度代价写在调用点：抽头是 ``kernel`` 个数的加权和、随后立刻过 silu，
+        敏感度低于 KV 缓存（那处 bf16 往返实测 99.912% 逐位相等）。
+
+        Args:
+            dtype: 目标 dtype，通常就是 ``mixed_qkv.dtype``。
+
+        Returns:
+            ``[conv_dim, 1, kernel]``，缓存复用；权重未变时不重复转换。
+        """
+        weight = self.conv1d.weight
+        version = (weight._version, weight.device, dtype)
+        if self._conv_cache is not None and self._conv_cache[0] == version:
+            return self._conv_cache[1]
+        cached = weight if weight.dtype == dtype else weight.detach().to(dtype)
+        self._conv_cache = (version, cached)
+        return cached
+
     def forward(self, hidden_states: torch.Tensor, conv_mask: torch.Tensor | None = None,
                 conv_state: torch.Tensor | None = None,
                 recurrent_state: torch.Tensor | None = None
@@ -674,9 +760,33 @@ class GatedDeltaNet(nn.Module):
             raise ValueError(
                 f"conv state must be {self.conv_kernel_size - 1} columns, got "
                 f"{conv_state.shape[-1]}.")
-        combined = torch.cat([conv_state, mixed_qkv], dim=-1)
-        new_conv_state = combined[..., -(self.conv_kernel_size - 1):].contiguous()
-        convolved = causal_depthwise_conv(mixed_qkv, self.conv1d.weight,
+        span = self.conv_kernel_size - 1
+        # 预填充分块用**激活 dtype**的卷积权重：`causal_depthwise_conv` 里那一步
+        # `x.to(weight.dtype)` 在权重是 fp32 时会把 10 MB 的 bf16 输入整块转成 20 MB
+        # 的 fp32、卷积本身也在 fp32 上算，白白多搬一倍字节（作业 353 定位到内核账里
+        # `copy_ [1,10240,512]` 108 次 24.24 ms 的根因就是这里）。
+        #
+        # 只在 `seq >= span`（预填充分块）换：decode 每步 1 个 token，换 dtype 省不到
+        # 什么，却会动到 decode 的四条红线。文件头那条「卷积不在融合范围内」说的是
+        # `conv1d_silu` 的 ABI（要 fp32 权重 + fp32 状态），而预填充分支根本走不到那个
+        # 融合核，所以这里换 dtype 不违反它。
+        conv_weight = (self._conv_weight(mixed_qkv.dtype)
+                       if seq >= span else self.conv1d.weight)
+        if span == 0:
+            new_conv_state = mixed_qkv[..., :0].contiguous()
+        elif seq >= span:
+            # 本步的 token 不比窗口短（prefill 的常态）：新状态就是本步最后 ``span`` 个
+            # token，历史一个字节都不用读。原来这里先
+            # ``torch.cat([conv_state, mixed_qkv], -1)`` 物化一整块
+            # ``[B, conv_dim, span + S]``（S=512、conv_dim=10240 时 **20 MB**）再切两列；
+            # 作业 314 把它量成 ``CatArrayBatchedCopy`` 72 次 39.69 ms 里的一半，
+            # 而真正需要的只有 40 KB。
+            new_conv_state = mixed_qkv[..., -span:].contiguous()
+        else:
+            # 比窗口还短（decode 每步 1 个 token）：历史要留后几个再拼上本步。
+            keep = conv_state[..., seq:] if seq else conv_state
+            new_conv_state = torch.cat([keep, mixed_qkv], dim=-1).contiguous()
+        convolved = causal_depthwise_conv(mixed_qkv, conv_weight,
                                          history=conv_state, dilation=1,
                                          activation=self.activation)
 
@@ -700,8 +810,23 @@ class GatedDeltaNet(nn.Module):
             g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
             if self.key_rep > 1:
                 # 第 j 个 V 头用第 j // rep 个 K 头，必须在 l2norm 之后对齐。
-                query = query.repeat_interleave(self.key_rep, dim=2)
-                key = key.repeat_interleave(self.key_rep, dim=2)
+                #
+                # 不用 ``repeat_interleave``：它在非首维上走的是通用 gather 路径，
+                # 实测（作业 314/315，``[1,512,16,128]`` 复制 3 份 = 6 MB 输出）
+                # **368 us/次**，而这是同一份数据的一次 memcpy，按本卡带宽应是 ~15 us。
+                # 36 个 GDN 层每层两次（query 与 key），prefill 512 一次就是 26.49 ms。
+                # ``expand + reshape`` 产出的东西与 ``repeat_interleave`` 逐位相同
+                # （头序都是"每头连续复制 rep 份"），只是换成一次稠密拷贝。
+                #
+                # 作业 355/357 的后续实测（这一条是给下一个想动它的人看的）：模型内用
+                # CUDA Event 夹住这两次调用是 **26.35 ms / 72 次 = 366 us/次**，而同一
+                # 操作在隔离循环里只要 51 us；``repeat_interleave``、``expand+reshape``、
+                # 预分配 ``copy_`` 三种写法**在模型内完全等价**（26.35/26.39/26.37 ms），
+                # 所以这不是"写法没选对"。它慢在模型内的访存争用上，要消掉只能让 delta
+                # 规则吃 16 个头（那三处 matmul 需要 48 个头，torch 对 stride-0 的 batch
+                # 维会自己物化 —— 与 QSA 稠密注意力那一处同一个机理）。
+                query = _expand_heads(query, self.key_rep)
+                key = _expand_heads(key, self.key_rep)
 
             # 参考实现在 seq_len == 1 时走递推、否则走分块；两条路径的数值必须一致，
             # 而递推是 decode 的真实路径，所以这里按同一条件分派。

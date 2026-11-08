@@ -423,6 +423,8 @@ ALLOWLISTS: dict[str, dict[str, dict[str, int]]] = {
             "tools/probe_q4_batch_b.py": 5,
             "tools/probe_q4_batch_divergence.py": 1,
             "tools/probe_q4_ep4_gen.py": 4,
+            # 胶水算子归属探针：要把 aten 层与内核层的耗时对上，只能设备侧夹事件。
+            "tools/probe_q4_glue.py": 3,
         },
         "prod": {
         },

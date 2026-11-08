@@ -15,6 +15,21 @@ rank 直接写对方可见的缓存行。
 11 ms、每层两次是 22 ms，会逼着去选 EP 来躲通信；换成 33 µs 之后，每层归约一次
 是 1.6 ms，**通信不再是决策变量**，拓扑可以纯粹按「哪个算得快」来挑。
 
+## 两条路按行数分，不是按载荷大小分
+
+四进程 EP4 实测（`tools/probe_q4_ep4_gen.py`，48 层，B=1）：gloo 侧一次归约
+**0.71 ms**，48 层/步 = **34 ms/步**，占 187.72 ms 步时间的 18%；共享内存侧
+`rows=1` 是 **32.9 µs/次**，48 层/步 = **1.6 ms**。所以 :class:`DecodeShmCombine`
+把 decode（`rows=1`）交给共享内存板、prefill 继续走 gloo。**不能反过来按「小载荷」
+分**：`rows=64` 时共享内存是 194 ms/次（Python 层 4 次全量拷贝），比 gloo 的
+0.73 ms 慢 266 倍。
+
+**0.71 ms 里有一半不是通信。** 那个探针在每次归约前多做一个 1 元素 all_reduce
+（帧号校验，用来发现各 rank 的调用序列错开一格），而 gloo 的成本几乎全是固定
+开销、与载荷无关，于是「载荷 + 校验」把单次成本抬了一倍。纯载荷约 0.35 ms，
+48 层/步 17 ms。这两个数不能混用：和 187.72 ms 比要减 34 ms（那是探针付的），
+和「引擎该付多少」比只能算 17 ms。
+
 Module: ``coffin/models/qwen4exp``。模型族内的并行原语。依赖只有 ``torch`` 和
 标准库——它不碰 ``backends``，因为这条路径只交换 CPU 上的 fp32，与平台无关；
 ``blocks.py`` / ``model.py`` 在构造时按 rank 拿到它，单卡时传 ``None``。
@@ -36,6 +51,8 @@ Constraints:
 """
 
 from __future__ import annotations
+
+from collections.abc import Sequence
 
 import mmap
 import os
@@ -155,3 +172,282 @@ class ShmAllReduce:
             self._mm.close()
         finally:
             os.close(self._fd)
+
+
+def board_path(path: str, rows: int) -> str:
+    """一块板用一个文件：``{path}-r{rows}``。
+
+    到达计数在文件头、每 rank 8 字节，而每个实例的 ``round`` 都从 0 开始。同一个
+    文件上放两块板（decode 的 ``rows=1`` 与 prefill 的 ``rows=128``）时，两边往同一
+    组计数器上累加，某个 rank 的 ``want = round * world`` 会被另一块板提前满足，
+    于是读到别人那一轮的数据——**不报错，只是数值错**。
+
+    Args:
+        path: 板文件前缀。
+        rows: 这一块板每次归约的行数。
+
+    Returns:
+        该行数对应的板文件路径。**行数不同就是不同文件**，这条不能省。
+    """
+    return f"{path}-r{int(rows)}"
+
+
+def prepare_shm_boards(path: str, ranks: int, rows: Sequence[int]) -> list[str]:
+    """在任何 rank 打开板文件之前，由 rank 0 把它建好并清零。
+
+    ``ShmAllReduce`` 自己不负责清空，理由见它的 ``Constraints``：四个并发
+    ``ftruncate`` 会互相把对方刚建好的文件截到 0，然后报
+    ``mmap length is greater than file size``。清空只允许发生在「没有并发者」的时刻，
+    所以调用顺序必须是：rank 0 建好 → ``dist.barrier()`` → 其余 rank 才构造实例。
+
+    Args:
+        path: 板文件前缀，与传给 :class:`DecodeShmCombine` 的一致。
+        ranks: 进程数，决定每块板要几个格子。
+        rows: 需要哪几档行数的板。decode 只有 1 一档。
+
+    Returns:
+        建好的文件路径列表。
+
+    Raises:
+        ValueError: ``rows`` 里出现非正数，或 ``ranks`` 非正。
+    """
+    if ranks <= 0:
+        raise ValueError("ranks must be positive")
+    made: list[str] = []
+    for row in sorted({int(r) for r in rows}):
+        if row <= 0:
+            raise ValueError(f"rows must be positive, got {row}")
+        target = board_path(path, row)
+        total = ShmAllReduce.HEADER + ranks * row * HIDDEN * 4
+        fd = os.open(target, os.O_RDWR | os.O_CREAT, 0o666)
+        try:
+            # 先截到 0 再截到 total：新文件的空洞读出来就是零，与「写满零」等价，
+            # 但不用真的搬 40 KB 字节。这样「清空」和「定尺寸」是同一次系统调用序，
+            # 后开的人只会看到已经够大的文件，不会再进 ``__init__`` 的 ftruncate。
+            os.ftruncate(fd, 0)
+            os.ftruncate(fd, total)
+        finally:
+            os.close(fd)
+        made.append(target)
+    return made
+
+
+class DecodeShmCombine:
+    """MoE 路由专家输出的跨 rank 归约：decode 走共享内存板，prefill 走 gloo。
+
+    模型侧只要 ``combine(x) -> x_reduced``（语义 ``all_reduce(SUM)``），所以这个类对
+    ``blocks.py`` / ``moe.py`` 是透明的。分路判据是行数，不是载荷大小：
+
+    * ``rows <= shm_rows``（decode，``rows=1``）：32.9 µs/次，48 层/步 1.6 ms；
+    * ``rows > shm_rows``（prefill，``tokens * top_k`` 从 80 起）：gloo 0.4-0.7 ms/次，
+      **绝不能用共享内存**——``rows=64`` 时它是 194 ms/次，按行数线性恶化。
+
+    一次 decode 调用只有一处同步：把激活从设备搬到锁页内存（``copy_`` 阻塞）。回传
+    用锁页缓冲 + ``non_blocking=True``，下一次调用的那一次阻塞拷贝会把它等干净，
+    所以复用同一个回传缓冲不会与未完成的 H2D 打架。
+
+    Attributes:
+        calls / calls_shm / calls_gloo: 三条计数分开记——换个判据时要知道各自付了
+            多少次，而不是只看到总耗时对不上。
+        millis / millis_shm / millis_gloo: 墙钟毫秒。**不能用 CUDA event 计时**：
+            载荷在主机上时设备全程空闲，event 量到的是循环本身。
+        tag: 当前正在归约的层号，由调用方在每层之前写进来。没有它，``trace`` 只是
+            一串没有层号的数，分不清「第 0 层算错」与「第 3 层才算错」。
+        trace: 前 ``trace_limit`` 次调用的 ``(tag, rows, 本 rank 输入和, 归约后和)``。
+            输入和四个 rank 各不相同是**对的**（各持 1/world 的专家），归约后必须
+            相同；两者能一眼分开「归约没生效」与「输入本身就不对」。
+        timing: 前 ``timing_limit`` 次调用的
+            ``(tag, rows, 走的是哪条路, 到达时刻, 等待微秒, 到达前微秒)``。
+
+            **为什么把「到达」和「等待」拆开**：整个调用里有一段是等设备跑到这一层
+            （阻塞 D2H），另一段才是等**最慢的那个 rank**。四卡 EP 的每次归约都在付
+            「最慢 rank」的钱，而它随每层的本地命中数变化；把两段混成一个数，就无法
+            回答「某次改动为什么把等待放大了」。
+
+            到达时刻用 ``time.perf_counter()``：Linux 上它是系统级单调时钟，同节点
+            不同进程之间可直接相减，因此四个 rank 的**到达时刻极差**是可测的。
+    """
+
+    def __init__(self, path: str, rank: int, world: int, dist,
+                 dtype: torch.dtype = torch.bfloat16, shm_rows: int = 1,
+                 trace_limit: int = 0, spin_limit: float = 20.0,
+                 timing_limit: int = 0) -> None:
+        """建共享板缓存与锁页中转缓冲，暂不打开任何板。
+
+        板在第一次用到那一档 ``rows`` 时才构造：decode 只有 ``rows=1`` 一档，而
+        prefill 永远走 gloo，于是 prefill 不会因为这里多建一块板而多一个文件。
+
+        Args:
+            path: 板文件前缀。必须已经由 :func:`prepare_shm_boards` 建好并清零。
+            rank: 本进程编号。
+            world: 进程数。
+            dist: 已初始化的 ``torch.distributed`` 模块，``rows > shm_rows`` 时用它。
+            dtype: 回传给模型的激活 dtype。
+            shm_rows: 行数不超过它就走共享板。
+            trace_limit: 记录前多少次调用的摘要；``0`` 表示不记录，引擎侧用 0，
+                因为每次记录要多付一次主机侧求和。
+            spin_limit: 共享板自旋上限（秒），到点抛 ``TimeoutError`` 而不是永久空转。
+            timing_limit: 记录前多少次调用的「到达 / 等待」耗时；``0`` 表示不记录。
+                探针量归约等待时打开，引擎侧保持 0（每次多两次 ``perf_counter``）。
+
+        Raises:
+            ValueError: ``world`` 或 ``shm_rows`` 非正。
+        """
+        if world <= 0 or shm_rows <= 0:
+            raise ValueError("world and shm_rows must be positive")
+        self.path = path
+        self.rank = int(rank)
+        self.world = int(world)
+        self.dist = dist
+        self.dtype = dtype
+        self.shm_rows = int(shm_rows)
+        self.trace_limit = int(trace_limit)
+        self.spin_limit = float(spin_limit)
+        self.timing_limit = int(timing_limit)
+        self.tag = -1
+        self.trace: list[tuple[int, int, float, float]] = []
+        self.timing: list[tuple[int, int, int, float, float, float]] = []
+        self.calls = 0
+        self.calls_shm = 0
+        self.calls_gloo = 0
+        self.millis = 0.0
+        self.millis_shm = 0.0
+        self.millis_gloo = 0.0
+        self._boards: dict[int, ShmAllReduce] = {}
+        self._pairs: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        self._host = torch.empty((0, HIDDEN), dtype=torch.float32, pin_memory=True)
+
+    def _pinned(self, rows: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """取（必要时分配）这一档行数的锁页中转：``(stage, out, act)``。
+
+        Args:
+            rows: 行数。
+
+        Returns:
+            ``stage`` 承接本 rank 输入、``out`` 承接归约结果（都是 fp32），``act``
+            是收窄回激活 dtype 的回传缓冲（锁页，才能让 H2D 真正异步）。
+        """
+        pair = self._pairs.get(rows)
+        if pair is None:
+            pair = (
+                torch.empty((rows, HIDDEN), dtype=torch.float32, pin_memory=True),
+                torch.empty((rows, HIDDEN), dtype=torch.float32, pin_memory=True),
+                torch.empty((rows, HIDDEN), dtype=self.dtype, pin_memory=True),
+            )
+            self._pairs[rows] = pair
+        return pair
+
+    def _host_for(self, rows: int) -> torch.Tensor:
+        """取（必要时扩容）gloo 路径的锁页中转。
+
+        Args:
+            rows: 行数。
+
+        Returns:
+            ``[rows, HIDDEN]`` 的 fp32 锁页张量，视图长度正好是 ``rows``。
+        """
+        if self._host.shape[0] < rows:
+            self._host = torch.empty((rows, HIDDEN), dtype=torch.float32,
+                                     pin_memory=True)
+        return self._host[:rows]
+
+    def _board(self, rows: int) -> ShmAllReduce:
+        """取（必要时打开）这一档行数的共享板。
+
+        Args:
+            rows: 行数，必须不超过 ``shm_rows``。
+
+        Returns:
+            对应的 :class:`ShmAllReduce`。
+
+        Raises:
+            RuntimeError: 板文件不存在或尺寸不够。**在这里拦下而不是让
+                ``ShmAllReduce`` 自己去 ftruncate**：那一步在四个 rank 同时发生时
+                会互相截断，症状是 ``mmap length is greater than file size`` 或者
+                更糟——四块板都建好但计数被清过，第一次归约就死等。
+        """
+        board = self._boards.get(rows)
+        if board is not None:
+            return board
+        target = board_path(self.path, rows)
+        total = ShmAllReduce.HEADER + self.world * rows * HIDDEN * 4
+        size = os.path.getsize(target) if os.path.exists(target) else -1
+        if size < total:
+            raise RuntimeError(
+                f"shared board {target} has {size} bytes, needs {total}: call "
+                "prepare_shm_boards() on rank 0 and barrier before constructing")
+        board = ShmAllReduce(target, self.rank, self.world, rows)
+        self._boards[rows] = board
+        return board
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        """归约一次，返回同形状、同 dtype、同设备的张量。
+
+        Args:
+            x: ``[rows, hidden]`` 激活，设备上的张量。
+
+        Returns:
+            归约后的张量，语义同 ``all_reduce(SUM)``。
+
+        Raises:
+            ValueError: 形状与 ``hidden`` 不符（宽度不是 2560 时共享板按错误的
+                步长寻址，数值会静默错位，所以在这里拦）。
+            TimeoutError: 某个 rank 没在 ``spin_limit`` 内到达共享板。
+        """
+        if x.dim() != 2 or x.shape[-1] != HIDDEN:
+            raise ValueError(f"combine expects [rows, {HIDDEN}], got {tuple(x.shape)}")
+        rows = int(x.shape[0])
+        tracing = len(self.trace) < self.trace_limit
+        timing = len(self.timing) < self.timing_limit
+        started = time.perf_counter()
+        if rows <= self.shm_rows:
+            stage, out, act = self._pinned(rows)
+            # 一次阻塞的 D2H 同时完成 dtype 收口：``copy_`` 允许跨 dtype。
+            stage.copy_(x)
+            local_sum = float(stage.sum()) if tracing else 0.0
+            # 到达时刻＝本 rank 已经可以往板上写的时刻。它之后到返回之间的那一段才是
+            # 「等最慢 rank」，之前那一段是「等本层设备算完」。
+            arrive = time.perf_counter()
+            self._board(rows)(stage, out, spin_limit=self.spin_limit)
+            back = time.perf_counter()
+            value = act.copy_(out).to(x.device, non_blocking=True)
+            self.calls_shm += 1
+            spent = (time.perf_counter() - started) * 1e3
+            self.millis_shm += spent
+            # 摘要和从**主机缓冲**取，不从回传的设备张量取：``float(value.sum())`` 会把
+            # 刚排下去的 H2D 等干净，等于让被记录的那些调用多付一次设备同步，而它们
+            # 正是拿来算单次微秒的样本。
+            out_sum = float(out.sum()) if tracing else 0.0
+            timed = (self.tag, rows, 0, arrive, (back - arrive) * 1e6,
+                     (arrive - started) * 1e6) if timing else None
+        else:
+            host = self._host_for(rows)
+            host.copy_(x)
+            local_sum = float(host.sum()) if tracing else 0.0
+            arrive = time.perf_counter()
+            self.dist.all_reduce(host, op=self.dist.ReduceOp.SUM)
+            back = time.perf_counter()
+            value = host.to(x.dtype).to(x.device)
+            self.calls_gloo += 1
+            spent = (time.perf_counter() - started) * 1e3
+            self.millis_gloo += spent
+            out_sum = float(host.sum()) if tracing else 0.0
+            timed = (self.tag, rows, 1, arrive, (back - arrive) * 1e6,
+                     (arrive - started) * 1e6) if timing else None
+        if tracing:
+            self.trace.append((self.tag, rows, local_sum, out_sum))
+        if timed is not None:
+            self.timing.append(timed)
+        self.calls += 1
+        self.millis += spent
+        return value
+
+    def close(self) -> None:
+        """释放所有共享板。
+
+        不关会泄漏 mmap 与文件描述符；进程退出时操作系统会回收，但探针一个进程里
+        可能跑好几档配置，攒着会先把文件描述符用光。
+        """
+        for board in self._boards.values():
+            board.close()
+        self._boards.clear()

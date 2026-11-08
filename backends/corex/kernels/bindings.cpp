@@ -54,10 +54,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("ws"), pybind11::arg("out"), pybind11::arg("group_size"),
           pybind11::arg("threads") = 0, pybind11::arg("unroll") = 0,
           pybind11::arg("split") = 0, pybind11::arg("width") = 0);
+    m.def("w4_dequant", &w4_dequant,
+          "packed W4 权重一趟反量化成 bf16（大 M 的厂商 GEMM 前置）",
+          pybind11::arg("packed"), pybind11::arg("scale"),
+          pybind11::arg("k"), pybind11::arg("n"), pybind11::arg("group"));
     m.def("w4a8_gemm_tcu", &w4a8_gemm_tcu,
           "分组 packed W4 与 int8 激活的张量核投影",
           pybind11::arg("a"), pybind11::arg("w"), pybind11::arg("xs"),
-          pybind11::arg("ws"), pybind11::arg("out"), pybind11::arg("group_size"));
+          pybind11::arg("ws"), pybind11::arg("out"), pybind11::arg("group_size"),
+          // M 方向 tile：0 表示默认 128，64 / 256 是另外两档；db 非 0 时走
+          // 「双缓冲 + k 步长 32」那一档。两个参数都只用于扫参与稠密路径调优。
+          pybind11::arg("m_tile") = 0, pybind11::arg("db") = 0);
     m.def("quant_act_i8_scaled", &quant_act_i8_scaled,
           "按跨 rank 共享的逐行 scale 量化激活",
           pybind11::arg("x"), pybind11::arg("out"), pybind11::arg("xs"));
@@ -193,4 +200,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("normed"), pybind11::arg("up_wt"), pybind11::arg("low"),
           pybind11::arg("inj_wt"), pybind11::arg("mixed"), pybind11::arg("inject"),
           pybind11::arg("hidden"), pybind11::arg("hc"), pybind11::arg("lowrank"));
+    // 路由融合：替掉 ``softmax -> topk -> div -> sum -> to`` 五个内核，其中 topk 对
+    // ``[1, 512]`` 取 top-10 在本卡上走 bitonic 排序网络、单次 38 us。
+    m.def("moe_router", &moe_router,
+          "\u8def\u7531\uff1a\u878d\u5408 softmax -> top-k -> \u5f52\u4e00\u5316\uff0c"
+          "\u4e00\u6b21\u53d1\u5c04\u5199\u51fa\u4e0b\u6807\u4e0e\u6743\u91cd",
+          pybind11::arg("logits"), pybind11::arg("out_idx"), pybind11::arg("out_w"),
+          pybind11::arg("top_k"), pybind11::arg("normalize"));
 }

@@ -131,6 +131,31 @@ def _moe_grouped(w, x: torch.Tensor, offsets: torch.Tensor,
     return out
 
 
+def _moe_router(logits: torch.Tensor, top_k: int, normalize: bool
+                ) -> tuple[torch.Tensor, torch.Tensor]:
+    """把路由写成 ``softmax -> topk -> 归一化``，作为 ``moe_router`` 的正确性基线。
+
+    这就是 ``models/qwen4exp/moe.py`` 里 ``TopKRouter`` 原本的写法，一字不改：fp32
+    softmax（``dtype=torch.float`` 让上游先窄化再算）、对概率取 ``topk``、按
+    ``norm_topk_prob`` 决定要不要再除以 top-k 自己的和。任何后端内核版的路由都拿它当
+    oracle，所以它必须保持「慢但对」——不要在这里做任何融合。
+
+    Args:
+        logits: ``[tokens, num_experts]``，dtype 是激活 dtype。
+        top_k: 每 token 取的专家数。
+        normalize: 是否把 top-k 概率再归一化（``norm_topk_prob``）。
+
+    Returns:
+        ``(index, weight)``：前者 ``[tokens, top_k]`` int64 按概率降序，后者同形、
+        dtype 同 ``logits``。
+    """
+    probs = torch.softmax(logits, dtype=torch.float, dim=-1)
+    value, index = torch.topk(probs, top_k, dim=-1)
+    if normalize:
+        value = value / value.sum(dim=-1, keepdim=True)
+    return index, value.to(logits.dtype)
+
+
 def _rms_norm(x: torch.Tensor, w: torch.Tensor, stride: int = 0,
               eps: float = 1e-6) -> torch.Tensor:
     """Zero-centred RMSNorm over the last axis of a 2-D activation block.
@@ -1026,6 +1051,7 @@ def build(caps: Caps | None = None) -> Ops:
         delta_normed=_delta_normed,
         triangular_solve=_triangular_solve,
         moe_grouped=functools.partial(_moe_grouped, weight_dtype=c.weight_dtype),
+        moe_router=_moe_router,
         hyper_norm=_hyper_norm,
         hyper_down=_hyper_down,
         hyper_up=_hyper_up,

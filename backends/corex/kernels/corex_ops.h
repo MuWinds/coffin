@@ -117,7 +117,23 @@ torch::Tensor w4a8_gemv(torch::Tensor a, torch::Tensor w, torch::Tensor xs,
                         int64_t threads, int64_t unroll, int64_t split,
                         int64_t width);
 torch::Tensor w4a8_gemm_tcu(torch::Tensor a, torch::Tensor w, torch::Tensor xs,
-                            torch::Tensor ws, torch::Tensor out, int64_t group_size);
+                            torch::Tensor ws, torch::Tensor out, int64_t group_size,
+                            int64_t m_tile = 0, int64_t db = 0);
+
+// @brief 把 packed W4 权重一趟反量化成 bf16，供大 M 的厂商 GEMM 使用。
+//
+// torch 层的等价写法要七八趟 elementwise、每趟把 79 MB 完整读写一遍，实测只有约
+// 35 GB/s；合成一趟是这个内核存在的全部理由（``w4_dequant.cu`` 头部有完整账）。
+//
+// @param packed ``[ceil(K/2), N]`` 连续 uint8（**K 在行、N 在列**）。
+// @param scale  ``[ceil(K/group), N]`` 连续 fp32。
+// @param k      输入宽度，允许奇数。
+// @param n      输出列数，必须是 4 的倍数（一列四字节的事务宽度决定的）。
+// @param group  分组大小。
+// @return ``[K, N]`` bf16。
+// @throws c10::Error 布局、dtype、形状或 ``N % 4`` 不自洽。
+torch::Tensor w4_dequant(torch::Tensor packed, torch::Tensor scale, int64_t k, int64_t n,
+                         int64_t group);
 torch::Tensor quant_act_i8_scaled(torch::Tensor x, torch::Tensor out, torch::Tensor xs);
 
 // 归一化。
@@ -573,6 +589,12 @@ torch::Tensor hyper_up(torch::Tensor normed, torch::Tensor up_wt, torch::Tensor 
 //                 给了它网格的 z 维就从 128 降到 10，消掉 92% 的空转 block。
 // @return out。
 // @throws c10::Error 布局、设备、dtype、形状或前缀和不自洽。
+//
+// 本实现内部按**每专家行数**分两档，调用方不需要知道：每专家 1 行（B=1 decode，用
+// ``tokens <= top_k`` 在 host 侧判定，不读 ``offsets``）走「按 weight-group 切 K +
+// 部分和归约」的分片内核，实测 203.3 -> 62.9 us（3.23x，作业 213，逐位相同）；其余
+// 走单趟内核 —— 分片在每专家 4 行以上反而慢 26%，因为部分和与归约是固定成本。
+// 判据、实测数字与取舍见 ``moe_grouped.cu`` 里 ``moe_grouped`` 的启动段。
 torch::Tensor moe_grouped(torch::Tensor a, torch::Tensor xs, torch::Tensor w,
                           torch::Tensor ws, torch::Tensor offsets,
                           torch::Tensor out, int64_t group_size,
@@ -683,3 +705,27 @@ torch::Tensor qsa_block_keys(torch::Tensor flat_keys, torch::Tensor table,
                              torch::Tensor block_batch, torch::Tensor out,
                              int64_t seq, int64_t tokens, int64_t rotary_dim,
                              double eps);
+
+// 路由：从一行 logits 里选 top_k 个专家，并给出（可归一化的）权重。
+
+// @brief 融合的 ``softmax(fp32) -> top-k -> 归一化``，一次发射写完下标与权重。
+//
+// 为什么新增这个入口：``moe.py`` 的 ``TopKRouter`` 这一步原本是
+// ``softmax -> topk -> div -> sum -> to`` 五个 torch 内核，在 decode 一步里 48 层
+// 各来一遍。其中 ``aten::topk`` 单次 38 us（作业 ``q4attrib3``，48 次/步 = 1.83 ms/步），
+// 而对 ``[1, 512]`` 取 top-10 在本卡上走的是 bitonic 排序网络 —— 45 轮比较交换，
+// 只为挑出最大的 10 个。这条路径给出的是「一次发射、不排序」的替代。
+//
+// 语义与参考实现（``torch.softmax`` + ``torch.topk`` + 归一化）对齐：fp32 softmax 先减
+// 行内最大值、按概率降序、等值取小下标（``torch.topk`` 对等值次序不作保证，这里固定
+// 成小下标以便同一输入两次运行逐位相同）。
+//
+// @param logits    ``[tokens, n]`` 连续 CUDA bf16 或 fp32 logits。
+// @param out_idx   ``[tokens, top_k]`` int64 目的地，按概率降序。
+// @param out_w     ``[tokens, top_k]`` 目的地，dtype 必须与 ``logits`` 相同。
+// @param top_k     每 token 的专家数，``(0, 32]`` 且不超过 ``n``。
+// @param normalize 是否把 top-k 概率再归一化（``norm_topk_prob``）。
+// @return 无。两个目的地原地写入。
+// @throws c10::Error 布局、设备、dtype、形状或 ``top_k`` 越界。
+void moe_router(torch::Tensor logits, torch::Tensor out_idx, torch::Tensor out_w,
+                int64_t top_k, bool normalize);

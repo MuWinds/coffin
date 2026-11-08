@@ -29,9 +29,16 @@ Constraints:
     * 量化路径的模型必须在 ``torch.device("meta")`` 下构造：占位参数虽然在构造末尾就被
       摘掉，但摘之前已经建过一份，48 层的稠密投影是 9 GiB 量级（``moe.Experts`` 记着
       同一次 OOM）。
+    * 同激活投影的融合组只在 decode 的**单行**前向上生效，且只在权重全部由 W4A8 供
+      货的成员之间生效；BF16 回填的窄投影走 ``_gemv_rows``，那条路的权重布局与内核
+      都不同，拼进去只会把两条路搅在一起。组命不中时一次都不许多算，命中率长期不到
+      一半就自愈停用并释放拼接权重（见 :meth:`_FusedGroup.try_forward`）。
 """
 
 from __future__ import annotations
+
+import os
+import weakref
 
 import torch
 import torch.nn.functional as F
@@ -113,6 +120,407 @@ def dispatch_linear(w, x: torch.Tensor, n: int | None = None) -> torch.Tensor:
     return out.reshape(*lead, out.shape[-1])
 
 
+#: 因为「量化产物没覆盖组内成员」而停用的组数，见 :func:`fusion_stats`。
+_UNCOVERED_GROUPS = 0
+
+#: ``Proj.forward`` 的单调调用序号。
+#:
+#: 融合组的信箱靠它判断「这次切片是不是同一次求值留下的」。用它而不是张量身份或
+#: 版本号，是因为 decode 的激活经常是**同一块缓冲区**每步被重写（``gated_residual``
+#: 的 ``_fused_bufs`` 就是复用的），身份与 ``_version`` 都分不出相邻两步；而序号在
+#: 同一组的成员之间只差 1，跨步至少差几十。``0`` 只在测试里直接构造组时出现。
+_SERIAL = 0
+
+
+class _FusedGroup:
+    """一组吃同一份激活的投影：合成一次量化 + 一次 N 拼接 GEMV。
+
+    存在理由是账本，不是整洁：一步 decode 有 314 次 W4A8 投影（每步
+    ``w4a8_dot`` 计数，作业 q4attrib3 的 3 步合计 942），而其中三簇天然吃同一份
+    ``hidden_states``：
+
+    * ``qsa.Attention.forward`` 里的 ``q_proj`` / ``k_proj`` / ``v_proj``（``K=2560``）；
+    * ``gdn.GatedDeltaNet.forward`` 里的 ``in_proj_qkv`` 与 ``in_proj_z``（``K=2560``）。
+      ``in_proj_a/b``
+      在真机产物里没有被量化（``N=48``，装载器走 ``set_bf16``），于是
+      ``gdn._fused_in_proj`` 的四路拼接整条失效——本组正好把那两个真正被量化的
+      补回来；
+    * ``moe.MLP.forward`` 的 ``gate_proj`` 与 ``up_proj``（``K=2560``、``N=512``，两者相邻
+      调用；宿主类名是通用的 ``MLP``，所以档位判定按属性名而不是类名）。
+
+    分开跑等于把同一份激活量化 3 次 / 2 次，并且各发一次 ``w4a8_dot`` 与
+    ``w4a8_finish``。合成一次之后，量化次数、发射次数、主机侧的 ``_w4_rows``
+    调用次数同时下降——这是这段代码唯一要买的东西。实测（作业 187，纯内核）：
+    QSA 那三路 220.60 -> 89.26 us/层，且**逐位相同**（``absmax`` 差 0）。
+
+    ``indexer.index_qk_proj`` 也吃同一份激活，但它挂在 ``QSAIndexer`` 下面而不是
+    ``Attention`` 下面，按「只认同一个父模块的直接子模块」就收不进来。收它要往
+    上找最小公共祖先，那会把跨层的同名投影放进同一个桶——它们吃不同的激活，
+    代价是每次求值白算整组。省下的约 0.1 ms/步不值得这条风险。
+
+    拼接由 :meth:`W4A8Weight.cat_output` 完成，沿 N 轴逐列独立，所以数值上只是
+    「同一份算术算到更宽的 N」：int32 累加逐组精确，唯一的变化是 ``split-K`` 的
+    分片数与 fp32 部分和的累加顺序（``pick_split_w4`` 依赖 ``N``），落在 fp32
+    归约噪声里。
+
+    Attributes:
+        members: 组的成员，顺序即 N 轴上的排列顺序。
+        boxes: 与 ``members`` 一一对应的 :class:`W4A8Weight`；``merged`` 由它们拼成。
+        offsets: ``(起点, 宽度)``，按成员下标索引。
+        merged: 拼好的 ``[K, N_total]`` 权重，惰性建一次。
+        window: 信箱的有效窗口，单位是 ``Proj.forward`` 调用序号之差。
+        hits / misses: 命中与「不得不自己算一遍」的次数，用于自愈。
+        disabled: 长期命中率低于一半时置真，此后该组退回逐投影路径。
+    """
+
+    __slots__ = ("members", "boxes", "offsets", "merged", "keys", "mailbox",
+                 "window", "hits", "misses", "disabled")
+
+    def __init__(self, members: list["Proj"]) -> None:
+        """登记成员；此时权重还没挂上，所以一次都不读它。
+
+        Args:
+            members: 同一模块下共享 ``in_features`` 的投影，至少两个。
+        """
+        self.members = list(members)
+        self.boxes: list = []
+        self.offsets: list[tuple[int, int]] = []
+        self.merged = None
+        self.keys: tuple | None = None
+        self.mailbox = None
+        self.window = len(members) + 1
+        self.hits = 0
+        self.misses = 0
+        self.disabled = False
+
+    def _reconcile(self) -> object | None:
+        """按实际挂上的权重收窄组，惰性拼出合并权重。
+
+        组在 ``release_quantized_placeholders`` 时建，那时每个投影的权重都还是
+        ``None``：量化产物只覆盖它认识的那批键，剩下的由 ``Proj.set_bf16`` 补回，
+        所以「这个组里到底有几个人真的是 W4A8」只有装载完成后才知道。第一次前向
+        时核一次，之后权重不再变（换了对象的话 :attr:`keys` 会让它重建）。
+
+        Returns:
+            合并后的 :class:`W4A8Weight`；成员不足两个、``K``/``group_size``/设备
+            不一致时返回 ``None``，此时整组停用而不是退化成更慢的路径。
+
+        Raises:
+            ValueError: 成员共享 ``K`` 但 ``group_size`` 或设备不同。拼接会在
+                scale 轴上整体错位，形状却完全合法。
+        """
+        if self.disabled:
+            return None
+        kept = []
+        boxes = []
+        for proj in self.members:
+            weight = proj._quantized
+            if isinstance(weight, W4A8Weight):
+                kept.append(proj)
+                boxes.append(weight)
+        if len(boxes) < 2:
+            # 不是自愈那条路：量化产物只覆盖了组里的一个（或零个）成员，拼了也没用。
+            # 这种情况 48 层会有上百个组，逐个打日志只会把真信号淹掉，所以只计数，
+            # 由 :func:`fusion_stats` 的 ``uncovered`` 报出来。
+            global _UNCOVERED_GROUPS
+            _UNCOVERED_GROUPS += 1
+            self.disabled = True
+            self.mailbox = None
+            return None
+        keys = tuple(id(box) for box in boxes)
+        if self.merged is not None and self.keys == keys:
+            return self.merged
+        first = boxes[0]
+        for box in boxes[1:]:
+            if (box.k, box.group_size) != (first.k, first.group_size):
+                raise ValueError(
+                    "fused projection group shares in_features but not K/group_size; "
+                    "concatenating the scales would silently shift every group")
+        offs = []
+        offset = 0
+        for box in boxes:
+            offs.append((offset, box.n))
+            offset += box.n
+        # 被摘掉的成员必须清掉自己的组指针：它们留在 ``self.members`` 里的那份
+        # 槽位已经指向别人的列段，继续走融合路径就会读到别人的输出。
+        kept_ids = {id(proj) for proj in kept}
+        for proj in self.members:
+            if id(proj) not in kept_ids:
+                proj._group = None
+                proj._group_slot = -1
+        self.members = kept
+        self.boxes = boxes
+        self.offsets = offs
+        self.keys = keys
+        self.merged = W4A8Weight.cat_output(boxes)
+        self.window = len(kept) + 1
+        for slot, proj in enumerate(kept):
+            proj._group_slot = slot
+        return self.merged
+
+    def _retire(self, reason: str) -> None:
+        """停用这个组并释放拼接权重，同时留一行日志。
+
+        静默停用与「命中了但没收益」在账本上长得一模一样，而这条路径一旦被分错组
+        就会白算整组，所以它必须留痕。
+
+        Args:
+            reason: 停用原因，写进日志。
+        """
+        if not self.disabled:
+            print(f"[proj] 融合组停用（{reason}）：N={sum(n for _, n in self.offsets)}",
+                  flush=True)
+        self.disabled = True
+        self.merged = None
+        self.boxes = []
+        self.mailbox = None
+
+    def _mailbox_hit(self, x: torch.Tensor):
+        """取出本次求值已经算好的整条输出；没有就返回 ``None``。
+
+        Args:
+            x: 成员收到的激活，``[..., K]``。
+
+        Returns:
+            ``[1, N_total]`` 的合并结果，或 ``None``。
+        """
+        box = self.mailbox
+        if box is None:
+            return None
+        serial, ptr, shape, dtype, _src, merged_out, served = box
+        if _SERIAL - serial > self.window:
+            # 窗口外一律当过期：留着它只会在下一次求值里被误当成同一步的结果。
+            self.mailbox = None
+            return None
+        if x.data_ptr() != ptr or tuple(x.shape) != shape or x.dtype != dtype:
+            return None
+        if served >= len(self.members):
+            # 组里每个成员都取过一次了。下一次同组求值必须重新算，否则复用到的
+            # 是**上一步**（或上一层）的结果——decode 的残差流缓冲区是复用的，
+            # 地址与形状都不足以区分两次求值。
+            self.mailbox = None
+            return None
+        self.mailbox = (serial, ptr, shape, dtype, box[4], merged_out, served + 1)
+        # 第 5 项是激活本身，故意留的强引用：它的存储活着，这块地址才不会被别的
+        # 张量复用，于是「同一个 data_ptr」等价于「同一份数据」。
+        return merged_out
+
+    def _store(self, x: torch.Tensor, out: torch.Tensor) -> None:
+        """记住本次求值的合并输出，供同组其余成员按序取用。
+
+        Args:
+            x: 本次求值用的激活。
+            out: ``[1, N_total]`` 的合并结果。
+        """
+        self.mailbox = (_SERIAL, x.data_ptr(), tuple(x.shape), x.dtype, x, out, 1)
+
+    def _piece(self, out: torch.Tensor, slot: int, lead: tuple[int, ...]
+               ) -> torch.Tensor:
+        """从合并输出里切出一个成员的列段，并恢复它的前导形状。
+
+        Args:
+            out: ``[1, N_total]``。
+            slot: 成员下标。
+            lead: 调用方的前导形状，元素个数必须是 1。
+
+        Returns:
+            ``[*lead, N_i]``。列段本身是非连续视图，但前导维全是 1，所以
+            ``reshape`` 是免费的视图，``qsa.py`` 下游的 ``.view(...)`` 也仍然成立
+            （作业 187 的 ``VIEW_OK`` 就是量这一条）。
+        """
+        offset, width = self.offsets[slot]
+        return out[:, offset:offset + width].reshape(*lead, width)
+
+    def try_forward(self, proj: "Proj", x: torch.Tensor):
+        """尝试走融合路径，返回 ``None`` 表示调用方应当照旧自己算。
+
+        Args:
+            proj: 调用方。
+            x: 激活，``[..., K]``，前导维元素个数必须是 1（decode）。
+
+        Returns:
+            ``[*lead, N_i]``，或 ``None``。
+        """
+        if self.disabled or proj.bias is not None:
+            return None
+        slot = proj._group_slot
+        if slot < 0:
+            return None
+        out = self._mailbox_hit(x)
+        if out is not None:
+            self.hits += 1
+            return self._piece(out, slot, x.shape[:-1])
+        merged = self._reconcile()
+        if merged is None:
+            return None
+        flat = x.reshape(1, -1) if x.dim() != 2 else x
+        out = bops.linear_m(merged, flat)
+        self.misses += 1
+        # 自愈：组若被分错（成员其实吃不同的激活），每次调用都会是一次 miss 并
+        # 顺带算完整组。命中率长期不到一半就停用并释放拼接权重，宁可退回逐投影，
+        # 也不留一条静默更慢的路径。
+        if self.misses > 16 + 2 * self.hits:
+            self._retire(f"命中 {self.hits} 次 / 未命中 {self.misses} 次")
+            return None
+        self._store(x, out)
+        return self._piece(out, slot, x.shape[:-1])
+
+
+#: ``COFFIN_W4_GROUP`` 认识的档位名，可以逗号组合。
+_TIER_NAMES = frozenset({"qsa", "gdn", "shared", "gatedresidual"})
+
+#: ``all``（默认）实际启用的档位。
+#:
+#: ``gatedresidual`` 故意不在里面：qwen4exp 的 decode 走 ``hyper_*`` 融合核，
+#: ``GatedResidual`` 的两个读写门投影一步被调用 **0 次**，而拼接权重要常驻约
+#: 0.9 GB ——B=1 时无所谓，但它会直接压低下一轮的 batch 上限（四卡 EP4 每卡 20 GB
+#: / 31.72 GiB）。保留这段分组逻辑是为了 ``hyper_*`` 一旦回退时的免费加速，
+#: 所以要它得显式点名 ``COFFIN_W4_GROUP=gatedresidual``。
+_DEFAULT_TIERS = frozenset({"qsa", "gdn", "shared"})
+
+
+def _group_kind(module: nn.Module, names: list[str]) -> str:
+    """把一个组归到档位名上，供 ``COFFIN_W4_GROUP`` 逐类开关。
+
+    判据是**成员的属性名**，不是父模块的类名。类名在这里不可靠：QSA 的宿主叫
+    ``Attention``、GDN 的叫 ``GatedDeltaNet``、而 shared expert 的宿主是一个通用的
+    ``MLP``——按类名分类时第三种会被判成"未知"而静默不融合（本仓库已经因为"按类名
+    猜"踩过一次）。属性名则是模型自己的契约，``state_dict`` 里也是它们。
+
+    Args:
+        module: 承载组内成员的父模块，只用于兜底命名。
+        names: 组内成员在这个父模块下的属性名。
+
+    Returns:
+        ``qsa`` / ``gdn`` / ``shared`` / ``gatedresidual``，或未归类时父模块的小写
+        类名（那种组只能靠显式点名启用，不会跟着 ``all`` 打开）。
+    """
+    joined = " ".join(names)
+    if "block_inject" in joined or "input_mix" in joined:
+        return "gatedresidual"
+    if "in_proj" in joined:
+        return "gdn"
+    if "q_proj" in joined or "index_qk" in joined:
+        return "qsa"
+    if "gate_proj" in joined or "up_proj" in joined or "down_proj" in joined:
+        return "shared"
+    return type(module).__name__.lower()
+
+
+def _enabled_kinds() -> set[str]:
+    """读 ``COFFIN_W4_GROUP``，返回要启用的档位集合。
+
+    为什么要有档位而不是一个布尔：拼接权重是**常驻**的，三档合计约 1.09 GB
+    （``gdn`` 那组最宽，803 MB）。decode B=1 时三档都值得开；大 batch 下显存吃紧，
+    最先该关的就是 ``gdn``，而那时只改一个环境变量比改代码快。
+
+    Returns:
+        空集合表示全关；否则是要启用的档位。
+
+    Raises:
+        ValueError: 出现不认识的档位名。静默当成「全关」会让一次 A/B 看起来像两边
+            一样快，而实际两边跑的是同一条路。
+    """
+    raw = os.environ.get("COFFIN_W4_GROUP", "").strip().lower()
+    if not raw or raw in {"1", "on", "yes", "all"}:
+        return set(_DEFAULT_TIERS)
+    if raw in {"0", "off", "no"}:
+        return set()
+    kinds = {part.strip() for part in raw.split(",") if part.strip()}
+    unknown = sorted(kinds - _TIER_NAMES)
+    if unknown:
+        raise ValueError(
+            f"COFFIN_W4_GROUP={raw!r} 里有不认识的档位 {unknown}；"
+            f"可用的是 all / 0 / {sorted(_TIER_NAMES)} 的任意组合")
+    return kinds
+
+
+def _plan_fused_groups(root: nn.Module) -> int:
+    """给「同一父模块下吃同一份激活的投影」登记融合组，返回建成的组数。
+
+    分组只能在模块树上做，因为真正的调用点在 ``qsa.py`` / ``gdn.py`` / ``moe.py`` 里，
+    而这三个文件不在本次改动范围内；但同激活投影在代码里都是**同一个父模块的相邻
+    兄弟调用**，于是「父模块 + 相同的 ``in_features``」就是分组键：
+
+    * ``Attention``（QSA）下的 ``{q_proj, k_proj, v_proj}``；
+    * ``GatedDeltaNet``（GDN）下的 ``{in_proj_qkv, in_proj_z, in_proj_b, in_proj_a}``
+      ——后两个在真机产物里没有被量化，第一次前向时会被摘到只剩两个，见
+      :meth:`_FusedGroup._reconcile`；
+    * ``MLP``（``SparseMoeBlock.shared_expert``，宽 ``512``）下的
+      ``{gate_proj, up_proj}``（``down_proj`` 的 ``in_features`` 是中间维，自然被排除）。
+
+    **只认直接子模块。** 往上找「最小公共祖先」还能多收一个
+    ``indexer.index_qk_proj``（它也吃同一份激活），但那会顺带把跨层的同名投影放进
+    同一个桶里——它们吃的是不同的激活，代价是每组每次求值都白算一遍整组。
+
+    Args:
+        root: 已构造完成的模型。
+
+    Returns:
+        建成的组数，供装载日志核对。
+    """
+    kinds = _enabled_kinds()
+    if not kinds:
+        return 0
+    groups = 0
+    for module in root.modules():
+        children = [(name, child) for name, child in module.named_children()
+                    if isinstance(child, Proj)]
+        if len(children) < 2:
+            continue
+        # 整个父模块先判一次档位：同一父模块下的组必然同类，省掉每个桶一次判断。
+        if _group_kind(module, [name for name, _ in children]) not in kinds:
+            continue
+        buckets: dict[int, list[Proj]] = {}
+        for _name, proj in children:
+            buckets.setdefault(proj.in_features, []).append(proj)
+        for members in buckets.values():
+            if len(members) < 2 or any(proj.bias is not None for proj in members):
+                continue
+            group = _FusedGroup(members)
+            for slot, proj in enumerate(members):
+                proj._group = group
+                proj._group_slot = slot
+            groups += 1
+    return groups
+
+
+def fusion_stats() -> dict:
+    """报告同激活投影融合组的累计状态，供探针核对「组真的被用上了」。
+
+    没有这个出口的话，「组没被命中」和「组命中了但没有收益」在账本上长得一模一样
+    ——两者都只表现为「发射次数没降」。
+
+    Returns:
+        ``{"groups": 组数, "active": 仍启用的组数, "uncovered": 因产物没覆盖成员而停用
+        的组数, "hits": 命中, "misses": 未命中, "widths": 每组的 N_total 列表}``。
+        ``uncovered`` 与「命中率不足」是两件事：前者说明 artifact 没量化，后者说明
+        分组分错了，处理方式完全不同。
+    """
+    groups = []
+    seen: set[int] = set()
+    for module in list(_ALL_PROJ):
+        group = getattr(module, "_group", None)
+        if group is None or id(group) in seen:
+            continue
+        seen.add(id(group))
+        groups.append(group)
+    return {
+        "groups": len(groups),
+        "active": sum(1 for g in groups if not g.disabled),
+        "uncovered": _UNCOVERED_GROUPS,
+        "hits": sum(g.hits for g in groups),
+        "misses": sum(g.misses for g in groups),
+        "widths": [g.offsets[-1][0] + g.offsets[-1][1] for g in groups
+                   if g.offsets],
+    }
+
+
+#: 所有建过的 :class:`Proj`，只给 :func:`fusion_stats` 用。弱集合的理由与
+#: ``pack`` 的身份缓存相同：诊断不能把一份已经释放的模型钉在显存里。
+_ALL_PROJ: "weakref.WeakSet" = weakref.WeakSet()
+
+
 class Proj(nn.Linear):
     """稠密投影 ``[..., K] -> [..., N]``，按激活行数挑后端的语义入口。
 
@@ -161,6 +569,12 @@ class Proj(nn.Linear):
         else:
             super().__init__(in_features, out_features, bias=bias)
             self._quantized: W4A8Weight | None = None
+        #: 所属的同激活融合组与自己在组内的槽位；``None`` / ``-1`` 表示不参与。
+        #: 由 :func:`_plan_fused_groups` 在模型构造末尾填，此时权重还没挂上，
+        #: 所以组内成员要到第一次前向才收敛（见 :meth:`_FusedGroup._reconcile`）。
+        self._group: _FusedGroup | None = None
+        self._group_slot = -1
+        _ALL_PROJ.add(self)
 
     @property
     def _source(self):
@@ -266,6 +680,11 @@ class Proj(nn.Linear):
         ``models/qwen4exp`` 里既有 ``[B, S, H]`` 也有 ``[B, S, 1]``。摊平是视图：
         只有最后一维 stride 不是 1 时才拷一份。
 
+        单行前向且本投影属于一个融合组（:func:`_plan_fused_groups`）时先试
+        :meth:`_FusedGroup.try_forward`：同组第一个成员把整组算出来，其余成员从
+        同一次结果里切自己的列段。这不是透明的小优化——它把「同一份激活量化 N 次、
+        发 N 次 GEMV」降成一次，见 :class:`_FusedGroup` 的账本。
+
         Args:
             x: 激活，``[..., K]``。
 
@@ -281,6 +700,18 @@ class Proj(nn.Linear):
             raise ValueError(
                 f"projection expects [..., {self.in_features}], got {tuple(x.shape)}")
         lead = x.shape[:-1]
+        # 这个序号只喂给融合组的信箱窗口，别处不读它。**每次前向都推进**，包括不
+        # 参与融合的投影：窗口要能区分「同一组在一次求值内的相邻调用」与「同一个组
+        # 在相邻两层里的两次求值」，而后者之间隔着的正是那些不融合的投影调用。
+        global _SERIAL
+        _SERIAL += 1
+        group = self._group
+        # decode 才有融合价值：前导维多于一个元素时，下游 ``.view(...)`` 会要求
+        # 连续性，而融合结果是宽的拼接缓冲，切片不再能 ``view`` 成原形状。
+        if group is not None and lead.numel() == 1:
+            fused = group.try_forward(self, x)
+            if fused is not None:
+                return fused
         out = dispatch_linear(self._source, x, self.out_features)
         if self.bias is not None:
             # bias 加在收敛后的激活 dtype 上，而 ``nn.Linear`` 把它折进 GEMM 的 epilogue
@@ -469,11 +900,16 @@ def release_quantized_placeholders(root: nn.Module) -> int:
             released += 1
         else:
             module.owns_quantized_weight = True
+    # 占位摘完正好是分组的时机：``Proj`` 全都在树上了，而权重还没有一个挂上来，
+    # 所以分组只看结构（父模块 + ``in_features``），不看谁被量化产物覆盖——那是
+    # 第一次前向才收敛的事，见 ``_FusedGroup._reconcile``。
+    _plan_fused_groups(root)
     return released
 
 
 __all__ = [
     "Proj",
+    "fusion_stats",
     "QuantizedEmbedding",
     "dispatch_linear",
     "proj_from_config",

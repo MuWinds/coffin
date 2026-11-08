@@ -20,8 +20,9 @@ Constraints:
       把缺的补齐，所以每个名字永远可调用（见 :func:`_has_native`）。
     * ``group_size`` 的语义是"把最后一维切成若干等长组、每组独立算 RMS"，
       权重仍是整条向量的宽度。残差流能稳住靠的就是 4 路各保尺度、不互相稀释。
-      分组路径不回退到 ``bops.rms_norm``：后者对整条最后一维归一化，用在 4 路
-      残差流上会把各路能量摊平，形状全对、尺度全错。
+      分组路径**不能**对整条最后一维调 ``bops.rms_norm``：那会把 4 路残差流的能量
+      摊平，形状全对、尺度全错。要走核必须先按组压成 ``[rows, group_size]``，让内核
+      的最后一维正好落在组边界上（见 :meth:`RMSNorm._grouped_native`）。
     * 这里绝不出现 ``torch.nn.functional.rms_norm``：那是 torch 2.4+ 的 API，
       部署目标是 2.1.0。
 """
@@ -104,6 +105,11 @@ class RMSNorm(nn.Module):
         # 于是 ``weights.verify`` 把它当成「模型有、checkpoint 没有」的多余参数。
         self.register_buffer("_gain", None, persistent=False)
         self._gain_version: int | None = None
+        #: ``(dtype, 1 + w)``：分组路径要把增益乘到归一化结果上，那一乘必须与激活同
+        #: dtype，否则 broadcasting 会把它升成 fp32、把那趟乘法变成两倍带宽。
+        self._gain_typed: tuple | None = None
+        #: ``(dtype, ones(group_size))``：喂给内核的「增益为 1」，见 :meth:`_unit_gain`。
+        self._unit: tuple | None = None
         if group_size is not None and dim % group_size != 0:
             raise ValueError(
                 f"hidden_size ({dim}) must be divisible by group_size ({group_size}).")
@@ -126,6 +132,54 @@ class RMSNorm(nn.Module):
                 self._gain = (1.0 + self.weight.float()).to(self.weight.dtype)
             self._gain_version = version
         return self._gain
+
+    def _gain_for(self, dtype: torch.dtype) -> torch.Tensor:
+        """按激活 dtype 取 ``1 + w``，与 :meth:`_folded_gain` 同源、多一层 dtype 缓存。
+
+        分组路径要把 gain 单独乘到归一化结果上，那一乘必须与激活同 dtype，否则
+        broadcasting 会把它升成 fp32、把那趟乘法变成两倍带宽。
+        """
+        cached = self._gain_typed
+        if cached is not None and cached[0] == dtype:
+            return cached[1]
+        gain = self._folded_gain().to(dtype)
+        self._gain_typed = (dtype, gain)
+        return gain
+
+    def _unit_gain(self, dtype: torch.dtype) -> torch.Tensor:
+        """缓存一份 ``group_size`` 长、全 1 的增益，喂给内核用。
+
+        分组路径不能把真实增益交给内核（内核只收一个 ``[N]`` 增益，而各组增益不同），
+        所以让它按"增益为 1"做纯 RMS，增益另乘。全 1 那份是常量，缓存住即可。
+        """
+        cached = self._unit
+        if cached is not None and cached[0] == dtype:
+            return cached[1]
+        unit = torch.ones(self.group_size, dtype=dtype, device=self.weight.device)
+        self._unit = (dtype, unit)
+        return unit
+
+    def _grouped_native(self, x: torch.Tensor) -> torch.Tensor:
+        """分组 RMSNorm 走融合核：按组压成二维再调，增益单独乘一趟。
+
+        ``[B, S, hc*g]`` 按 ``g`` 切开就是 ``hc`` 段互不重叠的行，``reshape(-1, g)``
+        之后内核的"最后一维"**恰好就是组边界**，归一化范围与参考实现一致 —— 文件头
+        那条禁令针对的是"对整条 ``hc*g`` 调核"，那是另一种（错的）语义。
+
+        收益是去掉 fp32 链：参考实现把 10 MB 的 bf16 放大成 20 MB 的 fp32 中间量来回
+        搬八趟（实测 606 us/次），这里内核读一遍写一遍、再乘一趟增益（184 us/次，
+        −69.6%）。``hc_norm`` 每 forward 被调 97 次，合计约 −41 ms。
+
+        Args:
+            x: 末维宽度为 ``hc_count * group_size`` 的激活。
+
+        Returns:
+            与 ``x`` 同形状、同 dtype。
+        """
+        lead = x.shape[:-1]
+        rows = x.reshape(-1, self.group_size)
+        normed = bops.rms_norm(rows, self._unit_gain(x.dtype), 0, self.eps)
+        return normed.view(*lead, -1) * self._gain_for(x.dtype)
 
     def _norm(self, x: torch.Tensor) -> torch.Tensor:
         """在 fp32 上算 RMS 归一化，不含权重。
@@ -158,6 +212,9 @@ class RMSNorm(nn.Module):
         """
         if self.group_size is None and _has_native("rms_norm"):
             return bops.rms_norm(x, self._folded_gain(), 0, self.eps)
+        # 分组路径也走核：见 :meth:`_grouped_native`（每 forward 97 次，606 -> 184 us）。
+        if self.group_size is not None and _has_native("rms_norm"):
+            return self._grouped_native(x)
         output = self._norm(x.float())
         # 权重是相对 1 的偏移量：checkpoint 里会出现负值，直接当增益用会把
         # 整层输出压成 0 附近。
@@ -226,6 +283,18 @@ class RMSNormGated(nn.Module):
         if self.activation == "silu" and _has_native("rms_norm_gated"):
             return bops.rms_norm_gated(hidden_states, self.weight.to(hidden_states.dtype),
                                        gate, self.variance_epsilon)
+        # 真实配置是 ``sigmoid``，而 ``norm.cu`` 把门控激活写死成 silu，所以这里拆两步：
+        # 归一化走 ``bops.rms_norm``（纯 RMS + 增益，与 ``norm.cu`` 的 ``v*inv*w`` 同款，
+        # 这里的 ``weight`` **不带** ``1 +`` 偏移，见下面的乘法注释），门另算。
+        #
+        # 门的激活放在激活 dtype 上算（原来在 fp32 上）：那会多一次 bf16 舍入，但整条链
+        # 从「fp32 上往返 ~150 MB」降到 ~60 MB —— 实测 838 -> 151 us/次，每 forward 36 次。
+        # 数值差 ≤1 ULP（7.8e-3，输出量级 1）。
+        if _has_native("rms_norm"):
+            normed = bops.rms_norm(hidden_states,
+                                   self.weight.to(hidden_states.dtype), 0,
+                                   self.variance_epsilon)
+            return normed * _GATE_ACTIVATIONS[self.activation](gate)
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
