@@ -422,6 +422,10 @@ class SparseMoE:
             # 收拢成「按专家排好序」的行，然后两次分组投影：gate/up 一次出中间量，
             # 过 SwiGLU 之后再投一次 down。两次都必须用分组内核——按专家分组的意义
             # 就是让每个专家 2 MB 的权重在一个解码步里只被读一遍。
+            # 位置表是 int32，``index_select`` 直接收。**但别为这个去掉 ``.long()``**：
+            # 实测每层少两次转换核（一步 80 次发射）端到端净变化为零（四档 +1.5/+1.6/-1.9/-2.3%），
+            # 说明单次发射的边际成本远低于 7.5 us —— CPU 时间花在 bops 包装与模型侧 Python glue，
+            # 不在发射本身。要省就得整条链一起换成一个内核（见 ``shared_gate_scale``）。
             packed = x.index_select(0, token_of_pos.long())
             gate, up = self._group(self.gate_up, packed, offsets).chunk(2, dim=-1)
             activated = bops.silu_mul(gate, up, up)
