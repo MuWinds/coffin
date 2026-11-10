@@ -282,9 +282,14 @@ class LinearAttn:
         bops.conv1d_silu_batch(self.conv_w, qkv, self.conv_state[:B], conv_out)
         # [B, conv_dim] 结果的列切片：行 stride 是 conv_dim，批处理 prologue 接受
         # 这种布局（只有两个内层 stride 必须紧凑）。
-        q = conv_out[:, :self.kdim].reshape(B, self.num_k, self.dk)
-        k = conv_out[:, self.kdim:2 * self.kdim].reshape(B, self.num_k, self.dk)
-        v = conv_out[:, 2 * self.kdim:].reshape(B, self.num_v, self.dv)
+        # 必须 contiguous：``reshape`` 对非连续切片返回的是 view，行步长会留在
+        # ``conv_dim`` 上，而 ``delta_prologue_batch`` 的行偏移按 ``kdim``/``dv`` 算。
+        # 那样 row 0 恰好对（偏移 0），row >= 1 全读错——批处理里表现为「第一条
+        # 正确、其余全乱」，而单条路径永远看不见这个错。
+        q = conv_out[:, :self.kdim].contiguous().reshape(B, self.num_k, self.dk)
+        k = (conv_out[:, self.kdim:2 * self.kdim].contiguous()
+             .reshape(B, self.num_k, self.dk))
+        v = conv_out[:, 2 * self.kdim:].contiguous().reshape(B, self.num_v, self.dv)
         bops.delta_prologue_batch(q, k, v, b.contiguous(), a.contiguous(),
                                   self.neg_expA, self.dt_bias,
                                   self.q_pro[:B], self.k_pro[:B], self.v_pro[:B],

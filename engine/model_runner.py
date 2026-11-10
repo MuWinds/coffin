@@ -608,6 +608,8 @@ class ModelRunner:
             if states is not None:
                 self.model.restore_linear_states(states, row=seq.row)
             matched_states.append((matched, states))
+        if os.environ.get("COFFIN_KV_TRACE") == "1":
+            self._check_block_alias(seqs, "prefill")
 
         # 带图 prompt 把载荷挂在 ``seq.mm`` 上；``model.prefill_group`` 自己从
         # 序列里读，所以这条路径不用再传 mm 参数。
@@ -749,6 +751,30 @@ class ModelRunner:
             seq.num_cached_tokens += len(acc)
         return accepted, logits
 
+    def _check_block_alias(self, seqs: list["Sequence"], where: str) -> None:
+        """报出活跃序列之间**块级**的重复占用。
+
+        槽位检查抓不到这一类损坏：两条序列各自的 ``pos2slot`` 都合法、也都连续，
+        但映射到同一个物理块，于是后写的覆盖先写的。前缀命中（``matched > 0``）
+        造成的共用是合法的，所以打印时带上 ``matched`` 便于区分。
+
+        Args:
+            seqs: 本趟前向涉及的序列。
+            where: 调用点标记，出现在日志里便于定位。
+        """
+        owner: dict[int, int] = {}
+        for seq in seqs:
+            table = list(seq.block_table)
+            matched = int(getattr(seq, "matched", 0))
+            clashes = sorted({b for b in table if b in owner and owner[b] != seq.seq_id})
+            print(f"[blktrace] {where} seq={seq.seq_id} row={seq.row} matched={matched} "
+                  f"nblocks={len(table)} head={table[:3]} alias={clashes}", flush=True)
+            for block in table:
+                if block in owner and owner[block] != seq.seq_id:
+                    print(f"[blktrace] ALIAS_BLOCK {where} block={block} "
+                          f"owner={owner[block]} intruder={seq.seq_id}", flush=True)
+                owner[block] = seq.seq_id
+
     def _trace_rows(self, seqs: list["Sequence"]) -> None:
         """打印活跃行的槽位区间，并在两条序列的区间相交时报出来。
 
@@ -816,6 +842,7 @@ class ModelRunner:
             tables.append(seq.block_table)
         model.set_rows(tokens, positions, tables, row_indices=rows)
         if os.environ.get("COFFIN_KV_TRACE") == "1":
+            self._check_block_alias(seqs, "decode")
             self._trace_rows(seqs)
         # 同样的铺设、同样的实现、同样的缓冲区：唯一区别是这一趟前向有没有被
         # 录进图。所以不允许 capture 的后端（SCOW 驱动）也照样能走批处理步。
