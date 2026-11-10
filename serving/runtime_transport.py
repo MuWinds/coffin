@@ -201,6 +201,8 @@ def _serve_connection(srv_model: "Server", conn: socket.socket) -> None:
             所以坏客户端不会泄漏描述符。
     """
     try:
+        if os.environ.get("COFFIN_DEBUG_STEP"):
+            print(f"[conn] t={time.time():.3f} accepted", flush=True)
         buf = b""
         while not buf.endswith(b"\n"):
             chunk = conn.recv(65536)

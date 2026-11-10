@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import gc
 import json
+import os
 import queue
 import threading
 import time
@@ -260,6 +261,10 @@ class RuntimeGenerationMixin:
             seq = self.engine.add_request(ids, params, mm=mm)
             self._outputs[seq.seq_id] = out_q
             self._cv.notify()
+            if os.environ.get("COFFIN_DEBUG_STEP"):
+                print(f"[req] t={time.time():.3f} seq={seq.seq_id} "
+                      f"waiting={len(self.engine.scheduler.waiting)} "
+                      f"running={len(self.engine.scheduler.running)}", flush=True)
         return seq, out_q
 
     def _blocking_generate(self, prompt_ids: list[int], max_new: int,

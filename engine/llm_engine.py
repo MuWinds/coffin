@@ -214,6 +214,7 @@ class LLMEngine:
             statuses = [s.status.name for s in self.scheduler.running]
             print(f"[step] stalled={getattr(self, '_stalled_steps', 0)} running={len(statuses)} "
                   f"statuses={statuses[:4]} decode={len(decode)} chunks={len(chunks)} "
+                  f"waiting={len(self.scheduler.waiting)} max_seqs={self.scheduler.max_num_seqs} "
                   f"free={self.bm.num_free if self.bm is not None else -1}", flush=True)
         # 只有发起方是禁区：受害者总得有人当，而抢占一条本步即将推进的请求，
         # 恰好就是给长不大的那个腾地方。它的解码还没跑，所以不会白做。
