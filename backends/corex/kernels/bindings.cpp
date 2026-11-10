@@ -131,7 +131,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("vpool"), pybind11::arg("kscale"), pybind11::arg("vscale"),
           pybind11::arg("pos2slot"), pybind11::arg("out"), pybind11::arg("pos"),
           pybind11::arg("max_pos"), pybind11::arg("rep"), pybind11::arg("scale"),
-          pybind11::arg("part_acc"), pybind11::arg("part_ml"));
+          pybind11::arg("part_acc"), pybind11::arg("part_ml"),
+          pybind11::arg("head_major") = false);
     m.def("attn_paged_multi_q", &attn_paged_multi_q,
           "\u6295\u673a\u6821\u9a8c\u5f62\u6001\uff1a\u6bcf\u884c c \u4e2a\u8349\u7a3f\u67e5\u8be2\u5171\u7528\u4e00\u904d\u5386\u53f2\u8bfb\u53d6",
           pybind11::arg("q"), pybind11::arg("gate"), pybind11::arg("kpool"),
@@ -139,7 +140,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("slots"), pybind11::arg("ctx_lens"), pybind11::arg("out"),
           pybind11::arg("max_seq"), pybind11::arg("rep"), pybind11::arg("scale"),
           pybind11::arg("part_acc"), pybind11::arg("part_ml"),
-          pybind11::arg("block_mask"), pybind11::arg("mask_block"));
+          pybind11::arg("block_mask"), pybind11::arg("mask_block"),
+          pybind11::arg("head_major") = false);
     // 门控 DeltaNet。
     m.def("conv1d_silu", &conv1d_silu,
           "depthwise causal conv1d + SiLU for one token, shifts the window in place");
@@ -210,7 +212,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("vpool"), pybind11::arg("kscale"), pybind11::arg("vscale"),
           pybind11::arg("slots"), pybind11::arg("context_lens"), pybind11::arg("out"),
           pybind11::arg("max_seq"), pybind11::arg("rep"), pybind11::arg("scale"),
-          pybind11::arg("part_acc"), pybind11::arg("part_ml"));
+          pybind11::arg("part_acc"), pybind11::arg("part_ml"),
+          pybind11::arg("head_major") = false);
     m.def("attn_sparse", &attn_sparse,
           "QSA \u7684\u7a00\u758f\u6ce8\u610f\u529b\uff1a\u53ea\u8bfb\u7d22\u5f15\u5668\u9009\u4e2d\u7684\u4f4d\u7f6e",
           pybind11::arg("q"), pybind11::arg("kcache"), pybind11::arg("vcache"),

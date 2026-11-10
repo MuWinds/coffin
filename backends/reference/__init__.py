@@ -407,7 +407,8 @@ def _attn_decode(q: torch.Tensor, gate: torch.Tensor, kcache: torch.Tensor,
                  vcache: torch.Tensor, kscale: torch.Tensor, vscale: torch.Tensor,
                  out: torch.Tensor, pos: torch.Tensor, rep: int, scale: float,
                  part_acc: torch.Tensor | None = None,
-                 part_ml: torch.Tensor | None = None) -> torch.Tensor:
+                 part_ml: torch.Tensor | None = None,
+                head_major: bool = False) -> torch.Tensor:
     """One decode token over the dense int8 KV cache.
 
     Args:
@@ -439,7 +440,8 @@ def _attn_paged(q: torch.Tensor, gate: torch.Tensor, kpool: torch.Tensor,
                 pos2slot: torch.Tensor, out: torch.Tensor, pos: torch.Tensor,
                 max_pos: int, rep: int, scale: float,
                 part_acc: torch.Tensor | None = None,
-                part_ml: torch.Tensor | None = None) -> torch.Tensor:
+                part_ml: torch.Tensor | None = None,
+                head_major: bool = False) -> torch.Tensor:
     """One decode token over a layer's paged int8 pool.
 
     Args:
@@ -464,10 +466,10 @@ def _attn_paged(q: torch.Tensor, gate: torch.Tensor, kpool: torch.Tensor,
     """
     n = _slice_window(pos, min(max_pos, pos2slot.numel()))
     slots = pos2slot[:n].long()
-    k = kpool.index_select(0, slots).permute(1, 0, 2)
-    v = vpool.index_select(0, slots).permute(1, 0, 2)
-    ks = kscale.index_select(0, slots).permute(1, 0)
-    vs = vscale.index_select(0, slots).permute(1, 0)
+    k = (kpool.index_select(1, slots) if head_major else kpool.index_select(0, slots).permute(1, 0, 2))
+    v = (vpool.index_select(1, slots) if head_major else vpool.index_select(0, slots).permute(1, 0, 2))
+    ks = (kscale.index_select(1, slots) if head_major else kscale.index_select(0, slots).permute(1, 0))
+    vs = (vscale.index_select(1, slots) if head_major else vscale.index_select(0, slots).permute(1, 0))
     out.copy_(_attn_math(q, gate, k, v, ks, vs, rep, scale))
     return out
 
@@ -477,7 +479,8 @@ def _attn_paged_batch(q: torch.Tensor, gate: torch.Tensor, kpool: torch.Tensor,
                       slots: torch.Tensor, context_lens: torch.Tensor,
                       out: torch.Tensor, max_seq: int, rep: int, scale: float,
                       part_acc: torch.Tensor | None = None,
-                      part_ml: torch.Tensor | None = None) -> torch.Tensor:
+                      part_ml: torch.Tensor | None = None,
+                      head_major: bool = False) -> torch.Tensor:
     """One decode token for a bucket of rows, each with its own context length.
 
     Args:
@@ -509,10 +512,10 @@ def _attn_paged_batch(q: torch.Tensor, gate: torch.Tensor, kpool: torch.Tensor,
             out[b].zero_()
             continue
         win = slots[b, :n].long()
-        k = kpool.index_select(0, win).permute(1, 0, 2)
-        v = vpool.index_select(0, win).permute(1, 0, 2)
-        ks = kscale.index_select(0, win).permute(1, 0)
-        vs = vscale.index_select(0, win).permute(1, 0)
+        k = (kpool.index_select(1, win) if head_major else kpool.index_select(0, win).permute(1, 0, 2))
+        v = (vpool.index_select(1, win) if head_major else vpool.index_select(0, win).permute(1, 0, 2))
+        ks = (kscale.index_select(1, win) if head_major else kscale.index_select(0, win).permute(1, 0))
+        vs = (vscale.index_select(1, win) if head_major else vscale.index_select(0, win).permute(1, 0))
         out[b].copy_(_attn_math(q[b], gate[b], k, v, ks, vs, rep, scale))
     return out
 
@@ -524,7 +527,8 @@ def _attn_paged_multi_q(q: torch.Tensor, gate: torch.Tensor, kpool: torch.Tensor
                         part_acc: torch.Tensor | None = None,
                         part_ml: torch.Tensor | None = None,
                         block_mask: torch.Tensor | None = None,
-                        mask_block: int = 64) -> torch.Tensor:
+                        mask_block: int = 64,
+                       head_major: bool = False) -> torch.Tensor:
     """Speculative verify: ``c`` draft queries per row share one pass over that row's history.
 
     Args:
@@ -569,10 +573,10 @@ def _attn_paged_multi_q(q: torch.Tensor, gate: torch.Tensor, kpool: torch.Tensor
                 if keep.numel() < n:
                     keep = F.pad(keep, (0, n - keep.numel()))
             win = slots[b, :n].long()
-            k = kpool.index_select(0, win).permute(1, 0, 2)
-            v = vpool.index_select(0, win).permute(1, 0, 2)
-            ks = kscale.index_select(0, win).permute(1, 0)
-            vs = vscale.index_select(0, win).permute(1, 0)
+            k = (kpool.index_select(1, win) if head_major else kpool.index_select(0, win).permute(1, 0, 2))
+            v = (vpool.index_select(1, win) if head_major else vpool.index_select(0, win).permute(1, 0, 2))
+            ks = (kscale.index_select(1, win) if head_major else kscale.index_select(0, win).permute(1, 0))
+            vs = (vscale.index_select(1, win) if head_major else vscale.index_select(0, win).permute(1, 0))
             out[b, j].copy_(_attn_math(q[b, j], gate[b, j], k, v, ks, vs,
                                        rep, scale, keep))
     return out

@@ -1501,7 +1501,8 @@ def attn_paged(q: torch.Tensor, gate: torch.Tensor, kpool: torch.Tensor,
                pos2slot: torch.Tensor, out: torch.Tensor, pos: torch.Tensor,
                max_pos: int, rep: int, scale: float,
                part_acc: torch.Tensor | None = None,
-               part_ml: torch.Tensor | None = None) -> torch.Tensor:
+               part_ml: torch.Tensor | None = None,
+               head_major: bool = False) -> torch.Tensor:
     """在某一层的分页 int8 池上算一个解码 token。
 
     Args:
@@ -1529,7 +1530,7 @@ def attn_paged(q: torch.Tensor, gate: torch.Tensor, kpool: torch.Tensor,
     module = _kernels()
     pa, pm = _split_k(part_acc, part_ml, (q.shape[0],), q)
     return module.attn_paged(q.contiguous(), gate.contiguous(), kpool, vpool, kscale,
-                             vscale, pos2slot, out, pos, max_pos, rep, scale, pa, pm)
+                             vscale, pos2slot, out, pos, max_pos, rep, scale, pa, pm, head_major)
 
 
 def attn_paged_batch(q: torch.Tensor, gate: torch.Tensor, kpool: torch.Tensor,
@@ -1537,7 +1538,8 @@ def attn_paged_batch(q: torch.Tensor, gate: torch.Tensor, kpool: torch.Tensor,
                      slots: torch.Tensor, context_lens: torch.Tensor,
                      out: torch.Tensor, max_seq: int, rep: int, scale: float,
                      part_acc: torch.Tensor | None = None,
-                     part_ml: torch.Tensor | None = None) -> torch.Tensor:
+                     part_ml: torch.Tensor | None = None,
+                     head_major: bool = False) -> torch.Tensor:
     """整个桶的行一次启动算一个解码 token。
 
     Args:
@@ -1575,7 +1577,7 @@ def attn_paged_batch(q: torch.Tensor, gate: torch.Tensor, kpool: torch.Tensor,
     # 所以它属于边界而不属于每个调用点。
     return module.attn_paged_batch(q.contiguous(), gate.contiguous(), kpool, vpool, kscale,
                                    vscale, slots, context_lens.contiguous(), out, max_seq,
-                                   rep, scale, pa, pm)
+                                   rep, scale, pa, pm, head_major)
 
 
 def attn_paged_multi_q(q: torch.Tensor, gate: torch.Tensor, kpool: torch.Tensor,
@@ -1585,7 +1587,8 @@ def attn_paged_multi_q(q: torch.Tensor, gate: torch.Tensor, kpool: torch.Tensor,
                        part_acc: torch.Tensor | None = None,
                        part_ml: torch.Tensor | None = None,
                        block_mask: torch.Tensor | None = None,
-                       mask_block: int = 64) -> torch.Tensor:
+                       mask_block: int = 64,
+                       head_major: bool = False) -> torch.Tensor:
     """投机校验：每行 ``c`` 个草稿查询共用一遍历史读取。
 
     Args:
@@ -1623,7 +1626,7 @@ def attn_paged_multi_q(q: torch.Tensor, gate: torch.Tensor, kpool: torch.Tensor,
     # 列切片。
     return module.attn_paged_multi_q(q.contiguous(), gate.contiguous(), kpool, vpool, kscale,
                                      vscale, slots, ctx_lens.contiguous(), out, max_seq,
-                                     rep, scale, pa, pm, mask, mask_block)
+                                     rep, scale, pa, pm, mask, mask_block, head_major)
 
 
 # 门控 DeltaNet

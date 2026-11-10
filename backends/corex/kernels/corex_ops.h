@@ -399,7 +399,8 @@ torch::Tensor attn_paged(torch::Tensor q, torch::Tensor gate, torch::Tensor kpoo
                          torch::Tensor vpool, torch::Tensor kscale,
                          torch::Tensor vscale, torch::Tensor pos2slot, torch::Tensor out,
                          torch::Tensor pos, int64_t max_pos, int64_t rep, double scale,
-                         torch::Tensor part_acc, torch::Tensor part_ml);
+                         torch::Tensor part_acc, torch::Tensor part_ml,
+                         bool head_major = false);
 
 // @brief 一个桶的行各带自身上下文长度，一次算一个解码 token。
 //
@@ -412,7 +413,8 @@ torch::Tensor attn_paged_batch(torch::Tensor q, torch::Tensor gate, torch::Tenso
                                torch::Tensor vscale, torch::Tensor slots,
                                torch::Tensor context_lens, torch::Tensor out,
                                int64_t max_seq, int64_t rep, double scale,
-                               torch::Tensor part_acc, torch::Tensor part_ml);
+                               torch::Tensor part_acc, torch::Tensor part_ml,
+                               bool head_major = false);
 
 // @brief 投机校验：每行 ``c`` 个草稿查询共用一遍历史读取。
 //
@@ -426,7 +428,8 @@ torch::Tensor attn_paged_multi_q(torch::Tensor q, torch::Tensor gate, torch::Ten
                                  torch::Tensor ctx_lens, torch::Tensor out,
                                  int64_t max_seq, int64_t rep, double scale,
                                  torch::Tensor part_acc, torch::Tensor part_ml,
-                                 torch::Tensor block_mask, int64_t mask_block);
+                                 torch::Tensor block_mask, int64_t mask_block,
+                                 bool head_major = false);
 
 // 门控 DeltaNet：喂给递推的深度卷积、头预处理，以及递推本身。
 

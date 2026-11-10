@@ -290,19 +290,25 @@ __global__ void rope_apply_kernel(const T* __restrict__ q, const T* __restrict__
 
 // @brief kv 头 ``g`` 的第 ``s`` 个键的平坦行号，稠密或分页。
 //
-// 稠密缓存是头主序（``[nkv, S, hd]``，行 ``g*S + s``），分页池是 token 主序
-// （``[slots, nkv, hd]``，行 ``slot*nkv + g``）。一个公式覆盖两者，所以 k、v 和两个每 token
-// 的 scale 全都用同一个行号索引。
+// 行号一律是 ``slot * stride_slot + g * stride_head``；三种布局只是两个步长取不同的值：
+// 稠密（``[nkv, S, hd]``）是 ``1`` 与 ``S``，分页 token 主序（``[slots, nkv, hd]``）是
+// ``nkv`` 与 ``1``，分页头主序（``[nkv, slots, hd]``）是 ``1`` 与 ``nslots``。
+//
+// **写成两个步长而不是按布局分支**：同一份内核只改池布局实测差 1.93x（4k 单层 0.806 ->
+// 0.418 ms），说明浪费在访存是否连续、不在映射本身；而每条指令多一次判断的开销在这张卡上
+// 并不便宜，所以布局差异必须在启动参数里消化掉，不能落到内层循环里。
 //
 // @param s 窗口内的位置。
 // @param g KV 头。
 // @param pos2slot 设备侧位置到槽位的映射，稠密布局下为 null。
-// @param stride 稠密是 ``S``，分页是 ``nkv``。
+// @param stride_slot 相邻槽位之间的行距。
+// @param stride_head 相邻 KV 头之间的行距。
 // @param map_base 本次查询的槽位表行起始的元素下标。
 // @return k、v 和两个 scale 共用的平坦行号。
 __device__ __forceinline__ int cache_row(int s, int g, const int64_t* pos2slot,
-                                         int stride, int map_base) {
-    return pos2slot ? (int)((long)pos2slot[map_base + s] * stride + g) : g * stride + s;
+                                         int stride_slot, int stride_head, int map_base) {
+    const int slot = pos2slot ? (int)pos2slot[map_base + s] : s;
+    return slot * stride_slot + g * stride_head;
 }
 //
 // ``map_base`` 是参数而不是写死的 ``b * max_seq``，因为两个调用方传进来的东西不一样，而
@@ -320,7 +326,7 @@ struct AttnLayout {
     const int32_t* ctx_lens;
     //: 设备侧位置；只在 ``ctx_lens`` 为 null 时读取。
     const int64_t* pos;
-    //: 行间距：稠密是 ``S``，分页是 ``nkv``。
+    //: 相邻槽位之间的行距：稠密与头主序是 ``1``，分页 token 主序是 ``nkv``。
     int stride;
     //: 窗口上限，即槽位表的行间距。
     int max_seq;
@@ -344,6 +350,11 @@ struct AttnLayout {
     //: （``docs/SLOT_MAP_BUG.md``）。放在末尾的理由与 ``ctx_anchor`` 相同：位置式聚合
     //: 初始化不能把 ``max_seq`` 重新绑掉。
     bool map_rows;
+    //: 相邻 KV 头之间的行距：稠密是 ``S``，token 主序是 ``1``，头主序是 ``nslots``。
+    //:
+    //: 同样加在末尾：四个入口都是位置式聚合初始化，插在中间会把 ``max_seq`` 重新绑掉，
+    //: 窗口随之变成 0。
+    int stride_head;
 };
 
 // @brief 每个（查询头，键切片，行）一个 block；在线 softmax 的一片。
@@ -411,7 +422,8 @@ __global__ void attn_slice_kernel(const uint16_t* __restrict__ q,
     for (int base = kfrom; base < kto; base += KEY_BLOCK) {
         const int nb = kto - base < KEY_BLOCK ? kto - base : KEY_BLOCK;
         for (int i = t; i < nb; i += nt) {
-            rows[i] = cache_row(base + i, g, layout.pos2slot, layout.stride, map_base);
+            rows[i] = cache_row(base + i, g, layout.pos2slot, layout.stride,
+                                layout.stride_head, map_base);
         }
         __syncthreads();
 
@@ -594,7 +606,7 @@ torch::Tensor attn_decode(torch::Tensor q, torch::Tensor gate, torch::Tensor kca
     const int nh = (int)q.size(0);
     const int hd = (int)q.size(1);
     const int S = (int)kcache.size(1);
-    AttnLayout layout{nullptr, nullptr, pos.data_ptr<int64_t>(), S, S, false, false};
+    AttnLayout layout{nullptr, nullptr, pos.data_ptr<int64_t>(), 1, S, false, false, S};
     return slice_launch(q, gate, kcache, vcache, kscale, vscale, out, part_acc, part_ml,
                         layout, nullptr, 1, nh, hd, (int)rep, (float)scale, 1, 0);
 }
@@ -623,7 +635,7 @@ torch::Tensor attn_paged(torch::Tensor q, torch::Tensor gate, torch::Tensor kpoo
                          torch::Tensor vpool, torch::Tensor kscale,
                          torch::Tensor vscale, torch::Tensor pos2slot, torch::Tensor out,
                          torch::Tensor pos, int64_t max_pos, int64_t rep, double scale,
-                         torch::Tensor part_acc, torch::Tensor part_ml) {
+                         torch::Tensor part_acc, torch::Tensor part_ml, bool head_major) {
     TORCH_CHECK(q.dim() == 2, "query must be [nh, hd]");
     TORCH_CHECK(kpool.scalar_type() == torch::kChar, "pool must be int8");
     TORCH_CHECK(pos2slot.scalar_type() == torch::kLong, "slot map must be int64");
@@ -634,12 +646,18 @@ torch::Tensor attn_paged(torch::Tensor q, torch::Tensor gate, torch::Tensor kpoo
                 "on the device, so a host tensor is read as garbage instead of being rejected");
     const int nh = (int)q.size(0);
     const int hd = (int)q.size(1);
-    const int nkv = (int)kpool.size(1);
+    // 池布局决定两个行距：token 主序是 ``[slots, nkv, hd]``（同一 KV 头的相邻键隔
+    // ``nkv`` 行），头主序是 ``[nkv, slots, hd]``（相邻键连续）。同一份内核只换布局实测
+    // 4k 单层 0.806 -> 0.418 ms，所以头主序是要走的方向。
+    const int nkv = head_major ? (int)kpool.size(0) : (int)kpool.size(1);
+    const int nslots = head_major ? (int)kpool.size(1) : (int)kpool.size(0);
+    const int stride_slot = head_major ? 1 : nkv;
+    const int stride_head = head_major ? nslots : 1;
     // 这里的 ``pos2slot`` 是 ``pool.pos2slot[row]``，一个元素 0 已经是本行第一个位置的视图，
     // 所以内核不加行偏移。批处理入口传整个映射并设置标志；这个入口搞错，单次解码步就会读到
     // 相邻行的键。
     AttnLayout layout{pos2slot.data_ptr<int64_t>(), nullptr, pos.data_ptr<int64_t>(),
-                      nkv, (int)max_pos, false, false};
+                      stride_slot, (int)max_pos, false, false, stride_head};
     return slice_launch(q, gate, kpool, vpool, kscale, vscale, out, part_acc, part_ml,
                         layout, nullptr, 1, nh, hd, (int)rep, (float)scale, 1, 0);
 }
@@ -668,7 +686,8 @@ torch::Tensor attn_paged_batch(torch::Tensor q, torch::Tensor gate, torch::Tenso
                                torch::Tensor vscale, torch::Tensor slots,
                                torch::Tensor context_lens, torch::Tensor out,
                                int64_t max_seq, int64_t rep, double scale,
-                               torch::Tensor part_acc, torch::Tensor part_ml) {
+                               torch::Tensor part_acc, torch::Tensor part_ml,
+                               bool head_major) {
     TORCH_CHECK(q.dim() == 3, "queries must be [B, nh, hd]");
     TORCH_CHECK(context_lens.scalar_type() == torch::kInt, "context lengths must be int32");
     TORCH_CHECK(context_lens.is_cuda() && context_lens.device() == q.device(),
@@ -678,11 +697,14 @@ torch::Tensor attn_paged_batch(torch::Tensor q, torch::Tensor gate, torch::Tenso
     const int rows = (int)q.size(0);
     const int nh = (int)q.size(1);
     const int hd = (int)q.size(2);
-    const int nkv = (int)kpool.size(1);
+    const int nkv = head_major ? (int)kpool.size(0) : (int)kpool.size(1);
+    const int nslots = head_major ? (int)kpool.size(1) : (int)kpool.size(0);
+    const int stride_slot = head_major ? 1 : nkv;
+    const int stride_head = head_major ? nslots : 1;
     // 这里的 ``context_lens`` 就是键数，所以校验锚点那次转换不适用。``slots`` 是整个
     // ``[B, max_seq]`` 映射，所以内核必须偏移到第 ``b`` 行。
     AttnLayout layout{slots.data_ptr<int64_t>(), context_lens.data_ptr<int32_t>(), nullptr,
-                      nkv, (int)max_seq, false, true};
+                      stride_slot, (int)max_seq, false, true, stride_head};
     return slice_launch(q.reshape({rows, nh, hd}), gate, kpool, vpool, kscale, vscale,
                         out, part_acc, part_ml, layout, nullptr, rows, nh, hd, (int)rep,
                         (float)scale, 1, 0);
@@ -717,7 +739,8 @@ torch::Tensor attn_paged_multi_q(torch::Tensor q, torch::Tensor gate, torch::Ten
                                  torch::Tensor ctx_lens, torch::Tensor out,
                                  int64_t max_seq, int64_t rep, double scale,
                                  torch::Tensor part_acc, torch::Tensor part_ml,
-                                 torch::Tensor block_mask, int64_t mask_block) {
+                                 torch::Tensor block_mask, int64_t mask_block,
+                                 bool head_major) {
     TORCH_CHECK(q.dim() == 4, "draft queries must be [B, c, nh, hd]");
     TORCH_CHECK(ctx_lens.scalar_type() == torch::kInt, "context lengths must be int32");
     TORCH_CHECK(ctx_lens.is_cuda() && ctx_lens.device() == q.device(),
@@ -728,12 +751,15 @@ torch::Tensor attn_paged_multi_q(torch::Tensor q, torch::Tensor gate, torch::Ten
     const int draft = (int)q.size(1);
     const int nh = (int)q.size(2);
     const int hd = (int)q.size(3);
-    const int nkv = (int)kpool.size(1);
+    const int nkv = head_major ? (int)kpool.size(0) : (int)kpool.size(1);
+    const int nslots = head_major ? (int)kpool.size(1) : (int)kpool.size(0);
+    const int stride_slot = head_major ? 1 : nkv;
+    const int stride_head = head_major ? nslots : 1;
     // 这里的 ``ctx_lens`` 是锚点的最后下标而不是计数：第 ``j`` 个查询需要
     // ``anchor + 1 + j`` 个键，而内核按 ``ctx_anchor`` 把两项都加上。``slots`` 是整个
     // ``[B, max_seq]`` 映射，所以内核必须偏移到第 ``b`` 行。
     AttnLayout layout{slots.data_ptr<int64_t>(), ctx_lens.data_ptr<int32_t>(), nullptr,
-                      nkv, (int)max_seq, true, true};
+                      stride_slot, (int)max_seq, true, true, stride_head};
     // 契约里掩码是可选的；「精确注意力」是以空张量传来的，把它当成掩码会把每个键都清零。
     const bool masked = block_mask.defined() && block_mask.numel() > 0;
     if (masked) {

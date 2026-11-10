@@ -38,6 +38,8 @@ Constraints:
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 import backends
@@ -62,7 +64,8 @@ class PagedKVCache:
 
     def __init__(self, n_layers: int, nkv: int, hd: int, num_blocks: int = 512,
                  block_size: int = 64, max_seq: int = 4096,
-                 device: "torch.device | str | None" = None, rows: int = 1) -> None:
+                 device: "torch.device | str | None" = None, rows: int = 1,
+                 head_major: "bool | None" = None) -> None:
         """一次性把整个池开出来，这是一笔显存承诺。
 
         Args:
@@ -88,13 +91,24 @@ class PagedKVCache:
         self.bs = block_size
         self.max_seq = max_seq
         self.num_slots = num_blocks * block_size
-        shape = (n_layers, self.num_slots, nkv, hd)
+        # 头主序让同一 KV 头的相邻 token 连续，注意力内层这才拿得到顺序读。同一份内核
+        # 只换布局实测 4k 单层 0.806 -> 0.418 ms（见 docs/occamy/SERVING.md），所以默认
+        # 走头主序；环境变量留给同一份二进制做 A/B。**默认关**：端到端实测无收益
+        # （四档 27.42/26.23/26.55/28.3 vs 27.47/26.32/26.64/28.4），单层探针的
+        # 1.93x 在服务里没有复现，见 docs/occamy/SERVING.md。
+        if head_major is None:
+            head_major = os.environ.get("COFFIN_KV_HEAD_MAJOR", "0") != "0"
+        self.head_major = bool(head_major)
+        if self.head_major:
+            shape = (n_layers, nkv, self.num_slots, hd)
+            scale_shape = (n_layers, nkv, self.num_slots)
+        else:
+            shape = (n_layers, self.num_slots, nkv, hd)
+            scale_shape = (n_layers, self.num_slots, nkv)
         self.k = torch.zeros(shape, dtype=torch.int8, device=device)
         self.v = torch.zeros(shape, dtype=torch.int8, device=device)
-        self.kscale = torch.zeros((n_layers, self.num_slots, nkv), dtype=torch.float32,
-                                  device=device)
-        self.vscale = torch.zeros((n_layers, self.num_slots, nkv), dtype=torch.float32,
-                                  device=device)
+        self.kscale = torch.zeros(scale_shape, dtype=torch.float32, device=device)
+        self.vscale = torch.zeros(scale_shape, dtype=torch.float32, device=device)
 
         #: 位置 -> 池槽位，每个批行一行（常驻设备）。第 0 行是单流那份表，
         #: 第 1 行起是批解码的行。
@@ -194,10 +208,24 @@ class PagedKVCache:
                 把槽位表指向 ``dst``；改去写 ``src`` 会破坏所有共享它的序列。
         """
         bs = self.bs
-        self.k[:, dst * bs:(dst + 1) * bs].copy_(self.k[:, src * bs:(src + 1) * bs])
-        self.v[:, dst * bs:(dst + 1) * bs].copy_(self.v[:, src * bs:(src + 1) * bs])
-        self.kscale[:, dst * bs:(dst + 1) * bs].copy_(self.kscale[:, src * bs:(src + 1) * bs])
-        self.vscale[:, dst * bs:(dst + 1) * bs].copy_(self.vscale[:, src * bs:(src + 1) * bs])
+        if self.head_major:
+            self.k[:, :, dst * bs:(dst + 1) * bs].copy_(
+                self.k[:, :, src * bs:(src + 1) * bs])
+            self.v[:, :, dst * bs:(dst + 1) * bs].copy_(
+                self.v[:, :, src * bs:(src + 1) * bs])
+            self.kscale[:, :, dst * bs:(dst + 1) * bs].copy_(
+                self.kscale[:, :, src * bs:(src + 1) * bs])
+            self.vscale[:, :, dst * bs:(dst + 1) * bs].copy_(
+                self.vscale[:, :, src * bs:(src + 1) * bs])
+        else:
+            self.k[:, dst * bs:(dst + 1) * bs].copy_(
+                self.k[:, src * bs:(src + 1) * bs])
+            self.v[:, dst * bs:(dst + 1) * bs].copy_(
+                self.v[:, src * bs:(src + 1) * bs])
+            self.kscale[:, dst * bs:(dst + 1) * bs].copy_(
+                self.kscale[:, src * bs:(src + 1) * bs])
+            self.vscale[:, dst * bs:(dst + 1) * bs].copy_(
+                self.vscale[:, src * bs:(src + 1) * bs])
         self.n_cows += 1
 
     @property
@@ -292,6 +320,12 @@ class PagedKVCache:
             sv: ``[nkv]`` 的 fp32 value 反量化 scale。
         """
         li = torch.full_like(slot, layer)
+        if self.head_major:
+            self.k[li, :, slot] = k
+            self.v[li, :, slot] = v
+            self.kscale[li, :, slot] = sk
+            self.vscale[li, :, slot] = sv
+            return
         self.k.index_put_((li, slot), k.unsqueeze(0))
         self.v.index_put_((li, slot), v.unsqueeze(0))
         self.kscale.index_put_((li, slot), sk.unsqueeze(0))
@@ -311,6 +345,12 @@ class PagedKVCache:
             sv: ``[T, nkv]`` 的 fp32 value scale。
         """
         li = torch.full_like(slots, layer)
+        if self.head_major:
+            self.k[li, :, slots] = k
+            self.v[li, :, slots] = v
+            self.kscale[li, :, slots] = sk
+            self.vscale[li, :, slots] = sv
+            return
         self.k.index_put_((li, slots), k)
         self.v.index_put_((li, slots), v)
         self.kscale.index_put_((li, slots), sk)
@@ -333,6 +373,12 @@ class PagedKVCache:
             sv: ``[B, nkv]`` 的 fp32 value scale。
         """
         li = torch.full_like(slots, layer)
+        if self.head_major:
+            self.k[li, :, slots] = k
+            self.v[li, :, slots] = v
+            self.kscale[li, :, slots] = sk
+            self.vscale[li, :, slots] = sv
+            return
         self.k.index_put_((li, slots), k)
         self.v.index_put_((li, slots), v)
         self.kscale.index_put_((li, slots), sk)
@@ -371,6 +417,12 @@ class PagedKVCache:
             稠密视图。
         """
         slots = self.pos2slot[row][:n_tokens]
+        if self.head_major:
+            # 头主序下槽位轴本来就在中间，选完就是 [nkv, S, hd]，不需要转置。
+            return (self.k[layer].index_select(1, slots),
+                    self.v[layer].index_select(1, slots),
+                    self.kscale[layer].index_select(1, slots),
+                    self.vscale[layer].index_select(1, slots))
         return (self.k[layer].index_select(0, slots).transpose(0, 1),
                 self.v[layer].index_select(0, slots).transpose(0, 1),
                 self.kscale[layer].index_select(0, slots).transpose(0, 1),

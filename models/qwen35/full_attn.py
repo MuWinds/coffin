@@ -346,7 +346,7 @@ class FullAttn:
             out = bops.attn_paged(q.contiguous(), gate.contiguous(), kp, vp, kps, vps,
                                   self.pool.pos2slot[self.prefill_row], self.attn_out1,
                                   pos1, self.max_seq, self.rep, self.scale,
-                                  self.part_acc1, self.part_ml1)
+                                  self.part_acc1, self.part_ml1, head_major=self.pool.head_major)
         else:
             out = bops.attn_decode(q.contiguous(), gate.contiguous(), self.kcache,
                                    self.vcache, self.kscale, self.vscale,
@@ -437,7 +437,7 @@ class FullAttn:
             bops.attn_paged_batch(q, gate, kp, vp, kps, vps,
                                   self.pool.pos2slot[:B], ctx_lens[:B],
                                   self.attn_out[:B], self.max_seq, self.rep, self.scale,
-                                  self.part_acc[:B], self.part_ml[:B])
+                                  self.part_acc[:B], self.part_ml[:B], head_major=self.pool.head_major)
         else:
             for b in range(B):
                 qk, sk = self._quant(k[b], self.k_i8[b], self.k_s[b])
@@ -448,7 +448,7 @@ class FullAttn:
                 bops.attn_paged(q[b].contiguous(), gate[b].contiguous(), kp, vp, kps, vps,
                                 self.pool.pos2slot[b], self.attn_out[b], pos_b,
                                 self.max_seq, self.rep, self.scale,
-                                self.part_acc[b], self.part_ml[b])
+                                self.part_acc[b], self.part_ml[b], head_major=self.pool.head_major)
         # 按容量定尺寸的缓冲区只写了前 ``B`` 行；切片让投影的 K 维保持为 nh*hd。
         return batch_proj(self.o_proj, self.attn_out[:B].reshape(B, -1))
 
@@ -568,7 +568,7 @@ class FullAttn:
         bops.attn_paged_multi_q(q.contiguous(), gate.contiguous(), kp, vp, kps, vps,
                                 self.pool.pos2slot[:b], lens, out,
                                 self.max_seq, self.rep, self.scale,
-                                self.mq_part_acc[:n], self.mq_part_ml[:n])
+                                self.mq_part_acc[:n], self.mq_part_ml[:n], head_major=self.pool.head_major)
         return out.reshape(n, self.nh * self.hd)
 
     def verify_batch_step(self, qg: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
@@ -614,7 +614,7 @@ class FullAttn:
         bops.attn_paged_batch(q, gate, kp, vp, kps, vps,
                               self.pool.pos2slot[:b], lens,
                               self.attn_out[:b], self.max_seq, self.rep, self.scale,
-                              self.part_acc[:b], self.part_ml[:b])
+                              self.part_acc[:b], self.part_ml[:b], head_major=self.pool.head_major)
         return self.o_proj.prefill(self.attn_out[:b].reshape(b, -1))
 
     def prefill_attend(self, qg: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
@@ -831,7 +831,7 @@ class FullAttn:
                                 self.pool.pos2slot[self.prefill_row], self.attn_out1,
                                 positions[i:i + 1],
                                 self.max_seq, self.rep, self.scale,
-                                self.part_acc1, self.part_ml1)
+                                self.part_acc1, self.part_ml1, head_major=self.pool.head_major)
             else:
                 self.kcache.index_copy_(1, positions[i:i + 1], qk.unsqueeze(1))
                 self.vcache.index_copy_(1, positions[i:i + 1], qv.unsqueeze(1))
