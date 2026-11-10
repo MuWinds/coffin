@@ -122,7 +122,18 @@ class ModelRunner:
         """
         return self.batching and self.bm is not None
 
-    def free_blocks(self) -> int:
+    def can_take_dense_solo(self) -> bool:
+        """批模式下当前是否只剩这一条序列。
+
+        没有任何序列占着批处理行时，单条请求不必走分页路径：稠密单发对单条序列
+        更快（实测批模式 B=1 从 28.4 掉到 23.5 tok/s），而且长 prompt 的分块
+        预填充在批模式下也慢一倍多。调度器保证稠密单条在跑时不再准入新请求，
+        所以这里看到空的行表就等于「只有这一条」。
+
+        Returns:
+            能不能走稠密单发。
+        """
+        return self.batching and not self._row_owner
         """池现在能发出去的块数。
 
         调度器在准入之前会问这一句，这样拿不到下一个分块所需块的客户端就在
@@ -272,15 +283,20 @@ class ModelRunner:
             if self.pc.seq is not None:
                 seq.block_table = list(self.pc.seq.blocks)
             seq.prefill_cursor = seq.num_tokens
-        elif self.batching:
+        elif self.batching and self._row_owner:
             self.begin_prefill(seq)
             logits = self.prefill_chunk(seq, seq.num_tokens - seq.prefill_cursor)
             if logits is None:                       # pragma: no cover - defensive
                 raise RuntimeError("prefill_chunk() did not finish the prompt")
         else:
+            # 批模式但当前没有任何序列占着批处理行 ⇒ 只有这一条在跑，走稠密单发。
+            # 两条路径的 KV 表示不同（这里是模型自带的单行状态，批处理是分页槽），
+            # 所以这个决定必须在这里定下，并对该序列的整个生命周期保持一致——
+            # 调度器会拦住第二条的准入，直到这条结束，见 ``Scheduler.schedule``。
             self.model.reset()
             logits = self.model.prefill(seq.token_ids, mm=seq.mm)
             seq.prefill_cursor = seq.num_tokens
+            seq.dense = True
         seq.num_cached_tokens = int(self.model.pos1)
         seq.num_scheduled_tokens = seq.num_cached_tokens - seq.matched
         self.last_prefill_s = time.time() - t0
@@ -308,6 +324,9 @@ class ModelRunner:
         bm, model = self.bm, self.model
         if bm is None:
             raise RuntimeError("chunked prefill needs a block manager")
+        # 分页准入后状态住在批处理行里，稠密单发的标记必须清掉，否则 ``decode``
+        # 会拿它去走没有块表的单行路径。
+        seq.dense = False
         radix = bm.radix
         if seq.row < 0:
             row = self._claim_row(seq)
@@ -651,7 +670,7 @@ class ModelRunner:
         Returns:
             每条序列一个采样出的 token id，顺序一致。
         """
-        if self.batching:
+        if self.batching and not (len(seqs) == 1 and seqs[0].dense):
             return self._decode_batch(seqs)
         out: list[int] = []
         for seq in seqs:

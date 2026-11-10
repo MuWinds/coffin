@@ -190,6 +190,14 @@ class LLMEngine:
             params.eos = set(self.eos)
         seq = Sequence(token_ids, params)
         seq.mm = mm
+        # 到达时刻。稠密单发要等一个合并窗口再决定，否则四个客户端错开 0.1-0.6 秒
+        # 连进来时，第一个请求会被准入成稠密单条，其余三个排在它后面，整批退化成
+        # 串行（实测 963 次采样里 running=1 占绝对多数、running=3 只有 3 次）。
+        # 用引擎步号而不是墙钟：四个 rank 各持一份调度器，墙钟差几毫秒就会让某个
+        # rank 判「只有我这一条」走稠密、其余走分页，段间 relay 圈数错位，rank0
+        # 等 ack 超时（实测 15 次超时、其余 rank 一条 step 日志都没有）。步号在
+        # 所有 rank 上完全一致。
+        seq.arrival_step = self.scheduler.step_idx
         self.scheduler.add(seq)
         self.n_requests += 1
         self.n_prompt_tokens += len(seq)
@@ -293,7 +301,21 @@ class LLMEngine:
         events = []
         for chunk in chunks:
             seq = chunk.seq
-            if not runner.can_chunk_prefill():
+            # 只有这一条序列时必须走稠密单发：批模式的分页路径对单条更贵（decode
+            # 掉 18%，长 prompt 的分块预填充慢一倍多），而稠密路径本来就是单流引擎
+            # 一直在用的那条，数字能原样保住。
+            # 还要看等待队列：四个客户端同时到达时第一个请求看到的行表也是空的，
+            # 若只按行表判就会把它当成「只有这一条」抢走稠密路径，其余三个被排队，
+            # 整批退化成串行（实测 963 次采样里 running=1 占绝对多数）。只有队列也
+            # 空着，才真的没有别人要进来。
+            # 合并窗口按「步」计：到达那一步不决定、下一步才决定，于是同一步内到达
+            # 的突发流量会一起被准入（走批处理）；真正孤身一条的请求只多等一步
+            # （约 40 ms）就走稠密单发，且四个 rank 的判定因此完全一致。
+            solo = (len(chunks) == 1 and runner.can_take_dense_solo()
+                    and not self.scheduler.waiting
+                    and self.scheduler.step_idx
+                    - getattr(seq, "arrival_step", 0) >= 1)
+            if not runner.can_chunk_prefill() or solo:
                 # 单流和前缀缓存引擎一次调用就把 prompt 预填充完，块记账也自己
                 # 管，所以 token 预算对它们不适用。整个 prompt 由这一次调用写完，
                 # 这也是序列在这里直接变成 ``RUNNING`` 而不是走

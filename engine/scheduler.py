@@ -149,6 +149,11 @@ class Scheduler:
         decode = [s for s in self.running if s.status is SequenceStatus.RUNNING]
         for seq in decode:
             seq.last_scheduled_step = self.step_idx
+        # 稠密单条用的是模型自带的单行状态（不占批处理行、没有块表），再准入一条
+        # 就会把它顶掉；两条路径的 KV 表示不同，混跑还会让流水并行的段间 relay
+        # 圈数对不上。所以正在跑稠密单条时不放行新请求，等它结束就恢复。
+        if any(getattr(seq, "dense", False) for seq in self.running):
+            return decode, []
         if not self.chunked:
             chunks = self._schedule_atomic()
         else:
