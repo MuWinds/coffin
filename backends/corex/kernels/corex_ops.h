@@ -661,6 +661,38 @@ torch::Tensor moe_grouped_i8_merge(torch::Tensor a, torch::Tensor xs, torch::Ten
                                    torch::Tensor ws, torch::Tensor offsets,
                                    torch::Tensor rw, torch::Tensor out, int64_t slices);
 
+// @brief 把 decode 一层的 MoE 块合成一次主机侧驱动，省掉十余次 pybind 往返。
+//
+// 只服务单行 int8 路径。中间缓冲由调用方预分配并复用，本函数不额外分配——否则驱动只是
+// 把 Python 的分配搬进 C++，而分配本身实测只有 1.4 us/次，省不下钱。
+//
+// @param x          归一化后的激活，`[1, H]`。
+// @param router_wt  `[H, E]` int8 路由权重，`router_scale` 是其逐列 fp32 scale。
+// @param gu_w       `[E, K, N]` 专家 gate/up 栈；`dn_w` 是 `[E, I, H]` 的 down 栈。
+// @param sg_wt      `[H, 2I]` 共享专家 gate/up；`sd_wt` 是 `[I, H]`；`gate_w` 是 fp32 门向量。
+// @param idx/rw     `[1, top_k]` 的路由下标与权重缓冲，由本函数写入。
+// @param offsets    分派写出的 `[E + 1]` 前缀和；三张位置表同由分派写入。
+// @param xq_gu      `[top_k, H]` int8 激活与 `[top_k]` 逐行 scale；`xq_dn/xs_dn` 给 down。
+// @param shared_hidden 共享专家输出缓冲；`out` 是最终目的地。
+// @return `out`。
+// @throws c10::Error 形状、dtype 或布局不自洽时由各内核抛出。
+torch::Tensor moe_decode_block(torch::Tensor x,
+                               torch::Tensor router_wt, torch::Tensor router_scale,
+                               torch::Tensor gu_w, torch::Tensor gu_scale,
+                               torch::Tensor dn_w, torch::Tensor dn_scale,
+                               torch::Tensor sg_wt, torch::Tensor sg_scale,
+                               torch::Tensor sd_wt, torch::Tensor sd_scale,
+                               torch::Tensor gate_w, torch::Tensor table,
+                               torch::Tensor idx, torch::Tensor rw,
+                               torch::Tensor offsets, torch::Tensor slot_pos,
+                               torch::Tensor token_of_pos, torch::Tensor slot_of_pos,
+                               torch::Tensor disp_scratch,
+                               torch::Tensor xq_gu, torch::Tensor xs_gu,
+                               torch::Tensor gu_out,
+                               torch::Tensor xq_dn, torch::Tensor xs_dn,
+                               torch::Tensor shared_hidden, torch::Tensor out,
+                               int64_t top_k, int64_t slices);
+
 // 分派：把路由结果变成分组内核要的前缀和与行序，替掉纯 torch 的一串小算子。
 
 // @brief 单 block 完成「计数 → 前缀和 → 稳定算位置」。

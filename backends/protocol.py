@@ -54,6 +54,7 @@ _OP_NAMES: tuple[str, ...] = (
     "moe_grouped_gemm",  # 同一件事的大 M 形态：按专家分段各做一次张量核 GEMM
     "moe_grouped_i8",
     "moe_grouped_i8_merge",    # 同一件事的 int8 形态：权重 [E, K, N] int8，激活按行量化
+    "moe_decode_block",        # 上面这一串在 decode 单行路径上的合成入口：一次调用顶十余次
     "shared_gate_scale",       # 共享专家门：sigmoid(x·w) 乘到投影输出上，一次启动
     "moe_dispatch",      # 路由结果 → 前缀和 + 行序（替掉十来个 torch 小算子）
     "moe_router",        # 路由自身：softmax -> top-k -> 归一化（替掉 512 元素的排序网络）
@@ -460,6 +461,11 @@ class Ops:
     #: ``moe_grouped_i8_merge(w, x, offsets, row_weight) -> y``：同一件事的归并形态，
     #: 把各行按路由权重加权累加成一行。``None`` 表示后端没有这个入口。
     moe_grouped_i8_merge: OpFn | None = None
+    #: 把 decode 一层的 MoE 块合成一次调用：路由投影、`moe_router`、共享专家的两个投影
+    #: 与门标量、`moe_dispatch`、两次分组 int8 投影与合并核。**中间缓冲全部由调用方
+    #: 预分配**，所以这个入口在稳态下不分配内存；它存在的唯一理由是省掉十余次 pybind
+    #: 往返，实测每次约 2 us 的编组加上 1.9 us 的 Python 包装。
+    moe_decode_block: OpFn | None = None
 
     #: ``shared_gate_scale(x, w, src, out) -> out``：共享专家门，``out = src * sigmoid(x . w)``。
     #: 参考链要六次启动才得到一个标量，这个入口一次启动完成，``out`` 由调用方按形状复用。

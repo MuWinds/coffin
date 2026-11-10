@@ -193,6 +193,17 @@ def _rms_norm(x: torch.Tensor, w: torch.Tensor, stride: int = 0,
     return (xf * scale).to(x.dtype) * w.to(x.dtype)
 
 
+def _moe_decode_block(*args, **kwargs):
+    """参考后端不提供 MoE 块的合成入口。
+
+    Raises:
+        RuntimeError: 总是抛出。这一项只是把核心后端已有的十来个算子合成一次调用，
+            参考路径逐算子调用本身就是它的语义，没有需要模拟的东西。
+    """
+    raise RuntimeError(
+        "moe_decode_block is a corex-only fused entry; call the individual ops instead.")
+
+
 def _rms_norm_gated(x: torch.Tensor, w: torch.Tensor, gate: torch.Tensor,
                     eps: float = 1e-6) -> torch.Tensor:
     """RMSNorm scaled by ``silu(gate)``, normalised per head.
@@ -1094,6 +1105,9 @@ def build(caps: Caps | None = None) -> Ops:
     moe_grouped_i8=functools.partial(_moe_grouped, weight_dtype=c.weight_dtype),    moe_grouped_i8_merge=functools.partial(_moe_grouped_merge,
                                             weight_dtype=c.weight_dtype),
         moe_router=_moe_router,
+        # 参考后端不实现这个合成入口：它是「同一串参考算子少跨几次语言边界」的加速形态，
+        # 语义与逐个调用完全一致。在这里给一个能跑的替代只会掩盖「有人以为参考路径也走它」。
+        moe_decode_block=_moe_decode_block,
         hyper_norm=_hyper_norm,
         hyper_down=_hyper_down,
         hyper_up=_hyper_up,

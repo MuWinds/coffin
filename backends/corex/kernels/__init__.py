@@ -40,7 +40,7 @@ _SOURCES = ("bindings.cpp", "gemv.cu", "w8a8.cu", "norm.cu", "attn.cu", "attn_sp
             "w4a8.cu", "hyper.cu", "moe_grouped.cu", "moe_grouped_i8.cu",
             "moe_dispatch.cu",
            "w4_dequant.cu", "mapped_shm.cu", "mapped_reduce.cu",
-            "moe_epilogue.cu")
+            "moe_epilogue.cu", "moe_block.cu")
 
 #: 驱动不报告 ISA 时的回退值。``ivcore10`` 是 BI-V100 的架构
 #: （``docs/qwen4/COREX-PLATFORM.md``）；报告了别的值的卡就用那个值，所以加载器把 ``arch``
@@ -54,7 +54,7 @@ DEFAULT_ARCH = "ivcore10"
 #: 法都递增这个值：后提交的人会静默复用前者的目标文件，量的是一个自己没改过的
 #: 内核。按 worker 加后缀让各自拥有独立的目标树和独立的构建锁，这也是并发构建
 #: 不必串在同一把锁后面的原因。
-_EXTENSION = os.environ.get("COFFIN_COREX_EXT", "").strip() or "coffin_corex_ops_v34"
+_EXTENSION = os.environ.get("COFFIN_COREX_EXT", "").strip() or "coffin_corex_ops_v35"
 
 #: 已加载的扩展，首次尝试之前是 ``None``。
 _module: Any = None
