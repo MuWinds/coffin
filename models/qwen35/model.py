@@ -960,6 +960,14 @@ class Qwen35:
 
         last_hidden: list[torch.Tensor | None] = [None] * n
         Q = PREFILL_ATTN_TILE
+        # 流水线：只有首段做嵌入，其余段从上一段收 hidden；每个分块跑完本段的层之后
+        # 立刻把 hidden 转发给下一段。这与单序列 ``prefill`` 的收尾是同一套约定，
+        # 也是分组预填充能在 PP 下跑起来的前提 —— 非首段没有 ``embed``，无条件调
+        # ``self.embed.lookup`` 会抛 ``NoneType has no attribute lookup``。
+        pipe = self.pipe
+        stage = 0 if pipe is None else pipe.rank
+        world = 1 if pipe is None else pipe.world_size
+        first = stage == 0
         for chunk in plans:
             parts: list[torch.Tensor] = []
             positions: list[torch.Tensor] = []
@@ -969,18 +977,21 @@ class Qwen35:
             for i, c0, c1 in chunk:
                 length = c1 - c0
                 base = matched[i] + c0
-                ids = list(seqs[i].token_ids[base:base + length])
-                emb = self.embed.lookup(torch.as_tensor(
-                    ids, dtype=torch.long, device=_device))
                 mm_i = mm_list[i]
-                if mm_i is not None:
-                    emb = scatter_image_embeds(emb, mm_i.embeds, mm_i.spans,
-                                               base, base + length)
-                    ropes.append(mrope_cos_sin(mm_i.slice_positions(base, base + length),
-                                               self.inv_freq))
+                if first:
+                    ids = list(seqs[i].token_ids[base:base + length])
+                    emb = self.embed.lookup(torch.as_tensor(
+                        ids, dtype=torch.long, device=_device))
+                    if mm_i is not None:
+                        emb = scatter_image_embeds(emb, mm_i.embeds, mm_i.spans,
+                                                   base, base + length)
+                        ropes.append(mrope_cos_sin(
+                            mm_i.slice_positions(base, base + length), self.inv_freq))
+                    else:
+                        ropes.append(None)
+                    parts.append(emb)
                 else:
                     ropes.append(None)
-                parts.append(emb)
                 positions.append(torch.arange(base, base + length,
                                               dtype=torch.long, device=_device))
                 # 绝对 key 范围：一个切块只读到自己的末尾。
@@ -989,7 +1000,11 @@ class Qwen35:
                      for q0 in range(0, length, Q)]
                     if length > Q else None)
                 starts.append(starts[-1] + length)
-            x = torch.cat(parts, dim=0)
+            total = starts[-1]
+            if first:
+                x = torch.cat(parts, dim=0)
+            else:
+                x = pipe.await_relay((total, self.hidden), stage - 1, _device, D)
 
             for layer in self.layers:
                 mix, proj = layer.prefill_group_project(x)
@@ -1008,6 +1023,8 @@ class Qwen35:
                 x = x + out
                 x = x + layer.mlp.prefill(layer.post_ln(x))
 
+            if stage + 1 < world:
+                pipe.relay(x, stage + 1)
             for k, (i, c0, c1) in enumerate(chunk):
                 if c1 == suffix[i]:
                     last_hidden[i] = x[starts[k + 1] - 1].clone()
@@ -1036,13 +1053,23 @@ class Qwen35:
         # 所有序列共用一次 lm_head 读取：[n, hidden] -> [n, vocab]。批处理 GEMV
         # 路径处理 n 为 2/4/8 的情形；其他计数退回逐行单个 GEMV（这里重要的是日常
         # 的 bucket 大小）。
-        last = torch.stack([self.norm(h) for h in last_hidden])
-        if n in (2, 4, 8):
-            logits = self.embed.prefill(last)
-            out = [logits[i] for i in range(n)]
+        if pipe is None:
+            # 单卡保留原来的批处理 lm_head 读取：[n, hidden] -> [n, vocab]。
+            last = torch.stack([self.norm(h) for h in last_hidden])
+            if n in (2, 4, 8):
+                logits = self.embed.prefill(last)
+                return [logits[i] for i in range(n)], states_at
+            return [self.lm_head(last[i]) for i in range(n)], states_at
+        # 流水线：末段算完把每条序列的最后一个 hidden 回传给其余各段，各段用自己那份
+        # ``lm_head`` 算 logits —— 与单序列 ``prefill`` 的收尾同一套约定。这样每段
+        # 返回的 logits 一致，非首段也不需要 ``embed``（它在这些段上是 None）。
+        last = torch.stack([h for h in last_hidden])
+        if stage == world - 1:
+            for dst in range(world - 1):
+                pipe.relay(last, dst)
         else:
-            out = [self.lm_head(last[i]) for i in range(n)]
-        return out, states_at
+            last = pipe.await_relay((n, self.hidden), world - 1, _device, D)
+        return [self.lm_head(self.norm(last[i])) for i in range(n)], states_at
 
     def capture(self, warmup: int = 3) -> None:
         """把 ``_forward`` 捕获进设备图，让解码步只需一次 launch。

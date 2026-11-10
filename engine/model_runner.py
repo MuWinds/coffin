@@ -749,6 +749,34 @@ class ModelRunner:
             seq.num_cached_tokens += len(acc)
         return accepted, logits
 
+    def _trace_rows(self, seqs: list["Sequence"]) -> None:
+        """打印活跃行的槽位区间，并在两条序列的区间相交时报出来。
+
+        两条 prompt 不同的序列没有任何理由共用池槽位：相交就意味着一条序列的
+        KV 会覆盖另一条的。环境变量 COFFIN_KV_TRACE=1 打开，默认静默。
+
+        Args:
+            seqs: 这一步要解码的序列，顺序与行序一致。
+        """
+        pool = getattr(self.model, "pool", None)
+        if pool is None:
+            return
+        owner: dict[int, int] = {}
+        for seq in seqs:
+            ctx = int(seq.num_cached_tokens) + 1
+            slots = pool.pos2slot[seq.row][:ctx].tolist()
+            print(f"[kvtrace] seq={seq.seq_id} row={seq.row} pos={seq.num_cached_tokens} "
+                  f"ctx={ctx} blocks={len(seq.block_table)} head={seq.block_table[:3]} "
+                  f"slots={slots[:4]}..{slots[-2:]}", flush=True)
+            if len(set(slots)) != len(slots):
+                print(f"[kvtrace] SELF_ALIAS seq={seq.seq_id} row={seq.row}", flush=True)
+            for slot in slots:
+                other = owner.get(slot)
+                if other is not None and other != seq.seq_id:
+                    print(f"[kvtrace] ALIAS slot={slot} owner={other} intruder={seq.seq_id}",
+                          flush=True)
+                owner[slot] = seq.seq_id
+
     def _decode_batch(self, seqs: list["Sequence"]) -> list[int]:
         """用一趟批解码前向推进多条序列。
 
@@ -787,6 +815,8 @@ class ModelRunner:
             positions.append(pos)
             tables.append(seq.block_table)
         model.set_rows(tokens, positions, tables, row_indices=rows)
+        if os.environ.get("COFFIN_KV_TRACE") == "1":
+            self._trace_rows(seqs)
         # 同样的铺设、同样的实现、同样的缓冲区：唯一区别是这一趟前向有没有被
         # 录进图。所以不允许 capture 的后端（SCOW 驱动）也照样能走批处理步。
         if self.graph:

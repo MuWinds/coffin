@@ -32,6 +32,8 @@ Constraints:
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from backends import caps as _caps
@@ -427,7 +429,10 @@ class FullAttn:
         q, k = self.rope(q, k, cos, sin)
 
         kp, vp, kps, vps = self._pool_views()
-        if ctx_lens is not None and _CAPS.batch_attn:
+        # COFFIN_NO_BATCH_ATTN=1 时退回逐行单 token 注意力：批处理注意力一旦有
+        # 正确性问题，这是唯一能区分「批量内核错」和「行映射错」的开关。
+        if (ctx_lens is not None and _CAPS.batch_attn
+                and os.environ.get("COFFIN_NO_BATCH_ATTN") != "1"):
             # 整个 bucket 一次 launch：量化每一行、把每行的 K/V 写进各自槽位，然后
             # 一趟分页注意力。
             qk, sk = self._quant_rows(k, self.k_i8[:B], self.k_s[:B])
