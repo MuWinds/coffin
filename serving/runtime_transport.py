@@ -44,7 +44,12 @@ def _init_tensor_parallel():
                            world_size=world)
     from models.qwen35.parallel import configure
 
-    configure(rank, world)
+    # ``COFFIN_PARALLEL=pp`` 走层切分管线，其余走张量并行。默认仍是 tp，因为那是既
+    # 有部署形态；而 MoE 模型在这张卡上必须显式选 pp——TP 每层两次跨卡归约，40 层
+    # 就是每 token 80 次，实测把 decode 从单卡的 82 ms/步拖到 170 ms/步。
+    mode = os.environ.get("COFFIN_PARALLEL", "tp")
+    configure(rank, world, mode)
+    print(f"[serve] parallel mode={mode} rank={rank}/{world}", flush=True)
     return rank, world, dist
 
 

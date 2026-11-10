@@ -419,7 +419,19 @@ __global__ void attn_slice_kernel(const uint16_t* __restrict__ q,
         for (int i = t; i < nb; i += nt) {
             const int8_t* kr = kc + (size_t)rows[i] * hd;
             float dot = 0.f;
-            for (int d = 0; d < hd; ++d) dot += qs[d] * (float)kr[d];
+            // 逐字节标量加载在这里是灾难：warp 内 32 个线程各自处理 *不同* 的键、同一列号，
+            // 于是每条指令摸到 32 个不同的 32 B sector 而每 sector 只用 1 字节 —— 32x 的读取
+            // 浪费。实测 seq=65536、rep=8 时该内核的有效带宽只有 17 GB/s，反推实际流量约
+            // 540 GB/s（已打满 HBM），耗时 31.9 ms。改成 int4 一次取 16 字节后，每条指令的
+            // 有效字节数从 1 提到 16，同一对齐前提下 sector 浪费降到 2x。
+            int d = 0;
+            for (; d + 16 <= hd; d += 16) {
+                const int4 raw = *reinterpret_cast<const int4*>(kr + d);
+                const int8_t* b = reinterpret_cast<const int8_t*>(&raw);
+#pragma unroll
+                for (int j = 0; j < 16; ++j) dot += qs[d + j] * (float)b[j];
+            }
+            for (; d < hd; ++d) dot += qs[d] * (float)kr[d];
             float sc = dot * ks[rows[i]] * scale;
             if (mask_row && !mask_row[(base + i) / mask_block]) sc = NO_MAX;
             w[i] = sc;

@@ -128,6 +128,8 @@ def main() -> None:
     ap.add_argument("--think", action="store_true", help="enable thinking mode")
     ap.add_argument("-n", "--max-new", type=int, default=64)
     ap.add_argument("--temperature", type=float, default=0.0)
+    # 打出生成的 token ids：投机解码的接受率必须按 id 比，按文本比会被解码/舍入糊掉。
+    ap.add_argument("--print-ids", action="store_true")
     args = ap.parse_args()
 
     # 必须在任何模块绑定算子表之前写入：``coffin.backends`` 在 import 时就选好
@@ -176,6 +178,8 @@ def main() -> None:
         print(r["text"])
         print(f"[{r['n_prompt']} prompt tok, {r['n_new']} new, "
               f"prefill {r['prefill_ms']}ms, decode {r['decode_tok_s']} tok/s]")
+        if args.print_ids:
+            print("IDS " + json.dumps(r.get("tokens", [])))
     elif args.cmd == "chat":
         msgs = []
         if args.system:

@@ -34,6 +34,13 @@ _SHARD_TEMPLATE = "quant-w4a8-{i:05d}-of-{total:05d}.safetensors"
 _NIBBLE_OFFSET = 8
 _QUANT_CHUNK_ROWS = 4096
 
+#: 必须保持稠密的二维矩阵后缀（Qwen3.5-MoE 的两处门）。
+#:
+#: 路由矩阵决定每个 token 选哪 8 个专家，4-bit 噪声足够翻转选择，而选错专家是整层
+#: 输出错，不是精度变差；共享专家门是逐 token 一个标量，量化它省不下解码带宽却会改变
+#: 共享分支的幅度。两者都只有几十 KB，保持 bf16 的代价可以忽略。
+DENSE_SUFFIXES = ("mlp.gate.weight", "mlp.shared_expert_gate.weight")
+
 
 def quantize_projection(w: torch.Tensor, group_size: int = 128
                         ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -211,7 +218,8 @@ def convert(checkpoint: Path, out: Path, *, weight_dtype: torch.dtype,
                     continue
 
                 tensor = handle.get_tensor(key).to(device)
-                if visual or not quant_disk.is_quantizable(key, tensor):
+                if (visual or key.endswith(DENSE_SUFFIXES)
+                        or not quant_disk.is_quantizable(key, tensor)):
                     dense = tensor.to(quant_disk.ACT_DTYPE).contiguous().cpu()
                     payload[key] = dense
                     tensors[key] = {"kind": "dense", "shape": list(dense.shape),

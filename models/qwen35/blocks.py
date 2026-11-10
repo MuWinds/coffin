@@ -24,6 +24,7 @@ from backends import ops as bops
 from models.qwen35.batch import batch_proj, wide_proj
 from models.qwen35.full_attn import FullAttn
 from models.qwen35.linear_attn import LinearAttn
+from models.qwen35.moe import SparseMoE
 from models.qwen35.parallel import row_projection
 from ops.gemv import _proj
 from ops.norm import RMSNorm
@@ -133,7 +134,11 @@ class Layer:
         self.type = cfg["layer_types"][i]
         self.in_ln = RMSNorm(sd[f"{p}.input_layernorm.weight"])
         self.post_ln = RMSNorm(sd[f"{p}.post_attention_layernorm.weight"])
-        self.mlp = MLP(sd, f"{p}.mlp", bench)
+        # 稠密层和 MoE 层只在这里分叉：``num_experts`` 是 checkpoint 的属性，
+        # 而两个块暴露的四个入口（``__call__`` / ``prefill`` / ``batch`` / ``wide``）
+        # 完全一致，所以层里再往下就没有分支了。
+        self.mlp = (SparseMoE(sd, f"{p}.mlp", cfg, bench)
+                    if cfg.get("num_experts") else MLP(sd, f"{p}.mlp", bench))
         if self.type == "linear_attention":
             self.mix = LinearAttn(sd, f"{p}.linear_attn", cfg, bench)
         else:

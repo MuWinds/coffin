@@ -85,6 +85,11 @@ class GEMV:
             批量解码和投机校验用这个入口，而不是围绕
             :meth:`__call__` 循环。
         """
+        # 与 :meth:`prefill` 同一个理由：行数为 1 时后端会把输出压成一维，而
+        # ``GEMVGroup.linear_m`` 要沿输出轴切分。宽形状（``Layer.wide``）确实会以
+        # ``M=1`` 调到这里，所以这条不是理论路径。
+        if x.shape[0] == 1:
+            return self(x[0]).unsqueeze(0)
         return bops.linear_m(self.w, x)
 
     def prefill(self, x: torch.Tensor) -> torch.Tensor:
@@ -105,6 +110,12 @@ class GEMV:
         Returns:
             投影后的激活，``[C, N]``，bf16。
         """
+        if x.shape[0] == 1:
+            # 单行的分块预填充会走到这里（长 prompt 的最后一块可能正好只剩 1 个 token）。
+            # 不能落到 ``linear_prefill``：它在行数为 1 时把输出压成一维，而
+            # ``GEMVGroup.prefill`` 接下来要沿输出轴切分，一维输入直接 IndexError。
+            # 走单流入口再把行维补回来，数值与批处理路径逐位一致。
+            return self(x[0]).unsqueeze(0)
         if 2 <= x.shape[0] <= 8:
             return bops.linear_m(self.w, x)
         return bops.linear_prefill(self.w, x)
@@ -188,6 +199,8 @@ class GEMVGroup:
         Returns:
             按给定顺序每个输入权重一个 ``[M, N_i]`` 张量。
         """
+        if x.shape[0] == 1:
+            return [part.unsqueeze(0) for part in self(x[0])]
         return self.g.linear_m(x).split(self.sizes, dim=1)
 
     def prefill(self, x: torch.Tensor) -> list[torch.Tensor]:
@@ -199,6 +212,8 @@ class GEMVGroup:
         Returns:
             按给定顺序每个输入权重一个 ``[C, N_i]`` 张量。
         """
+        if x.shape[0] == 1:
+            return [part.unsqueeze(0) for part in self(x[0])]
         return self.g.prefill(x).split(self.sizes, dim=1)
 
 

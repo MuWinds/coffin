@@ -112,6 +112,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("silu_mul", &silu_mul,
           "out = silu(gate) * up, the SwiGLU product, out may alias up",
           pybind11::arg("gate"), pybind11::arg("up"), pybind11::arg("out"));
+    m.def("shared_gate_scale", &shared_gate_scale,
+          "out = src * sigmoid(x . w), one launch for the shared-expert gate",
+          pybind11::arg("x"), pybind11::arg("w"), pybind11::arg("src"),
+          pybind11::arg("out"));
     m.def("rope_apply", &rope_apply,
           "rotate the leading rotary_dim channels of every q/k head, one launch",
           pybind11::arg("q"), pybind11::arg("k"), pybind11::arg("cos"),
@@ -122,18 +126,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("attn_decode", &attn_decode,
           "single-token attention over the dense int8 KV cache");
     m.def("attn_paged", &attn_paged,
-          "single-token attention over a paged int8 pool via a device slot map");
-    m.def("attn_paged_batch", &attn_paged_batch,
-          "batched single-token attention, one context length per row");
+          "\u5206\u9875\u6ce8\u610f\u529b\uff1a\u7ed9\u5b9a\u4f4d\u7f6e\u5728 int8 KV \u6c60\u4e0a\u7b97\u4e00\u4e2a\u89e3\u7801 token",
+          pybind11::arg("q"), pybind11::arg("gate"), pybind11::arg("kpool"),
+          pybind11::arg("vpool"), pybind11::arg("kscale"), pybind11::arg("vscale"),
+          pybind11::arg("pos2slot"), pybind11::arg("out"), pybind11::arg("pos"),
+          pybind11::arg("max_pos"), pybind11::arg("rep"), pybind11::arg("scale"),
+          pybind11::arg("part_acc"), pybind11::arg("part_ml"));
     m.def("attn_paged_multi_q", &attn_paged_multi_q,
-          "draft-verify attention: c queries per row share one history pass",
+          "\u6295\u673a\u6821\u9a8c\u5f62\u6001\uff1a\u6bcf\u884c c \u4e2a\u8349\u7a3f\u67e5\u8be2\u5171\u7528\u4e00\u904d\u5386\u53f2\u8bfb\u53d6",
           pybind11::arg("q"), pybind11::arg("gate"), pybind11::arg("kpool"),
           pybind11::arg("vpool"), pybind11::arg("kscale"), pybind11::arg("vscale"),
           pybind11::arg("slots"), pybind11::arg("ctx_lens"), pybind11::arg("out"),
           pybind11::arg("max_seq"), pybind11::arg("rep"), pybind11::arg("scale"),
-          pybind11::arg("part_acc"), pybind11::arg("part_ml"), pybind11::arg("block_mask"),
-          pybind11::arg("mask_block") = 64);
-
+          pybind11::arg("part_acc"), pybind11::arg("part_ml"),
+          pybind11::arg("block_mask"), pybind11::arg("mask_block"));
     // 门控 DeltaNet。
     m.def("conv1d_silu", &conv1d_silu,
           "depthwise causal conv1d + SiLU for one token, shifts the window in place");
@@ -174,6 +180,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           // 紧凑非空专家表，可为 None。decode 一个 token 只碰约 10 个专家，而每卡
           // 持 128 个；按全量开 z 维会让 92% 的 block 一进来就退出。
           pybind11::arg("active") = pybind11::none());
+    m.def("moe_grouped_i8", &moe_grouped_i8,
+          "\u5206\u7ec4 int8 \u6295\u5f71\uff1a\u4e13\u5bb6\u6808 [E, K, N] int8 "
+          "+ \u9010 (\u4e13\u5bb6, \u5217) scale",
+          pybind11::arg("a"), pybind11::arg("xs"), pybind11::arg("w"),
+          pybind11::arg("ws"), pybind11::arg("offsets"), pybind11::arg("out"),
+          pybind11::arg("slices") = 0);
+    m.def("moe_grouped_i8_merge", &moe_grouped_i8_merge,
+          "分组 int8 投影的归并形态：各行按路由权重加权累加成一行",
+          pybind11::arg("a"), pybind11::arg("xs"), pybind11::arg("w"),
+          pybind11::arg("ws"), pybind11::arg("offsets"), pybind11::arg("rw"),
+          pybind11::arg("out"), pybind11::arg("slices") = 0);
     m.def("moe_dispatch", &moe_dispatch,
           "\u5206\u6d3e\uff1a\u8def\u7531\u7ed3\u679c \u2192 \u524d\u7f00\u548c + \u884c\u5e8f",
           pybind11::arg("expert_idx"), pybind11::arg("local_table"),
@@ -187,6 +204,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("a"), pybind11::arg("xs"), pybind11::arg("w"),
           pybind11::arg("ws"), pybind11::arg("offsets"), pybind11::arg("out"),
           pybind11::arg("group_size"));
+    m.def("attn_paged_batch", &attn_paged_batch,
+          "分页注意力的批形态：一个桶的行各带自身上下文长度，一次算一个解码 token",
+          pybind11::arg("q"), pybind11::arg("gate"), pybind11::arg("kpool"),
+          pybind11::arg("vpool"), pybind11::arg("kscale"), pybind11::arg("vscale"),
+          pybind11::arg("slots"), pybind11::arg("context_lens"), pybind11::arg("out"),
+          pybind11::arg("max_seq"), pybind11::arg("rep"), pybind11::arg("scale"),
+          pybind11::arg("part_acc"), pybind11::arg("part_ml"));
     m.def("attn_sparse", &attn_sparse,
           "QSA \u7684\u7a00\u758f\u6ce8\u610f\u529b\uff1a\u53ea\u8bfb\u7d22\u5f15\u5668\u9009\u4e2d\u7684\u4f4d\u7f6e",
           pybind11::arg("q"), pybind11::arg("kcache"), pybind11::arg("vcache"),

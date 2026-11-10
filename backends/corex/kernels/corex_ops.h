@@ -326,6 +326,20 @@ torch::Tensor w8a8_gemm_tcu(torch::Tensor a, torch::Tensor w, torch::Tensor xs,
 // @throws c10::Error 形状、dtype 或重叠是内核服务不了的。
 torch::Tensor silu_mul(torch::Tensor gate, torch::Tensor up, torch::Tensor out);
 
+// @brief 共享专家的门标量：``sigmoid(x·w)`` 乘到 ``src`` 上写进 ``out``，一次启动。
+//
+// 替掉参考链的六次启动（``x.float()`` / ``mul`` / ``sum`` / ``to`` / ``sigmoid`` / ``mul``）
+// 加两次分配 —— 它算出来的只是一个 fp32 标量，付六次启动下限不值。
+//
+// @param x   激活，``[rows, width]`` 或 ``[width]``。
+// @param w   fp32 门权重，``[width]``，连续。
+// @param src 被缩放的输入，形状同 ``x``。
+// @param out 目的地，形状同 ``x``，允许与 ``src`` 重叠。
+// @return ``out``，便于调用链串接。
+// @throws c10::Error 形状、dtype、步长或宽度是内核服务不了的。
+torch::Tensor shared_gate_scale(torch::Tensor x, torch::Tensor w, torch::Tensor src,
+                               torch::Tensor out);
+
 // @brief 旋转每个 q/k 头最前面 ``rotary_dim`` 个通道，一次启动。
 //
 // 替代 ``apply_rope`` 每层跑的那条 torch 链 ``to -> mul -> cat -> mul -> add -> cat``：
@@ -599,6 +613,50 @@ torch::Tensor moe_grouped(torch::Tensor a, torch::Tensor xs, torch::Tensor w,
                           torch::Tensor ws, torch::Tensor offsets,
                           torch::Tensor out, int64_t group_size,
                           c10::optional<torch::Tensor> active);
+
+// 分组 int8 投影：专家栈按 ``[E, K, N]`` 常驻 int8，激活按行量化。
+
+// @brief 分组 int8 投影：``[tokens, K] -> [tokens, N]``，行按 ``offsets`` 分段。
+//
+// 与 :func:`moe_grouped` 的区别是权重的量化格式与分组粒度：那个吃 packed W4 加逐
+// (weight-group, 列) 的 scale，这个吃 ``[E, K, N]`` 的 int8 加逐 (专家, 列) 的 scale。
+// 后者让分片可以先把整数和直接相加、最后一次乘两个 scale，所以部分和是 int32 而不是
+// fp32（见 ``moe_grouped_i8.cu`` 的 Constraints）。
+//
+// 为什么需要它：int8 专家栈原来走逐专家 ``bops.linear``，一层 16 次发射、每次只覆盖
+// 一个专家的 2 MB，单层 MoE 实测 1.82 ms 而权重只有 24 MB。分组之后整层 2 次发射，
+// 块数是 ``行数 x 列块 x 分片``、与专家数无关。
+//
+// @param a       int8 激活，``[tokens, K]`` 连续 CUDA。
+// @param xs      逐 token 激活 scale，``[tokens]`` fp32 连续。
+// @param w       专家栈，``[E, K, N]`` 连续 int8（K 轴在外、N 连续）。
+// @param ws      专家栈 scale，``[E, N]`` 连续 fp32。
+// @param offsets ``[E+1]`` 前缀和，int32 连续。
+// @param out     ``[tokens, N]`` 连续，bf16 或 fp32，dtype 由它决定。
+// @param slices  K 方向分片数；``<= 0`` 表示按块数与每片最小 k 长度自动选。
+// @return out。
+// @throws c10::Error 布局、设备、dtype 或形状不自洽。
+torch::Tensor moe_grouped_i8(torch::Tensor a, torch::Tensor xs, torch::Tensor w,
+                             torch::Tensor ws, torch::Tensor offsets,
+                             torch::Tensor out, int64_t slices);
+
+// @brief 分组 int8 投影的归并形态：[rows, K] -> [1, N]，行按路由权重加权求和。
+//
+// decode 一步里省掉 [top_k, N] 激活缓冲与 mul / index_add_ / sum 三步。
+//
+// @param a       int8 激活，[rows, K] 连续，已按专家号排序。
+// @param xs      逐行激活 scale，[rows] fp32 连续。
+// @param w       专家栈，[E, K, N] 连续 int8。
+// @param ws      专家栈 scale，[E, N] 连续 fp32。
+// @param offsets [E+1] 前缀和，int32 连续。
+// @param rw       逐行路由权重，[rows] fp32 连续。
+// @param out      [1, N] 连续，bf16 或 fp32，dtype 由它决定。
+// @param slices   K 方向分片数；<= 0 自动，归并形态至少用 2 片。
+// @return out。
+// @throws c10::Error 布局、设备、dtype 或形状不自洽。
+torch::Tensor moe_grouped_i8_merge(torch::Tensor a, torch::Tensor xs, torch::Tensor w,
+                                   torch::Tensor ws, torch::Tensor offsets,
+                                   torch::Tensor rw, torch::Tensor out, int64_t slices);
 
 // 分派：把路由结果变成分组内核要的前缀和与行序，替掉纯 torch 的一串小算子。
 

@@ -133,6 +133,11 @@ def main() -> None:
     ap.add_argument("--max-seq", type=int, default=4096)
     ap.add_argument("--no-bench", action="store_true",
                     help="skip the backend's load-time kernel selection (its own autotune)")
+    # 预量化目录（带 quant_index.json 的那种）必须显式要 int8：不加这个开关时加载器
+    # 会把它当成普通 checkpoint 走反量化路径，70 GB 的稠密权重在 32 GB 的卡上是 OOM，
+    # 而不是一句"用错了目录"。
+    ap.add_argument("--int8", action="store_true",
+                    help="load a pre-quantised directory as int8/W4A8 instead of dequantising")
     ap.add_argument("--no-graph", action="store_true",
                     help="disable the device-graph decode path and run eager")
     args = ap.parse_args()
@@ -146,7 +151,8 @@ def main() -> None:
 
     print("loading weights ...", flush=True)
     t0 = time.time()
-    model = create_model(args.model, max_seq=args.max_seq, bench=not args.no_bench)
+    model = create_model(args.model, max_seq=args.max_seq, bench=not args.no_bench,
+                         quant=args.int8)
     info = describe(args.model)
     print(f"loaded {info['model']} ({info['arch']}) in {time.time()-t0:.1f}s", flush=True)
     graph = not args.no_graph

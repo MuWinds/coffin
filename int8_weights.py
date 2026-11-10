@@ -70,6 +70,94 @@ def is_quantizable(key: str, w: torch.Tensor) -> bool:
     return w.dim() == 2 and not key.endswith("conv1d.weight")
 
 
+class QWeightMoE:
+    """一组共享 K 的 int8 专家，``[E, K, N]`` int8 加 ``[E, N]`` fp32 scale。
+
+    布局是 ``kn``（K 轴在外、N 轴连续），与 ``W4A8MoEWeight`` 的 packed 一致，也正好是
+    本卡 ``gemv_kn_i8`` 要的形状：``expert(e)`` 交出的 ``QWeight`` 由 ``from_kn`` 构造，
+    它内部只取一个转置视图，``pack.to_kn`` 的 ``.contiguous()`` 因此是空操作。
+
+    反过来（存 ``[E, N, K]``）不会报错，但每次 ``bops.linear`` 都要真转置一遍 2-4 MB
+    的 int8 权重：``pack.as_kn`` 的缓存键是 ``id(w.wq)``，而每次新建的视图对象 id 都不同，
+    缓存必然 miss。实测这一步让每专家一次调用贵到 289 us（4.62 ms/层，decode 224 ms/token）。
+
+    MoE 的专家在 checkpoint 里是逐个二维张量（``experts.{e}.gate_proj.weight``），
+    逐专家建 :class:`QWeight` 会让解码一步变成 40 层 x 8 槽 x 2 次小调用，光是主机侧
+    启动就够把权重带宽吃回去。融合成一整栈之后，按专家取出来的视图与单独存的那份
+    逐位相同（scale 本来就是逐输出行独立的，两种切法算术一致），而调用方只需要一次
+    ``index_select`` 就能把命中的专家凑齐。
+
+    Constraints:
+        * ``wq`` 必须是 ``[E, K, N]`` 连续 int8，``scale`` 必须是 ``[E, N]`` 连续 fp32。
+          三维张量按 ``[N, K]`` 解释时形状校验照样能过，于是错位要到第一次取专家才
+          算出来——所以这里逐维校验。
+        * 第 ``e`` 个专家的视图是**视图**不是拷贝：``w8a8`` 内核本来就按偏移读这块
+          连续内存，拷贝会把省下的带宽还回去。
+    """
+
+    __slots__ = ("expert_count", "k", "n", "wq", "scale", "_cache")
+
+    def __init__(self, wq: torch.Tensor, scale: torch.Tensor, *, k: int) -> None:
+        """校验形状关系并原地持有两块缓冲。
+
+        Args:
+            wq: ``[E, K, N]`` 连续 int8 权重（K 轴在外、N 连续）。
+            scale: ``[E, N]`` 连续 fp32，每专家每输出行一个 absmax scale。
+            k: 每个专家沿 K 的长度。
+
+        Raises:
+            ValueError: 维度、dtype、连续性或形状关系不符。
+        """
+        if wq.dim() != 3 or wq.dtype != torch.int8 or not wq.is_contiguous():
+            raise ValueError("moe int8 weight must be contiguous 3-D int8 [E, K, N]")
+        if scale.dim() != 2 or scale.dtype != torch.float32 or not scale.is_contiguous():
+            raise ValueError("moe int8 scale must be contiguous 2-D fp32 [E, N]")
+        experts, k_dim, n = (int(d) for d in wq.shape)
+        if k <= 0 or k_dim != k:
+            raise ValueError(f"moe int8 weight holds K={k_dim} but k={k}")
+        if tuple(scale.shape) != (experts, n):
+            raise ValueError(f"moe int8 scale must be {(experts, n)}, got {tuple(scale.shape)}")
+        self.wq = wq
+        self.scale = scale
+        self.expert_count = experts
+        self.n = n
+        self.k = int(k)
+        #: 逐专家的 ``QWeight`` 缓存。每次新建视图会让 ``pack.as_kn`` 的 ``id()`` 键
+        #: 全部失效，转置成本就落在解码路径上；这里让同一个专家永远交同一个对象。
+        self._cache = None
+
+    def __len__(self) -> int:
+        """专家个数。"""
+        return self.expert_count
+
+    def expert(self, index: int) -> "QWeight":
+        """把第 ``index`` 个专家取成单投影视图。
+
+        Args:
+            index: 专家下标。
+
+        Returns:
+            共享同一块存储的 :class:`QWeight`。
+
+        Raises:
+            IndexError: 下标越界。
+        """
+        if not 0 <= index < self.expert_count:
+            raise IndexError(f"expert {index} out of range [0, {self.expert_count})")
+        cache = self._cache
+        if cache is None:
+            cache = self._cache = [None] * self.expert_count
+        view = cache[index]
+        if view is None:
+            view = QWeight.from_kn(self.wq[index], self.scale[index])
+            cache[index] = view
+        return view
+
+    def to(self, dtype: torch.dtype) -> torch.Tensor:
+        """解包为 ``[E, N, K]`` 浮点栈，仅供诊断与参考后端。"""
+        return torch.stack([self.expert(i).dequant(dtype) for i in range(self.expert_count)])
+
+
 class QWeight:
     """以 int8 加逐行 fp32 scale 持有的 ``[N, K]`` 权重。
 

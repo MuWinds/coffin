@@ -15,34 +15,58 @@ from __future__ import annotations
 from collections import OrderedDict
 import json
 import os
+import re
+import time
 from pathlib import Path
 
 import torch
 import torch.distributed as dist
 
+from int8_weights import QWeight, QWeightMoE
 from w4a8_weights import W4A8Weight
 
 
 class ParallelContext:
     """一个 rank 的主机通信上下文，进程组由启动器创建。"""
 
-    def __init__(self, rank: int, world_size: int) -> None:
+    def __init__(self, rank: int, world_size: int, mode: str = "tp") -> None:
         """核对进程组身份，防止按错误的 rank 读取权重。
 
         Args:
             rank: 当前进程编号。
             world_size: 并行进程数。
+            mode: ``"tp"`` 按张量切分、``"pp"`` 按层切分。两者用同一个 Gloo 组，
+                但通信形态完全不同：TP 每层两次 all-reduce，PP 每 token 只有几次
+                点对点。
 
         Raises:
             RuntimeError: Gloo 进程组尚未初始化或身份不符。
+            ValueError: ``mode`` 不是 ``tp`` / ``pp``。
         """
         if (not dist.is_initialized() or dist.get_backend() != "gloo"
                 or dist.get_world_size() != world_size or dist.get_rank() != rank):
             raise RuntimeError("tensor parallelism requires a matching CPU Gloo group")
+        if mode not in {"tp", "pp"}:
+            raise ValueError(f"parallel mode must be 'tp' or 'pp', got {mode!r}")
         self.rank, self.world_size = rank, world_size
+        self.mode = mode
         self._buffers = OrderedDict()
+        #: 流水载荷的主机中转缓冲，key 是 ``(numel, dtype)``。每步复用，避免
+        #: 每个 token 都新分配一次主机内存（实测一层的 CPU 侧有 8 次 ``empty``）。
+        self._relay_hosts = OrderedDict()
+        #: pinned 主机内存是否可用，首次 relay 时探一次（部分厂商后端不支持）。
+        self._pinned_ok = None
+        #: 段间通信的累计秒数与次数。流水把每 token 拆成几次点对点，而"卡在哪"和
+        #: "算得慢"在墙上时间上是同一副面孔；这两个计数器让两者可以分开看。
+        self.comm_s = 0.0
+        self.comm_calls = 0
         self.sum_calls = 0
         self.max_calls = 0
+        #: 流水模式的点对点链路；张量并行下为 ``None``，那条路只用 all-reduce。
+        self.link = None
+        if mode == "pp":
+            self.link = PipeLink(rank, world_size,
+                                 int(os.environ.get("COFFIN_PP_PORT", 29791)), self)
         self.scale_mode = os.environ.get("COFFIN_TP_SCALE_MODE", "shared")
         if self.scale_mode not in {"shared", "local", "decode_local"}:
             raise ValueError(
@@ -75,11 +99,324 @@ class ParallelContext:
             self.sum_calls += 1
         return result
 
+    def relay(self, tensor: torch.Tensor, dst: int) -> None:
+        """把一块激活原样送到下一个流水段。
+
+        gloo 只认 CPU 张量，而且不支持 bf16，所以这里经一次 fp32 主机中转。代价是
+        实测出来的选择：比 all-reduce 少两个数量级的次数，这点转换成本可以忽略。
+
+        Args:
+            tensor: 要送出的激活，``[tokens, hidden]``。
+            dst: 目标 rank。
+        """
+        if self.link is not None:
+            # 直接按模型 dtype（bf16）过线：载荷字节减半，并且省掉一次设备侧
+            # bf16->fp32 的转换核。pinned 缓冲让 D2H 走 DMA；``non_blocking``
+            # 之后必须显式同步当前流，否则读到的是没搬完的旧内容。
+            host = self._host_buffer(tensor.numel(), _wire_dtype(tensor.dtype))
+            host.copy_(tensor.reshape(-1), non_blocking=True)
+            torch.cuda.current_stream().synchronize()
+            self.link.send(host, dst)
+            return
+        # 非流水路径（gloo）只认 CPU 张量、且不支持 bf16，仍经 fp32 中转。
+        host = tensor.detach().to(torch.float32).cpu().contiguous()
+        t0 = time.perf_counter()
+        dist.send(host, dst=dst)
+        self.comm_s += time.perf_counter() - t0
+        self.comm_calls += 1
+
+    def _host_buffer(self, numel: int, dtype: torch.dtype) -> torch.Tensor:
+        """取一块长度为 ``numel``、dtype 为 ``dtype`` 的主机中转缓冲（复用）。
+
+        主机内存在这里按 ``(numel, dtype)`` 缓存：一层要发 4 次，每次新分配
+        既慢又会在 pageable 上多付一次中间暂存。pinned 是否可用只探一次。
+
+        Args:
+            numel: 元素个数，决定缓冲长度。
+            dtype: 缓冲的 dtype，决定缓冲身份。
+
+        Returns:
+            一维的主机缓冲。
+        """
+        key = (numel, dtype)
+        entry = self._relay_hosts.pop(key, None)
+        if entry is None:
+            if len(self._relay_hosts) >= 4:
+                self._relay_hosts.popitem(last=False)
+            if self._pinned_ok is None:
+                self._pinned_ok = _pin_probe()
+            entry = torch.empty(numel, dtype=dtype, pin_memory=self._pinned_ok)
+        self._relay_hosts[key] = entry
+        return entry
+
+    def await_relay(self, shape: tuple, src: int, device, dtype) -> torch.Tensor:
+        """从上一段/末段收一块激活并送进设备。
+
+        Args:
+            shape: 期望形状。
+            src: 来源 rank。
+            device: 目标设备。
+            dtype: 返回 dtype。
+
+        Returns:
+            该形状的设备张量。
+        """
+        if self.link is not None:
+            # ``dtype`` 同时用于校验线上字节数：两侧 dtype 不一致时会在这里报
+            # 「payload 字节数与期望不符」，而不是拿错位的数据继续算。
+            return self.link.recv(tuple(shape), src, _wire_dtype(dtype)).to(
+                device=device, dtype=dtype)
+        t0 = time.perf_counter()
+        host = torch.empty(tuple(shape), dtype=torch.float32)
+        dist.recv(host, src=src)
+        out = host.to(device=device, dtype=dtype)
+        self.comm_s += time.perf_counter() - t0
+        self.comm_calls += 1
+        return out
+
+    def layer_range(self, num_layers: int) -> tuple[int, int]:
+        """本 rank 负责的 decoder 层区间 ``[begin, end)``。
+
+        层数除不尽时前面的段多拿一层：40 层 4 段正好每段 10 层，而 41 层时第一段拿 11。
+
+        Args:
+            num_layers: 总层数。
+
+        Returns:
+            ``(begin, end)``，半开区间。
+        """
+        if self.mode != "pp":
+            return 0, num_layers
+        size, extra = divmod(num_layers, self.world_size)
+        begin = self.rank * size + min(self.rank, extra)
+        end = begin + size + (1 if self.rank < extra else 0)
+        return begin, end
+
+
+
+class PipeLink:
+    """同一节点上各流水段之间的点对点链路，走 UDP。
+
+    不用 ``torch.distributed`` 的 gloo 传输：它对 4 KB 的小消息实测 **30 ms 一次**，而且与
+    payload 大小无关（把回传从 1 MB 的 logits 换成 4 KB 的 hidden，lap 一点没变）——这是
+    Nagle 与延迟 ACK 互相等待的签名。流水每 token 有四次这样的消息，120 ms 全花在等 ACK 上。
+
+    UDP 是这里最省事的选择：四个 rank 全在同一台机器上，loopback 上 8 KB 一个包不会分片，
+    也不用握手（TCP 那套 connect/accept 在四进程同时启动时还要额外的重试与配对逻辑）。
+    一个 deltas 大小 8200 B，远在 65507 B 的 UDP 载荷上限之内。
+
+    Constraints:
+        * 所有 rank 必须同机；跨机要回到 gloo，这套链路只适用于单节点部署。
+        * 靠调用顺序配对，协议里没有序号：流水是严格锁步的，每条 (src, dst) 上同时只有
+          一个包在飞。丢包会撞上 30 s 的接收超时并响亮地失败，而不是给出错序的数据。
+    """
+
+    def __init__(self, rank: int, world_size: int, base_port: int, owner) -> None:
+        """绑定本 rank 的 UDP 端口。
+
+        Args:
+            rank: 当前 rank。
+            world_size: 流水段数。
+            base_port: 端口基址，rank r 绑定 ``base_port + r``。
+            owner: 持有本链路的 :class:`ParallelContext`；计数器写在它身上，这样探针
+                只需要读一个地方。
+
+        Raises:
+            OSError: 端口被占用。
+        """
+        import socket
+
+        self.rank, self.world_size = rank, world_size
+        self._owner = owner
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # 默认 208 KB 的接收缓冲在预填充的长分块（[C, hidden] 最多 16 MB）下会溢出让内核
+        # 丢包；锁步协议没有重传，丢包就是挂住，所以这里把缓冲放大到 32 MB。
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 32 << 20)
+        self.sock.bind(("127.0.0.1", base_port + rank))
+        self.sock.settimeout(30.0)
+        #: 单个数据报的载荷。32 KB 在 loopback 上一次拷贝的代价可以忽略，也不会撞上
+        #: 64 KB 的 UDP 上限。
+        self._MTU = 32 * 1024
+        #: 每发这么多个分片等一次 ack。``SO_RCVBUF`` 写 32 MB 会被内核按 ``rmem_max``
+        #: （常见 208 KB）静默钳回去，所以「一口气发完 4 MB」必然丢包 —— 丢了就是 30 s
+        #: 接收超时。窗口取 4（128 KB 在飞）留出安全余量，代价是每 128 KB 一次往返。
+        self._WINDOW = 4
+        #: 收到但当前调用不等它的报文。等 ack 时可能先收到对端下一条数据的头，
+        #: 直接丢弃会让后续 ``_await_header`` 永远等不到 —— 多块预填充必然会撞上，
+        #: 因为发送是重叠的。所以按类型取，不匹配的原样留在队列里。
+        self._inbox: list[bytes] = []
+        #: 超过这个长度的载荷改走 ``/dev/shm``：65507 是 UDP 单包上限，留出头的余量。
+        self._UDP_MAX = 60 * 1024
+        self._port = base_port
+        self._addr = {r: ("127.0.0.1", base_port + r) for r in range(world_size)}
+
+    def _spill(self, src: int, dst: int) -> str:
+        """本对 (src, dst) 的大载荷落盘路径。
+
+        ``/dev/shm`` 是 tmpfs，同机进程共享同一份页缓存，写一次读一次就是共享内存传递；
+        文件名带路由方向，四段全互联时每条单向链路各有一份，不会互相覆盖。
+
+        Args:
+            src: 发送方 rank。
+            dst: 接收方 rank。
+
+        Returns:
+            文件路径。
+        """
+        return f"/dev/shm/coffin_pp_{self._port}_{src}_{dst}.bin"
+
+    def _take(self, want: bytes) -> bytes:
+        """取第一条类型为 ``want`` 的报文载荷，其余按原顺序留在收件箱里。
+
+        Args:
+            want: 期望的类型字节，``b"H"`` / ``b"D"`` / ``b"A"``。
+
+        Returns:
+            该报文去类型字节后的载荷。
+        """
+        held = []
+        while True:
+            if self._inbox:
+                data = self._inbox.pop(0)
+            else:
+                data, _ = self.sock.recvfrom(65507)
+            if data[:1] == want:
+                self._inbox[:0] = held
+                return data[1:]
+            held.append(data)
+
+    def _await_header(self) -> int:
+        """等到一条 ``H`` 报文，返回它带的总长（负数表示载荷在 ``/dev/shm``）。"""
+        # ``signed=True`` 是必须的：负的总长是「载荷在 /dev/shm 里」的标记，
+        # 按无符号解会变成接近 2^64 的天文数字。
+        return int.from_bytes(self._take(b"H"), "little", signed=True)
+
+    def _await_data(self) -> bytes:
+        """等到一条 ``D`` 报文，返回它的载荷。"""
+        return self._take(b"D")
+
+    def _await_ack(self) -> None:
+        """等到一条 ``A`` 应答；其余报文（别的对端的数据/头）原地丢弃不合适，
+
+        所以我们只在「本 rank 只可能收到应答」的时机调用它 —— 流水的发送是严格
+        串行的，同一时刻一个 rank 只会有一条自己的请求在等应答。
+        """
+        self._take(b"A")
+
+    def send(self, host: torch.Tensor, dst: int) -> None:
+        """把一块**主机侧** float32 连续张量切成若干数据报送出。
+
+        分块预填充的 hidden 是 ``[C, H]``，C=512 就是 4 MB，而单个 UDP 载荷上限是 65507 B，
+        所以大块要分片。协议是先发一个 8 字节的总长头，再发若干 ``_MTU`` 大小的分片；
+        接收侧按顺序拼回来。loopback 上同一条连接的包序是保留的，因此这个顺序就是全部
+        的排序信息，不需要序号字段。
+
+        Args:
+            host: CPU 上连续的张量（流水载荷是 bf16）。
+            dst: 目标 rank。
+        """
+        # 走 ``uint8`` 视图而不是 ``host.numpy()``：numpy 没有 bf16，直接
+        # ``numpy()`` 会抛 TypeError；视图是按字节发送，与 dtype 无关。
+        payload = host.view(torch.uint8).numpy().tobytes()
+        addr = self._addr[dst]
+        t0 = time.perf_counter()
+        # 每条报文带一个类型字节：``H`` 头、``D`` 数据、``A`` 应答。多块预填充时
+        # 不同对端的报文会交错到达同一个 socket，按类型等就不会把 ack 当成头、
+        # 也不会把某个对端的头当成另一个对端的应答。
+        if len(payload) <= self._UDP_MAX:
+            self.sock.sendto(b"H" + len(payload).to_bytes(8, "little", signed=True),
+                             addr)
+            self.sock.sendto(b"D" + payload, addr)
+        else:
+            # 负的总长表示「载荷在共享内存里」，正数表示「跟着下一个数据报走」。
+            with open(self._spill(self.rank, dst), "wb") as handle:
+                handle.write(payload)
+            # ``to_bytes`` 默认无符号，负长度必须显式 ``signed=True``，否则这一句直接
+            # 抛 "can't convert negative int to unsigned"，而报错发生在发送侧、
+            # 客户端只看到 KeyError 'text'，很容易误判成接收端的问题。
+            self.sock.sendto(b"H" + (-len(payload)).to_bytes(8, "little", signed=True),
+                             addr)
+        self._await_ack()
+        self._owner.comm_s += time.perf_counter() - t0
+        self._owner.comm_calls += 1
+
+    def recv(self, shape: tuple, src: int, dtype=torch.float32) -> torch.Tensor:
+        """收一块已知形状的张量。
+
+        Args:
+            shape: 期望形状；长度取自线上的 8 字节前缀并核对。
+            src: 来源 rank。
+            dtype: 载荷 dtype，流水模式下是 bf16。它同时是长度校验的依据——
+                两侧 dtype 不一致会在这里报字节数不符，避免拿错位数据继续算。
+
+        Returns:
+            主机侧连续的同 dtype 张量。
+
+        Raises:
+            RuntimeError: 线上长度与期望形状不符（两侧协议不同步）。
+            TimeoutError: 30 s 内没收到包（丢包或对端没在跑）。
+        """
+        t0 = time.perf_counter()
+        count = self._await_header()
+        if count < 0:
+            with open(self._spill(src, self.rank), "rb") as handle:
+                payload = handle.read(-count)
+        else:
+            payload = self._await_data()
+        if len(payload) != abs(count):
+            raise RuntimeError(
+                f"pipe link: got {len(payload)} bytes, header said {abs(count)}")
+        width = int(torch.empty((), dtype=dtype).element_size())
+        expected = width * int(torch.tensor(shape).prod()) if shape else width
+        if abs(count) != expected:
+            raise RuntimeError(
+                f"pipe link: payload {abs(count)} bytes, expected {expected}")
+        self.sock.sendto(b"A", self._addr[src])
+        self._owner.comm_s += time.perf_counter() - t0
+        self._owner.comm_calls += 1
+        buf = torch.frombuffer(bytearray(payload), dtype=torch.uint8).view(dtype)
+        return buf.reshape(tuple(shape))
+
+def _wire_dtype(dtype: torch.dtype) -> torch.dtype:
+    """流水载荷在线上使用的 dtype。
+
+    默认就是模型 dtype（bf16），载荷字节比 fp32 少一半、也不需要一次设备侧
+    dtype 转换。``COFFIN_PP_RELAY_F32=1`` 回到改动前的 fp32 中转，只用于同
+    二进制 A/B 对照（两侧都必须读同一个开关，否则字节数校验会报不一致）。
+
+    Args:
+        dtype: 激活本身的 dtype。
+
+    Returns:
+        线上 dtype。
+    """
+    if os.environ.get("COFFIN_PP_RELAY_F32") == "1":
+        return torch.float32
+    return dtype
+
+
+def _pin_probe() -> bool:
+    """探测这套后端是否支持 pinned 主机内存。
+
+    ``pin_memory`` 依赖厂商后端实现，不可用时 ``torch.empty`` 会抛异常。这里
+    一次性探好并缓存，避免每个 token 都付一次异常开销；探不到就退回 pageable，
+    只是慢一点，不影响正确性。
+
+    Returns:
+        可用为 ``True``。
+    """
+    try:
+        probe = torch.empty(8, dtype=torch.bfloat16, pin_memory=True)
+        probe.zero_()
+        return bool(probe.is_pinned())
+    except Exception:
+        return False
+
 
 _context: ParallelContext | None = None
 
 
-def configure(rank: int, world_size: int) -> ParallelContext:
+def configure(rank: int, world_size: int, mode: str = "tp") -> ParallelContext:
     """在加载模型前绑定已初始化的 Gloo 进程组。
 
     Args:
@@ -94,8 +431,8 @@ def configure(rank: int, world_size: int) -> ParallelContext:
     """
     global _context
     if _context is not None:
-        raise RuntimeError("tensor parallel context is already configured")
-    _context = ParallelContext(rank, world_size)
+        raise RuntimeError("parallel context is already configured")
+    _context = ParallelContext(rank, world_size, mode)
     return _context
 
 
@@ -119,13 +456,39 @@ def local_config(cfg: dict, world_size: int) -> dict:
     """
     if world_size < 1:
         raise ValueError("positive world_size required")
+    parallel = context()
+    if parallel is not None and parallel.mode != "tp":
+        # 流水并行不切张量：头数、中间宽度都保持全局值，只有层号范围变。
+        return dict(cfg)
     result = dict(cfg)
+    # MoE 的两个中间宽度也要一起切：专家的 gate/up 按输出轴分片、down 按 K 轴分片，
+    # 局部宽度不对会让 ``SparseMoE`` 建出一个和权重对不上的融合栈。稠密 checkpoint
+    # 没有这两个键，按存在性跳过而不是按族名分支。
     for key in ("num_attention_heads", "num_key_value_heads", "linear_num_key_heads",
-                "linear_num_value_heads", "intermediate_size"):
+                "linear_num_value_heads", "intermediate_size", "moe_intermediate_size",
+                "shared_expert_intermediate_size"):
+        if key not in cfg:
+            continue
         value = int(cfg[key])
-        if value % world_size:
+        if value % world_size == 0:
+            result[key] = value // world_size
+        elif key == "num_key_value_heads" and world_size % value == 0:
+            # GQA 的 KV 头可以少于卡数：Qwen3.5-MoE 是 2 个 KV 头对 16 个 query 头
+            # （rep=8），4 卡时一个 KV 头由 2 张卡共享，每张卡只持有它自己那一个。
+            #
+            # 不能把两个 KV 头都复制给每张卡：Q 头按块分片后 rank r 拿的是全局头
+            # [4r, 4r+4)，而全局 rep=8 让 rank 0/1 只用到 KV 头 0、rank 2/3 只用到
+            # KV 头 1。复制两头的写法会让局部 rep 变成 4/2=2，rank 1 和 rank 3 的
+            # attention 就配错了 KV——形状全对，输出是垃圾。
+            result[key] = 1
+        else:
             raise ValueError(f"{key}={value} is not divisible by world_size={world_size}")
-        result[key] = value // world_size
+    heads = int(result["num_attention_heads"])
+    kv_heads = int(result["num_key_value_heads"])
+    if heads % kv_heads:
+        raise ValueError(
+            f"local query heads {heads} must be a multiple of KV heads {kv_heads}: "
+            "the attention kernel rebuilds each KV head for an integral number of queries")
     return result
 
 
@@ -161,7 +524,9 @@ def shard_weight(key: str, value, cfg: dict, rank: int, world_size: int):
     if world_size < 1 or not 0 <= rank < world_size:
         raise ValueError("invalid rank/world_size")
     axis, ranges = None, None
-    shape = value.shape
+    # ``QWeight`` 把形状放在 ``.n`` / ``.k`` 上，没有 ``.shape``；两处都读成 ``[N, K]``，
+    # 下面的分片判据因此对稠密、int8、packed W4 三种存储一视同仁。
+    shape = (value.n, value.k) if isinstance(value, QWeight) else value.shape
     if ".linear_attn." in key and key.endswith("in_proj_qkv.weight"):
         kd = cfg["linear_num_key_heads"] * cfg["linear_key_head_dim"]
         vd = cfg["linear_num_value_heads"] * cfg["linear_value_head_dim"]
@@ -176,14 +541,66 @@ def shard_weight(key: str, value, cfg: dict, rank: int, world_size: int):
         vd = cfg["linear_num_value_heads"] * cfg["linear_value_head_dim"]
         ranges = _ranges([kd, kd, vd], rank, world_size)
         axis = 0
+    elif key.endswith((".self_attn.k_proj.weight", ".self_attn.v_proj.weight")):
+        # KV 头数少于卡数时（Qwen3.5-MoE 是 2 对 4 卡），一个 KV 头由
+        # ``world_size / nkv`` 张卡共享，本 rank 只留它自己那一个头。判据必须与
+        # ``local_config`` 逐字一致：两边分叉会得到形状正确、注意力错位的模型。
+        kv = int(cfg["num_key_value_heads"])
+        if kv % world_size == 0:
+            axis, ranges = 0, _ranges([shape[0]], rank, world_size)
+        elif world_size % kv == 0:
+            hd = int(cfg["head_dim"])
+            head = rank // (world_size // kv)
+            axis, ranges = 0, [(head * hd, (head + 1) * hd)]
+        else:
+            raise ValueError(
+                f"{key}: num_key_value_heads={kv} cannot be split across {world_size} ranks")
     elif key.endswith((".mlp.gate_proj.weight", ".mlp.up_proj.weight",
-                       ".self_attn.q_proj.weight", ".self_attn.k_proj.weight",
-                       ".self_attn.v_proj.weight", ".linear_attn.in_proj_z.weight",
+                       ".self_attn.q_proj.weight", ".linear_attn.in_proj_z.weight",
                        ".linear_attn.in_proj_a.weight", ".linear_attn.in_proj_b.weight",
                        ".linear_attn.A_log", ".linear_attn.dt_bias")):
         axis, ranges = 0, _ranges([shape[0]], rank, world_size)
+    elif key.endswith((".experts.gate_up_stack", ".experts.down_stack")):
+        # 融合专家栈：gate_up 按 N 轴（专家内宽度）分片，down 按 K 轴分片。
+        #
+        # scale 是逐输出行一个、与 K 的长度无关，所以 down 的 K 轴切分不动它；
+        # gate_up 切的就是输出轴，它必须跟着切。
+        if not isinstance(value, QWeightMoE):
+            raise ValueError(
+                f"{key}: fused expert stack sharding supports int8 stacks only, got "
+                f"{type(value).__name__}")
+        # 栈是 ``[E, K, N]``：gate_up 切 N（dim 2），down 切 K（dim 1）。
+        gate_up = key.endswith(".experts.gate_up_stack")
+        axis = 2 if gate_up else 1
+        width = int(value.wq.shape[axis])
+        if width % world_size:
+            raise ValueError(f"{key}: width {width} not divisible by {world_size}")
+        size = width // world_size
+        begin = rank * size
+        if gate_up:
+            return QWeightMoE(value.wq.narrow(2, begin, size).contiguous(),
+                              value.scale.narrow(1, begin, size).contiguous(),
+                              k=value.k)
+        return QWeightMoE(value.wq.narrow(1, begin, size).contiguous(),
+                          value.scale, k=size)
+    elif ".mlp.experts." in key or ".mlp.shared_expert." in key:
+        # 专家的 gate/up 按输出轴（专家内宽度）分片，down 按 K 轴分片；路由器
+        # （``.mlp.gate.weight``）与共享专家门（``.mlp.shared_expert_gate.weight``）
+        # 故意不命中这两条：它们必须在各 rank 上有同一份，否则各 rank 会选出不同的
+        # 专家，而每 rank 只算自己那份的归约结果就是错的。
+        if key.endswith((".gate_proj.weight", ".up_proj.weight")):
+            axis, ranges = 0, _ranges([shape[0]], rank, world_size)
+        elif key.endswith(".down_proj.weight"):
+            axis, ranges = 1, _ranges([shape[1]], rank, world_size)
     if axis is None:
         return value
+    if isinstance(value, QWeight):
+        # int8 的 scale 是逐输出行一个、与 K 长度无关，所以 K 轴（axis 1）切分时它原样
+        # 跟着每个 rank 走；只有 N 轴切分才需要把它一起切开。
+        if axis == 0:
+            return QWeight(value.wq.narrow(0, a, b - a).contiguous(),
+                           value.scale.narrow(0, a, b - a).contiguous())
+        return QWeight(value.wq.narrow(1, a, b - a).contiguous(), value.scale)
     if not isinstance(value, W4A8Weight):
         return torch.cat([value.narrow(axis, a, b - a) for a, b in ranges], dim=axis).contiguous()
     if axis == 0:
@@ -197,6 +614,44 @@ def shard_weight(key: str, value, cfg: dict, rank: int, world_size: int):
     return W4A8Weight(value.packed[start // 2:(stop + 1) // 2].contiguous(),
                        value.scale[start // gs:(stop + gs - 1) // gs].contiguous(),
                        k=stop - start, group_size=gs)
+
+
+def pipe_keeps(key: str, cfg: dict, parallel: "ParallelContext",
+               tied_head: bool = False) -> bool:
+    """流水并行下本 rank 该不该读这一项权重。
+
+    首段要 ``embed_tokens``（它把 token 变成 hidden），末段要 ``norm`` 与 ``lm_head``
+    （它把 hidden 变成 logits），中间的段两者都不要——多读一份就是几百 MB 白占显存，
+    而且会让「谁算 logits」变得不唯一。视觉塔与 MTP 不参与流水，每段各留一份。
+
+    Args:
+        key: checkpoint 参数名。
+        cfg: 全局文本配置（用来算总层数）。
+        parallel: 已配置的流水上下文。
+        tied_head: checkpoint 没有独立的 ``lm_head.weight``（共享词嵌入）。此时词嵌入
+            同时是输出头，每个 rank 都要有它（见下面的取值规则）。
+
+    Returns:
+        应当读进 state dict 时为 ``True``。
+    """
+    begin, end = parallel.layer_range(int(cfg["num_hidden_layers"]))
+    match = re.match(r"^model\.language_model\.layers\.(\d+)\.", key)
+    if match is not None:
+        return begin <= int(match.group(1)) < end
+    if key.startswith("model.language_model.embed_tokens."):
+        # ``tied_head`` 的模型没有独立的 ``lm_head.weight``，输出头就是词嵌入本身。而
+        # ``_forward`` 是「末段把 4 KB hidden 回给各段、各段自己算 logits」的结构，所以
+        # 每个 rank 都要有它——只给 rank 0 会让非末段在算 logits 时拿到 ``None``。
+        # int8 下这份是 254 MB/rank，相对换掉的 logits 广播值得。
+        return tied_head or parallel.rank == 0
+    if key == "model.language_model.norm.weight" or key.startswith("lm_head."):
+        # 每个 rank 都留一份输出头：段间只传 4 KB 的 hidden，各 rank 自己算 logits。
+        #
+        # 反过来（只让末段持有、把 logits 广播出去）实测**更慢**：26.24 -> 21.48 tok/s。
+        # 原因是各段的头 GEMV 与流水等待重叠，净成本不到 1 ms；而每 token 把 1 MB 的
+        # logits 分发给三个对端要 5 ms 以上。省 508 MB 显存不值这个价。
+        return True
+    return True
 
 
 def load_weights(model_dir: str | Path, device: torch.device,
@@ -217,12 +672,15 @@ def load_weights(model_dir: str | Path, device: torch.device,
         RuntimeError: 调用方要求视觉塔，但产物没有保存它。
     """
     from safetensors import safe_open
+    from quantized_load import FORMAT as I8_FORMAT
     from quantized_load import W4A8_FORMAT, _check_source_config, read_index
 
     model_dir = Path(model_dir)
     index = read_index(model_dir)
-    if index["format"] != W4A8_FORMAT:
-        raise ValueError("tensor parallel loader currently requires packed W4 checkpoint")
+    if index["format"] not in (W4A8_FORMAT, I8_FORMAT):
+        raise ValueError(
+            f"tensor parallel loader needs a pre-quantised directory, got "
+            f"format={index['format']!r}")
     _check_source_config(model_dir, index)
     cfg = json.loads((model_dir / "config.json").read_text())["text_config"]
     local_config(cfg, parallel.world_size)
@@ -232,6 +690,14 @@ def load_weights(model_dir: str | Path, device: torch.device,
     entries = {k: v for k, v in index["tensors"].items()
                if k.startswith(("model.language_model.", "mtp.", "lm_head."))
                or (take_vision and k.startswith("model.visual."))}
+    if parallel.mode == "pp":
+        # 流水并行只读本段那 10 层的权重：每段 8.5 GB 而不是 34 GB，这也是 PP 能在
+        # 一张 32 GB 的卡上装下一半模型之外的其余段的原因。
+        # 共享词嵌入的模型要靠这个标志决定 embed_tokens 发给谁，所以先看索引里有没有
+        # 独立的输出头。
+        tied_head = not any(k.startswith("lm_head.") for k in index["tensors"])
+        entries = {k: v for k, v in entries.items()
+                   if pipe_keeps(k, cfg, parallel, tied_head)}
     sd = {}
     for shard in sorted({v["shard"] for v in entries.values()}):
         with safe_open(str(model_dir / shard), framework="pt", device="cpu") as handle:
@@ -239,15 +705,39 @@ def load_weights(model_dir: str | Path, device: torch.device,
                 if meta["shard"] != shard:
                     continue
                 value = handle.get_tensor(key)
-                if meta["kind"] == "q4":
+                kind = meta["kind"]
+                if kind == "q4":
                     scale = handle.get_tensor(meta["scale_key"])
                     if list(value.shape) != meta["packed_shape"] or list(scale.shape) != meta["scale_shape"]:
                         raise ValueError(f"{key}: packed checkpoint shape mismatch")
                     value = W4A8Weight(value, scale, k=meta["k"], group_size=meta["group_size"])
-                value = shard_weight(key, value, cfg, parallel.rank, parallel.world_size)
+                elif kind == "q8-moe":
+                    # 融合专家栈 `[E, K, N]` int8 + `[E, N]` fp32。漏掉这一条会让它落进
+                    # 下面的 "else"，被当成稠密张量原样搬到设备——形状合法、MoE 一跑
+                    # 就 mat1/mat2 形状不匹配，而引擎把那次异常当成「这一步没产出」，
+                    # 原地空转到看门狗报 KV pool 太小。
+                    scale = handle.get_tensor(meta["scale_key"])
+                    if (list(value.shape) != meta.get("shape")
+                            or list(scale.shape) != meta.get("scale_shape")):
+                        raise ValueError(f"{key}: moe int8 stack shape mismatch")
+                    value = QWeightMoE(value, scale, k=int(meta["k"]))
+                elif kind == "q8":
+                    # 盘上 int8 是 ``[K, N]`` 加逐输出列的 fp32 scale；``from_kn`` 只
+                    # 取一个转置视图，不复制也不转置，所以这一趟仍然是「读文件、装箱」。
+                    scale = handle.get_tensor(meta["scale_key"])
+                    if list(value.shape) != meta["shape"] or int(scale.numel()) != meta["n"]:
+                        raise ValueError(f"{key}: int8 checkpoint shape mismatch")
+                    value = QWeight.from_kn(value, scale)
+                if parallel.mode == "tp":
+                    value = shard_weight(key, value, cfg, parallel.rank, parallel.world_size)
                 if isinstance(value, W4A8Weight):
                     value = W4A8Weight(value.packed.to(device), value.scale.to(device),
                                        k=value.k, group_size=value.group_size)
+                elif isinstance(value, QWeight):
+                    value = QWeight(value.wq.to(device), value.scale.to(device))
+                elif isinstance(value, QWeightMoE):
+                    value = QWeightMoE(value.wq.to(device), value.scale.to(device),
+                                       k=value.k)
                 else:
                     value = value.to(device)
                 sd[key] = value
@@ -304,6 +794,13 @@ class RowParallelProjection:
 
 
 def row_projection(projection):
-    """仅在配置张量并行时给行投影添加归约。"""
+    """仅在配置**张量**并行时给行投影添加归约。
+
+    流水并行按层切分，每个 rank 手里的投影都是完整的；这时再加一次归约等于把同一个
+    数自己加 world_size 遍——数值翻倍而且完全静默。所以这里按 mode 分叉，不是按
+    「有没有上下文」分叉。
+    """
     parallel = context()
-    return projection if parallel is None else RowParallelProjection(projection, parallel)
+    if parallel is None or parallel.mode != "tp":
+        return projection
+    return RowParallelProjection(projection, parallel)

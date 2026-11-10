@@ -655,6 +655,131 @@ def moe_grouped(w, x: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
     return _restore(out, dtype)
 
 
+def shared_gate_scale(x: torch.Tensor, w: torch.Tensor, src: torch.Tensor,
+                      out: torch.Tensor) -> torch.Tensor:
+    """一次启动算 ``out = src * sigmoid(x · w)``，共享专家的门标量。
+
+    参考链是 ``x.float() * w`` → ``sum`` → ``to`` → ``sigmoid`` → ``mul``：六次启动
+    加两次分配，只为得到一个 fp32 标量。``out`` 由调用方按形状预分配并复用，
+    所以这一步在稳态下不分配任何内存。
+
+    Args:
+        x: 激活，``[rows, width]`` 或 ``[width]``，最内层步长为 1。
+        w: fp32 门权重，``[width]``，连续。
+        src: 被缩放的输入，形状同 ``x``。
+        out: 目的地，形状同 ``x``，允许与 ``src`` 重叠。
+
+    Returns:
+        ``out``，便于调用链串接。
+
+    Raises:
+        RuntimeError: 扩展不可用。
+    """
+    module = _kernels()
+    module.shared_gate_scale(x, w, src, out)
+    return out
+
+
+def moe_grouped_i8(w, x: torch.Tensor, offsets: torch.Tensor,
+                   slices: int = 0) -> torch.Tensor:
+    """按专家分组做 int8 投影，一整栈权重在一次启动里读完。
+
+    与 :func:`moe_grouped` 的区别是权重的量化格式：那个吃 packed W4 加逐 (weight-group,
+    列) 的 scale，这个吃 ``[E, K, N]`` 的 int8 加逐 (专家, 列) 的 scale。后者让 K 方向
+    分片可以先把整数和相加、最后一次乘两个 scale，所以部分和是 int32（见
+    ``kernels/moe_grouped_i8.cu``）。
+
+    激活按行量化一次再交给内核：量化与「哪些行属于哪个专家」无关，因此不必按段各量化
+    一次。约定与预填充的 ``quant_act_i8`` 完全一致（absmax/127，下限 1e-5），两处的
+    量化误差口径才对得上。
+
+    Args:
+        w: int8 专家栈，:class:`~int8_weights.QWeightMoE`（``[E, K, N]`` int8 加
+            ``[E, N]`` fp32）。
+        x: 激活，``[tokens, K]``，已按专家号排序。
+        offsets: ``[E+1]`` 前缀和，int32 或 int64；空段表示该专家没有行。
+
+    Returns:
+        ``[tokens, N]``，dtype 同 ``x``。
+
+    Raises:
+        ValueError: 激活或前缀和的形状与权重不自洽。
+    """
+    module = _kernels()
+    if x.dim() != 2 or x.shape[-1] != w.k:
+        raise ValueError("grouped MoE expects [tokens, K] activations")
+    if int(offsets.numel()) != len(w) + 1:
+        raise ValueError(f"offsets must have {len(w) + 1} entries")
+    tokens = x.shape[0]
+    dtype = x.dtype
+    if tokens == 0:
+        return torch.empty((0, w.n), dtype=dtype, device=x.device)
+
+    act = x if x.dtype in (torch.bfloat16, torch.float32) else x.float()
+    if act.shape != (tokens, w.k) or not act.is_contiguous():
+        act = act.reshape(tokens, w.k).contiguous()
+    xq, xs = _moe_scratch(tokens, w.k, act.device)
+    # 内核覆盖每一行的每一列（网格的 y 维就是行数），所以这里用 ``empty`` 而不是
+    # ``zeros``：一行清零的发射在 decode 一步里要付 80 次。
+    out = torch.empty((tokens, w.n), dtype=act.dtype, device=act.device)
+    if offsets.dtype == torch.int32 and offsets.is_contiguous():
+        bounds = offsets
+    else:
+        bounds = offsets.to(dtype=torch.int32, device=act.device).contiguous()
+    module.quant_act_i8(act, xq, xs)
+    module.moe_grouped_i8(xq, xs, w.wq, w.scale, bounds, out, slices)
+    return _restore(out, dtype)
+
+
+
+
+def moe_grouped_i8_merge(w, x: torch.Tensor, offsets: torch.Tensor,
+                         row_weight: torch.Tensor,
+                         slices: int = 0) -> torch.Tensor:
+    """按专家分组做 int8 投影，并把各行按路由权重加权累加成一行。
+
+    decode 时一个 token 激活 top_k 个专家，调用方要的是它们加权后的和而不是这 top_k
+    行本身。把这一步并进归约核，省掉 ``[top_k, N]`` 的激活缓冲与 ``mul`` /
+    ``index_add_`` / ``sum`` 三次发射：实测那几步 0.184 ms，比 down 的投影本身
+    （0.059 ms）还贵。
+
+    Args:
+        w: int8 专家栈，``[E, K, N]`` 加 ``[E, N]`` fp32 scale。
+        x: 激活，``[rows, K]``，已按专家号排序。
+        offsets: ``[E+1]`` 前缀和。
+        row_weight: ``[rows]`` 的逐行路由权重。
+
+    Returns:
+        ``[1, N]``，dtype 同 ``x``。
+
+    Raises:
+        ValueError: 激活行数、前缀和长度或逐行权重与权重栈不自洽。
+    """
+    module = _kernels()
+    if x.dim() != 2 or x.shape[-1] != w.k:
+        raise ValueError("grouped MoE expects [rows, K] activations")
+    rows = int(x.shape[0])
+    if int(offsets.numel()) != len(w) + 1:
+        raise ValueError("offsets must have " + str(len(w) + 1) + " entries")
+    dtype = x.dtype
+    act = x if x.dtype in (torch.bfloat16, torch.float32) else x.float()
+    if act.shape != (rows, w.k) or not act.is_contiguous():
+        act = act.reshape(rows, w.k).contiguous()
+    if row_weight.dtype != torch.float32 or not row_weight.is_contiguous():
+        row_weight = row_weight.to(dtype=torch.float32,
+                                   device=act.device).contiguous()
+    if int(row_weight.numel()) != rows:
+        raise ValueError("row_weight needs one entry per row")
+    xq, xs = _moe_scratch(rows, w.k, act.device)
+    if offsets.dtype == torch.int32 and offsets.is_contiguous():
+        bounds = offsets
+    else:
+        bounds = offsets.to(dtype=torch.int32, device=act.device).contiguous()
+    out = torch.empty((1, w.n), dtype=act.dtype, device=act.device)
+    module.quant_act_i8(act, xq, xs)
+    module.moe_grouped_i8_merge(xq, xs, w.wq, w.scale, bounds, row_weight, out,
+                                slices)
+    return _restore(out, dtype)
 #: ``(tokens, k, device)`` → ``(xq, xs)`` 的分组 MoE 激活暂存。
 #:
 #: 一步 decode 里 ``moe_grouped`` 被调 96 次（48 层 x gate_up/down），原来每次新建
@@ -686,7 +811,6 @@ def _moe_scratch(tokens: int, k: int, device: torch.device):
                 torch.empty(tokens, dtype=torch.float32, device=device))
         _MOE_SCRATCH[key] = pair
     return pair
-
 
 def moe_dispatch(expert_idx: torch.Tensor, local_table: torch.Tensor,
                  slots: int, local_experts: int, num_experts: int,
@@ -2081,6 +2205,8 @@ _NATIVE: dict[str, OpFn] = {
     "triangular_solve": triangular_solve,
     "moe_grouped": moe_grouped,
     "moe_grouped_gemm": moe_grouped_gemm,
+    "moe_grouped_i8": moe_grouped_i8,    "moe_grouped_i8_merge": moe_grouped_i8_merge,
+    "shared_gate_scale": shared_gate_scale,
     "attn_sparse": attn_sparse,
     "qsa_block_keys": qsa_block_keys,
     "moe_dispatch": moe_dispatch,
@@ -2189,8 +2315,11 @@ def caps() -> Caps:
         一个记录：``device="cuda"``（CoreX 实现了那个命名空间），两种 dtype 都是
         bf16，因为预填充 GEMM 在本卡上 bf16 和 fp16 都到 32.6 TFLOP/s，转换不值
         它的流量；``weight_layout="kn"``，因为那个布局在本卡上对解码值 14-22 倍；
-        ``attn_split=1``，因为注意力内核还不会按 K 切分——那是内核 ABI，而一个内核
-        没实现的数值会把注意力算错而不是让它失败。
+        ``attn_split=8``：切片轴就是内核的 ``grid.y``，切片数由 ``part_acc.size(-2)`` 读，
+        所以改这里就够、不用改内核。实测（合成 int8 池）4k 1.407→0.827 ms、32k 11.17→3.55、
+        64k 24.49→6.22，对 split=1 的相对误差 ≤2.8e-3。取 8 不取 16：两者在 4k 与 64k 都
+        处在同一平台（0.78 / 6.2 ms），而 8 的切片缓冲只有一半。原先这里写「内核还不会按 K
+        切分」，是把「能力记录里没开」误当成「内核没实现」——那次没有实测就下了结论。
 
         ``graph`` 和 ``batch_attn`` 是推导出来的，不是声明的。只有当解码步碰到的
         每个算子都有自己的内核（:data:`_DECODE_OPS`）时 ``graph`` 才为真，因为参考
@@ -2213,7 +2342,7 @@ def caps() -> Caps:
         weight_dtype=pack.WEIGHT_DTYPE,
         graph=_GRAPH_VERIFIED and _DECODE_OPS <= native,
         autotune=True,
-        attn_split=1,
+        attn_split=8,
         batch_attn="attn_paged_batch" in native,
         int8_weights=True,
         recurrent_state=True,

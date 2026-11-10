@@ -20,8 +20,16 @@ Constraints:
 
 from __future__ import annotations
 
+import os
 import time
 from typing import TYPE_CHECKING, Iterator
+
+#: 诊断开关：``COFFIN_DEBUG_STEP=1`` 时每 50 步打印一次调度器的真实状态。
+#:
+#: 存在的理由：``no progress`` 那条报错只说「200 步没动」，看不出是没调度到还是调度到
+#: 了但模型那步没产出。层切分管线第一次接上来时正是卡在这里，而这两种原因要改的
+#: 地方完全不同。默认关，因为每一步一次 ``print`` 会把 decode 的墙钟拖坏。
+_DEBUG_STEP = bool(os.environ.get("COFFIN_DEBUG_STEP"))
 
 import torch
 
@@ -202,6 +210,11 @@ class LLMEngine:
         for seq in expired:
             self._release(seq)
         decode, chunks = self.scheduler.schedule()
+        if _DEBUG_STEP and getattr(self, "_stalled_steps", 0) % 50 == 0:
+            statuses = [s.status.name for s in self.scheduler.running]
+            print(f"[step] stalled={getattr(self, '_stalled_steps', 0)} running={len(statuses)} "
+                  f"statuses={statuses[:4]} decode={len(decode)} chunks={len(chunks)} "
+                  f"free={self.bm.num_free if self.bm is not None else -1}", flush=True)
         # 只有发起方是禁区：受害者总得有人当，而抢占一条本步即将推进的请求，
         # 恰好就是给长不大的那个腾地方。它的解码还没跑，所以不会白做。
         self._preempted_this_step = set()

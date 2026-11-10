@@ -95,6 +95,16 @@ def _linear(w: torch.Tensor | QWeight, x: torch.Tensor,
     return F.linear(x.to(compute), dense).to(x.dtype)
 
 
+def _moe_grouped_merge(w, x: torch.Tensor, offsets: torch.Tensor,
+                       rw: torch.Tensor, *, weight_dtype) -> torch.Tensor:
+    """参考语义下的归并形态：分组投影后按行权重加权求和。
+
+    参考路径不做激活量化，所以它的输出是「无激活量化」的上界。
+    """
+    out = _moe_grouped(w, x, offsets, weight_dtype=weight_dtype)
+    return (out.float() * rw.reshape(-1, 1).float()).sum(0, keepdim=True).to(out.dtype)
+
+
 def _moe_grouped(w, x: torch.Tensor, offsets: torch.Tensor,
                  weight_dtype: torch.dtype) -> torch.Tensor:
     """把按专家排好序的激活逐专家投影，作为 ``moe_grouped`` 的正确性基线。
@@ -243,6 +253,28 @@ def _silu_mul(gate: torch.Tensor, up: torch.Tensor,
         ``out``, for call chaining.
     """
     out.copy_(F.silu(gate) * up)
+    return out
+
+
+def _shared_gate_scale(x: torch.Tensor, w: torch.Tensor, src: torch.Tensor,
+                       out: torch.Tensor) -> torch.Tensor:
+    """``out = src * sigmoid(x · w)``，共享专家的门标量。
+
+    这个算子存在的理由就是把参考链的六次启动收成一次：``x.float()``、``mul``、
+    ``sum``、``to``、``sigmoid``、``mul`` 作用在一个 2048 维向量上，算出来的只是
+    一个标量，代价几乎全是启动下限。
+
+    Args:
+        x: 激活，``[rows, width]`` 或 ``[width]``。
+        w: fp32 门权重，``[width]``。
+        src: 被缩放的输入，形状同 ``x``。
+        out: 目的地，形状同 ``x``，允许与 ``src`` 重叠。
+
+    Returns:
+        ``out``，便于调用链串接。
+    """
+    scalar = (x.float() * w).sum(-1, keepdim=True).to(x.dtype)
+    out.copy_(src * torch.sigmoid(scalar))
     return out
 
 
@@ -1035,6 +1067,7 @@ def build(caps: Caps | None = None) -> Ops:
         add_rms_norm=_add_rms_norm,
         kv_quant=_kv_quant,
         silu_mul=_silu_mul,
+    shared_gate_scale=_shared_gate_scale,
         rope_apply=_rope_apply,
         attn_decode=_attn_decode,
         attn_paged=_attn_paged,
@@ -1051,6 +1084,11 @@ def build(caps: Caps | None = None) -> Ops:
         delta_normed=_delta_normed,
         triangular_solve=_triangular_solve,
         moe_grouped=functools.partial(_moe_grouped, weight_dtype=c.weight_dtype),
+    # int8 专家栈（``QWeightMoE``）走同一份参考实现：它按 ``offsets`` 逐段取专家、
+    # 反量化到计算 dtype 再做一次 ``F.linear``。差别只在激活不量化——参考语义里
+    # 没有那一步，所以它的输出是「无激活量化」的上界，与内核的差就是量化误差本身。
+    moe_grouped_i8=functools.partial(_moe_grouped, weight_dtype=c.weight_dtype),    moe_grouped_i8_merge=functools.partial(_moe_grouped_merge,
+                                            weight_dtype=c.weight_dtype),
         moe_router=_moe_router,
         hyper_norm=_hyper_norm,
         hyper_down=_hyper_down,

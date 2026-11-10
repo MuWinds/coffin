@@ -52,6 +52,9 @@ _OP_NAMES: tuple[str, ...] = (
     "linear_prefill",    # 预填充分块的 GEMM（大 M）
     "moe_grouped",       # 稀疏专家：并行维是"专家 × 行"，与上面三档切法不同
     "moe_grouped_gemm",  # 同一件事的大 M 形态：按专家分段各做一次张量核 GEMM
+    "moe_grouped_i8",
+    "moe_grouped_i8_merge",    # 同一件事的 int8 形态：权重 [E, K, N] int8，激活按行量化
+    "shared_gate_scale",       # 共享专家门：sigmoid(x·w) 乘到投影输出上，一次启动
     "moe_dispatch",      # 路由结果 → 前缀和 + 行序（替掉十来个 torch 小算子）
     "moe_router",        # 路由自身：softmax -> top-k -> 归一化（替掉 512 元素的排序网络）
     # 归一化。
@@ -219,7 +222,19 @@ class Ops:
     #: 只要 2.30 ms/次。行数分档由模型侧按 ``tokens`` 决定。
     #: ``None`` 表示后端只有一个入口，模型侧退回 ``moe_grouped``。
     moe_grouped_gemm: OpFn | None = None
-    #: ``moe_dispatch(expert_idx, local_table, slots, local_experts, num_experts,
+    #: ``moe_grouped_i8(w, x, offsets) -> y``：同一件事的 int8 形态。
+    #:
+    #: ``w`` 是 int8 专家栈（``[E, K, N]`` 的 int8 加 ``[E, N]`` 的逐列 scale），
+    #: ``x`` / ``offsets`` 的约定与 :attr:`moe_grouped` 相同。
+    #:
+    #: 为什么单独一个算子而不是把 :attr:`moe_grouped` 泛化：两者的分组粒度不同。
+    #: W4A8 的 scale 是逐 (weight-group, 列) 的，分片必须每片各乘一次；int8 的 scale
+    #: 只跟输出列与专家有关，与 k 无关，所以分片可以先把整数和加起来、最后一次乘两个
+    #: scale。这条差别决定了部分和的类型（int32 对 fp32）和归约的次数，混成一个入口
+    #: 会让「哪一套算术」变成运行期才知道的事。
+    #:
+    #: ``None`` 表示后端没有 int8 分组内核，模型侧退回逐专家的 ``linear``。
+    moe_grouped_i8: OpFn | None = None    #: ``moe_dispatch(expert_idx, local_table, slots, local_experts, num_experts,
     #: top_k) -> (offsets, slot_pos, token_of_pos)``：一次内核算出分组要的前缀和与行序。
     #:
     #: 存在的理由是把「路由结果 → 分组偏移」这段从十来个 torch 小算子压成一次发射。
@@ -441,6 +456,14 @@ class Ops:
     #: ``backends/corex/kernels/hyper.cu`` 的 ``hyper_up``：门、加权和、写门共享同一份
     #: ``normed``，拆开就要把它读三遍。
     hyper_up: OpFn | None = None
+
+    #: ``moe_grouped_i8_merge(w, x, offsets, row_weight) -> y``：同一件事的归并形态，
+    #: 把各行按路由权重加权累加成一行。``None`` 表示后端没有这个入口。
+    moe_grouped_i8_merge: OpFn | None = None
+
+    #: ``shared_gate_scale(x, w, src, out) -> out``：共享专家门，``out = src * sigmoid(x . w)``。
+    #: 参考链要六次启动才得到一个标量，这个入口一次启动完成，``out`` 由调用方按形状复用。
+    shared_gate_scale: OpFn | None = None
 
     #: 规范算子名，按字段顺序。
     NAMES: ClassVar[tuple[str, ...]] = _OP_NAMES

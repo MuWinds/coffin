@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import shutil
 import sys
 import time
@@ -63,6 +64,13 @@ INDEX_NAME = "quant_index.json"
 #: 索引格式版本。布局一改就递增：读旧格式的加载器会明确报错，而不是按新布局错读
 #: 字节——错读出来的 int8 是一堆看似合理的数字，不会自己报错。
 FORMAT = "coffin-int8-kn-v1"
+
+#: 必须保持稠密的二维矩阵后缀（Qwen3.5-MoE 的两处门）。
+#:
+#: 路由矩阵决定每个 token 选哪 8 个专家，int8 的噪声比 4-bit 小得多，但它仍然是
+#: 「选谁」的依据，翻转一次就是整层错；共享专家门是逐 token 一个标量，量化它省不
+#: 下带宽。两者都只有几十 KB，保持 bf16 的代价可以忽略。
+DENSE_SUFFIXES = ("mlp.gate.weight", "mlp.shared_expert_gate.weight")
 
 #: 每个源分片对应一个输出分片，输出名按输入顺序编号。
 _SHARD_TEMPLATE = "quant-{i:05d}-of-{total:05d}.safetensors"
@@ -218,6 +226,148 @@ def _copy_sidecar_files(ckpt: Path, out: Path) -> list[str]:
     return copied
 
 
+#: 逐专家张量的名字。Qwen3.5-MoE 的 checkpoint 把它拆成 ``experts.{e}.{proj}.weight``，
+#: 一层 256 专家 x 3 个投影 = 768 个二维张量，40 层共 30720 个。
+#:
+#: 为什么必须在产物里融合：运行时加载是按张量循环的，而单张量的固定开销（本机实测
+#: int8 通路约 3 ms）乘上 30720 就是 90 s 起。Qwen3.8-Flash-Next 的 125B 能两分钟加载完，
+#: 靠的正是它的 checkpoint 本来就是 ``[E, 2I, H]`` / ``[E, H, I]`` 两个三维栈。
+_EXPERT_KEY = re.compile(
+    r"^(?P<mlp>.+\.mlp)\.experts\.(?P<e>\d+)\.(?P<proj>gate_proj|up_proj|down_proj)\.weight$")
+
+#: 融合后的两个栈在 state dict / 索引里的键名后缀。
+GATE_UP_STACK = "experts.gate_up_stack"
+DOWN_STACK = "experts.down_stack"
+
+
+def _scan_experts(shards: list, prefixes: tuple, include_vision: bool
+                  ) -> tuple[dict, dict, set]:
+    """第一趟只读键：把逐专家张量按层归组，并记下每层归哪个输出分片。
+
+    张量一律不读：这一趟的代价只与键的数量有关（31666 个键约几十毫秒），而真正的读盘
+    与量化留到第二趟，按分片顺序做，峰值内存因此只有一层。
+
+    Args:
+        shards: 源分片，按名字排序。
+        prefixes: 要收进来的参数名前缀。
+        include_vision: 视觉张量是否一并收进来。
+
+    Returns:
+        ``(groups, owner, expert_keys)``：``groups[mlp][proj][e] = (shard, key)``；
+        ``owner[mlp] = shard`` 是这层非专家张量所在的分片（融合栈就写到那里）；
+        ``expert_keys`` 是要从逐张量通路里排除掉的键。
+    """
+    from safetensors import safe_open
+
+    groups: dict = {}
+    owner: dict = {}
+    expert_keys: set = set()
+    for source in shards:
+        with safe_open(str(source), framework="pt", device="cpu") as handle:
+            for key in handle.keys():
+                if key.startswith(VISUAL_PREFIX):
+                    if not include_vision:
+                        continue
+                elif not key.startswith(prefixes):
+                    continue
+                match = _EXPERT_KEY.match(key)
+                if match is None:
+                    layer = _owner_of(key)
+                    if layer:
+                        owner.setdefault(layer, source)
+                    continue
+                mlp = match.group("mlp")
+                groups.setdefault(mlp, {"gate_proj": {}, "up_proj": {}, "down_proj": {}})
+                groups[mlp][match.group("proj")][int(match.group("e"))] = (source, key)
+                expert_keys.add(key)
+    return groups, owner, expert_keys
+
+
+def _owner_of(key: str) -> str:
+    """从任意非专家键取出它所属层的 ``mlp`` 前缀之外的稳定标识。
+
+    Args:
+        key: checkpoint 参数名。
+
+    Returns:
+        ``model.language_model.layers.N`` 这样的层前缀；匹配不到时返回空串。
+    """
+    match = re.match(r"^(.*\.layers\.\d+)\.", key)
+    return match.group(1) if match else ""
+
+def _fused_stacks(group: dict, read, weight_dtype: torch.dtype,
+                  device: torch.device) -> tuple:
+    """把一层 768 个逐专家投影量化并融合成两个三维栈。
+
+    Args:
+        group: ``{"gate_proj": {e: (shard, key)}, "up_proj": ..., "down_proj": ...}``。
+        read: ``pair -> Tensor``，把 ``(shard, key)`` 读成 CPU bf16 张量。
+        weight_dtype: 量化前把权重窄到的 dtype。
+        device: 量化执行设备。
+
+    Returns:
+        ``(gate_up_wq, gate_up_scale, down_wq, down_scale)``：前两个是 ``[E, 2I, H]``
+        int8 与 ``[E, 2I]`` fp32，后两个是 ``[E, H, I]`` 与 ``[E, H]``。gate 在前、
+        up 在后——与参考实现 ``gate_up_proj[e].chunk(2, -1)`` 的顺序一致，反过来
+        不会报错，只会让模型把门和升混起来算。
+    """
+    experts = len(group["gate_proj"])
+    if len(group["up_proj"]) != experts or len(group["down_proj"]) != experts:
+        raise SystemExit(
+            f"expert count mismatch: gate={experts} up={len(group['up_proj'])} "
+            f"down={len(group['down_proj'])}")
+    gu_parts, gu_scales, dn_parts, dn_scales = [], [], [], []
+    for e in range(experts):
+        gq, gs = quantize_projection(
+            read(group["gate_proj"][e]).to(device).to(weight_dtype).contiguous())
+        uq, us = quantize_projection(
+            read(group["up_proj"][e]).to(device).to(weight_dtype).contiguous())
+        dq, ds = quantize_projection(
+            read(group["down_proj"][e]).to(device).to(weight_dtype).contiguous())
+        # 按 ``kn`` 布局拼：``quantize_projection`` 交出来的已经是 ``[K, N]``，gate 与 up
+        # 沿 N 轴接起来就是 ``[K, 2I]``，转置一次都不用做。
+        gu_parts.append(torch.cat([gq, uq], dim=1))
+        gu_scales.append(torch.cat([gs, us], dim=0))
+        dn_parts.append(dq)
+        dn_scales.append(ds)
+    return (torch.stack(gu_parts).contiguous(), torch.stack(gu_scales).contiguous(),
+            torch.stack(dn_parts).contiguous(), torch.stack(dn_scales).contiguous())
+
+
+def _emit_stack(payload: dict, tensors: dict, per_file: dict, kinds: Counter,
+                mlp: str, suffix: str, wq: torch.Tensor, scale: torch.Tensor,
+                shard_name: str) -> None:
+    """把一个融合栈写进当前分片的 payload 与索引。
+
+    Args:
+        payload: 当前分片待写的张量字典。
+        tensors: 索引里的张量表。
+        per_file: 当前分片的字节统计。
+        kinds: 全局的类型计数。
+        mlp: 这一层的 ``mlp`` 前缀。
+        suffix: :data:`GATE_UP_STACK` 或 :data:`DOWN_STACK`。
+        wq: ``[E, N, K]`` int8 栈。
+        scale: ``[E, N]`` fp32。
+        shard_name: 当前输出分片名。
+    """
+    key = f"{mlp}.{suffix}"
+    payload[key] = wq.cpu()
+    payload[key + "#scale"] = scale.cpu()
+    tensors[key] = {
+        "kind": "q8-moe",
+        "experts": int(wq.shape[0]),
+        "n": int(wq.shape[2]),
+        "k": int(wq.shape[1]),
+        "shape": list(wq.shape),
+        "scale_shape": list(scale.shape),
+        "scale_key": key + "#scale",
+        "shard": shard_name,
+    }
+    kinds["int8-moe"] += 1
+    per_file["tensors"] += 1
+    per_file["int8_bytes"] += wq.numel()
+    per_file["scale_bytes"] += scale.numel() * 4
+
 def convert(ckpt: Path, out: Path, *, weight_dtype: torch.dtype,
             device: torch.device, prefixes: tuple[str, ...], include_vision: bool,
             copy_sidecars: bool) -> dict:
@@ -260,12 +410,38 @@ def convert(ckpt: Path, out: Path, *, weight_dtype: torch.dtype,
     totals = {"int8_bytes": 0, "scale_bytes": 0, "dense_bytes": 0}
     skipped_vision = 0
 
+    # 第一趟只读键：把逐专家张量按层归组。第二趟按分片顺序读盘、量化、融合，峰值
+    # 内存因此只有一层（gate/up/down 各 256 份 bf16 加融合后的 int8 栈约 2.4 GB）。
+    groups, owner, expert_keys = _scan_experts(shards, prefixes, include_vision)
+    #: 跨分片读专家时要同时打开多个源分片；它们都是内存映射，打开本身不花钱。
+    extra: dict = {}
+
+    def read(pair):
+        """把 ``(shard, key)`` 读成 CPU 张量。
+
+        Args:
+            pair: ``(源分片, 参数名)``。
+
+        Returns:
+            该张量的 CPU 副本（safetensors 自己管缓存）。
+        """
+        origin, key = pair
+        handle = extra.get(origin)
+        if handle is None:
+            handle = safe_open(str(origin), framework="pt", device="cpu")
+            handle.__enter__()
+            extra[origin] = handle
+        return handle.get_tensor(key)
+
     for index, source in enumerate(shards, 1):
         name = _SHARD_TEMPLATE.format(i=index, total=len(shards))
         payload: dict[str, torch.Tensor] = {}
         per_file = {"tensors": 0, "int8_bytes": 0, "scale_bytes": 0, "dense_bytes": 0}
         with safe_open(str(source), framework="pt", device="cpu") as handle:
             for key in handle.keys():
+                # 逐专家张量留到本分片末尾由 ``_fused_stacks`` 一次性融合，不走这里。
+                if key in expert_keys:
+                    continue
                 if key.startswith(VISUAL_PREFIX):
                     if not include_vision:
                         skipped_vision += 1
@@ -274,9 +450,10 @@ def convert(ckpt: Path, out: Path, *, weight_dtype: torch.dtype,
                     continue
 
                 tensor = handle.get_tensor(key).to(device)
-                if key.startswith(VISUAL_PREFIX) or not is_quantizable(key, tensor):
-                    # 视觉张量和非投影张量原样穿过去。它们不参与 W8A8，也没有内核
-                    # 能消费 int8 形式，量化只会白丢精度。
+                # 视觉张量、非投影张量、以及路由器/共享专家门原样穿过去。它们不参与
+                # W8A8，也没有内核能消费 int8 形式，量化只会白丢精度。
+                if (key.startswith(VISUAL_PREFIX) or key.endswith(DENSE_SUFFIXES)
+                        or not is_quantizable(key, tensor)):
                     dense = tensor.to(ACT_DTYPE).contiguous().cpu()
                     payload[key] = dense
                     kinds[_dtype_name(dense.dtype)] += 1
@@ -311,6 +488,18 @@ def convert(ckpt: Path, out: Path, *, weight_dtype: torch.dtype,
                 per_file["scale_bytes"] += scale.numel() * 4
                 del wt, scale
 
+            # 这一层属于哪个分片由它的非专家张量决定；融合栈写到同一个分片，
+            # 加载侧因此仍能按分片顺序一次走完。
+            for mlp, group in groups.items():
+                if owner.get(mlp[:-4]) != source:
+                    continue
+                wq_gu, sc_gu, wq_dn, sc_dn = _fused_stacks(group, read, weight_dtype, device)
+                _emit_stack(payload, tensors, per_file, kinds, mlp, GATE_UP_STACK,
+                            wq_gu, sc_gu, name)
+                _emit_stack(payload, tensors, per_file, kinds, mlp, DOWN_STACK,
+                            wq_dn, sc_dn, name)
+                del wq_gu, sc_gu, wq_dn, sc_dn
+
         save_file(payload, str(out / name), metadata={"format": FORMAT})
         for field in ("int8_bytes", "scale_bytes", "dense_bytes"):
             totals[field] += per_file[field]
@@ -318,6 +507,9 @@ def convert(ckpt: Path, out: Path, *, weight_dtype: torch.dtype,
         print(f"  [{index}/{len(shards)}] {source.name} -> {name}  "
               f"{per_file['tensors']} tensors", flush=True)
         del payload
+
+    for handle in extra.values():
+        handle.__exit__(None, None, None)
 
     if not tensors:
         raise SystemExit(

@@ -49,6 +49,10 @@ def _rows(x: torch.Tensor) -> torch.Tensor:
     """
     if x.stride(-1) != 1:
         x = x.contiguous()
+    if x.dim() == 2:
+        # 已经是 ``[M, n]``：``reshape`` 只会多构造一次元数据（实测 5.8 us/次）而不改变
+        # 任何东西。一层里这条路径被走 7 次，值 40 us。
+        return x
     return x.reshape(-1, x.shape[-1])
 
 

@@ -89,6 +89,9 @@ class LinearAttn:
         # 状态。
         self._bcap = 1
         self.prefill_row = 0
+        #: 按行号缓存的持久缓冲切片与 q/k/v 视图（见 :meth:`_plan_for`）。凡是重建
+        #: 下列缓冲的地方都必须清掉它，否则缓存里会留着已经没人引用的旧张量。
+        self._plans: dict[int, tuple] = {}
         rows = 1
         self.conv_state = torch.zeros(rows, self.conv_dim, self.kernel - 1,
                                       dtype=torch.float32, device=_device)
@@ -234,6 +237,8 @@ class LinearAttn:
         rows = capacity
         self._bcap = capacity
         self.prefill_row = int(prefill_row)
+        # 缓冲即将重建，缓存里的视图全部失效。
+        self._plans.clear()
         self.conv_state = torch.zeros(rows, self.conv_dim, self.kernel - 1,
                                       dtype=torch.float32, device=_device)
         self.conv_out = torch.zeros(rows, self.conv_dim, dtype=torch.float32,
@@ -294,6 +299,36 @@ class LinearAttn:
                                    z[i].reshape(self.num_v, self.dv)).reshape(self.vdim)
         return batch_proj(self.out_proj, proj_in)
 
+    def _plan_for(self, pr: int):
+        """按行号缓存本层用到的持久缓冲切片与 q/k/v 视图。
+
+        这些东西每 token 完全一样：``conv_state``/``conv_out``/``q_pro``/``k_pro``/
+        ``v_pro``/``beta``/``g``/``state``/``delta_out`` 都是按 ``prefill_row`` 切的持久
+        缓冲，而 q/k/v 三视图是从持久缓冲 ``conv_out`` 里切出来的。原来每次都重新索引、
+        重新 :meth:`Tensor.split`、重新 :meth:`Tensor.reshape` —— 一层里累计 21 次
+        reshape、6 次 as_strided、10 次 contiguous，占了单层 Python glue 的大头。
+        行号在一次解码过程中不变，所以按它缓存一次即可，之后是纯 tuple 解包。
+
+        Args:
+            pr: ``prefill_row``，解码用的暂存行号。
+
+        Returns:
+            ``(conv_state, conv_out, q, k, v, q_pro, k_pro, v_pro, beta, g, state,
+            delta_out)``；其中 q/k/v 是 ``[num_k|num_v, dk|dv]`` 的持久视图。
+        """
+        plan = self._plans.get(pr)
+        if plan is not None:
+            return plan
+        conv_out = self.conv_out[pr]
+        q, k, v = conv_out.split([self.kdim, self.kdim, self.vdim], dim=0)
+        plan = (self.conv_state[pr], conv_out,
+                q.reshape(self.num_k, self.dk), k.reshape(self.num_k, self.dk),
+                v.reshape(self.num_v, self.dv),
+                self.q_pro[pr], self.k_pro[pr], self.v_pro[pr],
+                self.beta[pr], self.g[pr], self.state[pr], self.delta_out[pr])
+        self._plans[pr] = plan
+        return plan
+
     def __call__(self, x: torch.Tensor, *_) -> torch.Tensor:
         """单 token 解码步，状态就地更新。
 
@@ -308,30 +343,28 @@ class LinearAttn:
         qkv, z, b, a = self.qkvzb_a(x)
         z = z.reshape(self.num_v, self.dv)
         pr = self.prefill_row
-        conv_state, conv_out = self.conv_state[pr], self.conv_out[pr]
+        # 下面这一整串都是**按行号取的持久缓冲切片**与从 ``conv_out`` 里切出的 q/k/v
+        # 视图：每 token 完全一样，但原来每次都重新索引 + 重新切片 + 重新 reshape。
+        # 一层里这类元数据调用实测 21 次 reshape、6 次 as_strided、10 次 contiguous，
+        # 是单层 305 us Python glue 的主要来源。按行号缓存一次即可。
+        (conv_state, conv_out, q_view, k_view, v_view, q_pro, k_pro, v_pro,
+         beta, g, state, delta_out) = self._plan_for(pr)
 
         # 在最近 3 个状态加当前输入上做 depthwise 因果 conv1d（核宽 4），与 SiLU 融合
         # 成一个算子（原来是 cat + copy_ + mul + sum + silu）。
         bops.conv1d_silu(self.conv_w, qkv, conv_state, conv_out)
         qkv = conv_out
-
-        q, k, v = qkv.split([self.kdim, self.kdim, self.vdim], dim=0)
-        q = q.reshape(self.num_k, self.dk)
-        k = k.reshape(self.num_k, self.dk)
-        v = v.reshape(self.num_v, self.dv)
+        q, k, v = q_view, k_view, v_view
 
         # 用三算子拼法，不用融合的 ``delta_normed``。那个融合是逐位一致的，还能省掉
         # 每步 48 次 launch，但它仍然更慢：在卡上实测，单测时每层多 5.3 us 设备时间，
         # 真实步骤里每层多 13.1 us（24 层累计 20.285 -> 20.615 ms），因为一个内核要同时
         # 伺候递推的寄存器循环几何和两次块内归约。它省下的 launch 名额不值这个价。
         # 见 docs/qwen4/QWEN4-PERF.md。
-        q_pro, k_pro, v_pro = self.q_pro[pr], self.k_pro[pr], self.v_pro[pr]
-        beta, g = self.beta[pr], self.g[pr]
         bops.delta_prologue(q, k, v, b, a, self.neg_expA, self.dt_bias,
                             q_pro, k_pro, v_pro, beta, g,
                             self.qscale, self.rep)
-        out = bops.delta(q_pro, k_pro, v_pro, beta, g,
-                         self.state[pr], self.delta_out[pr])
+        out = bops.delta(q_pro, k_pro, v_pro, beta, g, state, delta_out)
 
         out = self.norm(out, z).reshape(self.vdim)
         return self.out_proj(out)

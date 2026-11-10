@@ -137,4 +137,9 @@ def wide_proj(proj, x: torch.Tensor):
     if isinstance(proj, GEMVGroup):
         return wide_proj(proj.g, x).split(proj.sizes, dim=1)
     _count("smallM" if x.shape[0] <= 8 else "prefill")
-    return proj.linear_m(x) if x.shape[0] > 1 else proj(x).unsqueeze(0)
+    # 单行必须把 **1 维** 向量交给 ``proj``：``GEMV.__call__`` 的契约是
+    # ``[K] -> [N]`` / ``[C, K] -> [C, N]``，传 ``[1, K]`` 进去它已经返回
+    # ``[1, N]``，再 unsqueeze 就成了 ``[1, 1, N]`` —— 上层按 dim=1 切分
+    # （``GEMVGroup.sizes``）时维度只有 1，会报 split 求和不为 1；普通 GEMV
+    # 更糟，形状错成三维但没人检查。与 :func:`_project` 保持同一写法。
+    return proj.linear_m(x) if x.shape[0] > 1 else proj(x[0]).unsqueeze(0)

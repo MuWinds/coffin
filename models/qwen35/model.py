@@ -111,6 +111,19 @@ class Qwen35:
         self.parallel = context()
         if self.parallel is not None:
             self.cfg = local_config(self.cfg, self.parallel.world_size)
+        #: 流水并行上下文；``None`` 表示这一层栈是完整的。
+        #:
+        #: TP 与 PP 的差别不是「切哪儿」而是「每 token 通信几次」：TP 每层两次 all-reduce
+        #: （40 层 80 次），PP 每 token 三次点对点。这张卡的跨卡归约实测 1 ms 量级，
+        #: 所以 MoE 这种 40 层的模型在 TP 下每 token 要付 80 ms 通信，而 PP 只付 0.2 ms。
+        self.pipe = (self.parallel if self.parallel is not None
+                     and self.parallel.mode == "pp" else None)
+        total_layers = int(self.cfg["num_hidden_layers"])
+        self.layer_begin, self.layer_end = (
+            self.pipe.layer_range(total_layers) if self.pipe is not None
+            else (0, total_layers))
+        self.hidden = int(self.cfg["hidden_size"])
+        self.vocab = int(self.cfg["vocab_size"])
         self.max_seq = max_seq
         #: 本实例是否拥有该 state dict、可以在消费张量的同时释放它们。自己加载时是；
         #: 调用方提供的字典保持完整，同一批张量才能在重载时重建模型。
@@ -128,10 +141,15 @@ class Qwen35:
         own_sd = weights is None
         sd = weights if weights is not None else load_weights(model_dir, quant=quant)
 
-        self.embed = TiedEmbedding(sd["model.language_model.embed_tokens.weight"], bench)
+        # 首段持有词嵌入（它把 token 变成 hidden），末段持有最后的归一化与 lm_head
+        # （它把 hidden 变成 logits）；中间的段两者都不建，省下的显存正好装层。
+        last_stage = self.pipe is not None and self.pipe.rank == self.pipe.world_size - 1
+        first_stage = self.pipe is None or self.pipe.rank == 0
+        self.embed = (TiedEmbedding(sd["model.language_model.embed_tokens.weight"], bench)
+                     if first_stage else None)
         self.norm = RMSNorm(sd["model.language_model.norm.weight"])
         self.layers = []
-        for i in range(self.cfg["num_hidden_layers"]):
+        for i in range(self.layer_begin, self.layer_end):
             self.layers.append(Layer(sd, i, self.cfg, bench, max_seq, paged))
             # 建好的层已经持有它需要的一切；它在字典里剩下的条目都是 `GEMVGroup`
             # 已经拷过的，纯粹是峰值。
@@ -143,8 +161,25 @@ class Qwen35:
         # 按张量而不是按族名来判断，才让一条代码路径同时服务两者——反过来的做法不是
         # 崩溃，而是头悄悄改读嵌入，用错误的矩阵产生看似合理的 logits。
         head_w = sd.get("lm_head.weight")
-        self.lm_head = self.embed if head_w is None else TiedEmbedding(head_w, bench)
-        self.head_is_tied = head_w is None
+        if head_w is not None:
+            self.lm_head = TiedEmbedding(head_w, bench)
+            self.head_is_tied = False
+        elif self.pipe is not None:
+            # 共享词嵌入的模型（``tie_word_embeddings=True``，如 Qwen3.5-0.8B）：输出头就是
+            # 词嵌入本身。流水下每个 rank 都要有它 —— ``_forward`` 是「末段回传 4 KB
+            # hidden、各段自己算 logits」的结构，``pipe_keeps`` 因此也把 embed_tokens 发给
+            # 了每个 rank。这里直接另建一个 ``TiedEmbedding``，不依赖 ``self.embed``（非首段
+            # 的 ``self.embed`` 是 ``None``）。
+            tied_w = sd.get("model.language_model.embed_tokens.weight")
+            if tied_w is None:
+                raise ValueError(
+                    "tied-head model under pipeline parallel needs embed_tokens on every "
+                    "stage; pipe_keeps should have kept it")
+            self.lm_head = TiedEmbedding(tied_w, bench)
+            self.head_is_tied = True
+        else:
+            self.lm_head = self.embed
+            self.head_is_tied = True
         self.mtp = MTP(sd, self.cfg, bench, max_seq) if "mtp.fc.weight" in sd else None
         #: 视觉张量留在常驻字典里，但只在第一次图像请求时才变成视觉塔（见
         #: ``enable_vision``）；纯文本服务端因此背着那 0.62 GiB，却从不构建该模块。
@@ -192,7 +227,7 @@ class Qwen35:
         self.rope_delta = torch.zeros(1, dtype=torch.long, device=_device)
         self.rope_delta1 = self.rope_delta[:1]
         self.token_in = torch.zeros(1, dtype=torch.long, device=_device)
-        self.logits_out = torch.zeros(self.embed.shape[0], dtype=D, device=_device)
+        self.logits_out = torch.zeros(self.vocab, dtype=D, device=_device)
         self.logits_single = self.logits_out
         self._graph = None
 
@@ -221,7 +256,7 @@ class Qwen35:
         self.verify_toks = torch.zeros(self.verify_c, dtype=torch.long, device=_device)
         self.verify_pos = torch.zeros(self.verify_c, dtype=torch.long, device=_device)
         self.verify_hidden = torch.zeros(self.verify_c, hidden, dtype=D, device=_device)
-        self.verify_logits = torch.zeros(self.verify_c, self.embed.shape[0], dtype=D, device=_device)
+        self.verify_logits = torch.zeros(self.verify_c, self.vocab, dtype=D, device=_device)
         self._verify_graph = None
 
         # 上一次 ``spec_generate`` 的接受统计，由 ``spec_stats`` 读取。
@@ -267,7 +302,7 @@ class Qwen35:
         self.rope_delta = torch.zeros(capacity, dtype=torch.long, device=_device)
         self.rope_delta1 = self.rope_delta[self.prefill_row:self.prefill_row + 1]
         self.token_in = torch.zeros(capacity, dtype=torch.long, device=_device)
-        self.logits_out = torch.zeros(capacity, self.embed.shape[0], dtype=D, device=_device)
+        self.logits_out = torch.zeros(capacity, self.vocab, dtype=D, device=_device)
         self.logits_single = self.logits_out[self.prefill_row]
         # 阶段 3 批处理注意力内核用的逐行注意力窗口长度（``pos+1``）；用 int32 是因为
         # 内核要在设备上读它。
@@ -486,14 +521,37 @@ class Qwen35:
         纯文本请求里这个缓冲区是 0，于是恰好就是原来的单一项查表。
         """
         pr = self.prefill_row
-        x = self.embed.lookup(self.token_in[pr:pr + 1]).view(-1)
+        if self.pipe is None or self.pipe.rank == 0:
+            x = self.embed.lookup(self.token_in[pr:pr + 1]).view(-1)
+        else:
+            x = self.pipe.await_relay((1, self.hidden), self.pipe.rank - 1,
+                                      _device, D).view(-1)
         ctx = (self.pos1, self.cos_tbl, self.sin_tbl, self.mask_idx,
                self.rope_delta1)
         for layer in self.layers:
             x = layer(x, ctx)
-        x = self.norm(x)
-        self.logits_single.copy_(self.lm_head(x))
         self.pos1.add_(1)
+        if self.pipe is None:
+            self.logits_single.copy_(self.lm_head(self.norm(x)))
+            return
+        # 段间只传激活：中间段把 hidden 交给下一段，末段把 logits 送回 rank 0。
+        # 末段必须在这里早退，否则它会去等一个永远不会来的回包。
+        # 段间只传 hidden（[hidden] = 4 KB）。末段算完自己那层后把 hidden 回给其他各段，
+        # 各段用自己那份输出头算 logits —— 每个 rank 因此拿到**逐位相同**的 logits，
+        # 引擎的采样决定自然一致，而线上跑的是 4 KB 而不是 1 MB。
+        # 段间只传 4 KB 的 hidden；末段把 hidden 回给各段，各段用自己的头算 logits。
+        # 这样每段都能在等对端的时候把自己的头 GEMV 藏在等待里，实测比「末段算、
+        # 广播 logits」快 22%（26.24 vs 21.48 tok/s）。
+        nxt = self.pipe.rank + 1
+        if nxt >= self.pipe.world_size:
+            for dst in range(self.pipe.world_size - 1):
+                self.pipe.relay(x.reshape(1, -1), dst)
+            h = x
+        else:
+            self.pipe.relay(x.reshape(1, -1), nxt)
+            h = self.pipe.await_relay((self.hidden,), self.pipe.world_size - 1,
+                                      _device, D)
+        self.logits_single.copy_(self.lm_head(self.norm(h)))
 
     def _forward_batch(self, rows: int) -> None:
         """在一次前向里为 ``rows`` 个序列各跑一个 token。
@@ -508,14 +566,32 @@ class Qwen35:
             rows: 这张图跑多少行，也就是 bucket 大小。它必须等于捕获时的宽度；它碰
                 的缓冲区是捕获的固定件，不是参数。
         """
-        x = self.embed.lookup(self.token_in[:rows])           # [rows, hidden]
+        if self.pipe is None or self.pipe.rank == 0:
+            x = self.embed.lookup(self.token_in[:rows])       # [rows, hidden]
+        else:
+            x = self.pipe.await_relay((rows, self.hidden), self.pipe.rank - 1,
+                                      _device, D)
         positions = self.pos[:rows]
         ctx = (self.cos_tbl, self.sin_tbl, self.mask_idx, self.ctx_lens,
                self.rope_delta)
         for layer in self.layers:
             x = layer.batch(x, positions, ctx)
+        if self.pipe is not None:
+            # 与 ``_verify_impl`` 同一套走法：末段把 hidden 回给各段、各段自己算 logits。
+            # 让末段算完再广播 logits 实测慢 22%（文档 §8.8），因为各段算 logits 的
+            # 那点开销本来就躲在流水等待窗口里。
+            nxt = self.pipe.rank + 1
+            if nxt >= self.pipe.world_size:
+                for dst in range(self.pipe.world_size - 1):
+                    self.pipe.relay(x, dst)
+            else:
+                self.pipe.relay(x, nxt)
+                x = self.pipe.await_relay((rows, self.hidden), self.pipe.world_size - 1,
+                                          _device, D)
         x = self.norm(x)
-        self.logits_out[:rows].copy_(batch_proj(self.embed.gemv, x))
+        # 输出头用 ``self.lm_head`` 而不是 ``self.embed.gemv``：后者只在首段存在，
+        # 而这行在每个 rank 上都会执行（occamy 的输出头是独立的，不与嵌入共享）。
+        self.logits_out[:rows].copy_(self.lm_head.prefill(x))
         self.pos[:rows].add_(1)
 
     def reset(self) -> None:
@@ -612,13 +688,80 @@ class Qwen35:
                 lg = self.logits(t)
             return lg
 
+        if self.pipe is not None:
+            # 分块预填充：每段只跑自己那 10 层，块沿管线逐段传递。这是参考实现
+            # （enginex-vllm-bi100-qwen36）的核心配置 ``--max-num-batched-tokens 4096
+            # --enable-chunked-prefill`` 在层切分下的等价物——逐 token 驱动时 M=1，
+            # 张量核完全用不上，5 个 token 要跑 5 个完整的管线来回。
+            if mm is not None:
+                raise RuntimeError(
+                    "pipeline parallel does not support image inputs: the vision tower "
+                    "lives on stage 0 and its embeddings would have to cross the wire")
+            # 分块路径目前只对**单块**（n <= 512）验证过：空多块会让段间协议失步
+            # （实测 2001 token 时 rank0 在等末段的回包超时，而同一 prompt 走逐 token
+            # 是通的，代价是 prefill 89.4 s）。所以按块数分流：单块走分块，多块回退，
+            # 等把多块的失步修掉再放开。
+            # 三档：``auto``（默认）按长度选路、``1`` 强制分块、``0`` 一律逐 token。
+            #
+            # 阈值 64 是实测的：23 token 时逐 token 更快（935 vs 1220 ms，M 太小，库 GEMM
+            # 还不如解码入口），2001 token 时分块快 8.4 倍（10.8 s vs 90.8 s）。中间的
+            # 24..512 没有逐点测过，取 64 是保守的一侧 —— 宁可早一点切到分块。
+            mode = os.environ.get("COFFIN_PP_CHUNKED", "auto")
+            if not (mode == "1" or (mode == "auto" and n >= 64)):
+                # 逐 token 的兜底：短 prompt 上它反而更快（M 太小，库 GEMM 不如解码入口），
+                # 多块长 prompt 上它是唯一正确的路。
+                lg = None
+                for t in tokens:
+                    lg = self.logits(int(t))
+                return lg
+            toks = torch.tensor(tokens, dtype=torch.long, device=_device)
+            ctx = (self.cos_tbl, self.sin_tbl, self.mask_idx)
+            # 块宽按段间载荷定：C 行 hidden 是 C*H*4 字节，C=512 时 4 MB，接收缓冲
+            # （32 MB）装得下整批分片，不用等对端边收边放。
+            step = max(1, min(int(chunk), 512))
+            comm_before = self.pipe.comm_calls
+            last_row = None
+            for c0 in range(0, n, step):
+                c1 = min(c0 + step, n)
+                if self.pipe.rank == 0:
+                    x = self.embed.lookup(toks[c0:c1])
+                else:
+                    x = self.pipe.await_relay((c1 - c0, self.hidden),
+                                              self.pipe.rank - 1, _device, D)
+                positions = torch.arange(pos0 + c0, pos0 + c1, device=_device)
+                for layer in self.layers:
+                    x = layer.prefill(x, positions, ctx, None)
+                nxt = self.pipe.rank + 1
+                if nxt < self.pipe.world_size:
+                    self.pipe.relay(x, nxt)
+                last_row = x[-1]
+            if os.environ.get("COFFIN_PP_DEBUG"):
+                # 多块失步时唯一能定位的东西就是「每个 rank 各发/收了几次」。期望值：
+                # rank0 = 块数 + 1，中间段 = 2 * 块数 + 1，末段 = 块数 + (段数 - 1)。
+                print(f"[pipe] rank={self.pipe.rank} n={n} step={step} "
+                      f"chunks={(n + step - 1) // step} "
+                      f"comm={self.pipe.comm_calls - comm_before}", flush=True)
+            self.pos1.fill_(pos0 + n)
+            if self.pipe.rank == self.pipe.world_size - 1:
+                for dst in range(self.pipe.world_size - 1):
+                    self.pipe.relay(last_row.reshape(1, -1), dst)
+            else:
+                last_row = self.pipe.await_relay((self.hidden,),
+                                                 self.pipe.world_size - 1,
+                                                 _device, D)
+            return self.lm_head(self.norm(last_row))
+
         toks = torch.tensor(tokens, dtype=torch.long, device=_device)
         ctx = (self.cos_tbl, self.sin_tbl, self.mask_idx)
         Q = PREFILL_ATTN_TILE
         last = None
         for c0 in range(0, n, chunk):
             c1 = min(c0 + chunk, n)
-            x = self.embed.lookup(toks[c0:c1])
+            if self.pipe is None or self.pipe.rank == 0:
+                x = self.embed.lookup(toks[c0:c1])
+            else:
+                x = self.pipe.await_relay((c1 - c0, self.hidden), self.pipe.rank - 1,
+                                          _device, D)
             positions = torch.arange(pos0 + c0, pos0 + c1, device=_device)
             # 因果注意力的查询切块：每块只读到自己的最后一个位置，score 块里被掩掉的那
             # 一半因此根本不会被构造。切块坐标在主机侧算成整数，每层不会多一次设备同步。
@@ -636,6 +779,7 @@ class Qwen35:
                 layer_ctx = ctx + (rope,)
             for layer in self.layers:
                 x = layer.prefill(x, positions, layer_ctx, tiles)
+
             if self.mtp is not None and self.mtp_prefill:
                 # 把 MTP 头按分块喂，而不是把所有分块的隐含状态都攒着最后拼接：256k 的
                 # prompt 其 `H` 是 1.34 GB bf16，拼接拷贝还要再翻一倍。最后一个 prompt
@@ -672,6 +816,10 @@ class Qwen35:
         elif self.batch_spec and spec_row is not None:
             self.h_prev_b[spec_row].copy_(last)
 
+        if self.pipe is not None:
+            # 流水模式在函数开头就按 token 早退了；还能走到这里说明分块路径和流水被同时
+            # 打开，而那条路的段间分块边界没有核对过，宁可响亮地失败。
+            raise RuntimeError("pipeline prefill must take the per-token path")
         return self.lm_head(self.norm(last))
 
     @torch.no_grad()
@@ -1211,7 +1359,7 @@ class Qwen35:
         self.spec_width = width
         self.spec_buckets = buckets
         hidden = self.cfg["hidden_size"]
-        vocab = self.embed.shape[0]
+        vocab = self.vocab
         self.verify_toks_b = torch.zeros(cap, width, dtype=torch.long, device=_device)
         self.verify_pos_b = torch.zeros(cap, width, dtype=torch.long, device=_device)
         self.verify_hidden_b = torch.zeros(cap, width, hidden, dtype=D, device=_device)
@@ -1344,7 +1492,7 @@ class Qwen35:
         logits = wide_proj(self.embed.gemv, x)
         self.verify_hidden_b[:rows].copy_(x.view(rows, c, hidden))
         self.verify_logits_b[:rows].copy_(
-            logits.view(rows, c, self.embed.shape[0]))
+            logits.view(rows, c, self.vocab))
         if s is not None:
             lap("lmhead", s)
 
@@ -1461,6 +1609,10 @@ class Qwen35:
             raise ValueError(f"{n} tokens vs row_indices {active_rows}")
         if n < 1 or max(active_rows) >= bucket or bucket not in self._verify_batch_graphs:
             raise ValueError(f"bad rows/bucket ({active_rows}, {bucket})")
+        if self.mtp is None:
+            raise RuntimeError(
+                "this checkpoint has no MTP head (mtp_num_hidden_layers = 0), so batched "
+                "speculative decoding is unavailable")
         self.mtp.check_len(max(positions) + K + 1)
         width = K + 1
         if width > self.spec_width:
@@ -1534,16 +1686,37 @@ class Qwen35:
 
         这是 ``capture_verify`` 录下的主体；它读固定的校验缓冲区，并就地写
         ``verify_hidden``/``verify_logits``，所以图在重放时既不需要参数也不需要分配。
+
+        流水并行下这段和单行 ``_forward`` 用同一套走法：首段自己做嵌入，中间段收
+        ``[c, hidden]`` 再往下发；末段算完把 hidden 回给各段、各段自己算 logits。
+        不能让末段算完再广播 logits——那条路实测慢 22%（文档 §8.8）。
         """
-        x = self.embed.lookup(self.verify_toks)
+        c = self.verify_c
+        if self.pipe is None or self.pipe.rank == 0:
+            x = self.embed.lookup(self.verify_toks)
+        else:
+            x = self.pipe.await_relay((c, self.hidden), self.pipe.rank - 1,
+                                      _device, D)
         # 第 4 项：本请求的 mRoPE 偏移（是个缓冲区，图因此原样重放；``verify_pos``
-        # unchanged; ``verify_pos`` keeps addressing the KV slots).
-        # unchanged; ``verify_pos`` keeps addressing the KV slots).
+        # 继续寻址 KV 槽位）。
         ctx = (self.cos_tbl, self.sin_tbl, self.mask_idx, self.rope_delta1)
         for layer in self.layers:
             x = layer.verify(x, self.verify_pos, ctx)
-        self.verify_hidden.copy_(x)
-        self.verify_logits.copy_(self.lm_head.prefill(self.norm(x)))
+        if self.pipe is None:
+            self.verify_hidden.copy_(x)
+            self.verify_logits.copy_(self.lm_head.prefill(self.norm(x)))
+            return
+        nxt = self.pipe.rank + 1
+        if nxt >= self.pipe.world_size:
+            for dst in range(self.pipe.world_size - 1):
+                self.pipe.relay(x, dst)
+            h = x
+        else:
+            self.pipe.relay(x, nxt)
+            h = self.pipe.await_relay((c, self.hidden), self.pipe.world_size - 1,
+                                      _device, D)
+        self.verify_hidden.copy_(h)
+        self.verify_logits.copy_(self.lm_head.prefill(self.norm(h)))
 
     def capture_verify(self, c: int = 4, warmup: int = 3) -> None:
         """把 c token 的校验前向捕获进它自己的图。
@@ -1569,14 +1742,19 @@ class Qwen35:
         self.verify_toks = torch.zeros(c, dtype=torch.long, device=_device)
         self.verify_pos = self.verify_off.clone()
         self.verify_hidden = torch.zeros(c, hidden, dtype=D, device=_device)
-        self.verify_logits = torch.zeros(c, self.embed.shape[0], dtype=D, device=_device)
+        self.verify_logits = torch.zeros(c, self.vocab, dtype=D, device=_device)
         self._verify_graph = runtime.capture(self._verify_impl, warmup, reset=self.reset)
         self.reset()
 
     @torch.inference_mode()
-    def spec_step(self, logits_prev: torch.Tensor, K: int) -> tuple[list[int], torch.Tensor]:
-        """用 MTP 草拟 K 个 token，一次校验全部 K+1 个，接受匹配的前缀并把循环状态
-        倒回到那里。
+    def spec_step(self, logits_prev: torch.Tensor, K: int,
+                  draft_tokens: list[int] | None = None) -> tuple[list[int], torch.Tensor]:
+        """草拟 K 个 token，一次校验全部 K+1 个，接受匹配的前缀并把循环状态倒回
+        到那里。
+
+        草稿有两个来源：``draft_tokens`` 为空时用 checkpoint 自带的 MTP 头；给了就
+        用外部草稿器（独立的小模型）的产出。后者是 ``mtp_num_hidden_layers == 0``
+        的模型上唯一可用的路——它没有 MTP 头可草拟，但校验和回滚这两半是模型无关的。
 
         两半都是图重放，每个位置/载荷都留在设备上，所以每步唯一的主机往返就是接受
         判断——而调用方本来就要它才能吐出 token。
@@ -1586,6 +1764,7 @@ class Qwen35:
                 做种子。
             K: 要草拟多少份。随后在一次重放里校验 ``K + 1`` 个 token，所以 ``K + 1``
                 必须放得进捕获的校验宽度。
+            draft_tokens: 外部草稿器的 ``K`` 个 token；``None`` 表示用 MTP 头自己草拟。
 
         Returns:
             ``(accepted_token_ids, logits_after_prefix)``。主模型自己的下一个 token
@@ -1593,19 +1772,34 @@ class Qwen35:
             的那份。
 
         Raises:
-            AssertionError: 没有 MTP 头或没有校验图，或者 ``K + 1`` 超过 ``verify_c``。
-                两者都是配置错误：打开 MTP 头，并按引擎会用的最宽 ``K`` 捕获。
+            AssertionError: 没有校验图，或者 ``K + 1`` 超过 ``verify_c``。两者都是
+                配置错误：按引擎会用的最宽 ``K`` 捕获校验图。
+            RuntimeError: 既没给 ``draft_tokens``、checkpoint 又没有 MTP 头——
+                那种模型只能靠外部草稿器，调用方必须自己提供草稿。
+            ValueError: ``draft_tokens`` 的长度不是 ``K``。
         """
-        assert self.mtp is not None and self._verify_graph is not None, "MTP not available"
+        assert self._verify_graph is not None, "verification graph is not captured"
         assert K + 1 <= self.verify_c, f"K+1={K + 1} exceeds verify width {self.verify_c}"
 
         # 草拟：t0 是主模型自己的下一个 token，然后是 K 个串起来的 MTP 步。草稿器在
         # 和主模型相同的 mRoPE 位置上旋转，所以第一次重放之前先把请求的偏移拷过去。
 
-        self.mtp.pos.copy_(self.pos1).sub_(1)
-        self.mtp.rope_delta.copy_(self.rope_delta1)
         t0 = logits_prev.argmax()
-        self.mtp.draft(self.h_prev, t0, K, self.verify_toks[:K + 1])
+        if draft_tokens is None:
+            if self.mtp is None:
+                raise RuntimeError(
+                    "this checkpoint has no MTP head (mtp_num_hidden_layers = 0) "
+                    "and no external drafts were supplied")
+            self.mtp.pos.copy_(self.pos1).sub_(1)
+            self.mtp.rope_delta.copy_(self.rope_delta1)
+            self.mtp.draft(self.h_prev, t0, K, self.verify_toks[:K + 1])
+        else:
+            if len(draft_tokens) != K:
+                raise ValueError(f"draft_tokens has {len(draft_tokens)} entries, "
+                                 f"but K={K}")
+            self.verify_toks[0].copy_(t0)
+            self.verify_toks[1:K + 1].copy_(
+                torch.tensor(draft_tokens, dtype=torch.long, device=t0.device))
 
         # 校验：重放一次 c token 的图
         self.verify_pos.copy_(self.verify_off).add_(self.pos1)
@@ -1623,7 +1817,9 @@ class Qwen35:
         self.n_spec_steps += 1
         self.pos1.add_(j + 1)
         self.h_prev.copy_(self.verify_hidden[j])
-        self.mtp.pos.copy_(self.pos1).sub_(1)
+        # 外部草稿器不需要 MTP 头；只有 MTP 那条路才要同步草稿器的位置缓冲。
+        if self.mtp is not None:
+            self.mtp.pos.copy_(self.pos1).sub_(1)
         for layer in self.layers:
             mix = layer.mix
             if isinstance(mix, LinearAttn):

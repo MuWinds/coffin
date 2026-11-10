@@ -746,6 +746,10 @@ __global__ void moe_router_t(const XT* __restrict__ logits, int64_t* __restrict_
         }
     }
 
+    // 全量 softmax 保留在两条路径上。曾经试过「归一化时只对 top-k 做 softmax」
+    // （数学等价：分母被约掉，且 softmax 单调所以 TopK 不变），隔离测量里 router
+    // 42.2 -> 35.1 us，但端到端四档冒烟慢 2.6%。最可能的原因是两条路径并存把
+    // ``v[ELEMS]`` 那个寄存器数组顶到溢出，多出来的 local memory 流量吃掉收益。
     float m = ROUTER_NEG;
 #pragma unroll
     for (int i = 0; i < ELEMS; ++i) m = fmaxf(m, v[i]);
