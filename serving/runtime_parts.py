@@ -268,7 +268,8 @@ class RuntimeGenerationMixin:
         return seq, out_q
 
     def _blocking_generate(self, prompt_ids: list[int], max_new: int,
-                           temperature: float, deadline: float = 0.0, mm=None):
+                           temperature: float, deadline: float = 0.0, mm=None,
+                           on_submitted=None):
         """提交一个请求，一直收 token 到引擎说完成。
 
         Args:
@@ -288,6 +289,10 @@ class RuntimeGenerationMixin:
         """
         seq, out_q = self._submit(prompt_ids,
                                   self._sampling(max_new, temperature, deadline), mm=mm)
+        # 请求已经进引擎了：准入顺序从这一刻起固定，调用方可以放开那把罩住整次生成的锁。
+        # 锁只该保证「四个 rank 看到同一个顺序」，不该保证「整条生成独占」。
+        if on_submitted is not None:
+            on_submitted()
         t0 = time.time()
         out: list[int] = []
         while True:
@@ -370,7 +375,8 @@ class RuntimeGenerationMixin:
 
     @torch.inference_mode()
     def _generate(self, prompt_ids: list[int], max_new: int, temperature: float,
-                  deadline: float = 0.0, mm=None) -> tuple[list[int], float, float]:
+                  deadline: float = 0.0, mm=None,
+                  on_submitted=None) -> tuple[list[int], float, float]:
         """走引擎的批处理路径做非流式生成。
 
         Args:
@@ -387,7 +393,8 @@ class RuntimeGenerationMixin:
         Raises:
             RuntimeError: 引擎为这个请求报了错。
         """
-        return self._blocking_generate(prompt_ids, max_new, temperature, deadline, mm=mm)
+        return self._blocking_generate(prompt_ids, max_new, temperature, deadline,
+                                       mm=mm, on_submitted=on_submitted)
 
     @torch.inference_mode()
     def _spec_generate(self, prompt_ids: list[int], max_new: int, k: int,
@@ -738,7 +745,7 @@ class RuntimeChatMixin:
         return mm_ids, prompt, mm
 
     @torch.inference_mode()
-    def stream_chat(self, req: dict):
+    def stream_chat(self, req: dict, on_submitted=None):
         """把 ``chat`` 做成生成器：每步一行回复，供 SSE 客户端使用。
 
         先产出 ``type: "start"``（prompt 长度，以及 prompt 自身是否已经打开了
@@ -787,6 +794,9 @@ class RuntimeChatMixin:
                "image_tokens": len(mm) if mm is not None else 0}
         t0 = time.time()
         seq, out_q = self._submit(ids, self._sampling(n, temp, deadline), mm=mm)
+        # 与 _blocking_generate 同理：请求进了引擎，准入顺序已定，锁可以放开了。
+        if on_submitted is not None:
+            on_submitted()
         out: list[int] = []
         hold: list[int] = []             # 暂扣的 token id：UTF-8 编码不完整
         t1 = time.time()
@@ -837,7 +847,7 @@ class RuntimeChatMixin:
                "stopped": ("deadline" if deadline and time.time() >= deadline else None),
                "spec_k": 0, "spec": None}
 
-    def handle(self, req: dict) -> dict:
+    def handle(self, req: dict, on_submitted=None) -> dict:
         """处理一个非流式操作。
 
         诊断类操作（bench/profile/ops/spec/reload/reset）直接动模型，所以有请求
@@ -855,7 +865,7 @@ class RuntimeChatMixin:
         op = req.get("op", "ping")
         debug = op in ("reload", "reset", "bench", "profile", "ops", "spec")
         if not debug:
-            return self._handle_impl(req)
+            return self._handle_impl(req, on_submitted=on_submitted)
         engine = self.engine
         if op in ("bench", "profile", "ops", "spec") and engine is not None \
                 and engine.batching:
@@ -887,7 +897,7 @@ class RuntimeChatMixin:
         token = int(logits.argmax())
         return self.model.decode_step(token) if self.graph else self.model.logits(token)
 
-    def _handle_impl(self, req: dict) -> dict:
+    def _handle_impl(self, req: dict, on_submitted=None) -> dict:
         """分派一个操作并构造它的回复。
 
         每个回复都带同一组计时字段（``prefill_ms``、``decode_ms``、
@@ -961,7 +971,8 @@ class RuntimeChatMixin:
                 out, t_pre, t_dec = self._spec_generate(ids, n, k, deadline)
                 spec = self.model.spec_stats
             else:
-                out, t_pre, t_dec = self._generate(ids, n, temp, deadline)
+                out, t_pre, t_dec = self._generate(ids, n, temp, deadline,
+                                                   on_submitted=on_submitted)
             return {"ok": True, "tokens": out, "text": self.tok.decode(out),
                     "n_prompt": len(ids), "n_new": len(out), "max_new": n,
                     "window_full": window_full, "cached_tokens": self._cached_tokens(),
@@ -985,7 +996,8 @@ class RuntimeChatMixin:
                 out, t_pre, t_dec = self._spec_generate(ids, n, k, deadline, mm=mm)
                 spec = self.model.spec_stats
             else:
-                out, t_pre, t_dec = self._generate(ids, n, temp, deadline, mm=mm)
+                out, t_pre, t_dec = self._generate(ids, n, temp, deadline, mm=mm,
+                                                   on_submitted=on_submitted)
             raw = self.tok.decode(out, skip_special_tokens=False)
             full = prefix + raw
             thinking, answer = self._split(full, thinking_on)

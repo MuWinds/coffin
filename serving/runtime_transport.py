@@ -67,22 +67,43 @@ def _run_request(srv_model: "Server", req: dict):
 
 
 def _tp_worker(srv_model: "Server", dist) -> None:
-    """等待 rank 0 广播请求，并在本地推进同一份服务状态。"""
+    """等待 rank 0 广播请求，并在本地推进同一份服务状态。
+
+    ``broadcast_object_list`` 是集合操作：只要有一个 rank 还卡在上一条请求的生成里，
+    rank 0 的下一条广播就会阻塞，批处理于是永远凑不到第二条序列（实测 ``running``
+    恒为 1，四路并发请求的总墙钟正好是单条的 4 倍）。所以非 0 rank 的广播循环**不能**
+    等生成结束——生成交给独立线程，循环立刻回到下一次广播。
+
+    这只在流水并行下成立：``pp`` 的段间通信走 UDP（``PipeLink``），不占用 gloo 进程组，
+    生成线程因此不会和广播线程打乱集合顺序。``tp`` 每一步都要 gloo 归约，多个生成线程
+    会交错集合操作，所以它保持「整次生成独占广播循环」的老行为。
+    """
+    concurrent = os.environ.get("COFFIN_PARALLEL", "tp") == "pp"
     srv_model.start()
-    while True:
-        payload = [None]
-        dist.broadcast_object_list(payload, src=0)
-        req = payload[0]
+    pending: list[threading.Thread] = []
+
+    def _generate(req: dict) -> None:
+        """在独立线程里把一条请求跑完；非 0 rank 不使用返回值。"""
         try:
             result = None
             for result in _run_request(srv_model, req):
                 pass
             if isinstance(result, dict) and result.get("stopping"):
                 srv_model.stop()
-                break
         except Exception:
             srv_model.stop()
             raise
+
+    while True:
+        payload = [None]
+        dist.broadcast_object_list(payload, src=0)
+        req = payload[0]
+        if not concurrent:
+            _generate(req)
+            continue
+        thread = threading.Thread(target=_generate, args=(req,), daemon=True)
+        thread.start()
+        pending = [t for t in pending if t.is_alive()] + [thread]
     dist.destroy_process_group()
 
 def serve(model_dir: str, max_seq: int, bench: bool, sock_path: str,
@@ -215,12 +236,22 @@ def _serve_connection(srv_model: "Server", conn: socket.socket) -> None:
         if req.get("op") == "chat_stream":
             # 每个 token 一行回复，客户端才能把它们当作 SSE 转发出去。
             if tp:
-                with _TP_LOCK:
-                    import torch.distributed as dist
+                import torch.distributed as dist
 
+                released: list[bool] = []
+
+                def _release() -> None:
+                    if not released:
+                        released.append(True)
+                        _TP_LOCK.release()
+
+                _TP_LOCK.acquire()
+                try:
                     dist.broadcast_object_list([req], src=0)
-                    for line in srv_model.stream_chat(req):
+                    for line in srv_model.stream_chat(req, on_submitted=_release):
                         conn.sendall((json.dumps(line, ensure_ascii=False) + "\n").encode())
+                finally:
+                    _release()
             else:
                 for line in srv_model.stream_chat(req):
                     conn.sendall((json.dumps(line, ensure_ascii=False) + "\n").encode())
@@ -228,11 +259,25 @@ def _serve_connection(srv_model: "Server", conn: socket.socket) -> None:
                   flush=True)
             return
         if tp:
-            with _TP_LOCK:
-                import torch.distributed as dist
+            # 这把锁只该保证「四个 rank 看到同一个准入顺序」，不该保证「整条生成独占」：
+            # 罩住整次生成的话，引擎一步里永远只凑得到一条序列，--max-num-seqs 形同虚设。
+            # 所以广播与提交在锁内，收 token 在锁外——提交那一刻起顺序就已经固定了。
+            import torch.distributed as dist
 
+            released: list[bool] = []
+
+            def _release() -> None:
+                # 只放一次：正常路径由 on_submitted 放开，异常路径由 finally 兜底。
+                if not released:
+                    released.append(True)
+                    _TP_LOCK.release()
+
+            _TP_LOCK.acquire()
+            try:
                 dist.broadcast_object_list([req], src=0)
-                rep = srv_model.handle(req)
+                rep = srv_model.handle(req, on_submitted=_release)
+            finally:
+                _release()
         else:
             rep = srv_model.handle(req)
         rep["wall_ms"] = round((time.time() - t0) * 1000, 1)

@@ -150,8 +150,18 @@ class Scheduler:
         for seq in decode:
             seq.last_scheduled_step = self.step_idx
         if not self.chunked:
-            return decode, self._schedule_atomic()
-        return decode, self._schedule_chunked(self.max_num_batched_tokens - len(decode))
+            chunks = self._schedule_atomic()
+        else:
+            chunks = self._schedule_chunked(self.max_num_batched_tokens - len(decode))
+        # 预填充与解码不混在同一步。流水并行的段间 relay 要求各 rank 每步的转发
+        # 圈数严格相同，而混合批的行数是由「RUNNING 的行」加「分块的行」拼出来的：
+        # 只要有一个 rank 把某个分块算成解码行、另一个不算，圈数就对不上，另一端
+        # 在接收上超时——实测表现为 `[serve] engine step failed: timed out`，两次
+        # 失败间隔正好是 30 秒的接收超时，而 `running` 会一路涨到 max_num_seqs。
+        # 代价只是预填充那几步不产出 token，而 prompt 通常只有几十个 token。
+        if chunks:
+            decode = []
+        return decode, chunks
 
     def _schedule_atomic(self) -> list[PrefillChunk]:
         """整段准入一个 prompt，不看 token 预算。

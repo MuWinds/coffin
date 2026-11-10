@@ -597,10 +597,14 @@ def shard_weight(key: str, value, cfg: dict, rank: int, world_size: int):
     if isinstance(value, QWeight):
         # int8 的 scale 是逐输出行一个、与 K 长度无关，所以 K 轴（axis 1）切分时它原样
         # 跟着每个 rank 走；只有 N 轴切分才需要把它一起切开。
+        # 区间来自 ``ranges``（逐 rank 的 ``(lo, hi)``），不是某个循环里残留的 a/b：
+        # 早先这里直接用了 a、b，任何走到该分支的调用都会 NameError，而 PP 下永远
+        # 走不到这条分支，所以一直没暴露。
+        lo, hi = ranges[0]
         if axis == 0:
-            return QWeight(value.wq.narrow(0, a, b - a).contiguous(),
-                           value.scale.narrow(0, a, b - a).contiguous())
-        return QWeight(value.wq.narrow(1, a, b - a).contiguous(), value.scale)
+            return QWeight(value.wq.narrow(0, lo, hi - lo).contiguous(),
+                           value.scale.narrow(0, lo, hi - lo).contiguous())
+        return QWeight(value.wq.narrow(1, lo, hi - lo).contiguous(), value.scale)
     if not isinstance(value, W4A8Weight):
         return torch.cat([value.narrow(axis, a, b - a) for a, b in ranges], dim=axis).contiguous()
     if axis == 0:
