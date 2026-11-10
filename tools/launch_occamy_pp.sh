@@ -22,6 +22,9 @@ LOGDIR=${OCCAMY_LOGS:-$H/coffin-work/base/occamy_pp_logs}
 PORT=${OCCAMY_PORT:-29611}
 MAX_SEQ=${OCCAMY_SEQ:-4096}
 BLOCKS=${OCCAMY_BLOCKS:-256}
+# 并发序列数。KV 池要按 MAX_SEQ * MAX_SEQS / block_size 配块数，否则调度器
+# 拿不到块会卡住（表现为「no progress for N steps」）。
+MAX_SEQS=${OCCAMY_SEQS:-1}
 # 前缀缓存默认关：流水并行下它要搬线性注意力状态快照，而那套假设「一个 rank 持有整
 # 个模型」。先让「能不能吐字」成立，再单独验缓存的命中与正确性。
 if [ "${OCCAMY_PREFIX:-0}" = "1" ]; then PREFIX_FLAG=""; else PREFIX_FLAG="--no-prefix-cache"; fi
@@ -66,7 +69,7 @@ for ((R = 0; R < WORLD; R++)); do
         "$PY" -B -u -m entrypoints.cli.runtime --serve \
         --model "$MODEL" --sock "$SOCK" --max-seq "$MAX_SEQ" \
         --num-blocks "$BLOCKS" $PREFIX_FLAG \
-        --no-bench --no-vision --prefill-quantum 2048 --max-num-seqs 1 \
+        --no-bench --no-vision --prefill-quantum 2048 --max-num-seqs "$MAX_SEQS" \
         > "$LOGDIR/rank$R.log" 2>&1 &
     PIDS+=($!)
 done
