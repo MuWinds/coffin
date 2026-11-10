@@ -26,8 +26,11 @@ constexpr int64_t kAutoSlices = 0;
 // @param scale `[N]` fp32 逐列 scale。
 // @return `[N]` 或 `[M, N]`，dtype 同 `x`。
 torch::Tensor project(torch::Tensor wt, torch::Tensor x, torch::Tensor scale) {
-  return x.dim() == 1 ? gemv_kn_i8(wt, x, scale, 0, 0, 0, 0)
-                      : gemv_kn_i8_m(wt, x, scale, 0, 0);
+  if (x.dim() == 1) return gemv_kn_i8(wt, x, scale, 0, 0, 0, 0);
+  // ``GEMV.linear_m`` 在 ``M == 1`` 时会绕回一维入口（见 ops/gemv.py）：多行内核与
+  // 单行内核的累加方式不同，这里必须照抄那个判据，否则这一层与 Python 路径不逐位相同。
+  if (x.size(0) == 1) return gemv_kn_i8(wt, x[0], scale, 0, 0, 0, 0).unsqueeze(0);
+  return gemv_kn_i8_m(wt, x, scale, 0, 0);
 }
 
 }  // namespace
@@ -54,7 +57,14 @@ torch::Tensor moe_decode_block(torch::Tensor x,
 
   // 路由：投影 → 融合的 softmax/top-k/归一化。`logits` 与 `moe_router` 的两个输出都按
   // Python 那条路的形状走，`idx`/`rw` 由调用方复用。
-  torch::Tensor logits = project(router_wt, x, router_scale);
+  // 路由权重可能是稠密的（本模型的 ``mlp.gate.weight`` 就在 ``DENSE_SUFFIXES`` 里：量化
+  // 噪声会翻转专家选择）。``router_scale`` 为空表示稠密，走 bf16 的 ``gemv_kn``，
+  // 与 ``bops.linear`` 在稠密权重上的选择一致；否则走 int8 的 W8A16。
+  torch::Tensor logits =
+      router_scale.numel() == 0
+          ? (x.dim() == 1 ? gemv_kn(router_wt, x, 0, 0, 0)
+                          : gemv_kn(router_wt, x[0], 0, 0, 0).unsqueeze(0))
+          : project(router_wt, x, router_scale);
   moe_router(logits, idx, rw, top_k, true);
 
   // 共享专家：投影 → SwiGLU → 投影 → 门标量乘到**输出**上（位置错了不报错，只会按另一条
@@ -69,7 +79,9 @@ torch::Tensor moe_decode_block(torch::Tensor x,
 
   // 专家：一次分派算出分组与位置表，再两次分组 int8 投影。`tokens * top_k` 行全部有效，
   // 所以合并核可以直接把 top_k 行加权成一行，不需要外层再 reduce。
-  torch::Tensor flat_index = idx.reshape({-1});
+  // ``moe_router`` 写 int64（它自己的契约），而 ``moe_dispatch`` 只收 int32；Python 那条路
+  // 也是在包装层做这一次转换的，所以这里逐位等价。
+  torch::Tensor flat_index = idx.reshape({-1}).to(torch::kInt);
   moe_dispatch(flat_index, table, offsets, slot_pos, token_of_pos, slot_of_pos,
                disp_scratch, flat_index.numel(), experts, experts, top_k);
   torch::Tensor packed = x.index_select(0, token_of_pos);
@@ -80,7 +92,10 @@ torch::Tensor moe_decode_block(torch::Tensor x,
   torch::Tensor up = gu.narrow(1, inter, inter);
   silu_mul(gate, up, up);
   quant_act_i8(up, xq_dn, xs_dn);
-  torch::Tensor flat_weights = rw.reshape({-1}).index_select(0, slot_of_pos);
+  // ``moe_grouped_i8_merge`` 的逐行权重契约是 fp32；``rw`` 的 dtype 跟着 logits（bf16）。
+  // Python 包装层同样做这一步转换。
+  torch::Tensor flat_weights =
+      rw.reshape({-1}).index_select(0, slot_of_pos).to(torch::kFloat);
   torch::Tensor merged = moe_grouped_i8_merge(xq_dn, xs_dn, dn_w, dn_scale, offsets,
                                               flat_weights, out,
                                               slices > 0 ? slices : kAutoSlices);

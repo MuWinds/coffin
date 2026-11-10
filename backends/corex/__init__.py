@@ -866,6 +866,21 @@ def moe_dispatch(expert_idx: torch.Tensor, local_table: torch.Tensor,
 _DISP_SCRATCH: dict = {}
 
 
+def moe_decode_block(*args) -> torch.Tensor:
+    """decode 单层 MoE 块的合成入口：一次调用顶掉十余次 pybind 往返。
+
+    权重与全部中间缓冲都由调用方给，本入口不做分配——分配本身实测只有 1.4 us/次，
+    把它搬进 C++ 省不下那笔钱，而这个入口赚的是参数编组与 Python 包装那约 4 us/次。
+
+    Args:
+        *args: 与扩展入口同序的位置参数，见 ``kernels/corex_ops.h`` 的声明。
+
+    Returns:
+        最终 MoE 输出张量（即调用方传入的 ``out``）。
+    """
+    return _kernels().moe_decode_block(*args)
+
+
 def _disp_scratch(local_experts: int, device: torch.device) -> torch.Tensor:
     """取（必要时分配）分派内核的逐桶游标暂存。
 
@@ -2209,6 +2224,7 @@ _NATIVE: dict[str, OpFn] = {
     "moe_grouped": moe_grouped,
     "moe_grouped_gemm": moe_grouped_gemm,
     "moe_grouped_i8": moe_grouped_i8,    "moe_grouped_i8_merge": moe_grouped_i8_merge,
+    "moe_decode_block": moe_decode_block,
     "shared_gate_scale": shared_gate_scale,
     "attn_sparse": attn_sparse,
     "qsa_block_keys": qsa_block_keys,

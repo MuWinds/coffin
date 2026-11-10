@@ -245,6 +245,12 @@ class SparseMoE:
         self._grouped_gemm = (getattr(bops, "moe_grouped_gemm", None)
                               if "moe_grouped_gemm" in native else None)
         self._identity = None
+        #: decode 单行的整块驱动。它只省 pybind 编组与 Python 包装（约 4 us/次 x 17 次），
+        #: 分配与发射照付，所以上限是个位数百分比；``COFFIN_LAYER_DRIVER=1`` 才启用，
+        #: 便于同二进制 A/B。
+        self._block_driver = getattr(bops, "moe_decode_block", None)
+        self._block_w = None
+        self._block_b = None
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         """解码一步：``[H]`` 或 ``[B, H]`` 进，同形出。
@@ -290,6 +296,74 @@ class SparseMoE:
         """
         return self._forward(x, "wide")
 
+    def _build_block(self, flat: torch.Tensor) -> None:
+        """准备整块驱动的权重视图与复用缓冲；前提不满足时清空入口。
+
+        路由权重在本模型里是**稠密**的（``mlp.gate.weight`` 在 ``DENSE_SUFFIXES`` 里，
+        量化噪声会翻转专家选择），所以 ``router_scale`` 传一个零长度张量表示「走 bf16」。
+
+        Args:
+            flat: ``[1, H]`` 的归一化激活，用来定 dtype 与设备。
+        """
+        hidden = self.hidden
+        inter = self.inter
+        top_k = self.top_k
+        device = flat.device
+        bf16 = flat.dtype
+        group = getattr(self.shared_gate_up, "g", self.shared_gate_up)
+        sg = getattr(group, "q", None)
+        sd_proj = getattr(self.shared_down, "g", self.shared_down)
+        sd = getattr(sd_proj, "q", None)
+        if not isinstance(self.gate_up, QWeightMoE) or sg is None or sd is None:
+            self._block_driver = None
+            return
+        router_w = self.router.w
+        self._block_w = (
+            router_w.t().contiguous(),
+            torch.empty(0, dtype=torch.float32, device=device),
+            self.gate_up.wq, self.gate_up.scale,
+            self.down.wq, self.down.scale,
+            sg.wq.t().contiguous(), sg.scale,
+            sd.wq.t().contiguous(), sd.scale,
+            self._gate_w32.to(device), self._identity_table(device),
+        )
+        self._block_b = (
+            torch.empty((1, top_k), dtype=torch.int64, device=device),
+            torch.empty((1, top_k), dtype=bf16, device=device),
+            torch.empty(self.num_experts + 1, dtype=torch.int32, device=device),
+            torch.empty(top_k, dtype=torch.int32, device=device),
+            torch.empty(top_k, dtype=torch.int32, device=device),
+            torch.empty(top_k, dtype=torch.int32, device=device),
+            torch.empty(self.num_experts, dtype=torch.int32, device=device),
+            torch.empty((top_k, hidden), dtype=torch.int8, device=device),
+            torch.empty(top_k, dtype=torch.float32, device=device),
+            torch.empty((top_k, 2 * inter), dtype=bf16, device=device),
+            torch.empty((top_k, inter), dtype=torch.int8, device=device),
+            torch.empty(top_k, dtype=torch.float32, device=device),
+            torch.empty((1, hidden), dtype=bf16, device=device),
+            torch.empty((1, hidden), dtype=bf16, device=device),
+        )
+
+    def _decode_block(self, flat: torch.Tensor):
+        """用 C++ 驱动算 decode 一层的 MoE 块。
+
+        Args:
+            flat: ``[1, H]`` 的归一化激活。
+
+        Returns:
+            ``[1, H]``；开关关闭或前提不满足时返回 ``None``，由调用方走原编排。
+        """
+        driver = self._block_driver
+        if driver is None or os.environ.get("COFFIN_LAYER_DRIVER", "1") != "1":
+            return None
+        if flat.dim() != 2 or flat.shape[0] != 1 or flat.shape[1] != self.hidden:
+            return None
+        if self._block_w is None:
+            self._build_block(flat)
+            if self._block_w is None:
+                return None
+        return driver(flat, *self._block_w, *self._block_b, self.top_k, 0)
+
     def _forward(self, x: torch.Tensor, kind: str) -> torch.Tensor:
         """MoE 的公共主体：路由、专家分组、定序归并、加共享专家。
 
@@ -305,6 +379,10 @@ class SparseMoE:
         shape = x.shape
         flat = (x if x.dim() == 2 and x.shape[1] == self.hidden
                 else x.reshape(-1, self.hidden))
+        if kind == "decode":
+            driven = self._decode_block(flat)
+            if driven is not None:
+                return driven if driven.shape == shape else driven.reshape(shape)
         weights, index = self._route(x, kind)
         # 路由与分组按二维算（专家内核与 top-k 都只认二维），共享专家则保留原始
         # 维数交给投影：单条解码时 ``x`` 是一维，``GEMV`` 只在一维输入上给出
