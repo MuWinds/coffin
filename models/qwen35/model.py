@@ -1233,6 +1233,12 @@ class Qwen35:
         for row in sorted(pad):
             if self.pool is not None:
                 self.pool.assign(self._scratch_blocks[row], 0, row)
+                # 池里的表被改成了暂存块，所以 set_rows 的行表缓存必须一起失效。
+                # 不清的话：该行被新序列拿到、且它的块表恰好等于上一个占用者留在缓存里的
+                # 那一份（块回收后同序复用很常见），set_rows 就会跳过 assign_table，
+                # 于是这一行继续指向只有一块的暂存区——上下文超出一个块之后开始出错，
+                # 而按 seq.block_table 做的别名检查发现不了（Python 侧的列表是对的）。
+                self._row_tables.pop(int(row), None)
             self.token_in[row] = self._sentinel_token
             self.pos[row] = 0
             self.rope_delta[row] = 0
