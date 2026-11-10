@@ -40,6 +40,7 @@ Constraints:
 
 from __future__ import annotations
 
+import os
 import time
 from typing import TYPE_CHECKING
 
@@ -283,7 +284,8 @@ class ModelRunner:
             if self.pc.seq is not None:
                 seq.block_table = list(self.pc.seq.blocks)
             seq.prefill_cursor = seq.num_tokens
-        elif self.batching and self._row_owner:
+        elif self.batching and (self._row_owner
+                              or os.environ.get("COFFIN_NO_DENSE_PREFILL") == "1"):
             self.begin_prefill(seq)
             logits = self.prefill_chunk(seq, seq.num_tokens - seq.prefill_cursor)
             if logits is None:                       # pragma: no cover - defensive
@@ -410,9 +412,14 @@ class ModelRunner:
             bm.reserve((end - held + bs - 1) // bs + 1)
         bm.ensure_blocks(seq, end)
 
+        trace = os.environ.get("COFFIN_PREFILL_TRACE") == "1"
+        _t0 = time.perf_counter()
         model.move_linear_states(row, stage)
         bm.assign(seq.block_table, row=stage)
         model.pos[stage:stage + 1].fill_(cursor)
+        if trace:
+            print(f"[chunk] cursor={cursor} end={end} enter={(_t0 and (time.perf_counter() - _t0) * 1e3):.2f}ms",
+                  flush=True)
 
         # 两个粒度，出于两种不同的原因。`step` 是快照间隔向上取整到整块：循环
         # 状态只在块边界上可复用，而长 prompt 每个块打一次快照比权重还费显存，
@@ -428,20 +435,37 @@ class ModelRunner:
         done = cursor
         while done < end:
             stop = end if done - cursor >= head_len else min(done + step, end)
+            _t1 = time.perf_counter()
             logits = model.prefill(seq.token_ids[done:stop], chunk=self.cfg.chunk,
-                                   spec_row=spec_row, mm=seq.mm)
+                                   spec_row=spec_row, mm=seq.mm,
+                                   need_logits=(stop >= total))
+            _pf = (time.perf_counter() - _t1) * 1e3
             done = stop
             seq.prefill_cursor = done
             seq.num_cached_tokens = done
+            if trace:
+                _t2 = time.perf_counter()
             if radix is not None and done % bs == 0 and done <= prompt_len:
                 seq.prefill_states_at[done] = model.snapshot_linear_states(row=stage)
+                _snap = (time.perf_counter() - _t2) * 1e3 if trace else 0.0
                 self._trim_states(seq)
                 # 每个边界插一次，而不是等 prompt 跑完再插：预填充中途被抢占的
                 # 请求因此把已经算好的块留成可复用，第二个请求还能在第一个仍在
                 # 预填充时就从这些边界接上。
                 self._insert_prefix(seq, radix)
+                if trace:
+                    print(f"[chunk] span={done - (stop - (stop - done))}"
+                          f" prefill={_pf:.1f}ms snap={_snap:.1f}ms"
+                          f" insert={(time.perf_counter() - _t2) * 1e3 - _snap:.1f}ms",
+                          flush=True)
+            elif trace:
+                print(f"[chunk] prefill={_pf:.1f}ms (no boundary)", flush=True)
 
+        _t3 = time.perf_counter()
         model.move_linear_states(stage, row)
+        if trace:
+            print(f"[chunk] move_back={(time.perf_counter() - _t3) * 1e3:.2f}ms",
+                  flush=True)
         seq.num_scheduled_tokens = seq.prefill_cursor - seq.matched
         if seq.prefill_cursor < total:
             self.last_prefill_s = time.time() - t0

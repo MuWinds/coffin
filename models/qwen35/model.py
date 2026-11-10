@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 
 import torch
@@ -632,7 +633,8 @@ class Qwen35:
     @torch.no_grad()
     def prefill(self, tokens: list[int], chunk: int = 2048,
                 spec_row: int | None = None,
-                mm: "MMInput | None" = None) -> torch.Tensor:
+                mm: "MMInput | None" = None,
+                need_logits: bool = True) -> torch.Tensor | None:
         """用批处理 GEMM 处理整个 prompt；返回最后一个 token 的 logits。
 
         ``chunk`` 就是 GEMM 的 M，它很值钱：fp16 上的库 GEMM 在 M=256 时约
@@ -729,11 +731,17 @@ class Qwen35:
                     x = self.pipe.await_relay((c1 - c0, self.hidden),
                                               self.pipe.rank - 1, _device, D)
                 positions = torch.arange(pos0 + c0, pos0 + c1, device=_device)
+                _tl = time.perf_counter()
                 for layer in self.layers:
                     x = layer.prefill(x, positions, ctx, None)
+                _tlayers = (time.perf_counter() - _tl) * 1e3
                 nxt = self.pipe.rank + 1
                 if nxt < self.pipe.world_size:
                     self.pipe.relay(x, nxt)
+                if os.environ.get("COFFIN_PREFILL_TRACE") == "1":
+                    print(f"[pp-prefill] rank={self.pipe.rank} n={n} c=[{c0},{c1}) "
+                          f"layers={_tlayers:.1f}ms comm={self.pipe.comm_calls}",
+                          flush=True)
                 last_row = x[-1]
             if os.environ.get("COFFIN_PP_DEBUG"):
                 # 多块失步时唯一能定位的东西就是「每个 rank 各发/收了几次」。期望值：
@@ -742,6 +750,13 @@ class Qwen35:
                       f"chunks={(n + step - 1) // step} "
                       f"comm={self.pipe.comm_calls - comm_before}", flush=True)
             self.pos1.fill_(pos0 + n)
+            # 分块预填充的中间块不需要 logits：尾部的段间回传 + 每个 rank 各算一次
+            # ``lm_head``（2048 -> 248320 的 GEMV，权重 254 MB）在 2001 token 的 4 块
+            # 上实测要 3.5 s，而只有最后一块的结果会被用到。四 rank 的判定依据
+            # （``need_logits``）由调用方按同一个 ``stop == total`` 传下来，所以跳过时
+            # 各 rank 的 relay 圈数仍然一致。
+            if not need_logits:
+                return None
             if self.pipe.rank == self.pipe.world_size - 1:
                 for dst in range(self.pipe.world_size - 1):
                     self.pipe.relay(last_row.reshape(1, -1), dst)

@@ -31,6 +31,7 @@ Constraints:
 
 from __future__ import annotations
 
+import os
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -97,6 +98,14 @@ class Scheduler:
         #: 单调步计数器，一个步碰过的每条序列都会被打上。抢占评分读它来优先挑
         #: 已经被饿过的受害者。
         self.step_idx = 0
+        #: 孤身一条请求先让出的步数，用来等错峰到达的请求凑成一批。0 表示不让。
+        #: 真实流量的到达间隔常常只有几十毫秒，而一条孤身请求一旦被准入就走
+        #: 稠密单发并挡住后续准入，于是永远凑不出批。
+        self.batch_window = max(0, int(os.environ.get("COFFIN_BATCH_WINDOW", "0")))
+        #: 窗口的起始步号；``None`` 表示当前没有在等窗口。按步号而不是墙钟，
+        #: 因为四个 rank 各持一份调度器：墙钟差几毫秒就会出现一个 rank 判稠密、
+        #: 其余判分页，流水并行的段间 relay 圈数错位后接收端 30 秒超时。
+        self._window_since: int | None = None
 
     @property
     def chunked(self) -> bool:
@@ -154,6 +163,8 @@ class Scheduler:
         # 圈数对不上。所以正在跑稠密单条时不放行新请求，等它结束就恢复。
         if any(getattr(seq, "dense", False) for seq in self.running):
             return decode, []
+        if self._hold_for_batch():
+            return decode, []
         if not self.chunked:
             chunks = self._schedule_atomic()
         else:
@@ -167,6 +178,35 @@ class Scheduler:
         if chunks:
             decode = []
         return decode, chunks
+
+    def _hold_for_batch(self) -> bool:
+        """孤身一条请求是否该再让出这一步，好让错峰到达的请求凑成一批。
+
+        真实流量的到达间隔常常只有几十毫秒；而一条孤身请求一旦被准入，就会走
+        稠密单发并挡住后续准入，于是永远只有 ``running == 1``。所以这里在准入
+        之前先空转若干步，等一个更大的批：窗口内只要等到第二条，``waiting`` 就
+        会大于 1，立刻正常准入，两条一起走分页批处理。
+
+        判定按 :attr:`step_idx` 而不是墙钟：四个 rank 各持一份调度器，墙钟差
+        几毫秒就会出现一个 rank 判稠密、其余判分页，流水并行的段间 relay 圈数
+        因此错位，接收端 30 秒后超时。
+
+        Returns:
+            本步应该空转时返回 ``True``。
+        """
+        if self.batch_window <= 0 or self.running or not self.waiting:
+            self._window_since = None
+            return False
+        if len(self.waiting) > 1:
+            self._window_since = None
+            return False
+        if self._window_since is None:
+            self._window_since = self.step_idx
+            return True
+        if self.step_idx - self._window_since < self.batch_window:
+            return True
+        self._window_since = None
+        return False
 
     def _schedule_atomic(self) -> list[PrefillChunk]:
         """整段准入一个 prompt，不看 token 预算。
