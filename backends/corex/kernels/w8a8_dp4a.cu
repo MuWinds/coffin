@@ -2,10 +2,8 @@
 // @brief 手写 int8 GEMM：``[K, N]`` 原生布局的带宽路径、``[N, K]`` 布局的 ``__dp4a``
 //        计算路径、跨层共享 grid，以及三条量天花板用的微基准。
 //
-// Module: coffin/backends/corex/kernels。绑定成 ``w8a8_dp4a`` / ``w8a8_dp4a_nk`` /
-// ``w8a8_dp4a_groups`` / ``w8a8_dp4a_read`` / ``w8a8_dp4a_rate``。只被
-// 探针调用；定稿之后才由 ``backends/corex/__init__.py`` 当作
-// ``w8a8_gemm`` 的一条后端。
+// Module: coffin/backends/corex/kernels。``w8a8_dp4a_nk`` 供 Qwen3.5 投机校验的
+// W8A8 宽 M 投影使用；同文件的其他入口仍只供内核探针调用。
 //
 // 为什么手写：厂商库的 tile、lane 宽度和 grid 全都改不了，而三条方向里有两条（4 字节
 // lane / 512 列、跨层共享 grid）恰恰就是这三样。库在本卡上跑 49.07 TINT8-OPS/s
@@ -44,6 +42,7 @@
 #include "w8a8_dp4a.h"
 
 #include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime.h>
 
@@ -65,17 +64,17 @@ constexpr int kMaxGroups = 8;
 //: 归约类内核的线程数上限；共享归约数组按它静态分配。
 constexpr int kRedThreads = 256;
 
-//: ``nk`` 家族的块内几何。一个块 = ``NK_TX * NK_TY`` 个线程，每个线程一块
-//: ``NK_WM x NK_WN`` 的累加器，于是块覆盖 ``NK_BM x NK_BN`` 个输出。
+//: 默认 ``nk`` 块内几何。一个块 = ``NK_TX * NK_TY`` 个线程，每个线程一块
+//: ``NK_WM x NK_WN`` 的累加器，于是块覆盖 ``NK_BM x NK_BN`` 个输出。M=4/8
+//: 另用更窄的编译期几何，让每块只计算有效行，并把列块缩到 32。
 //:
 //: 这些数不是随手挑的：``NK_WM * NK_WN = 32`` 个 int32 累加器，加 4 条激活字和 8 条权重
 //: 字，寄存器账大约 60 个——在 255 的上限里留足余量给地址计算和循环变量。32 个累加器
 //: 同时意味着每个 k4 步只要 12 次 LDS 读就能喂 32 条 ``__dp4a``，读:算 = 1:2.7，LDS
 //: 带宽不会成为瓶颈（这是分块的全部意义）。
 //:
-//: ``NK_BM = 32`` 还有一个 M=1 上的后果：块覆盖 32 行而只有 1 行有数据，97% 的块空转。
-//: 这是寄存器分块的固有代价，而 ``nk`` 本来就是给预填充写的；M=1 上该走的是 ``kn``
-//: （见 ``kn_kernel`` 的注释，那里每字节一次乘加在 M=1 上完全藏在访存后面）。
+//: ``NK_BM = 32`` 的默认形状不适合小 M，所以 M=4/8 不走这个几何；M=1 上仍走
+//: ``kn``（见 ``kn_kernel`` 的注释，那里每字节一次乘加在 M=1 上完全藏在访存后面）。
 constexpr int NK_TX = 16;
 constexpr int NK_TY = 8;
 constexpr int NK_WM = 4;
@@ -89,15 +88,13 @@ constexpr int NK_BK = 64;
 constexpr int NK_AELEMS = NK_BM * NK_BK;
 constexpr int NK_BELEMS = NK_BN * NK_BK;
 
-//: LDS 行距。**必须带 padding**。
+//: A 保持普通行主序；B 在 LDS 中按 ``[j, tx, k]`` 排列。
 //:
-//: 行距取 ``NK_BK`` 时，相邻线程（``tx`` 差一）在 B 块上的地址差是
-//: ``NK_WN * NK_BK = 8 x 64 = 512`` 字节，正好是 128 个 4 字节字——也就是 LDS 的
-//: 32 bank 走了整数 4 轮，于是同一个 wavefront 里 16 个 ``tx`` 全部落在同一个 bank 上：
-//: 16 路冲突，每次 LDS 读要 16 拍。实测这个内核只跑到指令天花板的 1/13.7，正是这个
-//: 数字；把它当成「dp4a 不行」会得出完全错误的结论。
-//:
-//: 加 4 字节让行距变成 544 字节 = 136 字，136 mod 32 = 8，相邻线程散开到不同 bank。
+//: 只给 B 行距加 padding 并不能消掉冲突：相邻 ``tx`` 的逻辑行相差 ``NK_WN=8``，
+//: 行距为 17 个 4 字节字时 bank 仍只跨 8 格，16 个 ``tx`` 实际落在 4 个 bank 上。
+//: 将 ``tx`` 放到 LDS 行的内层后，相邻 ``tx`` 的 bank 跨度变为 17；它与 32 互质，
+//: 一条 ``bcol[j]`` 读取的 16 个不同地址各落一个 bank。行距必须是 17 个字，否则
+//: 16 个 ``tx`` 会在两个 bank 间冲突。
 constexpr int NK_LD = NK_BK + 4;
 constexpr int NK_AELEMS_PAD = NK_BM * NK_LD;
 constexpr int NK_BELEMS_PAD = NK_BN * NK_LD;
@@ -255,11 +252,22 @@ __global__ void kn_kernel(const int8_t* __restrict__ A, const int8_t* __restrict
 // @param K 归约长度；必须是 4 的倍数（``__dp4a`` 的原子粒度）。
 // @param N 输出列数。
 // @param ld_out 融合输出的行间距。
-template <int MODE>
+template <int MODE, int TX, int TY, int WM, int WN>
 __global__ void nk_kernel(const int8_t* __restrict__ A, const int8_t* __restrict__ WT,
                           int32_t* __restrict__ C, const float* __restrict__ xs,
                           const float* __restrict__ ws, void* __restrict__ out, int M, int K,
                           int N, int ld_out) {
+    constexpr int NK_TX = TX;
+    constexpr int NK_TY = TY;
+    constexpr int NK_WM = WM;
+    constexpr int NK_WN = WN;
+    constexpr int NK_BM = NK_TY * NK_WM;
+    constexpr int NK_BN = NK_TX * NK_WN;
+    constexpr int NK_THREADS = NK_TX * NK_TY;
+    constexpr int NK_AELEMS = NK_BM * NK_BK;
+    constexpr int NK_BELEMS = NK_BN * NK_BK;
+    constexpr int NK_AELEMS_PAD = NK_BM * NK_LD;
+    constexpr int NK_BELEMS_PAD = NK_BN * NK_LD;
     __shared__ int8_t atile[NK_AELEMS_PAD];
     __shared__ int8_t btile[NK_BELEMS_PAD];
 
@@ -291,7 +299,8 @@ __global__ void nk_kernel(const int8_t* __restrict__ A, const int8_t* __restrict
                                   : 0;
             *(int32_t*)(atile + r * NK_LD + c) = v;
         }
-        // 搬 B 块：``NK_BN`` 行 x ``NK_BK`` 字节，同一个形状。
+        // 全局仍按原始行主序连续读取；落入 LDS 时把逻辑行 ``tx * NK_WN + j``
+        // 重排成 ``j * NK_TX + tx``，让后面的每条 B 读取在 bank 间均匀分布。
         for (int idx = tid * 4; idx < NK_BELEMS; idx += NK_THREADS * 4) {
             const int r = idx / NK_BK;
             const int c = idx - r * NK_BK;
@@ -299,7 +308,8 @@ __global__ void nk_kernel(const int8_t* __restrict__ A, const int8_t* __restrict
             const int32_t v = (gn < N && k0 + c + 3 < k4)
                                   ? *(const int32_t*)(WT + (size_t)gn * K + k0 + c)
                                   : 0;
-            *(int32_t*)(btile + r * NK_LD + c) = v;
+            const int sr = (r % NK_WN) * NK_TX + r / NK_WN;
+            *(int32_t*)(btile + sr * NK_LD + c) = v;
         }
         __syncthreads();
 
@@ -315,7 +325,7 @@ __global__ void nk_kernel(const int8_t* __restrict__ A, const int8_t* __restrict
             }
 #pragma unroll
             for (int j = 0; j < NK_WN; ++j) {
-                bcol[j] = *(const int32_t*)(btile + (tx * NK_WN + j) * NK_LD + l);
+                bcol[j] = *(const int32_t*)(btile + (j * NK_TX + tx) * NK_LD + l);
             }
 #pragma unroll
             for (int i = 0; i < NK_WM; ++i) {
@@ -569,12 +579,28 @@ void kn_launch(const int8_t* A, const int8_t* W, int32_t* C, const float* xs, co
 using NkFn = void (*)(const int8_t*, const int8_t*, int32_t*, const float*, const float*, void*,
                       int, int, int, int, cudaStream_t);
 
-template <int MODE>
+template <int MODE, int TX, int TY, int WM, int WN>
 void nk_launch(const int8_t* A, const int8_t* WT, int32_t* C, const float* xs, const float* ws,
                void* out, int M, int K, int N, int ld_out, cudaStream_t stream) {
-    const dim3 grid((N + NK_BN - 1) / NK_BN, (M + NK_BM - 1) / NK_BM);
-    const dim3 block(NK_TX, NK_TY);
-    nk_kernel<MODE><<<grid, block, 0, stream>>>(A, WT, C, xs, ws, out, M, K, N, ld_out);
+    constexpr int BM = TY * WM;
+    constexpr int BN = TX * WN;
+    const dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+    const dim3 block(TX, TY);
+    nk_kernel<MODE, TX, TY, WM, WN>
+        <<<grid, block, 0, stream>>>(A, WT, C, xs, ws, out, M, K, N, ld_out);
+}
+
+template <int TX, int TY, int WM, int WN>
+void nk_launch_mode(int mode, const int8_t* A, const int8_t* WT, int32_t* C, const float* xs,
+                    const float* ws, void* out, int M, int K, int N, int ld_out,
+                    cudaStream_t stream) {
+    if (mode == kOutBf16) {
+        nk_launch<kOutBf16, TX, TY, WM, WN>(A, WT, C, xs, ws, out, M, K, N, ld_out, stream);
+    } else if (mode == kOutF32) {
+        nk_launch<kOutF32, TX, TY, WM, WN>(A, WT, C, xs, ws, out, M, K, N, ld_out, stream);
+    } else {
+        nk_launch<kOutNone, TX, TY, WM, WN>(A, WT, C, xs, ws, out, M, K, N, ld_out, stream);
+    }
 }
 
 // @brief 按 ``MODE`` 取 ``kn`` 启动器。
@@ -738,14 +764,22 @@ torch::Tensor w8a8_dp4a_nk(torch::Tensor a, torch::Tensor wt, torch::Tensor c,
                            c10::optional<torch::Tensor> out, torch::Tensor xs, torch::Tensor ws,
                            int64_t threads) {
     TORCH_CHECK(a.dim() == 2 && wt.dim() == 2 && c.dim() == 2, "A, WT and C must all be 2-D");
+    TORCH_CHECK(a.is_cuda() && wt.is_cuda() && c.is_cuda() && xs.is_cuda() && ws.is_cuda(),
+                "all tensors must be CUDA tensors");
     TORCH_CHECK(a.scalar_type() == torch::kChar && wt.scalar_type() == torch::kChar,
                 "operands must be int8");
     TORCH_CHECK(c.scalar_type() == torch::kInt, "accumulator must be int32");
     TORCH_CHECK(a.is_contiguous() && wt.is_contiguous() && c.is_contiguous(),
                 "contiguous operands required");
+    TORCH_CHECK(wt.device() == a.device() && c.device() == a.device() &&
+                    xs.device() == a.device() && ws.device() == a.device(),
+                "all tensors must be on the same device");
+    TORCH_CHECK(xs.dim() == 1 && ws.dim() == 1 && xs.is_contiguous() && ws.is_contiguous(),
+                "xs and ws must be contiguous vectors");
     const int M = (int)a.size(0);
     const int K = (int)a.size(1);
     const int N = (int)wt.size(0);
+    TORCH_CHECK(M > 0 && K > 0 && N > 0, "A, WT and C dimensions must be non-empty");
     TORCH_CHECK((int)wt.size(1) == K, "WT must be [N, K]: got ", wt.sizes(), " for K = ", K);
     TORCH_CHECK((int)c.size(0) == M && (int)c.size(1) == N, "C ", c.sizes(), " must be [", M,
                 ", ", N, "]");
@@ -762,24 +796,33 @@ torch::Tensor w8a8_dp4a_nk(torch::Tensor a, torch::Tensor wt, torch::Tensor c,
     if (out.has_value()) {
         TORCH_CHECK(out->scalar_type() == torch::kBFloat16 || out->scalar_type() == torch::kFloat,
                     "fused output must be bf16 or fp32");
+        TORCH_CHECK(out->is_cuda() && out->device() == a.device(),
+                    "fused output must be on the operands' CUDA device");
+        TORCH_CHECK(out->dim() == 2 && (int)out->size(0) == M && (int)out->size(1) == N,
+                    "fused output must have shape [", M, ", ", N, "]");
+        TORCH_CHECK(out->stride(1) == 1 && out->stride(0) >= N,
+                    "fused output must have unit column stride and row stride >= N");
     }
 
+    const c10::cuda::CUDAGuard guard(a.device());
     const int mode = out_mode_of(out);
     const int ld = out.has_value() ? (int)out->stride(0) : N;
     const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
     void* outp = out.has_value() ? (void*)out->data_ptr() : nullptr;
-    if (mode == kOutBf16) {
-        nk_launch<kOutBf16>(a.data_ptr<int8_t>(), wt.data_ptr<int8_t>(),
-                            c.data_ptr<int32_t>(), xs.data_ptr<float>(),
-                            ws.data_ptr<float>(), outp, M, K, N, ld, stream);
-    } else if (mode == kOutF32) {
-        nk_launch<kOutF32>(a.data_ptr<int8_t>(), wt.data_ptr<int8_t>(),
-                           c.data_ptr<int32_t>(), xs.data_ptr<float>(), ws.data_ptr<float>(),
-                           outp, M, K, N, ld, stream);
+    // M=4/8 时改用精确行块；默认 32 行块会让无效行也完整执行 dp4a，且 128 列块
+    // 给小输出形状的网格块数偏少。显式传 128 则保留默认几何，便于同机对照。
+    if (threads <= 0 && M == 4) {
+        nk_launch_mode<8, 4, 1, 4>(mode, a.data_ptr<int8_t>(), wt.data_ptr<int8_t>(),
+                                   c.data_ptr<int32_t>(), xs.data_ptr<float>(),
+                                   ws.data_ptr<float>(), outp, M, K, N, ld, stream);
+    } else if (threads <= 0 && M == 8) {
+        nk_launch_mode<8, 8, 1, 4>(mode, a.data_ptr<int8_t>(), wt.data_ptr<int8_t>(),
+                                   c.data_ptr<int32_t>(), xs.data_ptr<float>(),
+                                   ws.data_ptr<float>(), outp, M, K, N, ld, stream);
     } else {
-        nk_launch<kOutNone>(a.data_ptr<int8_t>(), wt.data_ptr<int8_t>(),
-                            c.data_ptr<int32_t>(), xs.data_ptr<float>(),
-                            ws.data_ptr<float>(), outp, M, K, N, ld, stream);
+        nk_launch_mode<NK_TX, NK_TY, NK_WM, NK_WN>(
+            mode, a.data_ptr<int8_t>(), wt.data_ptr<int8_t>(), c.data_ptr<int32_t>(),
+            xs.data_ptr<float>(), ws.data_ptr<float>(), outp, M, K, N, ld, stream);
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out.has_value() ? *out : c;

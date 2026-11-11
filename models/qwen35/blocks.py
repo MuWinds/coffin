@@ -277,7 +277,8 @@ class Layer:
         x = x + h
         return x + self.mlp.prefill(self.post_ln(x))
 
-    def batch(self, x: torch.Tensor, positions: torch.Tensor, ctx) -> torch.Tensor:
+    def batch(self, x: torch.Tensor, positions: torch.Tensor, ctx,
+              verify_slot: int | None = None) -> torch.Tensor:
         """为静态批解码步运行本层。
 
         投影走批处理（所有行共用一次权重读取）；有状态的 mixer 仍跑现有的逐行
@@ -287,12 +288,13 @@ class Layer:
             x: 每个解码序列一行，``[B, hidden]``。
             positions: 每行下一个绝对位置，``[B]``。
             ctx: 该批对应的 mixer 输入。
+            verify_slot: 仅校验时传入当前日志位置，让线性注意力保存秩一更新。
 
         Returns:
             ``[B, hidden]`` 的输出状态。
         """
         if self.type == "linear_attention":
-            h = self.mix.batch(self.in_ln(x))
+            h = self.mix.batch(self.in_ln(x), record_slot=verify_slot)
         else:
             h = self.mix.batch(self.in_ln(x), positions, ctx)
         x = x + h

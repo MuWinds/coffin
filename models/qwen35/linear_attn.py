@@ -8,13 +8,12 @@ Module: ``coffin/models/qwen35``。另一种逐层注意力在这里是 ``full_a
 
 全部状态（卷积窗口、fp32 循环状态）都在固定缓冲区里就地更新，所以解码步可以被
 图捕获。解码跑融合的 prologue 和 delta 入口；预填充用 ``ops.delta`` 里的分块
-形式；校验逐 token 跑解码入口，并在每个 token 之后拷贝状态，因为被拒绝的草稿
-必须回滚。
+形式；校验保留初始状态并记录每步的秩一更新，提交时按接受前缀重放。
 
 Constraints:
-    * 循环状态 ``[num_v, dk, dv]`` 在 fp32 下每层 2 MB，没有闭式回退办法。所以
-      每个能回滚的路径（单流校验、批量校验）都在每个 token 前后把状态拷进
-      ``ckpt_*``；少了这份拷贝，被拒的草稿会让 mixer 永久领先于 KV。
+    * 循环状态 ``[num_v, dk, dv]`` 在 fp32 下每层 2 MB，没有闭式回退办法。校验
+      只保存一次基态和每步的 ``(k, u, exp(g))``；接受长度确定后从基态重放，避免
+      为每个候选保留一份稠密状态。
     * 前缀引擎导出快照时，状态必须和全注意力的 KV *一起*打快照，否则复用的前缀
       会把一个请求的 key 配上从未见过它们的递推状态。
     * 缓冲区按容量定尺寸、批行打头，单流预填充/校验跑在 ``prefill_row``（最后
@@ -27,6 +26,8 @@ Constraints:
 """
 
 from __future__ import annotations
+
+import os
 
 import torch
 
@@ -119,49 +120,52 @@ class LinearAttn:
         # 这里用 fp32 容器会改变到达投影的激活 dtype，即便数值相等也算数值改动。
         self.normed_out = torch.zeros(rows, self.num_v, self.dv, dtype=D, device=_device)
 
-        # 投机校验回滚用的逐 token 状态快照（每个校验 token 一个槽位；否则循环状态
-        # 无法倒回）。``CKPT`` 限定校验宽度也是同一个理由。
-        self.ckpt_state = torch.zeros(CKPT, self.num_v, self.dk, self.dv,
-                                      dtype=torch.float32, device=_device)
+        # 单流校验保留一个基态和每步的秩一更新日志，日志比稠密状态小约 64 倍。
+        self.verify_state_base = torch.empty(self.num_v, self.dk, self.dv,
+                                             dtype=torch.float32, device=_device)
+        self.verify_record = torch.empty(CKPT, self.num_v, self.dk + self.dv + 1,
+                                         dtype=torch.float32, device=_device)
         self.ckpt_conv = torch.zeros(CKPT, self.conv_dim, self.kernel - 1,
                                      dtype=torch.float32, device=_device)
-        # 批量投机校验按 (行, 校验 token) 保存一份快照；只有打开批量投机解码时才由
-        # ``enable_verify_batch`` 分配，因为 fp32 状态每层每份快照就是 2 MB。
-        self.ckpt_state_b: torch.Tensor | None = None
+        # 批量投机只在启用时分配基态与更新日志；卷积仍保留短窗口快照。
+        self.verify_state_base_b: torch.Tensor | None = None
+        self.verify_record_b: torch.Tensor | None = None
         self.ckpt_conv_b: torch.Tensor | None = None
 
     def enable_verify_batch(self, capacity: int, width: int) -> None:
-        """为每个批行的 ``width`` 份回滚快照腾出空间。
+        """为每个批行的校验基态、更新日志和卷积窗口快照腾出空间。
 
         Args:
             capacity: 解码行数。
-            width: 每行的校验 token 数，即快照槽位数。单流路径也要持有时，不得
-                超过 ``CKPT``。
+            width: 每行的校验 token 数，即更新日志的容量。
 
         Returns:
             无。形状不变时是幂等的，所以第一次 ``enable_verify_batch`` 之后再调一次
             不会在图下面重新分配。
         """
-        if self.ckpt_state_b is not None and self.ckpt_state_b.shape[:2] == (capacity, width):
+        if (self.verify_state_base_b is not None
+                and self.verify_state_base_b.shape[0] == capacity
+                and self.verify_record_b.shape[:2] == (capacity, width)):
             return
-        self.ckpt_state_b = torch.zeros(capacity, width, self.num_v, self.dk, self.dv,
-                                        dtype=torch.float32, device=_device)
+        self.verify_state_base_b = torch.empty(capacity, self.num_v, self.dk, self.dv,
+                                              dtype=torch.float32, device=_device)
+        self.verify_record_b = torch.empty(capacity, width, self.num_v,
+                                           self.dk + self.dv + 1,
+                                           dtype=torch.float32, device=_device)
         self.ckpt_conv_b = torch.zeros(capacity, width, self.conv_dim, self.kernel - 1,
                                        dtype=torch.float32, device=_device)
 
-    def snapshot_batch(self, rows: int, slot: int) -> None:
-        """把 ``rows`` 行当前的循环（以及卷积）状态存进一个槽位。
+    def snapshot_conv_batch(self, rows: int, slot: int) -> None:
+        """保存批量校验位置上的短卷积窗口。
 
         Args:
             rows: 要拷贝的前导行数；其余不动，所以没装满的 bucket 不必为闲置行
                 付代价。
-            slot: 校验宽度内的快照下标，也就是此刻已经接受了多少个草稿 token。
+            slot: 校验位置下标。
 
         Returns:
-            无。这是批量校验唯一能倒回的手段，所以必须在每个校验 token 之后、下一
-            个 token 就地改写状态之前调用。
+            无。卷积窗口很短，逐位置保存比提交时重新跑卷积便宜。
         """
-        self.ckpt_state_b[:rows, slot].copy_(self.state[:rows])
         self.ckpt_conv_b[:rows, slot].copy_(self.conv_state[:rows])
 
     def verify_batch_step(self, qkv: torch.Tensor, z: torch.Tensor,
@@ -169,15 +173,14 @@ class LinearAttn:
         """从已投影好的 qkv/z/b/a 出发，为 ``B`` 行处理一个校验 token。
 
         跑的是和解码步相同的 conv / prologue / delta 入口（各自一次批处理 launch，
-        所以每行仍保持贪心解码的数字），并在该 token 之后给循环状态打快照——
-        ``slot`` 就是它在校验宽度内的下标，也就是到此为止的草稿都被接受时的回滚点。
+        所以每行仍保持贪心解码的数字），并记录该 token 的秩一更新。
 
         Args:
             qkv: 该 token 的融合 q/k/v 投影，``[B, conv_dim]``。
             z: 门投影，``[B, vdim]``。
             b: beta logits，``[B, num_v]``。
             a: 衰减 logits，``[B, num_v]``。
-            slot: 快照下标，``0 <= slot < width``。
+            slot: 日志下标，``0 <= slot < width``。
 
         Returns:
             ``[B, vdim]``，``out_proj`` 之前的输出，好让调用方对整个 bucket 只做
@@ -195,29 +198,33 @@ class LinearAttn:
                                   self.q_pro[:rows], self.k_pro[:rows],
                                   self.v_pro[:rows], self.beta[:rows],
                                   self.g[:rows], self.qscale, self.rep)
-        bops.delta_batch(self.q_pro[:rows], self.k_pro[:rows],
-                         self.v_pro[:rows], self.beta[:rows], self.g[:rows],
-                         self.state[:rows], self.delta_out[:rows])
-        self.snapshot_batch(rows, slot)
+        if slot == 0:
+            self.verify_state_base_b[:rows].copy_(self.state[:rows])
+        bops.delta_batch_record(self.q_pro[:rows], self.k_pro[:rows],
+                                self.v_pro[:rows], self.beta[:rows], self.g[:rows],
+                                self.state[:rows], self.delta_out[:rows],
+                                self.verify_record_b[:rows], slot)
+        self.snapshot_conv_batch(rows, slot)
         # 所有行只发一次门控归一化（RMSNormGated 入口内部把 (行, 头) 对摊平）；原来
         # 这里的逐行循环每 token 要约 8 次 launch，主导了一次前向校验的耗时。
         zz = z.reshape(rows, self.num_v, self.dv).contiguous()
         proj_in = self.norm(self.delta_out[:rows], zz)
         return proj_in.reshape(rows, self.vdim)
 
-    def restore_batch(self, row: int, slot: int) -> None:
-        """把某一行的循环状态倒回校验期间打下的快照。
+    def restore_batch(self, row: int, slot: int, commit_state: bool = True) -> None:
+        """把某一行的循环状态和卷积窗口恢复到已接受前缀。
 
         Args:
             row: 要恢复的解码行。
-            slot: 被接受的快照下标；它之后的东西靠把状态移回去就丢掉了，这也是
-                校验循环无条件打快照、而不是只在接受时打的原因。
+            slot: 已接受的最后一个校验位置。
+            commit_state: 若完整校验窗口都被接受，状态已经是目标状态时跳过重放。
 
         Returns:
-            无。只有状态和卷积窗口会动——KV 缓存是按位置索引的，靠位置计数器
-            倒回。
+            无。KV 缓存按位置索引，靠位置计数器倒回。
         """
-        self.state[row].copy_(self.ckpt_state_b[row, slot])
+        if commit_state:
+            bops.delta_commit(self.verify_state_base_b[row], self.verify_record_b[row],
+                              self.state[row], slot + 1)
         self.conv_state[row].copy_(self.ckpt_conv_b[row, slot])
 
     def enable_batching(self, capacity: int, prefill_row: int) -> None:
@@ -257,7 +264,8 @@ class LinearAttn:
         self.g = torch.zeros(rows, self.num_v, dtype=torch.float32, device=_device)
         self.normed_out = torch.zeros(rows, self.num_v, self.dv, dtype=D, device=_device)
 
-    def batch(self, x: torch.Tensor, *_) -> torch.Tensor:
+    def batch(self, x: torch.Tensor, *_,
+              record_slot: int | None = None) -> torch.Tensor:
         """``x`` [B, hidden] -> [B, hidden]：批处理投影，逐行递推。
 
         delta 规则沿位置串行、且按序列有状态，所以递推数学仍是逐行的——但用上批
@@ -268,6 +276,7 @@ class LinearAttn:
             x: 解码行输入，``[B, hidden]``。
             *_: 吸收掉的层参数占位，好让 ``Layer.batch`` 用同一签名调用每种
                 mixer。
+            record_slot: 校验时的更新日志位置；普通批量解码传 ``None``。
 
         Returns:
             ``[B, hidden]``，经批处理 ``out_proj`` 之后的层输出。
@@ -294,9 +303,18 @@ class LinearAttn:
                                   self.neg_expA, self.dt_bias,
                                   self.q_pro[:B], self.k_pro[:B], self.v_pro[:B],
                                   self.beta[:B], self.g[:B], self.qscale, self.rep)
-        bops.delta_batch(self.q_pro[:B], self.k_pro[:B], self.v_pro[:B],
-                         self.beta[:B], self.g[:B], self.state[:B],
-                         self.delta_out[:B])
+        if record_slot is None:
+            bops.delta_batch(self.q_pro[:B], self.k_pro[:B], self.v_pro[:B],
+                             self.beta[:B], self.g[:B], self.state[:B],
+                             self.delta_out[:B])
+        else:
+            if record_slot == 0:
+                self.verify_state_base_b[:B].copy_(self.state[:B])
+            bops.delta_batch_record(
+                self.q_pro[:B], self.k_pro[:B], self.v_pro[:B], self.beta[:B],
+                self.g[:B], self.state[:B], self.delta_out[:B],
+                self.verify_record_b[:B], record_slot)
+            self.snapshot_conv_batch(B, record_slot)
         # 门控归一化按 (行, value 头) 做，权重是 [dv]，所以折不进批处理入口——这个
         # 循环是每行一次 launch，不是每个头一次。
         for i in range(B):
@@ -375,20 +393,19 @@ class LinearAttn:
         return self.out_proj(out)
 
     def verify(self, x: torch.Tensor) -> torch.Tensor:
-        """``x`` [C, hidden] -> [C, hidden]，并逐 token 打状态快照。
+        """``x`` [C, hidden] -> [C, hidden]，并逐 token 记录状态更新。
 
-        线性层上的数学和 ``prefill`` 相同，但那 C 个 token 走的是*解码*入口
-        （融合 prologue + delta），所以每个 token 之后的循环状态可以拷进
-        ``ckpt_state``/``ckpt_conv``，草稿被拒时再恢复。投影是批处理的，C 个 token
-        因此大约只花一次权重读取。
+        线性层上的数学和 ``prefill`` 相同，但那 C 个 token 走的是解码入口。循环状态
+        只保存一份基态，递推入口同时记录 ``k``、更新向量和衰减；卷积窗口仍按 token
+        保存，因为它比循环状态小得多。投影是批处理的，C 个 token 因此大约只花一次
+        权重读取。
 
         Args:
             x: 草稿 token 的输入，``[C, hidden]``，``C <= CKPT``。
 
         Returns:
-            ``[C, hidden]``，经 ``out_proj`` 之后的层输出。``ckpt_state[i]`` 里的
-            快照是第 ``i`` 个 token *之后*的状态，所以前 ``i+1`` 份草稿都被接受时，
-            它同时就是续跑点。
+            ``[C, hidden]``，经 ``out_proj`` 之后的层输出；``verify_record`` 的每行
+            足以从校验开始的基态重建对应前缀状态。
         """
         C = x.shape[0]
         # [C, conv_dim], [C, vdim], [C, nv]x2
@@ -398,27 +415,78 @@ class LinearAttn:
         proj_in = torch.empty(C, self.vdim, dtype=D, device=_device)
         pr = self.prefill_row
         conv_state, conv_out = self.conv_state[pr], self.conv_out[pr]
-        q_pro, k_pro, v_pro = self.q_pro[pr], self.k_pro[pr], self.v_pro[pr]
-        beta, g = self.beta[pr], self.g[pr]
-        state, delta_out = self.state[pr], self.delta_out[pr]
+        state = self.state[pr]
+        # 三算子拼法只作同二进制 A/B：它与融合入口逐位等价，但每层每 token 多三次
+        # 发射。融合省下的主要是主机提交时间，所以两者要在同一进程、同一批缓冲区上
+        # 交替量——跨进程比较会被这张卡 3.4% 的端到端散布吃掉。
+        chain = os.environ.get("COFFIN_DELTA_CHAIN") == "1"
+        self.verify_state_base.copy_(state)
         for i in range(C):
             bops.conv1d_silu(self.conv_w, qkv[i], conv_state, conv_out)
             q, k, v = conv_out.split([self.kdim, self.kdim, self.vdim])
-            bops.delta_prologue(q.reshape(self.num_k, self.dk),
-                                k.reshape(self.num_k, self.dk),
-                                v.reshape(self.num_v, self.dv), b[i], a[i],
-                                self.neg_expA, self.dt_bias,
-                                q_pro, k_pro, v_pro, beta, g,
-                                self.qscale, self.rep)
-            bops.delta(q_pro, k_pro, v_pro, beta, g, state, delta_out)
-            # 门控归一化按 value 头做：权重是 [dv] 而不是 [vdim]，所以状态必须保持
-            # [num_v, dv]。先摊平会让内核去要 num_v*dv 个权重，然后冲出那个 [dv]
-            # 张量的末尾。
-            proj_in[i] = self.norm(delta_out,
-                                   z[i].reshape(self.num_v, self.dv)).reshape(self.vdim)
-            self.ckpt_state[i].copy_(state)
+            if chain:
+                self._verify_chain(q, k, v, b[i], a[i], z[i], state, proj_in[i], i)
+            else:
+                bops.delta_normed(
+                    q.reshape(self.num_k, self.dk), k.reshape(self.num_k, self.dk),
+                    v.reshape(self.num_v, self.dv), b[i], a[i], self.neg_expA,
+                    self.dt_bias, z[i].reshape(self.num_v, self.dv), self.norm.w,
+                    state, proj_in[i].view(self.num_v, self.dv), self.qscale, self.rep,
+                    self.verify_record, i)
             self.ckpt_conv[i].copy_(conv_state)
         return self.out_proj.prefill(proj_in)
+
+    def _verify_chain(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                      b_row: torch.Tensor, a_row: torch.Tensor, z_row: torch.Tensor,
+                      state: torch.Tensor, out_row: torch.Tensor, slot: int) -> None:
+        """用三算子拼法处理一个校验 token，作为融合入口的同二进制对照。
+
+        这条链就是 :func:`delta_normed` 融合掉的那条：头预处理、秩一递推、门控
+        归一化各一次发射。算术相同而中间缓冲不同，所以两条路必须逐位对拍，
+        「结果接近」不足以证明替换成立。
+
+        Args:
+            q: 卷积输出里的查询段，``[kdim]``。
+            k: 卷积输出里的键段，``[kdim]``。
+            v: 卷积输出里的值段，``[vdim]``。
+            b_row: 该 token 的 beta logits，``[num_v]`` bf16。
+            a_row: 该 token 的衰减 logits，``[num_v]`` bf16。
+            z_row: 该 token 的输出门，``[vdim]``。
+            state: 本层循环状态，``[num_v, dk, dv]`` fp32，原地更新。
+            out_row: 归一化结果的去向，``[vdim]``。
+            slot: 更新日志中的校验位置。
+
+        Returns:
+            无；状态、更新日志与 ``out_row`` 都原地写入。
+        """
+        pr = self.prefill_row
+        bops.delta_prologue(q.reshape(self.num_k, self.dk),
+                            k.reshape(self.num_k, self.dk),
+                            v.reshape(self.num_v, self.dv), b_row, a_row,
+                            self.neg_expA, self.dt_bias,
+                            self.q_pro[pr], self.k_pro[pr], self.v_pro[pr],
+                            self.beta[pr], self.g[pr], self.qscale, self.rep)
+        bops.delta_record(self.q_pro[pr], self.k_pro[pr], self.v_pro[pr],
+                          self.beta[pr], self.g[pr], state, self.delta_out[pr],
+                          self.verify_record, slot)
+        out_row.copy_(self.norm(self.delta_out[pr],
+                                z_row.reshape(self.num_v, self.dv)).reshape(self.vdim))
+
+    def restore_verify(self, slot: int, commit_state: bool = True) -> None:
+        """恢复单流校验接受前缀的循环状态和卷积窗口。
+
+        Args:
+            slot: 已接受的最后一个校验位置。
+            commit_state: 若完整校验窗口都被接受，状态已经是目标状态时跳过重放。
+
+        Returns:
+            无。全注意力 KV 按位置索引，靠位置计数器倒回。
+        """
+        pr = self.prefill_row
+        if commit_state:
+            bops.delta_commit(self.verify_state_base, self.verify_record,
+                              self.state[pr], slot + 1)
+        self.conv_state[pr].copy_(self.ckpt_conv[slot])
 
     def prefill_project(self, x: torch.Tensor):
         """预填充的投影半边：``[C, hidden]`` -> 原始 ``(qkv, z, b, a)``。

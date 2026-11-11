@@ -99,24 +99,27 @@ def _run_py(code: str, env: dict | None = None) -> subprocess.CompletedProcess:
 
 
 class OpTableTest(unittest.TestCase):
-    """``Ops`` 就是契约：33 个名字、固定顺序、不许有被悄悄丢掉的条目。"""
+    """``Ops`` 就是契约：40 个名字、固定顺序、不许有被悄悄丢掉的条目。"""
 
     def test_names_are_the_contract_ops(self):
         """改名或漏名对每个调用点都是契约破坏，所以元组按字面钉死。"""
         self.assertEqual(Ops.NAMES, (
-            "linear", "linear_m", "linear_prefill", "moe_grouped",
-            "moe_grouped_gemm", "moe_grouped_i8", "moe_grouped_i8_merge", "moe_dispatch","moe_grouped_gemm", "moe_grouped_i8", "moe_dispatch", "moe_router",
+            "linear", "linear_m", "linear_m_verify", "linear_prefill",
+            "moe_grouped",
+            "moe_grouped_gemm", "moe_grouped_i8", "moe_dispatch", "moe_router",
             "rms_norm", "add_rms_norm", "rms_norm_gated", "kv_quant", "silu_mul",
             "rope_apply",
             "attn_decode", "attn_paged", "attn_paged_batch", "attn_paged_multi_q",
             "attn_sparse", "qsa_block_keys",
             "conv1d_silu", "conv1d_silu_seq", "conv1d_silu_batch",
             "delta_prologue", "delta_prologue_batch", "delta_prep_seq",
-            "delta", "delta_batch", "delta_normed",
+            "delta", "delta_record", "delta_batch",
+            "delta_batch_record", "delta_commit", "delta_normed",
             "triangular_solve",
             "hyper_norm", "hyper_down", "hyper_up",
+            "moe_grouped_i8_merge", "moe_decode_block", "shared_gate_scale",
         ))
-        self.assertEqual(len(Ops.NAMES), 33)
+        self.assertEqual(len(Ops.NAMES), 40)
 
     def test_names_match_the_dataclass_fields_in_order(self):
         """这条元组是手工维护的，可能与 dataclass 漂移；这里就是漂移报警器。"""

@@ -462,7 +462,8 @@ __global__ void delta_normed_kernel(const float* __restrict__ q,
                                     const ZT* __restrict__ z,
                                     const uint16_t* __restrict__ nw,
                                     float* __restrict__ st, OT* __restrict__ out,
-                                    float qscale, int dk, int dv, int rep) {
+                                    float* __restrict__ record, int record_slot,
+                                    float qscale, int nv, int dk, int dv, int rep) {
     const int vh = blockIdx.x;
     const int t = (int)threadIdx.x;
     const int kh = vh / rep;
@@ -471,6 +472,9 @@ __global__ void delta_normed_kernel(const float* __restrict__ q,
     float* red = sh;                          // [2 * blockDim.x] 归约树
     float* qs = sh + 2 * (int)blockDim.x;     // [dk] 本头归一化后的查询
     float* ks = qs + dk;                      // [dk] 本头归一化后的键
+    float* head_record = record
+        ? record + ((size_t)record_slot * nv + vh) * (dk + dv + 1)
+        : nullptr;
 
     // 头预处理：与 ``prologue_kernel`` 相同的算术、相同的单趟归约和相同的树配对。
     const float qv = t < dk ? q[(size_t)kh * dk + t] : 0.f;
@@ -484,6 +488,7 @@ __global__ void delta_normed_kernel(const float* __restrict__ q,
     if (t < dk) {
         qs[t] = qv * rsqrtf(ssq + L2_EPS) * qscale;
         ks[t] = kv * rsqrtf(ssk + L2_EPS);
+        if (head_record) head_record[t] = ks[t];
     }
     __shared__ float rate_sh;
     __shared__ float decay_sh;
@@ -494,6 +499,7 @@ __global__ void delta_normed_kernel(const float* __restrict__ q,
         // 都只在 fp32 下把乘积舍入一次。改成每线程各做一遍，只会把一次超越函数重复 128
         // 次而毫无收益。
         decay_sh = __expf(neg_expA[vh] * softplus(av));
+        if (head_record) head_record[dk + dv] = decay_sh;
     }
     __syncthreads();
 
@@ -513,10 +519,18 @@ __global__ void delta_normed_kernel(const float* __restrict__ q,
         const float value = v[(size_t)vh * dv + t];
         float* column = st + (size_t)vh * dk * dv + t;
         float kv_mem = 0.f;
+        // 两段 dk 递推各 128 次迭代，实测是标量下标与控制流指令的主要来源：不展开时
+        // 每 wavefront 3,453 条标量 + 337 条控制流，八倍展开后降到 1,561/116，
+        // 设备时间 93.8 -> 62.5 us（-33%），状态、输出与更新日志逐位不变。再往上到
+        // 十六倍只多 2.3%，寄存器却从 23 继续涨，不值得。
+        // 只复制标量下标与分支，不改 4 B 列访问：16 B 宽访存在这张卡上有 2.4 倍惩罚。
+#pragma unroll 8
         for (int i = 0; i < dk; ++i) {
             kv_mem = fmaf(column[(size_t)i * dv] * decay, ks[i], kv_mem);
         }
         const float delta = (value - kv_mem) * rate;
+        if (head_record) head_record[dk + t] = delta;
+#pragma unroll 8
         for (int i = 0; i < dk; ++i) {
             const float s = fmaf(ks[i], delta, column[(size_t)i * dv] * decay);
             column[(size_t)i * dv] = s;
@@ -561,7 +575,8 @@ __global__ void delta_normed_kernel(const float* __restrict__ q,
 void launch_normed(const float* q, const float* k, const float* v, const uint16_t* b,
                    const uint16_t* a, const float* neg_expA, const float* dt_bias,
                    const void* z, bool z_bf16, const uint16_t* nw, float* st, void* out,
-                   bool out_bf16, float qscale, int nv, int dk, int dv, int rep,
+                   bool out_bf16, float* record, int record_slot, float qscale,
+                   int nv, int dk, int dv, int rep,
                    int threads, cudaStream_t stream) {
     const size_t smem = (size_t)(2 * threads + 2 * dk) * sizeof(float);
     // 四种实例化，因为目的地 dtype 和门的存储 dtype 是两个独立的选择。四种算的是同一套
@@ -570,21 +585,25 @@ void launch_normed(const float* q, const float* k, const float* v, const uint16_
         if (z_bf16) {
             delta_normed_kernel<uint16_t, uint16_t><<<nv, threads, smem, stream>>>(
                 q, k, v, b, a, neg_expA, dt_bias, (const uint16_t*)z, nw, st,
-                reinterpret_cast<uint16_t*>(out), qscale, dk, dv, rep);
+                reinterpret_cast<uint16_t*>(out), record, record_slot, qscale,
+                nv, dk, dv, rep);
         } else {
             delta_normed_kernel<uint16_t, float><<<nv, threads, smem, stream>>>(
                 q, k, v, b, a, neg_expA, dt_bias, (const float*)z, nw, st,
-                reinterpret_cast<uint16_t*>(out), qscale, dk, dv, rep);
+                reinterpret_cast<uint16_t*>(out), record, record_slot, qscale,
+                nv, dk, dv, rep);
         }
     } else {
         if (z_bf16) {
             delta_normed_kernel<float, uint16_t><<<nv, threads, smem, stream>>>(
                 q, k, v, b, a, neg_expA, dt_bias, (const uint16_t*)z, nw, st,
-                reinterpret_cast<float*>(out), qscale, dk, dv, rep);
+                reinterpret_cast<float*>(out), record, record_slot, qscale,
+                nv, dk, dv, rep);
         } else {
             delta_normed_kernel<float, float><<<nv, threads, smem, stream>>>(
                 q, k, v, b, a, neg_expA, dt_bias, (const float*)z, nw, st,
-                reinterpret_cast<float*>(out), qscale, dk, dv, rep);
+                reinterpret_cast<float*>(out), record, record_slot, qscale,
+                nv, dk, dv, rep);
         }
     }
 }
@@ -804,17 +823,21 @@ void delta_prep_seq(torch::Tensor qkv, torch::Tensor b, torch::Tensor a,
 // @param st [nv, dk, dv] fp32 状态，原地更新。
 // @param out [nv, dv] bf16 或 fp32。bf16 是那条链产出的、也是 ``out_proj`` 读的，所以除非
 //        调用方需要更宽的容器，就传它；fp32 目的地装的是同一个 bf16 值而不是更精确的值。
+// @param record 可选的 ``[width, nv, dk + dv + 1]`` fp32 更新日志；非空时写入归一化 key、
+//        本步更新向量和衰减因子，供校验提交时重放。
+// @param slot 更新日志中的位置。
 // @param qscale ``dk ** -0.5``。
 // @param rep 每个键头对应的值头数。
 // @return ``out``，便于调用链串接。
 // @throws c10::Error dtype、形状或头的几何与内核的索引方式矛盾。几何那一种是值得读的：
 //         它意味着 ``dk`` 或 ``dv`` 宽到那条链会用不同的块大小做归约，于是本内核无法复现
 //         它的舍入，调用方必须继续走三算子路径。
-torch::Tensor delta_normed(torch::Tensor q, torch::Tensor k, torch::Tensor v,
-                           torch::Tensor b, torch::Tensor a,
-                           torch::Tensor neg_expA, torch::Tensor dt_bias,
-                           torch::Tensor z, torch::Tensor nw, torch::Tensor st,
-                           torch::Tensor out, double qscale, int64_t rep) {
+static torch::Tensor delta_normed_impl(torch::Tensor q, torch::Tensor k, torch::Tensor v,
+                                       torch::Tensor b, torch::Tensor a,
+                                       torch::Tensor neg_expA, torch::Tensor dt_bias,
+                                       torch::Tensor z, torch::Tensor nw, torch::Tensor st,
+                                       torch::Tensor out, double qscale, int64_t rep,
+                                       torch::Tensor record, int64_t slot) {
     TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous(),
                 "q/k/v must be contiguous");
     TORCH_CHECK(q.scalar_type() == torch::kFloat && k.scalar_type() == torch::kFloat
@@ -847,6 +870,16 @@ torch::Tensor delta_normed(torch::Tensor q, torch::Tensor k, torch::Tensor v,
     TORCH_CHECK(z.size(0) == nv && z.size(1) == dv, "norm gate must be [nv, dv]");
     TORCH_CHECK(nw.numel() == (int64_t)dv, "norm gain must have dv elements");
     TORCH_CHECK(out.size(0) == nv && out.size(1) == dv, "out view must be [nv, dv]");
+    float* record_ptr = nullptr;
+    if (record.defined()) {
+        TORCH_CHECK(record.is_cuda() && record.device() == st.device()
+                    && record.is_contiguous() && record.scalar_type() == torch::kFloat
+                    && record.dim() == 3 && record.size(1) == nv
+                    && record.size(2) == dk + dv + 1
+                    && slot >= 0 && slot < record.size(0),
+                    "record must be contiguous [width, nv, dk + dv + 1] fp32 on the state device");
+        record_ptr = record.data_ptr<float>();
+    }
 
     // 每个值头一个 block，它的大小由被替代的那条链固定，而不是在这里选。比
     // ``head_threads(dk)`` 更宽或更窄的 block 会用与 ``prologue_kernel`` 不同的伙伴去求 q/k
@@ -868,8 +901,28 @@ torch::Tensor delta_normed(torch::Tensor q, torch::Tensor k, torch::Tensor v,
                   neg_expA.data_ptr<float>(), dt_bias.data_ptr<float>(),
                   z.data_ptr(), z.scalar_type() == torch::kBFloat16,
                   reinterpret_cast<const uint16_t*>(nw.data_ptr()), st.data_ptr<float>(),
-                  out.data_ptr(), out.scalar_type() == torch::kBFloat16, (float)qscale,
+                  out.data_ptr(), out.scalar_type() == torch::kBFloat16, record_ptr,
+                  (int)slot, (float)qscale,
                   nv, dk, dv, (int)rep, threads, c10::cuda::getCurrentCUDAStream());
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
+}
+
+torch::Tensor delta_normed(torch::Tensor q, torch::Tensor k, torch::Tensor v,
+                           torch::Tensor b, torch::Tensor a,
+                           torch::Tensor neg_expA, torch::Tensor dt_bias,
+                           torch::Tensor z, torch::Tensor nw, torch::Tensor st,
+                           torch::Tensor out, double qscale, int64_t rep) {
+    return delta_normed_impl(q, k, v, b, a, neg_expA, dt_bias, z, nw, st, out,
+                             qscale, rep, torch::Tensor(), 0);
+}
+
+torch::Tensor delta_normed_record(torch::Tensor q, torch::Tensor k, torch::Tensor v,
+                                  torch::Tensor b, torch::Tensor a,
+                                  torch::Tensor neg_expA, torch::Tensor dt_bias,
+                                  torch::Tensor z, torch::Tensor nw, torch::Tensor st,
+                                  torch::Tensor out, double qscale, int64_t rep,
+                                  torch::Tensor record, int64_t slot) {
+    return delta_normed_impl(q, k, v, b, a, neg_expA, dt_bias, z, nw, st, out,
+                             qscale, rep, record, slot);
 }

@@ -19,6 +19,8 @@
 
 #pragma once
 
+#include "w8a8_dp4a.h"
+
 #include <torch/extension.h>
 
 #include <cstdint>
@@ -500,12 +502,30 @@ void delta_prep_seq(torch::Tensor qkv, torch::Tensor b, torch::Tensor a,
 torch::Tensor delta(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor beta,
                     torch::Tensor g, torch::Tensor st, torch::Tensor out);
 
+// @brief 推进状态并记录 ``k``、更新向量和衰减，供投机校验提交前缀。
+// @param record ``[C, heads, dk + dv + 1]`` fp32。
+// @param slot 当前校验位置。
+torch::Tensor delta_record(torch::Tensor q, torch::Tensor k, torch::Tensor v,
+                           torch::Tensor beta, torch::Tensor g, torch::Tensor st,
+                           torch::Tensor out, torch::Tensor record, int64_t slot);
+
 // @brief 批处理 delta 步：每个批条目一行独立状态。
 //
 // @return ``out`` [B, heads, dv]，便于调用链串接。
 torch::Tensor delta_batch(torch::Tensor q, torch::Tensor k, torch::Tensor v,
                           torch::Tensor beta, torch::Tensor g, torch::Tensor st,
                           torch::Tensor out);
+
+// @brief 批量推进状态并记录 ``k``、更新向量和衰减。
+// @param record ``[B, C, heads, dk + dv + 1]`` fp32。
+// @param slot 当前校验位置。
+torch::Tensor delta_batch_record(torch::Tensor q, torch::Tensor k, torch::Tensor v,
+                                 torch::Tensor beta, torch::Tensor g, torch::Tensor st,
+                                 torch::Tensor out, torch::Tensor record, int64_t slot);
+
+// @brief 从基态重放更新日志的前缀并提交到 ``st``。
+torch::Tensor delta_commit(torch::Tensor base, torch::Tensor record,
+                           torch::Tensor st, int64_t steps);
 
 // @brief 单解码 token 的预处理、递推与门控归一化，一次启动。
 //
@@ -534,6 +554,16 @@ torch::Tensor delta_normed(torch::Tensor q, torch::Tensor k, torch::Tensor v,
                            torch::Tensor neg_expA, torch::Tensor dt_bias,
                            torch::Tensor z, torch::Tensor nw, torch::Tensor st,
                            torch::Tensor out, double qscale, int64_t rep);
+
+// @brief 单 token 融合递推并记录秩一更新，供投机校验提交前缀。
+// @param record ``[width, nv, dk + dv + 1]`` fp32。
+// @param slot 当前校验位置。
+torch::Tensor delta_normed_record(torch::Tensor q, torch::Tensor k, torch::Tensor v,
+                                  torch::Tensor b, torch::Tensor a,
+                                  torch::Tensor neg_expA, torch::Tensor dt_bias,
+                                  torch::Tensor z, torch::Tensor nw, torch::Tensor st,
+                                  torch::Tensor out, double qscale, int64_t rep,
+                                  torch::Tensor record, int64_t slot);
 
 // 三角求解：分块 delta 规则唯一需要的库操作，也是本卡 cuSOLVER 答不了的那一个。
 

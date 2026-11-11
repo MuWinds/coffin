@@ -863,11 +863,11 @@ class RuntimeChatMixin:
             不是异常：传输层会把它变成一行客户端能读的普通 JSON。
         """
         op = req.get("op", "ping")
-        debug = op in ("reload", "reset", "bench", "profile", "ops", "spec")
+        debug = op in ("reload", "reset", "bench", "profile", "ops", "spec", "verify")
         if not debug:
             return self._handle_impl(req, on_submitted=on_submitted)
         engine = self.engine
-        if op in ("bench", "profile", "ops", "spec") and engine is not None \
+        if op in ("bench", "profile", "ops", "spec", "verify") and engine is not None \
                 and engine.batching:
             return {"ok": False, "error": "diagnostic ops need the single-stream "
                                           "engine (run without --max-num-seqs)"}
@@ -1087,4 +1087,236 @@ class RuntimeChatMixin:
                               "us": round(r.self_device_time_total / n, 1),
                               "pct": round(100 * r.self_device_time_total / total, 1)}
                              for r in rows]}
+        if op == "verify":
+            return self._verify_ab(req)
         return {"ok": False, "error": f"unknown op {op!r}"}
+
+    def _verify_ab(self, req: dict) -> dict:
+        """量一次整模型校验前向（``c`` 个候选 token）的融合开/关差异。
+
+        ``COFFIN_DELTA_CHAIN`` 选择线性注意力的实现。无 graph 的 CoreX 路径会在每次
+        replay 时重新执行 Python 分支；支持 graph capture 的路径则按分支分别捕获。
+        两边从同一 prompt 与 token 位置开始，并在同一进程里交替测量。
+
+        Args:
+            req: 请求字典；``c`` 是校验宽度（2/4/8），``n`` 是每轮重放次数，
+                ``prompt`` 可选，用来填 KV（校验位置紧跟它的末尾）。带 ``drafts``
+                时改跑完整的投机步循环，见 :meth:`_spec_loop`。
+
+        Returns:
+            ``{ok, c, n, same_logits, maxdiff, chain_off: {...}, chain_on: {...}}``。
+            每种写法报 host 提交与设备排空的 µs/次、kernel top rows 和目标 kernel。
+        """
+        if req.get("drafts") is not None:
+            return self._spec_loop(req)
+        c = int(req.get("c", 4))
+        n = int(req.get("n", 30))
+        ids = self.tok.encode(req.get("prompt") or "The quick brown fox")
+        m = self.model
+        if m._verify_graph is None or m.verify_c != c:
+            os.environ["COFFIN_DELTA_CHAIN"] = "0"
+            m.capture_verify(c)
+        captured_mode = None
+
+        def prepare(chain_on: bool) -> None:
+            """选择指定分支并把相同输入铺进校验缓冲。"""
+            nonlocal captured_mode
+            os.environ["COFFIN_DELTA_CHAIN"] = "1" if chain_on else "0"
+            # CoreX 没有 graph 时 replay 会重新执行 Python 分支；有 graph 才需按模式重捕获。
+            if getattr(m._verify_graph, "captured", False) and captured_mode != chain_on:
+                m._verify_graph = None
+                sync()
+                m.capture_verify(c)
+                captured_mode = chain_on
+            m.reset()
+            logits = m.prefill(ids)
+            base = int(m.pos1)
+            tok = int(logits.argmax())
+            m.verify_toks.fill_(tok)
+            m.verify_pos.copy_(torch.arange(base, base + c, dtype=m.verify_pos.dtype,
+                                            device=m.verify_pos.device))
+
+        def replay(chain_on: bool) -> None:
+            os.environ["COFFIN_DELTA_CHAIN"] = "1" if chain_on else "0"
+            m._verify_graph.replay()
+
+        # 逐位对拍：两边都从「重置 + 同一 prompt 预填充」出发，分别执行对应分支。
+        outs = {}
+        for chain_on in (False, True):
+            prepare(chain_on)
+            replay(chain_on)
+            sync()
+            outs[chain_on] = (m.verify_logits.clone(), m.verify_hidden.clone())
+        same_logits = bool(torch.equal(outs[False][0], outs[True][0]))
+        maxdiff = float((outs[False][0].float() - outs[True][0].float()).abs().max())
+
+        def timeit(chain_on: bool) -> tuple[float, float]:
+            """量一轮：host 侧从进循环到最后一个 launch 返回，设备侧到排空。"""
+            for _ in range(3):
+                replay(chain_on)
+            sync()
+            t0 = time.perf_counter()
+            for _ in range(n):
+                replay(chain_on)
+            t1 = time.perf_counter()
+            sync()
+            t2 = time.perf_counter()
+            return (t1 - t0) / n * 1e6, (t2 - t0) / n * 1e6
+
+        def census(chain_on: bool, steps: int = 8) -> dict:
+            """在一个独立窗口里数这次校验重放了多少个内核。
+
+            profiler 会把墙钟拉长，所以它单独开窗，绝不和上面的干净窗口混用。
+            """
+            replay(chain_on)
+            sync()
+            with torch.profiler.profile(
+                    activities=profiler_activities(device=True),
+                    with_stack=False) as prof:
+                for _ in range(steps):
+                    replay(chain_on)
+                sync()
+            calls = 0
+            rows = []
+            for row in prof.key_averages():
+                us = getattr(row, "self_device_time_total", None)
+                if us is None:
+                    us = getattr(row, "self_cuda_time_total", 0)
+                if not us:
+                    continue
+                calls += int(row.count)
+                rows.append({"kernel": str(row.key)[:56],
+                             "calls": round(int(row.count) / steps, 1),
+                             "us": round(float(us) / steps, 1)})
+            rows.sort(key=lambda item: -item["us"])
+            target_totals = {"gemv_m": {"calls": 0.0, "us": 0.0},
+                             "moe_grouped_i8": {"calls": 0.0, "us": 0.0}}
+            for item in rows:
+                name = item["kernel"].lower()
+                if any(token in name for token in
+                       ("gemv_kn_m", "gemv_kn_i8_m", "gemv_i8_m")):
+                    group = target_totals["gemv_m"]
+                    group["calls"] += item["calls"]
+                    group["us"] += item["us"]
+                if "moe_grouped_i8" in name:
+                    group = target_totals["moe_grouped_i8"]
+                    group["calls"] += item["calls"]
+                    group["us"] += item["us"]
+            target_totals = {name: {"calls": round(value["calls"], 1),
+                                   "us": round(value["us"], 1)}
+                             for name, value in target_totals.items()}
+            target_rows = [item for item in rows if any(
+                name in item["kernel"].lower() for name in
+                ("gemv_kn_m", "gemv_kn_i8_m", "gemv_i8_m", "moe_grouped_i8"))]
+            return {"n_kernel_per_step": round(calls / steps, 1),
+                    "rows": rows[:8], "targets": target_rows,
+                    "target_totals": target_totals}
+
+        def med(pairs, index: int) -> float:
+            """两轮的中位数；两轮时就是平均，保留小数以便看点散布。"""
+            values = sorted(pair[index] for pair in pairs)
+            mid = len(values) // 2
+            return (values[mid] if len(values) % 2 else 0.5 * (values[mid - 1] + values[mid]))
+
+        # 交替两轮 capture 顺序，控制时钟与热状态带来的偏差。
+        runs = {"chain_off": [], "chain_on": []}
+        kernel_census = {}
+        for order in ((False, True), (True, False)):
+            for chain_on in order:
+                prepare(chain_on)
+                key = "chain_on" if chain_on else "chain_off"
+                if key not in kernel_census:
+                    kernel_census[key] = census(chain_on)
+                runs[key].append(timeit(chain_on))
+
+        os.environ["COFFIN_DELTA_CHAIN"] = "0"
+
+        off = {"host_us": round(med(runs["chain_off"], 0), 1),
+               "dev_us": round(med(runs["chain_off"], 1), 1),
+               "launches_per_token_per_layer": 1,
+               "kernels": kernel_census["chain_off"]}
+        on = {"host_us": round(med(runs["chain_on"], 0), 1),
+              "dev_us": round(med(runs["chain_on"], 1), 1),
+              "launches_per_token_per_layer": 4,
+              "kernels": kernel_census["chain_on"]}
+        rank = os.environ.get("RANK", "0")
+        for tag, row in (("chain=0", off), ("chain=1", on)):
+            print(f"[verify] rank={rank} c={c} n={n} {tag} "
+                  f"host_us={row['host_us']} dev_us={row['dev_us']} "
+                  f"launch/token/layer={row['launches_per_token_per_layer']} "
+                  f"n_kernel/step={row['kernels']['n_kernel_per_step']}",
+                  flush=True)
+            for item in row["kernels"]["rows"][:4]:
+                print(f"[verify-row] rank={rank} {tag} calls={item['calls']} "
+                      f"us={item['us']} {item['kernel']}", flush=True)
+            for item in row["kernels"]["targets"]:
+                print(f"[verify-target] rank={rank} {tag} calls={item['calls']} "
+                      f"us={item['us']} {item['kernel']}", flush=True)
+            print(f"[verify-family] rank={rank} {tag} "
+                  f"{row['kernels']['target_totals']}", flush=True)
+        m.reset()
+        return {"ok": True, "c": c, "n": n, "graph": bool(self.graph),
+                "same_logits": same_logits, "maxdiff": maxdiff,
+                "chain_off": off, "chain_on": on,
+                "host_delta_us": round(off["host_us"] - on["host_us"], 1),
+                "dev_delta_us": round(off["dev_us"] - on["dev_us"], 1),
+                "raw": {k: [[round(p[0], 1), round(p[1], 1)] for p in v]
+                        for k, v in runs.items()}}
+
+    def _spec_loop(self, req: dict) -> dict:
+        """用外部草稿流跑一遍完整的 C 宽投机步循环，只量真实的一步。
+
+        每一步都是 ``spec_step``：草稿进校验图、按接受前缀提交、其余从基态重放
+        回滚。选哪种递推写法由 ``COFFIN_DELTA_CHAIN`` 定，所以同一份草稿流可以
+        跑两遍做 A/B——两遍的 token 序列必须逐位相同，否则差异不是性能而是行为。
+
+        Args:
+            req: ``drafts`` 是外部草稿器的 token 流（按 ``k`` 个一组切给每一步），
+                ``k`` 是每步草稿数（默认 3，即 C=4），``steps`` 是循环步数，
+                ``mode`` 是 ``fused`` / ``chain``，``prompt`` 可选。
+
+        Returns:
+            ``{ok, mode, k, steps, tokens, accept, host_us_per_step,
+            dev_us_per_step, raw}``；``tokens`` 是这套循环实际产出的 token。
+        """
+        drafts = list(req.get("drafts") or [])
+        k = int(req.get("k", 3))
+        steps = int(req.get("steps", len(drafts) // max(k, 1)))
+        mode = "chain" if req.get("mode") == "chain" else "fused"
+        os.environ["COFFIN_DELTA_CHAIN"] = "1" if mode == "chain" else "0"
+        ids = self.tok.encode(req.get("prompt") or "The quick brown fox")
+        m = self.model
+        if m._verify_graph is None or m.verify_c != k + 1:
+            m.capture_verify(k + 1)
+        m.reset()
+        logits = m.prefill(ids)
+        m.n_drafted = m.n_accepted = m.n_spec_steps = 0
+        out: list[int] = []
+        host: list[float] = []
+        dev: list[float] = []
+        for step in range(steps):
+            part = drafts[step * k:(step + 1) * k]
+            if len(part) < k:
+                break
+            sync()
+            t0 = time.perf_counter()
+            toks, logits = m.spec_step(logits, k, draft_tokens=part)
+            t1 = time.perf_counter()
+            sync()
+            t2 = time.perf_counter()
+            out.extend(toks)
+            host.append((t1 - t0) * 1e6)
+            dev.append((t2 - t0) * 1e6)
+        accept = dict(m.spec_stats)
+        m.reset()
+        os.environ["COFFIN_DELTA_CHAIN"] = "0"
+        rank = os.environ.get("RANK", "0")
+        print(f"[specloop] rank={rank} mode={mode} k={k} steps={len(host)} "
+              f"host_us={round(sum(host) / max(len(host), 1), 1)} "
+              f"dev_us={round(sum(dev) / max(len(dev), 1), 1)} "
+              f"tokens={len(out)} accept_rate={accept.get('accept_rate')}", flush=True)
+        return {"ok": True, "mode": mode, "k": k, "steps": len(host),
+                "tokens": out, "accept": accept,
+                "host_us_per_step": round(sum(host) / max(len(host), 1), 1),
+                "dev_us_per_step": round(sum(dev) / max(len(dev), 1), 1),
+                "raw": [[round(h, 1), round(d, 1)] for h, d in zip(host, dev)]}

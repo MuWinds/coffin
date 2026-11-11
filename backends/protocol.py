@@ -49,13 +49,11 @@ _OP_NAMES: tuple[str, ...] = (
     # 投影：按激活行数的档位命名，不是按内核命名。
     "linear",            # 1 行或少数几行
     "linear_m",          # 小 M 的批，一次权重读取
+    "linear_m_verify",   # 投机校验批投影，可由后端选专用量化路径
     "linear_prefill",    # 预填充分块的 GEMM（大 M）
     "moe_grouped",       # 稀疏专家：并行维是"专家 × 行"，与上面三档切法不同
     "moe_grouped_gemm",  # 同一件事的大 M 形态：按专家分段各做一次张量核 GEMM
     "moe_grouped_i8",
-    "moe_grouped_i8_merge",    # 同一件事的 int8 形态：权重 [E, K, N] int8，激活按行量化
-    "moe_decode_block",        # 上面这一串在 decode 单行路径上的合成入口：一次调用顶十余次
-    "shared_gate_scale",       # 共享专家门：sigmoid(x·w) 乘到投影输出上，一次启动
     "moe_dispatch",      # 路由结果 → 前缀和 + 行序（替掉十来个 torch 小算子）
     "moe_router",        # 路由自身：softmax -> top-k -> 归一化（替掉 512 元素的排序网络）
     # 归一化。
@@ -80,7 +78,10 @@ _OP_NAMES: tuple[str, ...] = (
     "delta_prologue_batch",
     "delta_prep_seq",
     "delta",
+    "delta_record",
     "delta_batch",
+    "delta_batch_record",
+    "delta_commit",
     "delta_normed",
     # 三角求解：分块 delta 规则每个块要反解一个单位下三角方程组，那是*库*能力，
     # 不是模型数学。
@@ -90,6 +91,9 @@ _OP_NAMES: tuple[str, ...] = (
     "hyper_norm",
     "hyper_down",
     "hyper_up",
+    "moe_grouped_i8_merge",    # 同一件事的 int8 形态：权重 [E, K, N] int8，激活按行量化
+    "moe_decode_block",        # decode 单行路径的 MoE 融合入口
+    "shared_gate_scale",       # 共享专家门：sigmoid(x·w) 乘到投影输出上，一次启动
 )
 
 
@@ -199,6 +203,10 @@ class Ops:
     #: 一次权重读取服务全部 ``M`` 行。后端自己决定特化哪个 ``M``、余下的怎么切，
     #: 调用方只知道自己的行数大于一。
     linear_m: OpFn | None = None
+    #: ``linear_m_verify(w, x) -> y``：投机校验中的批量投影，``x`` 为 ``[M, K]``。
+    #: 校验接受率只依赖 logits 的 argmax，后端可使用 W8A8 路径减少宽 M 的整数乘加；
+    #: 其他后端回退到普通 ``linear_m``。静态批解码仍使用 :attr:`linear_m`。
+    linear_m_verify: OpFn | None = None
     #: ``linear_prefill(w, x) -> y``：大 M 档位，此时 GEMM 胜过权重流式内核。
     #: 权重为 int8 时，没有反量化 GEMM 的后端会为这次调用把 ``w`` 实体化成
     #: :attr:`Caps.weight_dtype`，这个取舍是对的，因为预填充是算力受限的。
@@ -388,12 +396,25 @@ class Ops:
     #: 由*更新后*的状态算出。这个循环是本层唯一的跨 token 记忆，且没有闭式回退，
     #: 所以需要回滚的调用方要先给 ``st`` 打快照。
     delta: OpFn | None = None
+    #: ``delta_record(q, k, v, beta, g, st, out, record, slot) -> out``：一步
+    #: gated delta 解码，同时记录本步实际使用的 ``k``、更新向量 ``u`` 和
+    #: ``exp(g)``。记录形状为 ``[C, num_v, dk + dv + 1]``；校验提交可以从
+    #: 初始状态按原顺序重放前缀，而不用保存每步的稠密状态。
+    delta_record: OpFn | None = None
     #: ``delta_batch(q, k, v, beta, g, st, out) -> out``：与 :attr:`delta` 相同，但
     #: 每个参数都多一个前导行维；单独看每一行，结果必须与 :attr:`delta` 一致。
     delta_batch: OpFn | None = None
+    #: ``delta_batch_record(...) -> out``：批量的 :attr:`delta_record`，``record``
+    #: 形状为 ``[B, C, num_v, dk + dv + 1]``，各行独立。
+    delta_batch_record: OpFn | None = None
+    #: ``delta_commit(base, record, st, steps) -> st``：从初始状态 ``base`` 出发，
+    #: 按记录的顺序重放前 ``steps`` 个秩一更新并写入 ``st``。每个状态标量沿 token
+    #: 维串行计算，保留递推的浮点运算顺序。
+    delta_commit: OpFn | None = None
     #: ``delta_normed(q, k, v, b, a, neg_expA, dt_bias, z, nw, st, out, qscale,
-    #: rep) -> out``：单个解码 token 的整个线性注意力混合器——头准备、循环、带门控
-    #: 的输出归一化——一次启动完成。
+    #: rep[, record, slot]) -> out``：单个解码 token 的整个线性注意力混合器——头准备、
+    #: 循环、带门控的输出归一化——一次启动完成。校验可选记录实际使用的 ``k``、
+    #: 更新向量和 ``exp(g)``，因此无需额外启动来生成回滚日志。
     #:
     #: 它成为一个算子，是因为它是一个*访存*问题而不是三个。分三段的写法每层每
     #: token 要写入再读回约 48 KB fp32 中间缓冲区（``q_pro``/``k_pro``/``v_pro``

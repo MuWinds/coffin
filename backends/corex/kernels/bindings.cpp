@@ -107,6 +107,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "out[M, N] = (A[M, K] @ W[K, N]) scaled, in one launch",
           pybind11::arg("a"), pybind11::arg("w"), pybind11::arg("xs"),
           pybind11::arg("ws"), pybind11::arg("out"));
+    m.def("w8a8_dp4a_nk", &w8a8_dp4a_nk,
+          "W8A8 DP4A GEMM over contiguous [N, K] int8 weights",
+          pybind11::arg("a"), pybind11::arg("wt"), pybind11::arg("c"),
+          pybind11::arg("out"), pybind11::arg("xs"), pybind11::arg("ws"),
+          pybind11::arg("threads") = 0);
     m.def("kv_quant", &kv_quant,
           "symmetric int8 quantisation of [M, N], one fp32 scale per row, one launch");
     m.def("silu_mul", &silu_mul,
@@ -156,10 +161,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("delta_prep_seq", &delta_prep_seq,
           "prefill head prep into the head-major [H, T, d] layout");
     m.def("delta", &delta, "gated delta decode step, updates the state in place");
+    m.def("delta_record", &delta_record,
+          "记录秩一更新的 gated delta 解码步");
     m.def("delta_batch", &delta_batch,
           "batched gated delta decode step, one state row per batch entry");
+    m.def("delta_batch_record", &delta_batch_record,
+          "批量记录秩一更新的 gated delta 解码步");
+    m.def("delta_commit", &delta_commit,
+          "从初始状态重放秩一更新");
     m.def("delta_normed", &delta_normed,
           "prologue + recurrence + gated norm for one decode token, one launch");
+    m.def("delta_normed_record", &delta_normed_record,
+          "融合 gated delta 校验步并记录秩一更新");
 
     // 三角求解：替代这份构建加载不了的 cuSOLVER 路径。
     m.def("triangular_solve", &triangular_solve,

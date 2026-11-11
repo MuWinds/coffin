@@ -12,7 +12,7 @@
 //     st  = st + k[:, :, None] * ((v - kv) * beta)[:, None, :]
 //     out = (st * q[:, :, None]).sum(-2)
 // 写成一条 torch 算子链，在 DCU 上每层约 140 us，24 层就是解码步的十分之一。状态没有
-// 闭式回滚，所以它是前缀复用必须打快照的那一块层内内存。
+// 闭式回滚：前缀复用仍须打完整快照，投机校验则记录 ``k``、更新向量和衰减后重放。
 //
 // Constraints:
 //   * 一个线程独占一列值，一个 block 覆盖一个头，块内线程按连续的 ``j`` 编址。这由状态
@@ -85,7 +85,9 @@ constexpr int THREADS = 128;
 __global__ void delta_kernel(const float* __restrict__ q, const float* __restrict__ k,
                              const float* __restrict__ v, const float* __restrict__ beta,
                              const float* __restrict__ g, float* __restrict__ st,
-                             float* __restrict__ out, int heads, int dk, int dv) {
+                             float* __restrict__ out, float* __restrict__ record,
+                             int record_slot, int record_width,
+                             int heads, int dk, int dv) {
     const int head = blockIdx.x;
     const int j = (int)(blockIdx.y * blockDim.x + threadIdx.x);
 
@@ -122,6 +124,18 @@ __global__ void delta_kernel(const float* __restrict__ q, const float* __restric
     __syncthreads();
     const float decay = decay_sh;
     const float rate = rate_sh;
+    float* head_record = nullptr;
+    if (record) {
+        const int record_dim = dk + dv + 1;
+        head_record = record +
+            ((row * (size_t)record_width + record_slot) * heads + head) * record_dim;
+        if (blockIdx.y == 0) {
+            if (threadIdx.x == 0) head_record[dk + dv] = decay;
+            for (int i = (int)threadIdx.x; i < dk; i += (int)blockDim.x) {
+                head_record[i] = ks[i];
+            }
+        }
+    }
     if (!active) return;
 
     const float value = v[ov + (size_t)head * dv + j];
@@ -131,12 +145,17 @@ __global__ void delta_kernel(const float* __restrict__ q, const float* __restric
     // 线程在 ``j`` 上相邻，所以每个 ``i`` 步对每个 wavefront 就是一次合并事务：这正是旧
     // 映射缺的访问模式。
     float kv_mem = 0.f;
+    // 这条递推原先已被编译器展开 4 倍（控制流 81 条/wavefront）；显式写八倍再省一半
+    // 控制流，整条链的设备时间 91.2 -> 86.3 us，逐位不变。列访问仍是 4 B 标量。
+#pragma unroll 8
     for (int i = 0; i < dk; ++i) {
         kv_mem = fmaf(column[(size_t)i * dv] * decay, ks[i], kv_mem);
     }
 
     const float delta = (value - kv_mem) * rate;
+    if (head_record) head_record[dk + j] = delta;
     float result = 0.f;
+#pragma unroll 8
     for (int i = 0; i < dk; ++i) {
         const float s = fmaf(ks[i], delta, column[(size_t)i * dv] * decay);
         column[(size_t)i * dv] = s;
@@ -162,13 +181,41 @@ __global__ void delta_kernel(const float* __restrict__ q, const float* __restric
 // @param rows 批行数；成为网格的 ``z`` 方向长度。
 // @param stream 启动所用的流。
 void launch_rows(const float* q, const float* k, const float* v, const float* beta,
-                 const float* g, float* st, float* out, int rows, int heads, int dk, int dv,
-                 cudaStream_t stream) {
+                 const float* g, float* st, float* out, float* record, int record_slot,
+                 int record_width, int rows, int heads, int dk, int dv, cudaStream_t stream) {
     const int threads = dv < THREADS ? dv : THREADS;
     const int blocks_y = (dv + threads - 1) / threads;
     const size_t smem = (size_t)(2 * dk) * sizeof(float);
     delta_kernel<<<dim3(heads, blocks_y, rows), threads, smem, stream>>>(
-        q, k, v, beta, g, st, out, heads, dk, dv);
+        q, k, v, beta, g, st, out, record, record_slot, record_width, heads, dk, dv);
+}
+
+__global__ void delta_commit_kernel(const float* __restrict__ base,
+                                    const float* __restrict__ record,
+                                    float* __restrict__ st, int heads, int dk, int dv,
+                                    int steps) {
+    const int head = (int)blockIdx.x;
+    const int j = (int)(blockIdx.y * blockDim.x + threadIdx.x);
+    if (j >= dv) return;
+
+    const int record_dim = dk + dv + 1;
+    const size_t state_head = (size_t)head * dk * dv;
+    const size_t record_head = (size_t)head * record_dim;
+    // 每线程沿 i 读写一个 4 B 标量，并让相邻线程覆盖连续的 j。自动向量化的 W=4 与手写
+    // ``float4`` 都只有 182.9 GB/s，4 B 标量为 435.2 GB/s；两种写法结果相同，说明惩罚来自
+    // ISA 的 16 B 访问路径。大块基态备份仍由 ``copy_`` 的 DMA 完成。
+#pragma unroll 8
+    for (int i = 0; i < dk; ++i) {
+        float value = base[state_head + (size_t)i * dv + j];
+#pragma unroll 8
+        for (int t = 0; t < steps; ++t) {
+            const float* step = record +
+                ((size_t)t * heads * record_dim) + record_head;
+            const float decay = step[dk + dv];
+            value = fmaf(step[i], step[dk + j], value * decay);
+        }
+        st[state_head + (size_t)i * dv + j] = value;
+    }
 }
 
 }  // namespace
@@ -197,7 +244,41 @@ torch::Tensor delta(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Te
                 "q/k/v head count does not match the state");
     launch_rows(q.data_ptr<float>(), k.data_ptr<float>(), v.data_ptr<float>(),
                 beta.data_ptr<float>(), g.data_ptr<float>(), st.data_ptr<float>(),
-                out.data_ptr<float>(), 1, heads, dk, dv,
+                out.data_ptr<float>(), nullptr, 0, 0, 1, heads, dk, dv,
+                c10::cuda::getCurrentCUDAStream());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
+// @brief 推进门控 delta 状态，并记录本步秩一更新。
+//
+// @param record ``[C, heads, dk + dv + 1]`` fp32，依次保存 key、更新向量和衰减。
+// @param slot 当前 token 在记录窗口中的位置。
+// @return ``out``，便于调用链串接。
+// @throws c10::Error 记录布局或位置与状态形状不一致。
+torch::Tensor delta_record(torch::Tensor q, torch::Tensor k, torch::Tensor v,
+                           torch::Tensor beta, torch::Tensor g, torch::Tensor st,
+                           torch::Tensor out, torch::Tensor record, int64_t slot) {
+    TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous()
+                && beta.is_contiguous() && g.is_contiguous() && st.is_contiguous()
+                && out.is_contiguous(), "contiguous inputs required");
+    TORCH_CHECK(q.scalar_type() == torch::kFloat && st.scalar_type() == torch::kFloat
+                && record.scalar_type() == torch::kFloat,
+                "delta inputs, state, and record are fp32");
+    const int heads = (int)st.size(0);
+    const int dk = (int)st.size(1);
+    const int dv = (int)st.size(2);
+    TORCH_CHECK(q.size(0) == heads && k.size(0) == heads && v.size(0) == heads,
+                "q/k/v head count does not match the state");
+    TORCH_CHECK(record.is_cuda() && record.device() == st.device()
+                && record.is_contiguous() && record.dim() == 3
+                && record.size(1) == heads && record.size(2) == dk + dv + 1
+                && slot >= 0 && slot < record.size(0),
+                "record must be contiguous [width, heads, dk + dv + 1] and contain slot");
+    launch_rows(q.data_ptr<float>(), k.data_ptr<float>(), v.data_ptr<float>(),
+                beta.data_ptr<float>(), g.data_ptr<float>(), st.data_ptr<float>(),
+                out.data_ptr<float>(), record.data_ptr<float>(), (int)slot,
+                (int)record.size(0), 1, heads, dk, dv,
                 c10::cuda::getCurrentCUDAStream());
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
@@ -237,8 +318,77 @@ torch::Tensor delta_batch(torch::Tensor q, torch::Tensor k, torch::Tensor v,
     const int dv = (int)st.size(3);
     launch_rows(q.data_ptr<float>(), k.data_ptr<float>(), v.data_ptr<float>(),
                 beta.data_ptr<float>(), g.data_ptr<float>(), st.data_ptr<float>(),
-                out.data_ptr<float>(), rows, heads, dk, dv,
+                out.data_ptr<float>(), nullptr, 0, 0, rows, heads, dk, dv,
                 c10::cuda::getCurrentCUDAStream());
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
+}
+
+// @brief 批量推进门控 delta 状态，并按行记录本步秩一更新。
+//
+// @param record ``[B, C, heads, dk + dv + 1]`` fp32。
+// @param slot 当前 token 在记录窗口中的位置。
+// @return ``out``，便于调用链串接。
+// @throws c10::Error 记录布局或位置与批状态形状不一致。
+torch::Tensor delta_batch_record(torch::Tensor q, torch::Tensor k, torch::Tensor v,
+                                 torch::Tensor beta, torch::Tensor g, torch::Tensor st,
+                                 torch::Tensor out, torch::Tensor record, int64_t slot) {
+    TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous()
+                && beta.is_contiguous() && g.is_contiguous() && st.is_contiguous()
+                && out.is_contiguous(), "contiguous inputs required");
+    TORCH_CHECK(q.scalar_type() == torch::kFloat && st.scalar_type() == torch::kFloat
+                && record.scalar_type() == torch::kFloat,
+                "delta inputs, state, and record are fp32");
+    const int rows = (int)st.size(0);
+    const int heads = (int)st.size(1);
+    const int dk = (int)st.size(2);
+    const int dv = (int)st.size(3);
+    TORCH_CHECK(record.is_cuda() && record.device() == st.device()
+                && record.is_contiguous() && record.dim() == 4
+                && record.size(0) == rows && record.size(2) == heads
+                && record.size(3) == dk + dv + 1
+                && slot >= 0 && slot < record.size(1),
+                "record must be contiguous [B, width, heads, dk + dv + 1]");
+    launch_rows(q.data_ptr<float>(), k.data_ptr<float>(), v.data_ptr<float>(),
+                beta.data_ptr<float>(), g.data_ptr<float>(), st.data_ptr<float>(),
+                out.data_ptr<float>(), record.data_ptr<float>(), (int)slot,
+                (int)record.size(1), rows, heads, dk, dv,
+                c10::cuda::getCurrentCUDAStream());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
+// @brief 从基态按顺序重放已记录的秩一更新。
+//
+// @param base ``[heads, dk, dv]`` fp32 初始状态。
+// @param record ``[C, heads, dk + dv + 1]`` fp32。
+// @param st ``[heads, dk, dv]`` fp32 提交目标。
+// @param steps 要重放的前缀长度。
+// @return ``st``，便于调用链串接。
+// @throws c10::Error 形状或前缀长度与记录容量不一致。
+torch::Tensor delta_commit(torch::Tensor base, torch::Tensor record,
+                           torch::Tensor st, int64_t steps) {
+    TORCH_CHECK(base.is_cuda() && record.is_cuda() && st.is_cuda()
+                && base.device() == st.device() && record.device() == st.device(),
+                "base, record, and state must share a CUDA device");
+    TORCH_CHECK(base.is_contiguous() && record.is_contiguous() && st.is_contiguous()
+                && base.scalar_type() == torch::kFloat
+                && record.scalar_type() == torch::kFloat
+                && st.scalar_type() == torch::kFloat,
+                "base, record, and state must be contiguous fp32");
+    TORCH_CHECK(base.dim() == 3 && st.sizes() == base.sizes() && record.dim() == 3,
+                "base/state must be [heads, dk, dv], record [width, heads, dk + dv + 1]");
+    const int heads = (int)base.size(0);
+    const int dk = (int)base.size(1);
+    const int dv = (int)base.size(2);
+    TORCH_CHECK(record.size(1) == heads && record.size(2) == dk + dv + 1
+                && steps >= 0 && steps <= record.size(0),
+                "record geometry or commit length is invalid");
+    const int threads = dv < THREADS ? dv : THREADS;
+    const dim3 grid((unsigned)heads, (unsigned)((dv + threads - 1) / threads));
+    delta_commit_kernel<<<grid, threads, 0, c10::cuda::getCurrentCUDAStream()>>>(
+        base.data_ptr<float>(), record.data_ptr<float>(), st.data_ptr<float>(),
+        heads, dk, dv, (int)steps);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return st;
 }

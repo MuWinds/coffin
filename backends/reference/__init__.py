@@ -873,11 +873,52 @@ def _delta_batch(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     return out
 
 
+def _delta_record(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                  beta: torch.Tensor, g: torch.Tensor, st: torch.Tensor,
+                  out: torch.Tensor, record: torch.Tensor, slot: int) -> torch.Tensor:
+    alpha = g.float().exp()
+    st.mul_(alpha[:, None, None])
+    kv = (st * k.float()[:, :, None]).sum(-2)
+    update = (v.float() - kv) * beta.float()[:, None]
+    st.add_(k.float()[:, :, None] * update[:, None, :])
+    out.copy_((st * q.float()[:, :, None]).sum(-2))
+    record[slot, :, :k.shape[-1]].copy_(k.float())
+    record[slot, :, k.shape[-1]:k.shape[-1] + v.shape[-1]].copy_(update)
+    record[slot, :, -1].copy_(alpha)
+    return out
+
+
+def _delta_batch_record(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                        beta: torch.Tensor, g: torch.Tensor, st: torch.Tensor,
+                        out: torch.Tensor, record: torch.Tensor,
+                        slot: int) -> torch.Tensor:
+    for b in range(q.shape[0]):
+        _delta_record(q[b], k[b], v[b], beta[b], g[b], st[b], out[b],
+                      record[b], slot)
+    return out
+
+
+def _delta_commit(base: torch.Tensor, record: torch.Tensor, st: torch.Tensor,
+                  steps: int) -> torch.Tensor:
+    dk = base.shape[-2]
+    dv = base.shape[-1]
+    st.copy_(base)
+    for t in range(int(steps)):
+        row = record[t]
+        k = row[:, :dk]
+        update = row[:, dk:dk + dv]
+        alpha = row[:, -1]
+        st.mul_(alpha[:, None, None])
+        st.add_(k[:, :, None] * update[:, None, :])
+    return st
+
+
 def _delta_normed(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                   b: torch.Tensor, a: torch.Tensor,
                   neg_expA: torch.Tensor, dt_bias: torch.Tensor,
                   z: torch.Tensor, nw: torch.Tensor, st: torch.Tensor,
-                  out: torch.Tensor, qscale: float, rep: int) -> torch.Tensor:
+                  out: torch.Tensor, qscale: float, rep: int,
+                  record: torch.Tensor | None = None, slot: int = 0) -> torch.Tensor:
     """Head prep, recurrence and gated norm for one decode token.
 
     The three-stage spelling allocates ``q_pro``/``k_pro``/``v_pro``/``beta``/``g``
@@ -908,7 +949,10 @@ def _delta_normed(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     qn, kn, beta, g = _head_prep(q, k, b, a, neg_expA, dt_bias, qscale, rep)
     vf = v.float()
     dh = torch.empty_like(vf)
-    _delta_step(qn, kn, vf, beta, g, st, dh)
+    if record is None:
+        _delta_step(qn, kn, vf, beta, g, st, dh)
+    else:
+        _delta_record(qn, kn, vf, beta, g, st, dh, record, slot)
     out.copy_(_rms_norm_gated(dh, nw, z.float(), 1e-6))
     return out
 
@@ -1076,6 +1120,7 @@ def build(caps: Caps | None = None) -> Ops:
     return Ops(
         linear=linear,
         linear_m=linear,
+        linear_m_verify=linear,
         linear_prefill=linear,
         rms_norm=_rms_norm,
         rms_norm_gated=_rms_norm_gated,
@@ -1095,7 +1140,10 @@ def build(caps: Caps | None = None) -> Ops:
         delta_prologue_batch=_delta_prologue_batch,
         delta_prep_seq=_delta_prep_seq,
         delta=_delta,
+        delta_record=_delta_record,
         delta_batch=_delta_batch,
+        delta_batch_record=_delta_batch_record,
+        delta_commit=_delta_commit,
         delta_normed=_delta_normed,
         triangular_solve=_triangular_solve,
         moe_grouped=functools.partial(_moe_grouped, weight_dtype=c.weight_dtype),

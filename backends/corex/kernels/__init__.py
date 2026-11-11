@@ -35,7 +35,8 @@ KERNEL_DIR = Path(__file__).resolve().parent
 
 #: 扩展的编译单元，按链接顺序。列在这里而不是 glob，是为了让散落的 ``.cu``
 #: （探针、实验）进不了生产构建，也让这份清单可复核。
-_SOURCES = ("bindings.cpp", "gemv.cu", "w8a8.cu", "norm.cu", "attn.cu", "attn_sparse.cu",
+_SOURCES = ("bindings.cpp", "gemv.cu", "w8a8.cu", "w8a8_dp4a.cu", "norm.cu",
+            "attn.cu", "attn_sparse.cu",
             "qsa_block_keys.cu", "linear_attn.cu", "delta.cu", "solve.cu", "w8a8_tcu.cu",
             "w4a8.cu", "hyper.cu", "moe_grouped.cu", "moe_grouped_i8.cu",
             "moe_dispatch.cu",
@@ -54,7 +55,7 @@ DEFAULT_ARCH = "ivcore10"
 #: 法都递增这个值：后提交的人会静默复用前者的目标文件，量的是一个自己没改过的
 #: 内核。按 worker 加后缀让各自拥有独立的目标树和独立的构建锁，这也是并发构建
 #: 不必串在同一把锁后面的原因。
-_EXTENSION = os.environ.get("COFFIN_COREX_EXT", "").strip() or "coffin_corex_ops_v36"
+_EXTENSION = os.environ.get("COFFIN_COREX_EXT", "").strip() or "coffin_corex_ops_v42"
 
 #: 已加载的扩展，首次尝试之前是 ``None``。
 _module: Any = None

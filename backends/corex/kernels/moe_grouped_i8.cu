@@ -1,5 +1,5 @@
 // @file moe_grouped_i8.cu
-// @brief 稀疏专家的**分组 int8** 投影：一次启动吃完整栈，行按 ``offsets`` 分段。
+// @brief 稀疏专家的分组 int8 投影：一次启动吃完整栈，行按 ``offsets`` 分段。
 //
 // Module: coffin/backends/corex/kernels。绑定成 ``moe_grouped_i8``，由
 // ``backends/corex/__init__.py::moe_grouped_i8`` 调用；``models/qwen35/moe.py`` 在
@@ -30,9 +30,8 @@
 //     只在 decode 那一档进来；内核本身对任意行数都成立，不需要额外的形状校验。
 //   * 激活先由 ``quant_act_i8`` 按行量化（absmax/127，下限 1e-5），与预填充路径同一套
 //     约定，所以两处的量化误差口径一致。
-//   * 不用 CUDA graph、不用 cp.async（``platform/scow/AGENTS.md`` 第 1、5 条）：两者在
-//     这张卡上都能过编译，然后静默挂死。
-//   * 全程不用 fp64（本设备对它返回 0，见 ``docs/qwen4/COREX-PLATFORM.md``）。
+//   * 不用 CUDA graph、不用 cp.async：两者在这张卡上都能过编译，然后静默挂死。
+//   * 全程不用 fp64
 
 #include "corex_ops.h"
 #include "corex_scalar.h"

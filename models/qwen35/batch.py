@@ -142,4 +142,4 @@ def wide_proj(proj, x: torch.Tensor):
     # ``[1, N]``，再 unsqueeze 就成了 ``[1, 1, N]`` —— 上层按 dim=1 切分
     # （``GEMVGroup.sizes``）时维度只有 1，会报 split 求和不为 1；普通 GEMV
     # 更糟，形状错成三维但没人检查。与 :func:`_project` 保持同一写法。
-    return proj.linear_m(x) if x.shape[0] > 1 else proj(x[0]).unsqueeze(0)
+    return proj.linear_m_verify(x) if x.shape[0] > 1 else proj(x[0]).unsqueeze(0)

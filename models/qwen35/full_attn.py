@@ -1,4 +1,4 @@
-"""带输出门、部分 RoPE 和 int8 KV 缓存的 GQA 全注意力。
+"""GQA 全注意力。
 
 Module: ``coffin/models/qwen35``。本族组合的两种逐层注意力之一（另一种是
 ``linear_attn``）；``blocks.Layer`` 按层下标二选一，``model.py`` 建出全部
@@ -125,6 +125,10 @@ class FullAttn:
         self._bind_single_views()
         self.pool = None
         self.pidx = 0
+        self.verify_mq_width = 0
+        self.verify_mq_out = None
+        self.verify_mq_part_acc = None
+        self.verify_mq_part_ml = None
 
     def _quant_buffers(self, rows: int) -> tuple[torch.Tensor, ...]:
         """分配一次解码或批处理步要量化进去的四个目标缓冲区。
@@ -515,8 +519,20 @@ class FullAttn:
         self.mq_part_ml = torch.zeros(n, self.nh, ATTN_SPLIT, 2,
                                       dtype=torch.float32, device=_device)
 
+    def enable_verify_multi_q(self, width: int) -> None:
+        self.verify_mq_width = int(width)
+        self.verify_mq_out = torch.zeros(width, self.nh, self.hd,
+                                         dtype=D, device=_device)
+        self.verify_mq_part_acc = torch.zeros(width, self.nh, ATTN_SPLIT, self.hd,
+                                              dtype=torch.float32, device=_device)
+        self.verify_mq_part_ml = torch.zeros(width, self.nh, ATTN_SPLIT, 2,
+                                             dtype=torch.float32, device=_device)
+
     def verify_batch_multi(self, qg: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-                           positions: torch.Tensor, ctx, rows: int) -> torch.Tensor:
+                           positions: torch.Tensor, ctx, rows: int, row_start: int = 0,
+                           out_buffer: torch.Tensor | None = None,
+                           part_acc: torch.Tensor | None = None,
+                           part_ml: torch.Tensor | None = None) -> torch.Tensor:
         """整个一次前向校验只调一次的多查询注意力。
 
         ``qg``/``k``/``v`` 是对 ``rows*c`` 个 token 的层投影（行主序），``positions``
@@ -561,19 +577,29 @@ class FullAttn:
         # 每行的历史（内核会把查询 j 掩在位置 j，所以一趟就服务整个投机块）。
         kq, ks = self._quant_seq(k.reshape(n, self.nkv, self.hd))
         vq, vs = self._quant_seq(v.reshape(n, self.nkv, self.hd))
-        slots = torch.stack([self.pool.pos2slot[i].index_select(0, positions[i])
-                             for i in range(b)]).reshape(n)
+        slot_map = self.pool.pos2slot[row_start:row_start + b]
+        if b == 1:
+            slots = slot_map[0].index_select(0, positions[0])
+        else:
+            slots = torch.stack([slot_map[i].index_select(0, positions[i])
+                                 for i in range(b)]).reshape(n)
         self.pool.write_rows(self.pidx, slots, kq, ks, vq, vs)
 
         kp, vp, kps, vps = self._pool_views()
         lens = positions[:, 0].to(torch.int32).contiguous()
-        out = self.mq_out[:n].view(b, c, self.nh, self.hd)
+        if out_buffer is None:
+            out_buffer = self.mq_out
+        if part_acc is None:
+            part_acc = self.mq_part_acc
+        if part_ml is None:
+            part_ml = self.mq_part_ml
+        out = out_buffer[:n].view(b, c, self.nh, self.hd)
         from models.qwen35.batch import _count
         _count("multi_q")
         bops.attn_paged_multi_q(q.contiguous(), gate.contiguous(), kp, vp, kps, vps,
-                                self.pool.pos2slot[:b], lens, out,
+                                slot_map, lens, out,
                                 self.max_seq, self.rep, self.scale,
-                                self.mq_part_acc[:n], self.mq_part_ml[:n], head_major=self.pool.head_major)
+                                part_acc[:n], part_ml[:n], head_major=self.pool.head_major)
         return out.reshape(n, self.nh * self.hd)
 
     def verify_batch_step(self, qg: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
@@ -812,6 +838,15 @@ class FullAttn:
         """
         C = x.shape[0]
         qg, k, v = self.qkv.prefill(x)
+        if self.pool is not None and self.verify_mq_width >= C:
+            multi_ctx = (cos_tbl, sin_tbl, mask_idx)
+            if rope_delta is not None:
+                multi_ctx += (None, rope_delta.reshape(1))
+            pre = self.verify_batch_multi(
+                qg, k, v, positions.view(1, C), multi_ctx, 1,
+                row_start=self.prefill_row, out_buffer=self.verify_mq_out,
+                part_acc=self.verify_mq_part_acc, part_ml=self.verify_mq_part_ml)
+            return self.o_proj.prefill(pre)
         qg = qg.reshape(C, self.nh, 2 * self.hd)
         q, gate = qg[..., :self.hd], qg[..., self.hd:]
         q = self.q_norm(q)

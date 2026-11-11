@@ -68,7 +68,7 @@ class KnQWeight:
     每列乘一次既更便宜，也正是量化器的误差模型所假设的。
     """
 
-    __slots__ = ("scale", "wt", "n", "k")
+    __slots__ = ("scale", "wt", "n", "k", "_wt_nk")
 
     #: 用来区分本形式与 :class:``KnWeight``，不必每次调用都做类型检查。
     int8 = True
@@ -97,6 +97,17 @@ class KnQWeight:
             raise ValueError(f"scale holds {scale.numel()} values for N = {self.n}")
         self.wt = wt
         self.scale = scale
+        self._wt_nk: torch.Tensor | None = None
+
+    def dp4a_weight(self) -> torch.Tensor:
+        """按需缓存 ``[N, K]`` 连续权重，供 ``__dp4a`` 归约连续 K。
+
+        Returns:
+            与 ``wt`` 同设备的 ``[N, K]`` int8 矩阵。副本随打包权重一同释放。
+        """
+        if self._wt_nk is None:
+            self._wt_nk = self.wt.t().contiguous()
+        return self._wt_nk
 
     def nbytes(self) -> int:
         """常驻字节数：int8 矩阵加它的 fp32 列 scale。

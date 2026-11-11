@@ -70,7 +70,7 @@ torch::Tensor w8a8_dp4a(torch::Tensor a, torch::Tensor w, torch::Tensor c,
 // @param out dtype 为 bf16/fp32 的 ``[M, N]`` 融合输出；空表示只出 int32。
 // @param xs [M] fp32 每 token 激活 scale。
 // @param ws [N] fp32 每输出列权重 scale。
-// @param threads 每块线程数；``0`` 或 ``-1`` 表示内核固定的值。
+// @param threads 每块线程数；``0`` 或 ``-1`` 按形状选择几何（M=4/8 用小块），``128`` 固定默认几何。
 // @return ``out`` 非空时返回它，否则返回 ``c``。
 // @throws c10::Error 形状、dtype、布局或 ``K % 4`` 不满足。
 torch::Tensor w8a8_dp4a_nk(torch::Tensor a, torch::Tensor wt, torch::Tensor c,

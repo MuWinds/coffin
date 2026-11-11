@@ -6,32 +6,20 @@
 //
 // ## 为什么需要它
 //
-// 一步 decode 里，分派这段原本是**纯 torch 的一串小算子**，每层来一遍。作业
-// ``q4attrib3`` 按调用点量到（48 层 × 每层一次）：
+// 一步 decode 里，分派这段原本是纯 torch 的一串小算子，每层来一遍。
 //
-//     moe.py:160  topk              48      moe.py:406  bincount   48
-//     moe.py:162  div, sum    48 + 48      moe.py:414  cumsum     48
-//     moe.py:163  to                48      moe.py:424  chunk      48
-//     moe.py:392  nonzero, flatten 48+48    moe.py:425  mul        48
-//     moe.py:398  div               48      moe.py:427  mul        48
-//     moe.py:402  argsort           48      moe.py:431  to         48
-//     合计 672 次内核/步
+// 这些算术的输入只有 ``slots = tokens * top_k`` 个整数（decode 时10个），输出
+// 几百字节，全部在一个 block 里做得完，分成 14 个内核纯粹是 torch 算子的粒度问题。
 //
-// 本卡实测发射地板 **5.76 µs/次**（作业 ``q4floor1``），672 × 5.76 = **3.87 ms/步**
-// 只花在「把 10 个路由结果排一下序」上。一步的目标是 17-20 ms，这笔钱没有理由付。
-//
-// 这些算术的输入只有 ``slots = tokens * top_k`` 个整数（decode 时 **10** 个），输出
-// 几百字节，全部在一个 block 里做得完 —— 分成 14 个内核纯粹是 torch 算子的粒度问题。
-//
-// ## 打包段必须并行（本版改动）
+// ## 打包段必须并行
 //
 // 旧版把「桶号 → 收拢后行号」的分配写成 ``tid == 0`` 的单线程循环：prefill 512 token
-// 时 ``slots = 5120``，每次迭代 5 个**相互依赖**的全局访问（读 ``slot_pos[t]`` →
+// 时 ``slots = 5120``，每次迭代 5 个相互依赖的全局访问（读 ``slot_pos[t]`` →
 // 读改写 ``cursor[e]`` → 写两张位置表 → 写 ``slot_pos[t]``），5120 × 约 400 周期
-// ≈ 2.0 ms/次，实测 **2.07 ms/次、48 层 99 ms**，占 prefill 1494 ms 的 6.6%，是
+// ≈ 2.0 ms/次，实测2.07 ms/次、48 层 99 ms，占 prefill 1494 ms 的 6.6%，是
 // MoE 内核降下来之后的第二大单项。
 //
-// 改成 ``atomicAdd(&cursor[e], 1)`` 之后**段内顺序变了也不影响结果**：每个槽位的
+// 改成 ``atomicAdd(&cursor[e], 1)`` 之后段内顺序变了也不影响结果：每个槽位的
 // 计算只依赖它自己那一行激活，而合并侧靠 ``slot_pos`` 把行按**槽位序** gather 回来
 // 再做一次定序求和（``moe.py`` 的 ``merged.sum(dim=1)``，取代了原来的 ``index_add_``），
 // 所以每个 token 的结果与段内排列无关。**这条不是推测而是可测的**：
@@ -40,15 +28,15 @@
 //
 // ## 为什么仍然是单 block（没有按 slots 拆多块）
 //
-// 「计数 → 前缀和 → 分配」需要一个**全网格**屏障：前缀和必须在所有计数写完之后才能
+// 「计数 → 前缀和 → 分配」需要一个全网格屏障：前缀和必须在所有计数写完之后才能
 // 算。多 block 只能靠 cooperative launch 或手写全局屏障，而后者一旦某个 block 没能
-// 同时驻留就是静默死等——本平台已经在 CUDA graph / cp.async 上吃过静默挂卡的亏。
+// 同时驻留就是静默死等
 //
-// 换成**全局原子 + 共享内存前缀和**之后，内核里只剩四次 ``__syncthreads()``
+// 换成全局原子 + 共享内存前缀和之后，内核里只剩四次 ``__syncthreads()``
 // （全在 block 内、每次只隔一个 O(slots) 的并行段），比拆多块的目标更划算，而且
 // 没有任何挂卡风险。
 //
-// 原子操作留在**全局内存**（``offsets[e+1]`` 与 ``scratch[e]``，后者本来就是为游标
+// 原子操作留在全局内存（``offsets[e+1]`` 与 ``scratch[e]``，后者本来就是为游标
 // 准备的常驻缓冲）：本仓所有内核里跑通的就只有这一种原子，不为了省那点延迟去赌
 // 共享内存原子的实现。
 //
@@ -67,10 +55,10 @@
 //   * **``offsets`` 逐位确定，三张位置表不再确定**：每个槽位写入的位置由
 //     ``atomicAdd`` 的到达顺序决定，所以同一输入两次运行里 ``token_of_pos`` /
 //     ``slot_of_pos`` / ``slot_pos`` 的**段内排列**会不同。这放弃的是「中间量可复现」，
-//     换来的是打包段从 2.07 ms 掉到几十微秒；**模型输出仍然逐位确定**，因为合并侧
+//     换来的是打包段从 2.07 ms 掉到几十微秒；模型输出仍然逐位确定，因为合并侧
 //     按槽位号定序求和，不依赖排列。这一条由 ``self_repeat`` 守着。
 //   * 不属于本 rank 的槽位（``local_table[e] < 0``）丢弃，不占桶、不写进行序。
-//   * 不用 CUDA graph、不用 cp.async（``platform/scow/AGENTS.md`` 第 1、5 条）。
+//   * 不用 CUDA graph、不用 cp.async
 
 #include "corex_ops.h"
 
@@ -153,8 +141,8 @@ __global__ void moe_dispatch_kernel(const int* expert_idx, const int* local_tabl
     __syncthreads();
 
     // 阶段 3：前缀和。把计数器并行抄进 LDS，再让一个线程串行扫——桶数只有 128/512，
-    // 扫完是微秒级；**旧的写法是 tid 0 直接对全局内存读改写，那 512 次依赖全局延迟
-    // 的迭代本身就是几十微秒**。
+    // 扫完是微秒级；旧的写法是 tid 0 直接对全局内存读改写，那 512 次依赖全局延迟
+    // 的迭代本身就是几十微秒
     for (int e = tid; e < local_experts; e += nthreads) counts[e] = offsets[e + 1];
     __syncthreads();
     if (tid == 0) {
@@ -170,9 +158,9 @@ __global__ void moe_dispatch_kernel(const int* expert_idx, const int* local_tabl
 
     // 阶段 4：并行分配位置。
     //
-    // **每一行的位置由原子递增决定，所以段内排列不确定**（见文件头的 Constraints）。
+    // 每一行的位置由原子递增决定，所以段内排列不确定
     // 允许这样做的依据是合并侧按槽位号定序求和，不读排列本身；而如果哪天有人把合并
-    // 改回 ``index_add_``，这里就会立刻变成不可复现——``self_repeat`` 是那条守卫。
+    // 改回 ``index_add_``，这里就会立刻变成不可复现
     for (int t = tid; t < slots; t += nthreads) {
         const int e = slot_pos[t];
         if (e < 0) continue;

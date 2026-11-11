@@ -31,15 +31,6 @@ Constraints:
     * 绝不要一次性反量化整个 int8 塔：一次一个 GEMM 把峰值临时量压在一个 fp16 矩阵上
       （merger 的 fc1 是 33 MB）。
 
-在真实 checkpoint 上与 ``transformers`` 4.57.6 的 ``Qwen3VLVisionModel`` 实测对比
-（canonical 验收、DCU、每个尺寸一张图）::
-
-    size   engine(fp32)  engine(fp16)  engine(fp16)     time   tower-only
-           vs HF(fp32)   vs HF(fp32)   vs HF(bf16)              peak
-    256^2      8.7e-6       7.1e-3       6.4e-2         67 ms   ~0.67 GiB
-    512^2      1.2e-5       1.3e-2       7.9e-2        129 ms   ~0.71 GiB
-    1024^2     1.4e-5       1.4e-2       9.0e-2        756 ms   ~0.85 GiB
-
 第一列是正确性门禁：公式误差是 O(1) 量级，所以 1e-5 比任何错误的 merge 顺序、rope
 布局或 LN 位置所能藏身的高度还低一百万倍。第二列是 fp16 的内在代价，它和 HF *自己*
 的 fp16 对 fp32 的差异一致（1.4e-2）——那是 dtype 的代价，不是实现的。第三列只是

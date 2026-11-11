@@ -92,6 +92,19 @@ class GEMV:
             return self(x[0]).unsqueeze(0)
         return bops.linear_m(self.w, x)
 
+    def linear_m_verify(self, x: torch.Tensor) -> torch.Tensor:
+        """为投机校验批量投影，允许后端使用校验专用的量化路径。
+
+        Args:
+            x: 激活，``[M, K]``，bf16。
+
+        Returns:
+            ``[M, N]``，dtype 同 ``x``。
+        """
+        if x.shape[0] == 1:
+            return self(x[0]).unsqueeze(0)
+        return bops.linear_m_verify(self.w, x)
+
     def prefill(self, x: torch.Tensor) -> torch.Tensor:
         """投影一个预填充分块，``[C, K]`` -> ``[C, N]``。
 
@@ -202,6 +215,19 @@ class GEMVGroup:
         if x.shape[0] == 1:
             return [part.unsqueeze(0) for part in self(x[0])]
         return self.g.linear_m(x).split(self.sizes, dim=1)
+
+    def linear_m_verify(self, x: torch.Tensor) -> list[torch.Tensor]:
+        """用投机校验专用投影处理融合权重，并按原通道切回各输出。
+
+        Args:
+            x: 激活，``[M, K]``，bf16。
+
+        Returns:
+            按构造顺序排列的 ``[M, N_i]`` 投影。
+        """
+        if x.shape[0] == 1:
+            return [part.unsqueeze(0) for part in self(x[0])]
+        return self.g.linear_m_verify(x).split(self.sizes, dim=1)
 
     def prefill(self, x: torch.Tensor) -> list[torch.Tensor]:
         """:meth:`__call__` 的预填充分块版本，沿输出轴切分。

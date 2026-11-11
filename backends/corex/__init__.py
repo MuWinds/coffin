@@ -92,6 +92,9 @@ _W4_DEQUANT_MAX_BYTES = int(os.environ.get("COFFIN_W4_DEQUANT_MAX_MB", "256")) <
 #: 不是随便定的。
 _ROW_CHUNK = 8
 
+#: 投机校验才启用的 W8A8 DP4A 路径；可用 0 关闭以对照原有 GEMV。
+_W8A8_DP4A_VERIFY = os.environ.get("COFFIN_COREX_W8A8_DP4A_VERIFY", "0").strip() == "1"
+
 #: 宽指令张量核 GEMM 的形状门限，按**权重字节数**而不是 K 或 N 单独判。
 #:
 #: 实测（4B 的真实预填充形状，M=2048，同一张卡同进程，``docs/TCU_INT8.md``）：
@@ -392,6 +395,51 @@ def linear_m(w: torch.Tensor | QWeight | pack.KnWeight, x: torch.Tensor) -> torc
     if x.shape[0] > _ROW_CHUNK:
         return linear_prefill(w, x)
     return _gemv_rows(w, x)
+
+
+def linear_m_verify(w: torch.Tensor | QWeight | pack.KnWeight,
+                    x: torch.Tensor) -> torch.Tensor:
+    """为投机校验的 W8A8 投影选择带 LDS 重排的 DP4A 内核。
+
+    Args:
+        w: int8 ``QWeight`` 或其他普通投影权重。
+        x: 激活，``[M, K]``。
+
+    Returns:
+        ``[M, N]``，dtype 同 ``x``。未启用开关或权重不是 int8 时沿用
+        :func:`linear_m`。
+    """
+    if not _W8A8_DP4A_VERIFY or x.shape[0] < 2:
+        return linear_m(w, x)
+    if isinstance(w, QWeight):
+        if w.k % 4:
+            return linear_m(w, x)
+        if w.wq.is_contiguous():
+            wt, ws = w.wq, w.scale
+        else:
+            packed = pack.as_kn(w)
+            wt, ws = packed.dp4a_weight(), packed.scale
+    elif isinstance(w, pack.KnQWeight):
+        if w.k % 4:
+            return linear_m(w, x)
+        wt, ws = w.dp4a_weight(), w.scale
+    else:
+        return linear_m(w, x)
+
+    act = _compute_dtype(x).contiguous()
+    rows, k = act.shape
+    n = int(ws.numel())
+    if rows < 2 or k % 4:
+        return linear_m(w, x)
+
+    module = _kernels()
+    xq = torch.empty((rows, k), dtype=torch.int8, device=act.device)
+    xs = torch.empty(rows, dtype=torch.float32, device=act.device)
+    acc = torch.empty((rows, n), dtype=torch.int32, device=act.device)
+    out = torch.empty((rows, n), dtype=act.dtype, device=act.device)
+    module.quant_act_i8(act, xq, xs)
+    module.w8a8_dp4a_nk(xq, wt, acc, out, xs, ws, 0)
+    return _restore(out, x.dtype)
 
 
 def _gemv_rows(w: torch.Tensor | QWeight | pack.KnWeight,
@@ -1845,11 +1893,70 @@ def delta_batch(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, beta: torch.T
     return _kernels().delta_batch(q, k, v, beta, g, st, out)
 
 
+def delta_record(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                 beta: torch.Tensor, g: torch.Tensor, st: torch.Tensor,
+                 out: torch.Tensor, record: torch.Tensor, slot: int) -> torch.Tensor:
+    """推进一条 GDN 状态，并记录可重放的秩一更新。
+
+    Args:
+        q, k, v, beta, g, st, out: 一步递推的输入、原地状态和输出缓冲。
+        record: ``[C, heads, dk + dv + 1]`` fp32 更新日志。
+        slot: 当前校验位置。
+
+    Returns:
+        ``out``。
+
+    Raises:
+        RuntimeError: 扩展不可用或输入布局不符合内核契约。
+    """
+    return _kernels().delta_record(q, k, v, beta, g, st, out, record, slot)
+
+
+def delta_batch_record(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                       beta: torch.Tensor, g: torch.Tensor, st: torch.Tensor,
+                       out: torch.Tensor, record: torch.Tensor,
+                       slot: int) -> torch.Tensor:
+    """批量推进 GDN 状态，并逐行记录可重放的秩一更新。
+
+    Args:
+        q, k, v, beta, g, st, out: 批量递推的输入、原地状态和输出缓冲。
+        record: ``[B, C, heads, dk + dv + 1]`` fp32 更新日志。
+        slot: 当前校验位置。
+
+    Returns:
+        ``out``。
+
+    Raises:
+        RuntimeError: 扩展不可用或输入布局不符合内核契约。
+    """
+    return _kernels().delta_batch_record(q, k, v, beta, g, st, out, record, slot)
+
+
+def delta_commit(base: torch.Tensor, record: torch.Tensor, st: torch.Tensor,
+                 steps: int) -> torch.Tensor:
+    """从基态按顺序重放若干步 GDN 秩一更新。
+
+    Args:
+        base: ``[heads, dk, dv]`` fp32 校验前状态。
+        record: ``[C, heads, dk + dv + 1]`` fp32 更新日志。
+        st: ``[heads, dk, dv]`` fp32 提交目标。
+        steps: 要接受并重放的前缀长度。
+
+    Returns:
+        更新后的 ``st``。
+
+    Raises:
+        RuntimeError: 扩展不可用或输入布局不符合内核契约。
+    """
+    return _kernels().delta_commit(base, record, st, steps)
+
+
 def delta_normed(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                  b: torch.Tensor, a: torch.Tensor, neg_expA: torch.Tensor,
                  dt_bias: torch.Tensor, z: torch.Tensor, nw: torch.Tensor,
                  st: torch.Tensor, out: torch.Tensor, qscale: float,
-                 rep: int) -> torch.Tensor:
+                 rep: int, record: torch.Tensor | None = None,
+                 slot: int = 0) -> torch.Tensor:
     """单解码 token 的头预处理、递推与门控输出归一化，一次启动。
 
     替代 ``delta_prologue`` -> ``delta`` -> ``rms_norm_gated`` 那条链：它每层每个
@@ -1871,6 +1978,8 @@ def delta_normed(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
         out: 输出缓冲区，``[num_v, dv]`` fp32，原地写入归一化后的结果。
         qscale: ``dk ** -0.5``。
         rep: 每个键头对应的值头数。
+        record: 可选的 ``[width, num_v, dk + dv + 1]`` fp32 更新日志。
+        slot: 日志中的校验位置。
 
     Returns:
         ``out``，便于调用链串接。
@@ -1878,8 +1987,11 @@ def delta_normed(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     Raises:
         RuntimeError: 扩展不可用。
     """
-    return _kernels().delta_normed(q, k, v, b, a, neg_expA, dt_bias, z, nw, st, out,
-                                   qscale, rep)
+    module = _kernels()
+    args = (q, k, v, b, a, neg_expA, dt_bias, z, nw, st, out, qscale, rep)
+    if record is None:
+        return module.delta_normed(*args)
+    return module.delta_normed_record(*args, record, slot)
 
 
 # 超连接（Gated Residual）
@@ -2200,6 +2312,7 @@ def triangular_solve(lower: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
 _NATIVE: dict[str, OpFn] = {
     "linear": linear,
     "linear_m": linear_m,
+    "linear_m_verify": linear_m_verify,
     "linear_prefill": linear_prefill,
     "rms_norm": rms_norm,
     "add_rms_norm": add_rms_norm,
@@ -2218,7 +2331,10 @@ _NATIVE: dict[str, OpFn] = {
     "delta_prologue_batch": delta_prologue_batch,
     "delta_prep_seq": delta_prep_seq,
     "delta": delta,
+    "delta_record": delta_record,
     "delta_batch": delta_batch,
+    "delta_batch_record": delta_batch_record,
+    "delta_commit": delta_commit,
     "delta_normed": delta_normed,
     "triangular_solve": triangular_solve,
     "moe_grouped": moe_grouped,
@@ -2317,11 +2433,13 @@ _GRAPH_VERIFIED = False
 #: 陈旧输出。``linear_prefill`` 故意 *不* 在这个集合里：它是预填充区间，从来不被
 #: 捕获，而且是唯一一个会调库的条目（分块调，以留在这张卡能算对的宽度内）。
 _DECODE_OPS: frozenset[str] = frozenset({
-    "linear", "linear_m", "rms_norm", "add_rms_norm", "rms_norm_gated",
+    "linear", "linear_m", "linear_m_verify", "rms_norm",
+    "add_rms_norm", "rms_norm_gated",
     "kv_quant", "silu_mul", "rope_apply", "attn_decode",
     "attn_paged", "attn_paged_batch", "attn_paged_multi_q", "conv1d_silu",
     "conv1d_silu_seq", "conv1d_silu_batch", "delta_prologue", "delta_prologue_batch",
-    "delta_prep_seq", "delta", "delta_batch", "delta_normed",
+    "delta_prep_seq", "delta", "delta_record", "delta_batch",
+    "delta_batch_record", "delta_commit", "delta_normed",
     "hyper_norm", "hyper_down", "hyper_up",
 })
 

@@ -1,4 +1,4 @@
-"""Qwen3.5-4B 文本引擎：从权重到层，再到捕获图。
+"""Qwen3.5 series 文本引擎：从权重到层，再到捕获图。
 
 模型族的组装点：它持有层列表、rope 表、固定的图缓冲区和三条执行路径——解码（重放
 一张图）、预填充（批处理 GEMM 加切块的因果注意力），以及校验（为投机解码捕获的 C
@@ -922,7 +922,7 @@ class Qwen35:
 
         mm_list = [getattr(s, "mm", None) for s in seqs]
         for s, row, m, mm_i in zip(seqs, rows, matched, mm_list):
-            self.pool.assign_table(list(s.block_table), 0, row)
+            self._assign_row_table(row, s.block_table)
             if m == 0:
                 self.zero_linear_states(row)      # 新序列
                 # matched > 0：调用方已把边界状态恢复进这一行，rope 偏移也一起恢复了——
@@ -1157,12 +1157,20 @@ class Qwen35:
                 self.ctx_lens[r] = pos + 1
         if self.pool is not None and slot_rows is not None:
             for row, blocks in zip(rows, slot_rows):
-                blocks = list(blocks)
-                key = tuple(blocks)
-                if self._row_tables.get(row) == key:
-                    continue
-                self.pool.assign_table(blocks, 0, row)
-                self._row_tables[row] = key
+                self._assign_row_table(row, blocks)
+
+    def _assign_row_table(self, row: int, blocks) -> None:
+        """让块表映射与它的去重缓存始终对应同一行。
+
+        Args:
+            row: 要改写的解码行。
+            blocks: 按位置顺序排列的物理块编号。
+        """
+        key = tuple(blocks)
+        if self._row_tables.get(row) == key:
+            return
+        self.pool.assign_table(list(key), 0, row)
+        self._row_tables[row] = key
 
     def capture_batch(self, buckets: tuple[int, ...] = (1, 2, 4, 8),
                       warmup: int = 3) -> None:
@@ -1232,13 +1240,7 @@ class Qwen35:
         pad.update(range(rows, bucket))
         for row in sorted(pad):
             if self.pool is not None:
-                self.pool.assign(self._scratch_blocks[row], 0, row)
-                # 池里的表被改成了暂存块，所以 set_rows 的行表缓存必须一起失效。
-                # 不清的话：该行被新序列拿到、且它的块表恰好等于上一个占用者留在缓存里的
-                # 那一份（块回收后同序复用很常见），set_rows 就会跳过 assign_table，
-                # 于是这一行继续指向只有一块的暂存区——上下文超出一个块之后开始出错，
-                # 而按 seq.block_table 做的别名检查发现不了（Python 侧的列表是对的）。
-                self._row_tables.pop(int(row), None)
+                self._assign_row_table(row, [self._scratch_blocks[row]])
             self.token_in[row] = self._sentinel_token
             self.pos[row] = 0
             self.rope_delta[row] = 0
@@ -1344,8 +1346,8 @@ class Qwen35:
         * ``"token"``——``c`` 次串行批处理解码前向；更慢，但只需 stage-3 的内核，
           留作回退。
 
-        每行 ``c`` 份回滚快照是贵的那部分（每份 24 层 × 2 MB fp32）；
-        ``enable_verify_batch`` 按这个宽度定它们的尺寸。
+        GDN 回滚只为每行保存一个 fp32 基态和 ``c`` 份秩一更新日志；短卷积窗口仍按
+        ``c`` 个位置保存。
 
         Args:
             K: 每个投机步的草稿数。校验宽度是 ``K + 1``，因为主模型自己的下一个 token
@@ -1439,7 +1441,7 @@ class Qwen35:
           历史服务全部 c 个查询（内核 task-12）。在调用前把它们全部写完是安全的：内核
           会把每个查询掩在它自己的位置上；
         * 线性注意力——卷积/delta 递推对 c 个 token 是串行的（状态依赖），每 token 一次
-          批处理 launch，第 j 个 token 之后立刻打状态快照供回滚。
+          批处理 launch，同时记录本步的秩一更新；卷积窗口按位置保存。
 
         多查询内核缺失时回退到逐 token 的注意力入口（结果正确，只是这条路径的意义就
         没了）。
@@ -1545,10 +1547,10 @@ class Qwen35:
             lap("lmhead", s)
 
     def _verify_batch_impl(self, rows: int) -> None:
-        """``c`` 次串行的批处理解码步，每步之后打状态快照。
+        """``c`` 次串行的批处理解码步，每步记录 GDN 秩一更新。
 
         每一步都是批处理贪心解码前向，所以一行的校验 logits 恰好就是普通贪心步在那个
-        token 上会产出的 logits；逐 token 的循环状态快照就是回滚点。
+        token 上会产出的 logits；校验基态和逐 token 的秩一更新日志用于回滚。
 
         （单次多 token 前向——全部 ``B*c`` 个 token 一趟投影——实现并测过，但在
         ``M = B*c = 16`` 时投影退回预填充路径，连带完整的 int8->fp16 反量化（这颗芯片上
@@ -1568,14 +1570,10 @@ class Qwen35:
             self.ctx_lens[:rows].copy_(poss.to(torch.int32).add_(1))
             x = self.embed.lookup(toks)
             for layer in self.layers:
-                x = layer.batch(x, poss, ctx)
+                x = layer.batch(x, poss, ctx, verify_slot=j)
             x = self.norm(x)
             self.verify_hidden_b[:rows, j].copy_(x)
             self.verify_logits_b[:rows, j].copy_(batch_proj(self.embed.gemv, x))
-            for layer in self.layers:
-                mix = layer.mix
-                if isinstance(mix, LinearAttn):
-                    mix.snapshot_batch(rows, j)
 
     def set_verify_mode(self, mode: str) -> None:
         """切换所捕获的校验实现（``"once"`` / ``"token"``）。
@@ -1674,7 +1672,7 @@ class Qwen35:
         pad = set(int(r) for r in pad_rows)
         pad |= {r for r in range(bucket) if r not in active_rows}
         for row in sorted(pad):
-            self.pool.assign(self._scratch_blocks[row], 0, row)
+            self._assign_row_table(row, [self._scratch_blocks[row]])
             self.token_in[row] = self._sentinel_token
             self.pos[row] = 0
             self.ctx_lens[row] = 1
@@ -1725,7 +1723,8 @@ class Qwen35:
             for layer in self.layers:
                 mix = layer.mix
                 if isinstance(mix, LinearAttn):
-                    mix.restore_batch(row, j)
+                    mix.restore_batch(row, j,
+                                      commit_state=(j < K or K + 1 < self.spec_width))
             self.h_prev_b[row].copy_(self.verify_hidden_b[row, j])
         return accepted_tokens, logits_next, accepted_counts
 
@@ -1791,6 +1790,10 @@ class Qwen35:
         self.verify_pos = self.verify_off.clone()
         self.verify_hidden = torch.zeros(c, hidden, dtype=D, device=_device)
         self.verify_logits = torch.zeros(c, self.vocab, dtype=D, device=_device)
+        if self.pool is not None and multi_q_ready() and MULTI_Q_WIRED:
+            for layer in self.layers:
+                if isinstance(layer.mix, FullAttn):
+                    layer.mix.enable_verify_multi_q(c)
         self._verify_graph = runtime.capture(self._verify_impl, warmup, reset=self.reset)
         self.reset()
 
@@ -1868,11 +1871,11 @@ class Qwen35:
         # 外部草稿器不需要 MTP 头；只有 MTP 那条路才要同步草稿器的位置缓冲。
         if self.mtp is not None:
             self.mtp.pos.copy_(self.pos1).sub_(1)
+        commit_state = j < K or K + 1 < self.verify_c
         for layer in self.layers:
             mix = layer.mix
             if isinstance(mix, LinearAttn):
-                mix.state[self.prefill_row].copy_(mix.ckpt_state[j])
-                mix.conv_state[self.prefill_row].copy_(mix.ckpt_conv[j])
+                mix.restore_verify(j, commit_state=commit_state)
         return toks, self.verify_logits[j]
 
     @torch.inference_mode()
