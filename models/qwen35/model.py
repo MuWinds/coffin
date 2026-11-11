@@ -703,15 +703,14 @@ class Qwen35:
             # （实测 2001 token 时 rank0 在等末段的回包超时，而同一 prompt 走逐 token
             # 是通的，代价是 prefill 89.4 s）。所以按块数分流：单块走分块，多块回退，
             # 等把多块的失步修掉再放开。
-            # 三档：``auto``（默认）按长度选路、``1`` 强制分块、``0`` 一律逐 token。
             #
-            # 阈值 64 是实测的：23 token 时逐 token 更快（935 vs 1220 ms，M 太小，库 GEMM
-            # 还不如解码入口），2001 token 时分块快 8.4 倍（10.8 s vs 90.8 s）。中间的
-            # 24..512 没有逐点测过，取 64 是保守的一侧 —— 宁可早一点切到分块。
+            # 逐 token 只剩诊断用途（``COFFIN_PP_CHUNKED=0``）。它曾经是「短 prompt
+            # 更快」的选择，那条结论已经过时：实测（4 卡 PP4、冷启动、同一会话内
+            # 交替扫）它在 22/43/64/106/400 token 上分别比分块慢 2.8/3.5/8.9/11/15.5 倍
+            # ——每个 token 要跑一整趟流水往返，n 越大越离谱（400 token 时 14.5 s）。
+            # 原因是分块路径把整段激活一次过线，逐 token 则是 n 次握手。
             mode = os.environ.get("COFFIN_PP_CHUNKED", "auto")
-            if not (mode == "1" or (mode == "auto" and n >= 64)):
-                # 逐 token 的兜底：短 prompt 上它反而更快（M 太小，库 GEMM 不如解码入口），
-                # 多块长 prompt 上它是唯一正确的路。
+            if mode == "0":
                 lg = None
                 for t in tokens:
                     lg = self.logits(int(t))

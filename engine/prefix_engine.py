@@ -15,6 +15,10 @@ Module: ``coffin/``（顶层）。夹在 ``llm_engine`` 和池之间：它为一
 ``block_size=64`` 时，512 token 的系统提示会让下一个请求的预填充只剩一个块的
 后缀。
 
+预填充/解码分离时它同时是交接点：:meth:`PrefixCacheEngine.export_state` 把
+预填充完的序列打包成纯 CPU 字典，:meth:`PrefixCacheEngine.adopt` 在另一个进程
+里装回去继续解码。搬的只是「池里的 KV + 循环状态 + 位置」，块号不搬。
+
 Constraints:
     * 从构造上就是单流：解码步是一张针对一个 token 和一张槽位表的 CUDA 图，
       所以引擎一次只服务一条序列，池的槽位表属于当前活跃序列。多序列批解码
@@ -34,6 +38,7 @@ Constraints:
 
 from __future__ import annotations
 
+import os
 import time
 
 import torch
@@ -85,6 +90,8 @@ class PrefixCacheEngine:
         self.snapshot_interval = snapshot_interval
         self.keep_states = max_state_snapshots
         self.seq: SeqKV | None = None
+        #: :meth:`adopt` 装进来的下一 token logits，来自预填充实例。
+        self.pending_logits: torch.Tensor | None = None
         self.last_matched = 0
         self.n_requests = 0
         self.n_prompt_tokens = 0
@@ -121,8 +128,11 @@ class PrefixCacheEngine:
             raise ValueError("empty prompt")
         model, pool, bm = self.model, self.pool, self.bm
         bs = pool.bs
+        _trace = bool(os.environ.get("COFFIN_PC_TRACE"))
+        _t0 = time.perf_counter() if _trace else 0.0
         blocks, matched, states = bm.match_prefix(tokens[:-1], require_states=True,
                                                   mm=mm)
+        _t1 = time.perf_counter() if _trace else 0.0
         if self.seq is not None:
             self.seq.free()
         seq = SeqKV(pool, blocks, matched)
@@ -138,6 +148,7 @@ class PrefixCacheEngine:
             # 重放 prompt 而不是续上。
             model.reset()
         model.pos1.fill_(matched)
+        _t2 = time.perf_counter() if _trace else 0.0
 
         states_at: dict[int, dict] = {}
         if matched and states is not None:
@@ -176,8 +187,150 @@ class PrefixCacheEngine:
         self.n_prompt_tokens += len(tokens)
         self.n_hit_tokens += matched
         radix = self.radix
+        _t3 = time.perf_counter() if _trace else 0.0
         radix.insert(tokens, seq.blocks, states_at, mm=mm)
+        if _trace:
+            # 分段的秒表是这套命中链路上唯一能分开「匹配/恢复快照/后缀前向/插树」
+            # 四件事的东西：它们在客户端只看得到合起来的 prefill_ms。
+            from models.qwen35.parallel import context as _pctx
+
+            _p = _pctx()
+            _t4 = time.perf_counter()
+            print(f"[pc] rank={0 if _p is None else _p.rank} n={len(tokens)} "
+                  f"matched={matched} states={'y' if states is not None else 'n'} "
+                  f"match={(_t1 - _t0) * 1e3:.1f} restore={(_t2 - _t1) * 1e3:.1f} "
+                  f"suffix={(_t3 - _t2) * 1e3:.1f} insert={(_t4 - _t3) * 1e3:.1f} "
+                  f"total={(_t4 - _t0) * 1e3:.1f}", flush=True)
         return logits
+
+    @torch.inference_mode()
+    def export_state(self) -> dict:
+        """把当前序列在本 rank 上的状态打包成可以跨进程搬运的纯 CPU 字典。
+
+        预填充/解码分离时，预填充实例跑完 prompt 就把状态交给解码实例。两个实例
+        用同一个 PP 切法，所以 rank r 只导出自己那几层，接收端 rank r 原样装回去，
+        中间没有任何跨 rank 聚合。
+
+        导出的是「池里已经写好的内容」，不是模型权重：线性注意力层的递推态按
+        模型局部层号，全注意力层的 KV 按池的层轴下标。两者不是同一套编号，见
+        :meth:`adopt` 的校验。
+
+        Returns:
+            ``pos``/``n_tokens``/``block_size``/``layer_begin``/``layer_end``/
+            ``n_layers``/``nkv``/``hd`` 是 int；``blocks`` 是块号 list；
+            ``linear`` 是 ``{局部层号: (递推态, 卷积态)}`` 的 CPU fp32 张量；
+            ``kv`` 是 ``{池层轴下标: (k, v, kscale, vscale)}``，其中 ``k``/``v``
+            是 ``[nkv, pos, hd]`` 的 int8、scale 是 ``[nkv, pos]`` 的 fp32；
+            模型带 ``rope_delta`` 时多一个同名字段。整份字典可以直接
+            ``torch.save``。
+
+        Raises:
+            RuntimeError: 没有活跃序列；或模型没有暴露 ``layer_begin``/
+                ``layer_end``，此时无法证明两端拓扑一致。
+            ValueError: 序列长度与 ``pos1`` 不一致。那说明有人动过位置计数器却没
+                提交，导出的状态会自带一个错位的长度，装到对面就是「输出是另一个
+                模型」。
+        """
+        seq = self.seq
+        if seq is None:
+            raise RuntimeError("no active sequence to export")
+        model, pool = self.model, self.pool
+        layer_begin, layer_end = _layer_span(model)
+        pos = int(model.pos1)
+        if int(seq.num_tokens) != pos:
+            raise ValueError(
+                f"sequence length {int(seq.num_tokens)} disagrees with pos1 {pos}; "
+                "the position counter moved without a commit")
+        if len(block_ids := list(seq.blocks)) != _blocks_for(pos, pool.bs):
+            raise ValueError(
+                f"{len(block_ids)} blocks cannot hold {pos} tokens at "
+                f"block_size {pool.bs}")
+        linear = {i: (st.detach().to("cpu").contiguous(),
+                      conv.detach().to("cpu").contiguous())
+                  for i, (st, conv) in model.snapshot_linear_states().items()}
+        kv = {}
+        for idx in sorted(_pool_layers(model)):
+            k, v, sk, sv = pool.gather(idx, pos)
+            kv[idx] = (k.detach().to("cpu").contiguous(),
+                       v.detach().to("cpu").contiguous(),
+                       sk.detach().to("cpu").contiguous(),
+                       sv.detach().to("cpu").contiguous())
+        state = {
+            "pos": pos,
+            "n_tokens": pos,
+            "blocks": block_ids,
+            "block_size": int(pool.bs),
+            "layer_begin": layer_begin,
+            "layer_end": layer_end,
+            "n_layers": int(pool.n_layers),
+            "nkv": int(pool.nkv),
+            "hd": int(pool.hd),
+            "linear": linear,
+            "kv": kv,
+        }
+        rope = getattr(model, "rope_delta", None)
+        if torch.is_tensor(rope):
+            state["rope_delta"] = rope[0].detach().to("cpu").contiguous()
+        return state
+
+    @torch.inference_mode()
+    def adopt(self, state: dict, logits: torch.Tensor, tokens: list[int]) -> None:
+        """把预填充实例交过来的状态装回本引擎，等价于「本地刚预填充完」。
+
+        装完之后的 :meth:`decode_iter` 与在同一个实例里 ``prefill`` 完直接解码
+        逐 token 相同——因为搬的正是解码要读的那几样东西：池里的 KV、线性注意力
+        的递推态、位置计数器，以及块表。
+
+        块号不搬。块 id 只在一个进程的池里有效，接收端自己 ``alloc`` 出等量的块
+        再重建槽位表；``state`` 里的 ``blocks`` 只用来核对长度。
+
+        Args:
+            state: :meth:`export_state` 的产物，来自切法完全相同的另一个实例。
+            logits: 预填充实例给出的下一个 token logits；存进
+                ``self.pending_logits``，紧接着的 :meth:`decode_iter` 用它作起点。
+            tokens: 那条序列的完整 prompt。它的长度必须等于状态里的 ``n_tokens``，
+                否则 logits 与位置对不上。
+
+        Raises:
+            KeyError: 缺字段。半份状态装进去只会得到看似正常的错误输出。
+            ValueError: 层区间、块大小、池层数、头数、头维、张量形状/dtype、
+                token 数或块表中任何一处与本地不一致。这些对不上说明两个实例不是
+                同一个拓扑，或者状态是用别的配置导出的。
+        """
+        model, pool, bm = self.model, self.pool, self.bm
+        _check_state(state, model, pool, tokens)
+        # logits 也先在动池之前查完：装了一半再抛，引擎停在半个序列上。
+        if not torch.is_tensor(logits) or logits.numel() != model.vocab:
+            raise ValueError(
+                f"logits must hold {model.vocab} values, got "
+                f"{getattr(logits, 'shape', type(logits))}")
+        pos = int(state["n_tokens"])
+        n_blocks = _blocks_for(pos, pool.bs)
+        if self.seq is not None:
+            self.seq.free()
+            self.seq = None
+        bm.reserve(n_blocks)
+        blocks = [pool.alloc() for _ in range(n_blocks)]
+        pool.assign_table(blocks, 0)
+        self.seq = SeqKV(pool, blocks, pos)
+        slots = pool.slots_for(torch.arange(pos, device=pool.pos2slot.device))
+        for idx, (k, v, sk, sv) in state["kv"].items():
+            # 导出的是 [nkv, pos, hd]，池的写入入口要 [pos, nkv, hd]。头轴的位置
+            # 是两套契约里唯一不同的一处；nkv == pos 时写反了不会报错。
+            pool.write_range(
+                int(idx), slots,
+                k.to(pool.k.device).transpose(0, 1).contiguous(),
+                sk.to(pool.kscale.device).transpose(0, 1).contiguous(),
+                v.to(pool.v.device).transpose(0, 1).contiguous(),
+                sv.to(pool.vscale.device).transpose(0, 1).contiguous())
+        states = {int(i): (st.to(model.pos1.device), conv.to(model.pos1.device))
+                  for i, (st, conv) in state["linear"].items()}
+        model.restore_linear_states(states)
+        model.pos1.fill_(pos)
+        if "rope_delta" in state:
+            model.rope_delta[0].copy_(state["rope_delta"])
+        self.pending_logits = logits.to(model.pos1.device)
+        self.last_matched = 0
 
     @torch.inference_mode()
     def decode_iter(self, logits: torch.Tensor, max_new: int,
@@ -298,3 +451,172 @@ class PrefixCacheEngine:
             "snapshot_mib": round(self.radix.snapshot_bytes() / 2**20, 1),
             "cows": self.pool.n_cows, "evicted_blocks": self.radix.num_evicted_blocks,
         }
+
+
+def _layer_span(model) -> tuple[int, int]:
+    """本实例负责的层区间，也就是两个实例「切法相同」的唯一凭据。
+
+    Args:
+        model: 一个 ``PagedModel``。
+
+    Returns:
+        ``(layer_begin, layer_end)``，全模型口径的层号。
+
+    Raises:
+        RuntimeError: 模型没有暴露这两个属性。没有它们就无法证明对面的 rank r
+            装的是同一段层，宁可拒绝。
+    """
+    begin = getattr(model, "layer_begin", None)
+    end = getattr(model, "layer_end", None)
+    if not isinstance(begin, int) or not isinstance(end, int):
+        raise RuntimeError(
+            "model does not expose layer_begin/layer_end; the two instances' "
+            "pipeline split cannot be compared")
+    return begin, end
+
+
+def _pool_layers(model) -> dict[int, int]:
+    """池层轴下标映射到模型局部层号。
+
+    这是两套编号：池的层轴只数全注意力层，``snapshot_linear_states`` 的键只数
+    线性注意力层，都用局部序号。把一套当另一套用不会报错，只会把状态装到别的
+    层上。
+
+    Args:
+        model: 一个已经 ``enable_paging()`` 的 ``PagedModel``。
+
+    Returns:
+        ``{池层轴下标: 模型局部层号}``；没有全注意力层时为空。
+    """
+    out: dict[int, int] = {}
+    for i, layer in enumerate(getattr(model, "layers", ())):
+        pidx = getattr(getattr(layer, "mix", None), "pidx", None)
+        if isinstance(pidx, int):
+            out[pidx] = i
+    return out
+
+
+def _linear_layers(model) -> set[int]:
+    """本实例里带循环状态的层，按模型局部层号。
+
+    Args:
+        model: 一个 ``PagedModel``。
+
+    Returns:
+        线性注意力层的局部层号集合，也就是 ``snapshot_linear_states`` 该有的键。
+    """
+    return {i for i, layer in enumerate(getattr(model, "layers", ()))
+            if hasattr(getattr(layer, "mix", None), "state")}
+
+
+def _blocks_for(n_tokens: int, block_size: int) -> int:
+    """``n_tokens`` 个位置要几个整块，口径与 ``SeqKV.reserve`` 一致。
+
+    Args:
+        n_tokens: token 数。
+        block_size: 每块的 token 数。
+
+    Returns:
+        向上取整的块数；``0`` 个 token 要 ``0`` 个块。
+    """
+    return (n_tokens + block_size - 1) // block_size
+
+
+def _check_state(state: dict, model, pool, tokens: list[int]) -> None:
+    """在动池之前把一份外来状态与本地契约逐项对齐。
+
+    每一项对不上都意味着「装进去也能跑，但输出属于另一个模型」，所以这里全部
+    抛异常而不是纠正或跳过。
+
+    Args:
+        state: :meth:`PrefixCacheEngine.export_state` 的产物。
+        model: 本实例的 ``PagedModel``。
+        pool: 本实例的池。
+        tokens: 那条序列的完整 prompt。
+
+    Raises:
+        KeyError: 缺字段。
+        ValueError: 层区间、块大小、池层数、头数、头维、张量形状或 dtype、token
+            数、块表长度中任何一项不一致。
+    """
+    required = ("pos", "n_tokens", "blocks", "block_size", "layer_begin",
+                "layer_end", "n_layers", "nkv", "hd", "linear", "kv")
+    missing = [key for key in required if key not in state]
+    if missing:
+        raise KeyError(f"prefill state is missing {missing}")
+    begin, end = _layer_span(model)
+    if (int(state["layer_begin"]), int(state["layer_end"])) != (begin, end):
+        raise ValueError(
+            f"this instance owns layers [{begin}, {end}) but the state was "
+            f"exported from [{int(state['layer_begin'])}, "
+            f"{int(state['layer_end'])}); the pipeline split differs")
+    if int(state["block_size"]) != int(pool.bs):
+        raise ValueError(
+            f"block_size {int(state['block_size'])} != local {int(pool.bs)}; "
+            "the block tables are not interchangeable")
+    if int(state["n_layers"]) != int(pool.n_layers):
+        raise ValueError(
+            f"state has {int(state['n_layers'])} pooled layers, local pool has "
+            f"{int(pool.n_layers)}")
+    if (int(state["nkv"]), int(state["hd"])) != (int(pool.nkv), int(pool.hd)):
+        raise ValueError(
+            f"state is {int(state['nkv'])}x{int(state['hd'])} per head, local "
+            f"pool is {int(pool.nkv)}x{int(pool.hd)}")
+    pos, n_tokens = int(state["pos"]), int(state["n_tokens"])
+    if pos != n_tokens:
+        raise ValueError(f"state disagrees with itself: pos {pos} vs n {n_tokens}")
+    if n_tokens < 1:
+        raise ValueError("state carries no tokens; nothing to decode from")
+    if n_tokens > pool.max_seq:
+        raise ValueError(
+            f"state holds {n_tokens} tokens, beyond the local max_seq "
+            f"{pool.max_seq}")
+    if len(tokens) != n_tokens:
+        raise ValueError(
+            f"state holds {n_tokens} tokens but the prompt has {len(tokens)}; "
+            "logits would be decoded from the wrong position")
+    if len(state["blocks"]) != _blocks_for(n_tokens, pool.bs):
+        raise ValueError(
+            f"{len(state['blocks'])} blocks cannot hold {n_tokens} tokens at "
+            f"block_size {int(state['block_size'])}")
+    local_linear = _linear_layers(model)
+    if set(map(int, state["linear"])) != local_linear:
+        raise ValueError(
+            f"state covers linear layers {sorted(map(int, state['linear']))}, "
+            f"local model has {sorted(local_linear)}")
+    for i, pair in state["linear"].items():
+        st, conv = pair
+        want = model.layers[int(i)].mix
+        for name, got, ref in (("state", st, want.state[0]),
+                               ("conv", conv, want.conv_state[0])):
+            if (not torch.is_tensor(got) or got.shape != ref.shape
+                    or got.dtype != ref.dtype):
+                raise ValueError(
+                    f"linear layer {int(i)} {name} must be {tuple(ref.shape)} "
+                    f"{ref.dtype}, got "
+                    f"{tuple(got.shape) if torch.is_tensor(got) else type(got)} "
+                    f"{getattr(got, 'dtype', None)}")
+    if set(map(int, state["kv"])) != set(_pool_layers(model)):
+        raise ValueError(
+            f"state covers pooled layers {sorted(map(int, state['kv']))}, local "
+            f"model has {sorted(_pool_layers(model))}")
+    for idx, quad in state["kv"].items():
+        k, v, sk, sv = quad
+        for name, got, want_dtype, want_shape in (
+                ("k", k, pool.k.dtype, (pool.nkv, n_tokens, pool.hd)),
+                ("v", v, pool.v.dtype, (pool.nkv, n_tokens, pool.hd)),
+                ("kscale", sk, pool.kscale.dtype, (pool.nkv, n_tokens)),
+                ("vscale", sv, pool.vscale.dtype, (pool.nkv, n_tokens))):
+            if (not torch.is_tensor(got) or tuple(got.shape) != want_shape
+                    or got.dtype != want_dtype):
+                raise ValueError(
+                    f"pooled layer {int(idx)} {name} must be {want_shape} "
+                    f"{want_dtype}, got "
+                    f"{tuple(got.shape) if torch.is_tensor(got) else type(got)} "
+                    f"{getattr(got, 'dtype', None)}")
+    if "rope_delta" in state:
+        rope = getattr(model, "rope_delta", None)
+        got = state["rope_delta"]
+        if not torch.is_tensor(rope) or not torch.is_tensor(got) \
+                or got.shape != rope[0].shape or got.dtype != rope[0].dtype:
+            raise ValueError("state carries a rope_delta this model cannot take")

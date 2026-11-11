@@ -295,8 +295,17 @@ class ModelRunner:
             # 两条路径的 KV 表示不同（这里是模型自带的单行状态，批处理是分页槽），
             # 所以这个决定必须在这里定下，并对该序列的整个生命周期保持一致——
             # 调度器会拦住第二条的准入，直到这条结束，见 ``Scheduler.schedule``。
+            _trace = os.environ.get("COFFIN_PREFILL_TRACE") == "1"
+            _t = time.perf_counter() if _trace else 0.0
             self.model.reset()
+            _t2 = time.perf_counter() if _trace else 0.0
             logits = self.model.prefill(seq.token_ids, mm=seq.mm)
+            if _trace:
+                # 单流这条路没有分块，所以耗时只能这样分成「清状态」和「前向」两段。
+                # 短 prompt 的 prefill_ms 与长 prompt 差不多时，答案就在这两段里。
+                _t3 = time.perf_counter()
+                print(f"[dense] n={len(seq.token_ids)} reset={(_t2 - _t) * 1e3:.1f}ms "
+                      f"prefill={(_t3 - _t2) * 1e3:.1f}ms", flush=True)
             seq.prefill_cursor = seq.num_tokens
             seq.dense = True
         seq.num_cached_tokens = int(self.model.pos1)
