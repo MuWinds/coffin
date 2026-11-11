@@ -1,13 +1,18 @@
-"""按注意力头和 MLP 通道切分 Qwen3.5 的 W4 权重与状态。
+"""按注意力头和 MLP 通道切分 Qwen3.5 的 W4 权重，并给出专家并行的归约件。
 
 Module: ``coffin/models/qwen35``。权重加载器和模型组装调用此模块；算子通过
-CoreX 整数投影完成，跨 rank 数据仅通过 Gloo 的 CPU fp32 张量交换。
+CoreX 整数投影完成。三种拓扑的跨 rank 数据面完全不同：``tp`` 走 Gloo 的 CPU
+fp32 全归约（每层两次），``pp`` 走 UDP 点对点（每 token 几次），``ep`` 走同机
+共享内存（每层一次，40 层/步 = 1.3 ms）。
 
 Constraints:
     * 每个进程只暴露一张健康 GPU，使既有设备分配和 KV/循环状态自然局部化。
     * K 轴分片必须落在量化组边界；q/k/v 和卷积通道要分别切分后重新拼接。
     * 行并行默认共享激活 A8 scale；诊断可改用 rank 本地 scale，部分和仍用 fp32 归约。
     * 调度及前缀缓存操作须在各 rank 以相同顺序执行，不允许 CUDA graph。
+    * ``ep`` 不切任何张量维度：dense、注意力、路由器和共享专家每卡各一份，
+      只有专家栈按**专家号**切——前向的归约也就落成「每层一次求和」，而不是
+      每个投影一次。任何按头/按通道的切分在 ``ep`` 下都是错的。
 """
 
 from __future__ import annotations
@@ -35,19 +40,21 @@ class ParallelContext:
         Args:
             rank: 当前进程编号。
             world_size: 并行进程数。
-            mode: ``"tp"`` 按张量切分、``"pp"`` 按层切分。两者用同一个 Gloo 组，
-                但通信形态完全不同：TP 每层两次 all-reduce，PP 每 token 只有几次
-                点对点。
+            mode: ``"tp"`` 按张量切分、``"pp"`` 按层切分、``"ep"`` 按专家切分。
+                三者共用同一个 Gloo 组，但那个组在 ``pp``/``ep`` 下只用来广播请求，
+                数据面各走各的（UDP 点对点 / 同机共享内存）。
 
         Raises:
             RuntimeError: Gloo 进程组尚未初始化或身份不符。
-            ValueError: ``mode`` 不是 ``tp`` / ``pp``。
+            ValueError: ``mode`` 不是 ``tp`` / ``pp`` / ``ep``，或 ``ep`` 的共享区
+                参数不成立。
         """
         if (not dist.is_initialized() or dist.get_backend() != "gloo"
                 or dist.get_world_size() != world_size or dist.get_rank() != rank):
             raise RuntimeError("tensor parallelism requires a matching CPU Gloo group")
-        if mode not in {"tp", "pp"}:
-            raise ValueError(f"parallel mode must be 'tp' or 'pp', got {mode!r}")
+        if mode not in {"tp", "pp", "ep"}:
+            raise ValueError(
+                f"parallel mode must be 'tp', 'pp' or 'ep', got {mode!r}")
         self.rank, self.world_size = rank, world_size
         self.mode = mode
         self._buffers = OrderedDict()
@@ -67,6 +74,21 @@ class ParallelContext:
         if mode == "pp":
             self.link = PipeLink(rank, world_size,
                                  int(os.environ.get("COFFIN_PP_PORT", 29791)), self)
+        #: 专家并行的同机归约件；``tp`` / ``pp`` 下为 ``None``。
+        #:
+        #: 走共享内存而不是 gloo 是实测的决定：4 个 rank 全在同一台机器上，gloo 一次
+        #: 归约 291-420 us（几乎全是固定开销），共享内存 barrier 只要 32.9 us。40 层
+        #: 一步就是 14-20 ms 对 1.3 ms —— 前者会把专家并行省下的 0.613 ms/层全部吃掉。
+        self.ep = None
+        if mode == "ep":
+            from models.qwen35.ep import EpShmReduce
+
+            #: 共享区由启动器预先建好，这里只负责映射；载荷容量要盖住一个预填充
+            #: 分块的 ``[tokens, hidden]`` fp32（2048 token 是 20 MiB，双缓冲即 40 MiB）。
+            self.ep = EpShmReduce(
+                rank, world_size,
+                os.environ.get("COFFIN_EP_SHM", "/dev/shm/coffin_ep.bin"),
+                int(os.environ.get("COFFIN_EP_SLOT_BYTES", str(64 << 20))))
         self.scale_mode = os.environ.get("COFFIN_TP_SCALE_MODE", "shared")
         if self.scale_mode not in {"shared", "local", "decode_local"}:
             raise ValueError(
@@ -192,6 +214,50 @@ class ParallelContext:
         end = begin + size + (1 if self.rank < extra else 0)
         return begin, end
 
+    def expert_range(self, num_experts: int) -> tuple[int, int]:
+        """本 rank 装哪一段专家，``[begin, end)``。
+
+        按专家号**连续**切，而不是交错切（``e % world == rank``）。两者负载期望相同，
+        但连续切让盘上的 ``[E, K, N]`` 栈可以直接按首轴读一段（safetensors 的
+        ``get_slice``），交错切则要整栈读进来再挑行——每层 805 MB，40 层付不起。
+
+        Args:
+            num_experts: 全局专家总数。
+
+        Returns:
+            ``(begin, end)``；``tp`` / ``pp`` 下是全部 ``(0, num_experts)``，因为那两个
+            拓扑的专家是完整的。
+        """
+        if self.mode != "ep":
+            return 0, num_experts
+        if num_experts < self.world_size:
+            raise ValueError(
+                f"{num_experts} experts cannot be split across {self.world_size} ranks")
+        size, extra = divmod(num_experts, self.world_size)
+        begin = self.rank * size + min(self.rank, extra)
+        return begin, begin + size + (1 if self.rank < extra else 0)
+
+    def combine(self, value: torch.Tensor) -> torch.Tensor:
+        """专家并行下把各 rank 的部分和加起来。
+
+        每个 rank 只算自己那 1/4 专家命中的槽位，未命中的槽位是零行，所以这里必须是
+        **求和**。漏掉它得到的是「每条 token 只剩 1/4 专家」的安静错误——形状全对，
+        输出是另一个模型。
+
+        Args:
+            value: 本 rank 的部分和，``[tokens, hidden]``，浮点。
+
+        Returns:
+            同 dtype、同形状的跨 rank 和。
+
+        Raises:
+            ValueError: ``ep`` 上下文没有建起来（配置错位）。
+        """
+        if self.mode != "ep":
+            return value
+        if self.ep is None:
+            raise ValueError("expert parallel context has no shared-memory arena")
+        return self.ep.all_reduce_sum(value)
 
 
 class PipeLink:
@@ -422,6 +488,8 @@ def configure(rank: int, world_size: int, mode: str = "tp") -> ParallelContext:
     Args:
         rank: 当前进程编号。
         world_size: 并行进程数。
+        mode: 拓扑，``tp`` / ``pp`` / ``ep``。Gloo 组在三种拓扑下都要建，因为请求
+            广播走它；``ep`` 的数据面另走共享内存。
 
     Returns:
         此进程的上下文，之后所有层共享它。
@@ -660,7 +728,10 @@ def pipe_keeps(key: str, cfg: dict, parallel: "ParallelContext",
 
 def load_weights(model_dir: str | Path, device: torch.device,
                  parallel: ParallelContext, vision: bool | None = None) -> dict:
-    """逐项读取并分片离线 W4 权重，只把本 rank 的部分搬到设备。
+    """逐项读取离线量化权重，只把本 rank 的那一份搬到设备。
+
+    三种拓扑各自省不同的东西：``pp`` 只读本段那 10 层，``tp`` 把每个矩阵按头/通道
+    切开，``ep`` 原样读全部 dense 与注意力、只把专家栈按首轴裁成本 rank 的那一段。
 
     Args:
         model_dir: 带 W4 索引的模型目录。
@@ -708,7 +779,15 @@ def load_weights(model_dir: str | Path, device: torch.device,
             for key, meta in entries.items():
                 if meta["shard"] != shard:
                     continue
-                value = handle.get_tensor(key)
+                # 专家并行必须**在读盘时**就把专家栈裁到本 rank 那一段：整栈每层
+                # 805 MB、40 层 32 GB，先读进来再切会把一张 31.7 GiB 的卡撑爆，而
+                # 这也正是「连续切专家」而不是「交错切」的理由（见 expert_range）。
+                ep_slice = (parallel.mode == "ep" and meta["kind"] == "q8-moe")
+                if ep_slice:
+                    lo, hi = parallel.expert_range(int(cfg["num_experts"]))
+                    value = handle.get_slice(key)[lo:hi]
+                else:
+                    value = handle.get_tensor(key)
                 kind = meta["kind"]
                 if kind == "q4":
                     scale = handle.get_tensor(meta["scale_key"])
@@ -720,10 +799,18 @@ def load_weights(model_dir: str | Path, device: torch.device,
                     # 下面的 "else"，被当成稠密张量原样搬到设备——形状合法、MoE 一跑
                     # 就 mat1/mat2 形状不匹配，而引擎把那次异常当成「这一步没产出」，
                     # 原地空转到看门狗报 KV pool 太小。
-                    scale = handle.get_tensor(meta["scale_key"])
-                    if (list(value.shape) != meta.get("shape")
-                            or list(scale.shape) != meta.get("scale_shape")):
-                        raise ValueError(f"{key}: moe int8 stack shape mismatch")
+                    if ep_slice:
+                        scale = handle.get_slice(meta["scale_key"])[lo:hi]
+                        expect = (hi - lo, *meta["shape"][1:])
+                        if tuple(value.shape) != expect:
+                            raise ValueError(
+                                f"{key}: expert slice shape {tuple(value.shape)} "
+                                f"does not match {expect}")
+                    else:
+                        scale = handle.get_tensor(meta["scale_key"])
+                        if (list(value.shape) != meta.get("shape")
+                                or list(scale.shape) != meta.get("scale_shape")):
+                            raise ValueError(f"{key}: moe int8 stack shape mismatch")
                     value = QWeightMoE(value, scale, k=int(meta["k"]))
                 elif kind == "q8":
                     # 盘上 int8 是 ``[K, N]`` 加逐输出列的 fp32 scale；``from_kn`` 只

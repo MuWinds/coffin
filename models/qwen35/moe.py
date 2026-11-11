@@ -218,6 +218,19 @@ class SparseMoE:
         self.gate_up, self.down = _fuse_experts(sd, p, self.num_experts)
 
         self.parallel = parallel_context()
+        #: 本 rank 的专家数。单卡 / ``pp`` / ``tp`` 下等于全局值；``ep`` 下是
+        #: 专家栈的首轴（加载器读盘时就裁好了），不能拿 ``cfg`` 的全局值去覆盖它。
+        self.local_experts = self.num_experts
+        if self.parallel is not None and self.parallel.mode == "ep":
+            begin, end = self.parallel.expert_range(self.num_experts)
+            stacked = getattr(self.gate_up, "wq", self.gate_up)
+            self.local_experts = int(stacked.shape[0])
+            if self.local_experts != end - begin:
+                raise ValueError(
+                    f"{p}: this rank holds {self.local_experts} experts but its "
+                    f"expert_range is [{begin}, {end}); the loader and the model "
+                    f"disagree about the topology, which would silently route "
+                    f"tokens to experts that are not loaded")
         native = _native_ops()
         self._dispatch = getattr(bops, "moe_dispatch", None) if "moe_dispatch" in native else None
         #: 共享专家门的融合入口，以及它按形状复用的输出缓冲。参考链要六次启动加两次
@@ -244,11 +257,18 @@ class SparseMoE:
                                   else None)
         self._grouped_gemm = (getattr(bops, "moe_grouped_gemm", None)
                               if "moe_grouped_gemm" in native else None)
-        self._identity = None
+        #: 全局专家号 → 本地号；``ep`` 下不归本 rank 的专家是 -1。见 :meth:`_expert_table`。
+        self._table: torch.Tensor | None = None
         #: decode 单行的整块驱动。它只省 pybind 编组与 Python 包装（约 4 us/次 x 17 次），
         #: 分配与发射照付，所以上限是个位数百分比；``COFFIN_LAYER_DRIVER=1`` 才启用，
         #: 便于同二进制 A/B。
         self._block_driver = getattr(bops, "moe_decode_block", None)
+        if self.parallel is not None and self.parallel.mode == "ep":
+            # 整块驱动把路由、分派、两次分组投影和 top_k 归并压进一次 C++ 调用，但它
+            # 的专家表按「宽度 = 全局专家数」建的。专家并行下要喂局部表，那条路径还
+            # 没验过，先关掉（实测代价 3.2-3.8%）——不把一条没验过的内核塞进正确性
+            # 路径，就是这个开关存在的理由。
+            self._block_driver = None
         self._block_w = None
         self._block_b = None
 
@@ -325,12 +345,12 @@ class SparseMoE:
             self.down.wq, self.down.scale,
             sg.wq.t().contiguous(), sg.scale,
             sd.wq.t().contiguous(), sd.scale,
-            self._gate_w32.to(device), self._identity_table(device),
+            self._gate_w32.to(device), self._expert_table(device),
         )
         self._block_b = (
             torch.empty((1, top_k), dtype=torch.int64, device=device),
             torch.empty((1, top_k), dtype=bf16, device=device),
-            torch.empty(self.num_experts + 1, dtype=torch.int32, device=device),
+            torch.empty(self.local_experts + 1, dtype=torch.int32, device=device),
             torch.empty(top_k, dtype=torch.int32, device=device),
             torch.empty(top_k, dtype=torch.int32, device=device),
             torch.empty(top_k, dtype=torch.int32, device=device),
@@ -492,11 +512,22 @@ class SparseMoE:
         old_multi_row = (os.environ.get("COFFIN_MOE_I8_GROUPED") == "0"
                          and tokens > 1)
         grouped_i8 = None if old_multi_row else self._grouped_i8
+        if (self.parallel is not None and self.parallel.mode == "ep"
+                and (self._dispatch is None or grouped_i8 is None)):
+            # 逐专家的兜底路径按**全局**专家号去索引专家栈，而这张卡只装了 1/world
+            # 那一段：形状照样合法，结果是错的行。宁可在这里响亮地失败。
+            raise RuntimeError(
+                "expert parallel needs the native moe_dispatch and moe_grouped_i8 "
+                "kernels; the per-expert fallback would index a full-width stack "
+                "while this rank holds only its own slice")
         if self._dispatch is not None and (self._grouped is not None
                                           or grouped_i8 is not None):
+            # 第四、五个实参依次是**本 rank**的专家数与全局专家数：分派内核要按局部
+            # 桶数做前缀和，按全局数建表。ep 下两者差 world_size 倍，写反了不会报错，
+            # 只会把一半槽位塞进不存在的桶。
             offsets, _slot_pos, token_of_pos, slot_of_pos = self._dispatch(
-                flat_index, self._identity_table(flat_index.device), flat_index.numel(),
-                self.num_experts, self.num_experts, top_k)
+                flat_index, self._expert_table(flat_index.device), flat_index.numel(),
+                self.local_experts, self.num_experts, top_k)
             # 收拢成「按专家排好序」的行，然后两次分组投影：gate/up 一次出中间量，
             # 过 SwiGLU 之后再投一次 down。两次都必须用分组内核——按专家分组的意义
             # 就是让每个专家 2 MB 的权重在一个解码步里只被读一遍。
@@ -513,6 +544,19 @@ class SparseMoE:
             # （decode 时 token 恒为 0，两种写法重合，这正是只有多行才炸的原因）。
             pos = slot_of_pos.long()
             flat_weights = weights.reshape(-1).index_select(0, pos)
+            if self.local_experts != self.num_experts:
+                # 专家并行下 ``[valid, slots)`` 这些行不属于本 rank：分派内核不把它们
+                # 排进行序（尾部位置表清 0），但分组内核仍然按 ``slots`` 行算了它们，
+                # 于是它们带着**真实的投影值**落到槽位 0 上——恒等映射时这批行不存在，
+                # 所以这个清零只在 ep 下需要，而漏掉它会让每条 token 多算 6 个假专家，
+                # 输出从第二个 token 起就变成胡话（实测：首 token 正常，其后全乱）。
+                #
+                # 掩码用 ``arange < offsets[-1]`` 而不是 ``offsets[-1].item()``：后者是
+                # 一次 D2H 同步，qwen4exp 在 decode 上量到每层一次同步会把 EP4 拖慢
+                # 11.7%（主机预取被打断），而这里整个比较都留在设备上。
+                keep = (torch.arange(pos.numel(), dtype=torch.int32, device=pos.device)
+                        < offsets[-1])
+                flat_weights = flat_weights * keep.to(flat_weights.dtype)
             if self._grouped_i8_merge is not None and tokens == 1:
                 # down 的输出对单条解码来说要的就是 top_k 行加权之和，让归约核顺手做完：
                 # 省掉 [top_k, H] 的激活、一次 mul、一次 index_add_ 和一次 sum（实测
@@ -531,23 +575,28 @@ class SparseMoE:
             self._experts_dense(x, index, weights, tokens, top_k), x.dtype)
 
     def _reduce(self, value: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-        """张量并行下把各 rank 的部分和加起来；单卡直接返回。
+        """把各 rank 的部分和加起来；单卡 / 流水并行直接返回。
 
-        专家的 ``down`` 按 K（中间宽度）分片，每个 rank 只算出一部分和，所以这一步
-        不是可选的优化：漏掉它得到的是「每个 rank 各算四分之一」的安静错误。
+        两种并行都只算出部分和，所以这一步不是可选的优化：漏掉它得到的是安静的错误。
+
+        * ``tp``：专家的 ``down`` 按 K（中间宽度）分片，每卡算的是一段 K 的部分和，
+          走 Gloo 的 fp32 全归约。
+        * ``ep``：每卡只算自己那 1/world 专家的槽位，未命中的槽位是零行，走同机
+          共享内存求和（40 层一步一次，1.3 ms；同一条路走 gloo 是 14-20 ms）。
 
         Args:
             value: 本 rank 的浮点结果。
             dtype: 返回的 dtype，与激活一致。
 
         Returns:
-            ``value``（单卡）或跨 rank 求和后窄化回 ``dtype`` 的结果。
+            ``value``（单卡 / 流水）或跨 rank 求和后窄化回 ``dtype`` 的结果。
         """
-        # 只有张量并行才需要跨 rank 求和：那时 down 的 K 轴被切开，每个 rank 只算部分
-        # 和。流水并行里专家是完整的，再加一次全归约等于把结果乘上世界大小。
-        if self.parallel is None or self.parallel.mode != "tp":
+        if self.parallel is None or self.parallel.mode not in {"tp", "ep"}:
             return value
-        return self.parallel.reduce(value).to(dtype)
+        if self.parallel.mode == "tp":
+            return self.parallel.reduce(value).to(dtype)
+        # 流水并行里专家是完整的，再加一次全归约等于把结果乘上世界大小。
+        return self.parallel.combine(value).to(dtype)
 
     def _group(self, stack, x: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
         """用分组内核按专家投影一整栈权重。
@@ -630,22 +679,34 @@ class SparseMoE:
         out = out * weights.reshape(-1)[:, None]
         return out.view(tokens, top_k, self.hidden).sum(dim=1)
 
-    def _identity_table(self, device: torch.device) -> torch.Tensor:
-        """全局专家号 → 本地号的恒等表（本族不做专家分片，所以是 ``0..E-1``）。
+    def _expert_table(self, device: torch.device) -> torch.Tensor:
+        """全局专家号 → 本地号的映射表；不归本 rank 的专家写 ``-1``。
 
-        留着这张表而不是传 ``None``：分派内核要求这张表存在，而专家并行若日后接上，
-        改的只是这里一行。
+        分派内核按这张表决定「哪些槽位留在本地、排到第几行」，所以它同时决定了本
+        rank 的专家栈该有多宽。单卡 / ``pp`` / ``tp`` 下专家栈是完整的，它就是恒等
+        映射；只有 ``ep`` 退化成 1/world 宽的子映射。
 
         Args:
             device: 表所在设备。
 
         Returns:
-            ``[E]`` 的 int32 张量。
+            ``[num_experts]`` 的 int32 张量；``-1`` 表示该专家的槽位不在这张卡上算。
+
+        Raises:
+            ValueError: ``ep`` 下专家数不能被世界大小整除（加载器会在更早的地方报，
+                这里只是不让一张半对半错的表流进前向）。
         """
-        table = self._identity
-        if table is None or table.device != device:
+        table = self._table
+        if table is not None and table.device == device:
+            return table
+        if self.parallel is not None and self.parallel.mode == "ep":
+            begin, _end = self.parallel.expert_range(self.num_experts)
+            table = torch.full((self.num_experts,), -1, dtype=torch.int32, device=device)
+            table[begin:begin + self.local_experts] = torch.arange(
+                self.local_experts, dtype=torch.int32, device=device)
+        else:
             table = torch.arange(self.num_experts, dtype=torch.int32, device=device)
-            self._identity = table
+        self._table = table
         return table
 
 
