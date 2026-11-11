@@ -223,7 +223,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("gu_out"),
           pybind11::arg("xq_dn"), pybind11::arg("xs_dn"),
           pybind11::arg("shared_hidden"), pybind11::arg("out"),
-          pybind11::arg("top_k"), pybind11::arg("slices") = 0);
+          pybind11::arg("top_k"), pybind11::arg("slices") = 0,
+          pybind11::arg("with_shared") = 1);
     m.def("moe_dispatch", &moe_dispatch,
           "\u5206\u6d3e\uff1a\u8def\u7531\u7ed3\u679c \u2192 \u524d\u7f00\u548c + \u884c\u5e8f",
           pybind11::arg("expert_idx"), pybind11::arg("local_table"),
@@ -302,5 +303,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "\u4ece\u6240\u6709 rank \u7684\u69fd\u6c42\u548c\u5230\u8bbe\u5907 out",
           pybind11::arg("out"), pybind11::arg("dev_base"), pybind11::arg("world"),
           pybind11::arg("blocks"), pybind11::arg("threads"));
+    m.def("mapped_finish_wait", &mapped_finish_wait,
+          "\u8bbe\u5907\u4fa7\u7b49\u6240\u6709 rank \u5230\u8fbe\u540e\u6c42\u548c"
+          "\uff08\u4e3b\u673a\u4e0d\u9700\u8981\u540c\u6b65\u6216\u8f6e\u8be2\uff09",
+          pybind11::arg("out"), pybind11::arg("dev_base"), pybind11::arg("world"),
+          pybind11::arg("blocks"), pybind11::arg("threads"), pybind11::arg("round"));
 }
 

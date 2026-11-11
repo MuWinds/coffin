@@ -721,7 +721,7 @@ torch::Tensor moe_decode_block(torch::Tensor x,
                                torch::Tensor gu_out,
                                torch::Tensor xq_dn, torch::Tensor xs_dn,
                                torch::Tensor shared_hidden, torch::Tensor out,
-                               int64_t top_k, int64_t slices);
+                               int64_t top_k, int64_t slices, int64_t with_shared);
 
 // 分派：把路由结果变成分组内核要的前缀和与行序，替掉纯 torch 的一串小算子。
 
@@ -901,3 +901,14 @@ void mapped_stage(torch::Tensor x, int64_t dev_base, int64_t world, int64_t rank
 // @param threads  每块线程数。
 void mapped_finish(torch::Tensor out, int64_t dev_base, int64_t world, int64_t blocks,
                    int64_t threads);
+
+// @brief 设备侧等所有 rank 到达后求和到 ``out``；主机不需要同步或轮询。
+//
+// @param out      ``[rows, hidden]`` fp32 设备张量。
+// @param dev_base 共享区设备指针。
+// @param world    进程数。
+// @param blocks   网格块数。
+// @param threads  每块线程数。
+// @param round    本轮轮次值，核等 ``counts[r] >= round``。
+void mapped_finish_wait(torch::Tensor out, int64_t dev_base, int64_t world,
+                        int64_t blocks, int64_t threads, int64_t round);

@@ -1,8 +1,17 @@
-"""同机多进程的全归约：一块 mmap 加自旋到达计数，语义同 ``dist.all_reduce(SUM)``。
+"""同机多进程的全归约，两条路：主机暂存（:class:`EpShmReduce`）与设备侧（:class:`MappedReduce`）。
 
 Module: ``coffin/models/qwen35``。EP 的通信底座：``moe.py`` 每个 MoE 层调一次
-``all_reduce_sum``，除此之外没有调用方。它只认 torch 和标准库，不 import
-``backends`` / ``models`` 里的任何东西——后端换来换去，这一层不该跟着动。
+``combine``，除此之外没有调用方。除了 torch 与标准库，它只碰后端绑定里的
+``mapped_*`` 那几个入口。
+
+两条路的差别只有一个：**主机搬不搬数据**。
+
+* :class:`EpShmReduce` 把载荷 D2H 进 mmap、主机累加、再 H2D。单次 30-100 µs，但它
+  每次都等设备把队列排空，一步 decode 40 层就是 40 次全流同步，实测每层多付约
+  445 µs（EP4 因此从 19.3 掉到比 PP4 的 29.6 tok/s 还慢）。
+* :class:`MappedReduce` 让核直接读写同一块物理页（``/dev/shm`` 文件 +
+  ``cudaHostRegister``），主机只轮询到达计数、求和由 ``mapped_finish`` 在设备上做完。
+  这才是 EP 想要的东西；前提是这张卡支持映射锁页内存（``mapped_pinned_probe`` 验）。
 
 Constraints:
     * 所有 rank 必须以**完全相同的顺序**调用同一个实例。协议里没有序号校验（省一次读），
@@ -25,6 +34,7 @@ Constraints:
 
 from __future__ import annotations
 
+import ctypes
 import gc
 import mmap
 import os
@@ -32,6 +42,47 @@ import struct
 import time
 
 import torch
+
+#: 归约分段的累计秒表，只在 ``COFFIN_EP_TRACE=1`` 时记账、进程退出时打印一次。
+#: 它回答的是「那 428 us/层到底花在 stage、同步、轮询还是 finish 上」——没有这个，
+#: 只能靠改代码猜，而每改一次都要重编 20 多个内核。
+_EP_TRACE = os.environ.get("COFFIN_EP_TRACE", "").strip() == "1"
+_EP_STATS: dict[str, list[float]] = {}
+
+
+def _ep_stat(key: str, dt: float) -> None:
+    """记一次分段耗时；每 640 次（约一条 16 token 回复）打一次累计。
+
+    不用 ``atexit`` 收尾：服务进程是被 kill 掉的，进程退出钩子根本不会跑。
+
+    Args:
+        key: 段名（``stage`` / ``sync`` / ``poll`` / ``finish`` / ``cast``）。
+        dt: 该段耗时，秒。
+    """
+    row = _EP_STATS.get(key)
+    if row is None:
+        _EP_STATS[key] = [dt, 1]
+    else:
+        row[0] += dt
+        row[1] += 1
+    _EP_STATS.setdefault("_calls", [0.0, 0])[1] += 1
+    calls = int(_EP_STATS["_calls"][1])
+    if calls % 640 == 0:
+        _ep_dump()
+
+
+def _ep_dump() -> None:
+    """打印分段累计与均值（累计值，比对相邻两行即可得到一段区间的平均）。"""
+    for key, (total, n) in sorted(_EP_STATS.items()):
+        if key == "_calls":
+            continue
+        print(f"[ep] {key}: n={n} total={total * 1e3:.1f}ms "
+              f"avg={total / n * 1e6:.1f}us", flush=True)
+
+
+if _EP_TRACE:
+    # 不在 atexit 里打：服务进程被 kill，退出钩子不会跑。
+    pass
 
 
 class EpShmReduce:
@@ -248,6 +299,236 @@ class EpShmReduce:
             self._mm.close()
         except BufferError:
             # 关不掉就交给进程退出收尸：在这里抛只会打断收尾，而映射本来就是进程级资源。
+            pass
+        finally:
+            os.close(self._fd)
+
+
+class MappedReduce:
+    """设备侧跨 rank 求和：核直接读写共享锁页区，主机只轮询到达计数。
+
+    与 :class:`EpShmReduce` 的差别全在「主机等不等数据」：那条路要把载荷搬到主机、
+    累加、再搬回去，每层一次全流同步（实测 445 µs/层 = 一步 decode 17.8 ms）；
+    这条路主机只读 ``world`` 个 int64，乘加由 ``mapped_finish`` 在设备上完成。
+
+    共享区的布局由本类与 ``mapped_reduce.cu`` 共同约定（改一边必须改另一边）：
+
+    ``[buf0: world*rows*hidden fp32][counters0: world int64][buf1: ...][counters1: ...]``
+
+    两块缓冲区按轮次交替，是为了让「跑得快的 rank 已经开始写下一层」不会覆盖
+    「跑得慢的 rank 还在读的上一层」：每块缓冲区带自己的到达计数，互相不干扰。
+
+    Constraints:
+        * 共享区必须已存在且足够大；这里只映射，不扩容。
+        * 载荷必须是 bf16 的二维连续 CUDA 张量——``mapped_stage`` 按位展开成 fp32，
+          换成别的 dtype 会在内核入口被拒。
+        * 每层一次往返，所以调用顺序必须各 rank 严格一致（与主机暂存那条同一条约束）。
+    """
+
+    def __init__(self, rank: int, world: int, path: str, rows: int, hidden: int,
+                 spin: float = 20.0) -> None:
+        """映射共享板，并把两半各自注册成设备可寻址的锁页内存。
+
+        Args:
+            rank: 本进程编号。
+            world: 进程数。
+            path: 共享板路径，启动器预先建好并清零。
+            rows: 单次归约的最大行数（预填充分块的 token 数）。
+            hidden: 隐藏宽度。
+            spin: 轮询到达计数的上限秒数，只用来把死锁变成异常。
+
+        Raises:
+            ValueError: rank/world/rows/hidden 不合法。
+            RuntimeError: 共享板不存在或太短；``mapped_register`` 拿不到设备指针。
+        """
+        if world <= 0 or not 0 <= rank < world:
+            raise ValueError(f"rank {rank} out of range [0, {world})")
+        if rows <= 0 or hidden <= 0:
+            raise ValueError("rows and hidden must be positive")
+        self.rank, self.world = int(rank), int(world)
+        self.rows, self.hidden = int(rows), int(hidden)
+        self.spin = float(spin)
+        #: 等待策略。默认 ``host``：先 ``cudaDeviceSynchronize`` 再轮询。实测这是三条
+        #: 里最快的一条（EP4 decode 20.3 tok/s 对设备侧自旋的 15.1、ixCCL 的 15.7、
+        #: 纯忙等的不可用）——这个运行时上「设备侧自旋等对端写宿主内存」不进展，
+        #: 而主机忙等又会被饿 20 ms，所以只剩「同步一次、然后几微秒轮询」这条路。
+        #: ``device`` 保留给以后换驱动/换卡复测。
+        self.host_wait = os.environ.get("COFFIN_EP_WAIT", "host").strip() != "device"
+        #: 一块缓冲区里各 rank 槽位的字节数。
+        self.slot_bytes = self.world * self.rows * self.hidden * 4
+        #: 紧随其后的到达计数，每个 rank 一个 int64。
+        self.counter_bytes = self.world * 8
+        self.frame = self.slot_bytes + self.counter_bytes
+        self.total_bytes = 2 * self.frame
+        self._buf = 0
+        self._rounds = [0, 0]
+
+        try:
+            self._fd = os.open(path, os.O_RDWR)
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"mapped 共享板不存在：{path}。启动器要先建好 {self.total_bytes} 字节"
+            ) from exc
+        size = os.fstat(self._fd).st_size
+        if size < self.total_bytes:
+            os.close(self._fd)
+            raise RuntimeError(
+                f"mapped 共享板太短：需要 {self.total_bytes} 字节"
+                f"（2 x ({self.world}x{self.rows}x{self.hidden} fp32 + 计数)），"
+                f"实际 {size} 字节")
+        self._mm = mmap.mmap(self._fd, self.total_bytes)
+
+        from backends.corex import _kernels
+
+        module = _kernels()
+        base = ctypes.addressof(ctypes.c_char.from_buffer(self._mm))
+        self._dev: list[int] = []
+        for i in range(2):
+            dev, detail = module.mapped_register(base + i * self.frame, self.frame)
+            if dev <= 0:
+                raise RuntimeError(
+                    f"mapped_register 失败（第 {i} 半）：{detail}。这张卡不支持把"
+                    f"mmap 区映射成设备可寻址的锁页内存时，EP 只能退回主机暂存")
+            self._dev.append(int(dev))
+        #: 设备侧求和结果，fp32；每步复用，避免每层一次分配。
+        self._out = torch.empty((self.rows, self.hidden), dtype=torch.float32,
+                                device="cuda")
+        self._threads = 256
+        self._blocks = max(1, min(512, (self.rows * self.hidden +
+                                        self._threads * 4 - 1) // (self._threads * 4)))
+
+    def _await(self, offset: int, want: int) -> None:
+        """轮询本轮的到达计数，直到所有 rank 都到达 ``want``。
+
+        轮询里必须定期让出主机。实测（``[1, 2048]``、4 rank）：纯忙等的版本每次要
+        **20 ms** 才看到计数，而同一段代码先 ``cuda.synchronize()`` 再轮询就只要 2 µs
+        ——设备写得很早，是 Python 忙等把下发/完成路径饿住了（四个进程在同一批核上
+        死等，驱动线程拿不到时间推进）。每 64 轮 ``sleep(0)`` 一次就能让出，代价是
+        每次等待多几微秒，换来的是 20 ms → 几十微秒。
+
+        Args:
+            offset: 本轮计数器在共享板里的字节偏移。
+            want: 本轮的轮次值。
+
+        Raises:
+            TimeoutError: 超过 ``spin`` 秒还有 rank 没到。
+        """
+        deadline = time.perf_counter() + self.spin
+        view = self._mm
+        world = self.world
+        spins = 0
+        while True:
+            ready = True
+            for r in range(world):
+                if struct.unpack_from("<q", view, offset + r * 8)[0] < want:
+                    ready = False
+                    break
+            if ready:
+                return
+            spins += 1
+            if not spins & 63:
+                # ``sleep(0)`` 只让出时间片，不引入定时器开销；忙等版本没有这一行。
+                time.sleep(0)
+            if time.perf_counter() > deadline:
+                raise TimeoutError(
+                    f"rank {self.rank} 在轮次 {want} 等不到全部 rank 的到达计数；"
+                    f"共享板 {self.fd_name}")
+
+    def all_reduce_sum(self, x: torch.Tensor) -> torch.Tensor:
+        """把各 rank 的 ``x`` 求和，返回同 dtype/shape/device 的新张量。
+
+        Args:
+            x: 本 rank 的贡献，bf16 ``[rows, hidden]``，连续 CUDA。
+
+        Returns:
+            求和结果，dtype 与 ``x`` 相同。
+
+        Raises:
+            ValueError: dtype/形状/宽度与初始化的约定不符。
+            TimeoutError: 有 rank 没有到达本轮。
+        """
+        rows = int(x.shape[0])
+        if x.dim() != 2 or int(x.shape[1]) != self.hidden:
+            raise ValueError(
+                f"mapped combine expects [rows, {self.hidden}], got "
+                f"{tuple(x.shape)}")
+        if rows > self.rows:
+            raise ValueError(
+                f"mapped combine payload {rows} rows exceeds the {self.rows} the "
+                f"shared board was sized for; raise COFFIN_EP_ROWS")
+        if x.dtype != torch.bfloat16:
+            raise ValueError(f"mapped combine needs bf16, got {x.dtype}")
+        from backends.corex import _kernels
+
+        module = _kernels()
+        buf = self._buf
+        self._rounds[buf] += 1
+        want = self._rounds[buf]
+        dev = self._dev[buf]
+        t0 = time.perf_counter()
+        module.mapped_stage(x.contiguous(), dev, self.world, self.rank,
+                            self._threads, want)
+        t1 = time.perf_counter()
+        # 到达计数紧跟在**本次载荷**的槽位之后（``mapped_reduce.cu`` 按
+        # ``world * rows * hidden`` 算偏移，不是按共享板的容量），所以这里的偏移
+        # 必须用实际的 ``rows`` 复算；按预分配容量算会永远等不到。
+        off = buf * self.frame + self.world * rows * self.hidden * 4
+        if self.host_wait:
+            # 两个实测过的坑都在这里：纯忙等要被**饿 20 ms**（这个运行时把 kernel
+            # 下发压在 flush 点上，主机不放手它就不放 kernel 出去）；所以先
+            # ``cudaDeviceSynchronize`` 再轮询（那只剩 106 us）。代价是每层清空一次
+            # 下发队列——这部分开销见 ``COFFIN_EP_TRACE`` 的分段秒表。
+            torch.cuda.synchronize()
+            t2 = time.perf_counter()
+            self._await(off, want)
+            t3 = time.perf_counter()
+            out = self._out[:rows]
+            module.mapped_finish(out, dev, self.world, self._blocks, self._threads)
+            t4 = time.perf_counter()
+        else:
+            # 设备侧等待：主机只下发 stage 与 finish。这条在这颗卡上**跑不起来**
+            # （自旋读不到对端写，实测 15 tok/s），保留给换驱动/换卡复测。
+            out = self._out[:rows]
+            module.mapped_finish_wait(out, dev, self.world, self._blocks,
+                                      self._threads, want)
+            t2 = t3 = t4 = time.perf_counter()
+        self._buf = 1 - buf
+        result = out.to(x.dtype)
+        if _EP_TRACE:
+            t5 = time.perf_counter()
+            _ep_stat("stage", t1 - t0)
+            _ep_stat("sync", t2 - t1)
+            _ep_stat("poll", t3 - t2)
+            _ep_stat("finish", t4 - t3)
+            _ep_stat("cast", t5 - t4)
+        return result
+
+    @property
+    def fd_name(self) -> str:
+        """共享板的文件名，只用于报错时说清是哪一块。"""
+        try:
+            return os.readlink(f"/proc/self/fd/{self._fd}")
+        except OSError:
+            return "<unknown>"
+
+    def close(self) -> None:
+        """解注册映射并释放 fd。可重复调用。"""
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        try:
+            from backends.corex import _kernels
+
+            module = _kernels()
+            base = ctypes.addressof(ctypes.c_char.from_buffer(self._mm))
+            for i in range(2):
+                module.mapped_release(base + i * self.frame)
+        except Exception:                                     # noqa: BLE001
+            # 解注册失败不该打断收尾：映射随进程退出一起消失。
+            pass
+        try:
+            self._mm.close()
+        except BufferError:
             pass
         finally:
             os.close(self._fd)

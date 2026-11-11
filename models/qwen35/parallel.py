@@ -80,15 +80,31 @@ class ParallelContext:
         #: 归约 291-420 us（几乎全是固定开销），共享内存 barrier 只要 32.9 us。40 层
         #: 一步就是 14-20 ms 对 1.3 ms —— 前者会把专家并行省下的 0.613 ms/层全部吃掉。
         self.ep = None
+        #: ``ep`` 的设备侧集合通信组（ixCCL/NCCL）。有它时 :meth:`combine` 走设备，
+        #: 主机不再逐层等归约结果——这一点是 EP 能不能用的分水岭，见 :meth:`combine`。
+        self._ep_group = None
+        #: ``ep`` 的映射锁页内存归约（``mapped_reduce.cu``）。比集合通信组更省：主机
+        #: 只轮询计数，连集合调用的 390 µs 固定开销都没有。
+        self._mapped = None
         if mode == "ep":
-            from models.qwen35.ep import EpShmReduce
+            kind = os.environ.get("COFFIN_EP_COLLECTIVE", "auto")
+            if kind not in {"auto", "mapped", "nccl", "shm"}:
+                raise ValueError(
+                    "COFFIN_EP_COLLECTIVE must be auto / mapped / nccl / shm, got "
+                    f"{kind!r}")
+            if kind in {"auto", "mapped"}:
+                self._mapped = _ep_mapped(rank, world_size, kind)
+            if self._mapped is None and kind in {"auto", "nccl"}:
+                self._ep_group = _ep_device_group(world_size, kind)
+            if self._mapped is None and self._ep_group is None:
+                from models.qwen35.ep import EpShmReduce
 
-            #: 共享区由启动器预先建好，这里只负责映射；载荷容量要盖住一个预填充
-            #: 分块的 ``[tokens, hidden]`` fp32（2048 token 是 20 MiB，双缓冲即 40 MiB）。
-            self.ep = EpShmReduce(
-                rank, world_size,
-                os.environ.get("COFFIN_EP_SHM", "/dev/shm/coffin_ep.bin"),
-                int(os.environ.get("COFFIN_EP_SLOT_BYTES", str(64 << 20))))
+                #: 共享区由启动器预先建好，这里只负责映射；载荷容量要盖住一个预填充
+                #: 分块的 ``[tokens, hidden]`` fp32（2048 token 是 20 MiB，双缓冲 40 MiB）。
+                self.ep = EpShmReduce(
+                    rank, world_size,
+                    os.environ.get("COFFIN_EP_SHM", "/dev/shm/coffin_ep.bin"),
+                    int(os.environ.get("COFFIN_EP_SLOT_BYTES", str(64 << 20))))
         self.scale_mode = os.environ.get("COFFIN_TP_SCALE_MODE", "shared")
         if self.scale_mode not in {"shared", "local", "decode_local"}:
             raise ValueError(
@@ -244,6 +260,18 @@ class ParallelContext:
         **求和**。漏掉它得到的是「每条 token 只剩 1/4 专家」的安静错误——形状全对，
         输出是另一个模型。
 
+        三条路，按实测好坏排：
+
+        1. **映射锁页内存**（``mapped_reduce.cu``）：核直接读写共享区，主机只轮询
+           一个 int64 计数，乘加在设备上。这是唯一不付「每次调用 390 µs」的那条。
+        2. **设备侧集合通信**（ixCCL/NCCL）：归约留在卡上，但每次调用有约 390 µs 的
+           固定开销（实测 10 KB 与 640 KB 同价），一步 decode 40 层就是 15.6 ms。
+        3. **主机暂存**（共享内存 barrier）：单次 30-100 µs 看着最快，但它每次都要等
+           设备把队列排空，40 层就是 40 次全流同步，实测每层多付约 445 µs——EP4 因此
+           从 19.3 掉到比 PP4 的 29.6 tok/s 还慢。
+
+        ``fp32`` 累加、只窄化一次，是因为四个 bf16 直接相加会丢两三位尾数。
+
         Args:
             value: 本 rank 的部分和，``[tokens, hidden]``，浮点。
 
@@ -251,13 +279,96 @@ class ParallelContext:
             同 dtype、同形状的跨 rank 和。
 
         Raises:
-            ValueError: ``ep`` 上下文没有建起来（配置错位）。
+            ValueError: ``ep`` 上下文两条路都没有建起来（配置错位）。
         """
         if self.mode != "ep":
             return value
+        if self._mapped is not None:
+            return self._mapped.all_reduce_sum(value)
+        if self._ep_group is not None:
+            acc = value.to(torch.float32)
+            dist.all_reduce(acc, op=dist.ReduceOp.SUM, group=self._ep_group)
+            return acc.to(value.dtype)
         if self.ep is None:
-            raise ValueError("expert parallel context has no shared-memory arena")
+            raise ValueError(
+                "expert parallel context has neither a mapped region, a device "
+                "collective group, nor a shared-memory arena")
         return self.ep.all_reduce_sum(value)
+
+
+def _ep_mapped(rank: int, world_size: int, kind: str):
+    """建一个映射锁页内存的归约器（设备侧求和），拿不到就返回 ``None``。
+
+    这是三条路里唯一不付集合调用开销的：主机只轮询计数，乘加在设备上。
+
+    Args:
+        rank: 本进程编号。
+        world_size: 进程数。
+        kind: ``auto`` 失败时回落并打印原因；``mapped`` 失败时抛。
+
+    Returns:
+        :class:`~models.qwen35.ep.MappedReduce` 或 ``None``。
+
+    Raises:
+        RuntimeError: ``kind="mapped"`` 而没有配置共享板或注册失败。
+    """
+    path = os.environ.get("COFFIN_EP_MAPPED", "").strip()
+    if not path:
+        if kind == "mapped":
+            raise RuntimeError(
+                "COFFIN_EP_COLLECTIVE=mapped needs COFFIN_EP_MAPPED=<共享板路径>")
+        return None
+    from models.qwen35.ep import MappedReduce
+
+    rows = int(os.environ.get("COFFIN_EP_ROWS", "2048"))
+    hidden = int(os.environ.get("COFFIN_EP_HIDDEN", "2048"))
+    try:
+        reducer = MappedReduce(rank, world_size, path, rows, hidden)
+    except Exception as exc:                                  # noqa: BLE001
+        if kind == "mapped":
+            raise
+        print(f"[ep] mapped reduce unavailable ({type(exc).__name__}: "
+              f"{str(exc)[:160]}); falling back", flush=True)
+        return None
+    if rank == 0:
+        print(f"[ep] mapped reduce ready: world={world_size} rows={rows} "
+              f"hidden={hidden} board={path}", flush=True)
+    return reducer
+
+
+def _ep_device_group(world_size: int, kind: str):
+    """为专家并行建一个设备侧集合通信组，拿不到就返回 ``None``。
+
+    这台卡（天数智芯 BI-V100）的厂商 torch 把 ``nccl`` 接到 ixCCL 上，实测可用；
+    ``xccl``/``cxcl`` 都不是它的名字（实测报 ``Unknown c10d backend type XCCL``）。
+    请求广播仍走 gloo 的默认组，两个组可以并存——本组只服务 MoE 的归约。
+
+    Args:
+        world_size: 组内 rank 数，必须等于并行进程数。
+        kind: ``auto`` 先试设备侧、失败回落共享内存；``nccl`` 强制设备侧（建不起来
+            就抛）；``shm`` 强制共享内存（对照用）。
+
+    Returns:
+        ``ProcessGroup`` 或 ``None``。
+
+    Raises:
+        RuntimeError: ``kind="nccl"`` 而设备侧组建不起来。
+    """
+    if kind in {"shm", "none"}:
+        return None
+    if not dist.is_initialized():
+        return None
+    try:
+        group = dist.new_group(ranks=list(range(world_size)), backend="nccl")
+    except Exception as exc:                                  # noqa: BLE001
+        if kind == "nccl":
+            raise RuntimeError(
+                f"COFFIN_EP_COLLECTIVE=nccl but the device collective group could "
+                f"not be created: {type(exc).__name__}: {exc}") from exc
+        print(f"[ep] device collective unavailable ({type(exc).__name__}: "
+              f"{str(exc)[:120]}); falling back to the shm arena", flush=True)
+        return None
+    return group
 
 
 class PipeLink:

@@ -74,6 +74,50 @@ __global__ void finish_kernel(float* __restrict__ out, const float* __restrict__
     }
 }
 
+// @brief 先等所有 rank 到达、再求和：把等待放在设备上，主机一次都不参与。
+//
+// 为什么需要它：主机侧轮询有两个都实测过的坏结局。纯忙等要被**饿 20 ms**
+// （``[1, 2048]`` 一次归约 20055 us，而同一段代码先同步再轮询只要 106 us：这个
+// 运行时把 kernel 下发压在 flush 点上，主机一直不放手它就不放 kernel 出去）；
+// 改成「先同步再轮询」虽然降到 106 us，但每层一次 ``cudaDeviceSynchronize`` 会把
+// 已经排好的下发队列清空——EP4 一步 40 层，实测因此多付约 11 ms。
+//
+// 自旋放在核里就没有这两个问题：主机只负责下发 stage 与 finish，两个核在同一个流上
+// 背靠背执行，finish 自己等对端写完再读。每个 block 各自等一次（线程 0 自旋 +
+// ``__syncthreads``），所以多 block 也不需要跨块同步。
+//
+// @param out      ``[rows, hidden]`` fp32 设备张量。
+// @param slots    ``world * rows * hidden`` 的共享区（设备可见）。
+// @param counts   紧随其后的 ``world`` 个 int64 到达计数。
+// @param round    本轮轮次值；等 ``counts[r] >= round``。
+__global__ void finish_wait_kernel(float* __restrict__ out,
+                                   const float* __restrict__ slots,
+                                   const long long* __restrict__ counts,
+                                   int rows, int hidden, int world, long long round) {
+    if (threadIdx.x == 0) {
+        for (int r = 0; r < world; ++r) {
+            // volatile：这份计数由别的进程写，编译器不能把它提到循环外。
+            //
+            // 不要在这里加 ``__threadfence_system()``：实测加了之后 ptxas 直接
+            // 崩（``clang-16: unable to execute command: Aborted``），与文件头记的
+            // 「同一翻译单元里混裸主机指针 + torch 张量 + 设备核会 ICE」是同一个病。
+            // 要修「读不到对端写」只能把自旋搬进独立的翻译单元，而不是在这里加栅栏。
+            while (reinterpret_cast<const volatile long long*>(counts)[r] < round) {
+            }
+        }
+    }
+    __syncthreads();
+    const long long total = static_cast<long long>(rows) * hidden;
+    for (long long i = blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x;
+         i < total; i += static_cast<long long>(gridDim.x) * blockDim.x) {
+        float acc = 0.0F;
+        for (int r = 0; r < world; ++r) {
+            acc += slots[static_cast<long long>(r) * total + i];
+        }
+        out[i] = acc;
+    }
+}
+
 // @brief 记一次注册，供 ``mapped_release`` 解注册。
 long long g_registered_host = 0;
 
@@ -172,6 +216,34 @@ void mapped_finish(torch::Tensor out, int64_t dev_base, int64_t world, int64_t b
     const float* slots = reinterpret_cast<const float*>(static_cast<uintptr_t>(dev_base));
     finish_kernel<<<static_cast<int>(blocks), static_cast<int>(threads)>>>(
         out.data_ptr<float>(), slots, rows, hidden, static_cast<int>(world));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// @brief 起 ``finish_wait_kernel``：设备侧等所有 rank 到达，再求和到设备 ``out``。
+//
+// 主机调用它之后**不需要任何同步或轮询**：等待在核里做，所以这一步不会清空下发队列。
+//
+// @param out      ``[rows, hidden]`` fp32 设备张量。
+// @param dev_base 共享区的设备指针。
+// @param world    进程数。
+// @param blocks   网格块数。
+// @param threads  每块线程数。
+// @param round    本轮轮次值，核等 ``counts[r] >= round``。
+void mapped_finish_wait(torch::Tensor out, int64_t dev_base, int64_t world,
+                        int64_t blocks, int64_t threads, int64_t round) {
+    TORCH_CHECK(out.is_cuda() && out.is_contiguous() && out.dim() == 2,
+                "out must be a contiguous 2-D CUDA tensor");
+    TORCH_CHECK(out.scalar_type() == torch::kFloat32, "out must be fp32");
+    TORCH_CHECK(blocks > 0 && threads > 0 && threads <= 1024, "grid out of range");
+    TORCH_CHECK(round > 0, "round must be positive");
+    const int rows = static_cast<int>(out.size(0));
+    const int hidden = static_cast<int>(out.size(1));
+    const float* slots = reinterpret_cast<const float*>(static_cast<uintptr_t>(dev_base));
+    const long long* counts = reinterpret_cast<const long long*>(
+        slots + static_cast<long long>(world) * rows * hidden);
+    finish_wait_kernel<<<static_cast<int>(blocks), static_cast<int>(threads)>>>(
+        out.data_ptr<float>(), slots, counts, rows, hidden, static_cast<int>(world),
+        static_cast<long long>(round));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

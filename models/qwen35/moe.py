@@ -221,7 +221,10 @@ class SparseMoE:
         #: 本 rank 的专家数。单卡 / ``pp`` / ``tp`` 下等于全局值；``ep`` 下是
         #: 专家栈的首轴（加载器读盘时就裁好了），不能拿 ``cfg`` 的全局值去覆盖它。
         self.local_experts = self.num_experts
-        if self.parallel is not None and self.parallel.mode == "ep":
+        #: 是不是专家并行。整块驱动与 :meth:`_reduce` 都按它分叉：EP 下驱动只回本 rank
+        #: 的专家部分，共享专家必须等跨 rank 求和之后再加一次。
+        self._is_ep = self.parallel is not None and self.parallel.mode == "ep"
+        if self._is_ep:
             begin, end = self.parallel.expert_range(self.num_experts)
             stacked = getattr(self.gate_up, "wq", self.gate_up)
             self.local_experts = int(stacked.shape[0])
@@ -263,12 +266,9 @@ class SparseMoE:
         #: 分配与发射照付，所以上限是个位数百分比；``COFFIN_LAYER_DRIVER=1`` 才启用，
         #: 便于同二进制 A/B。
         self._block_driver = getattr(bops, "moe_decode_block", None)
-        if self.parallel is not None and self.parallel.mode == "ep":
-            # 整块驱动把路由、分派、两次分组投影和 top_k 归并压进一次 C++ 调用，但它
-            # 的专家表按「宽度 = 全局专家数」建的。专家并行下要喂局部表，那条路径还
-            # 没验过，先关掉（实测代价 3.2-3.8%）——不把一条没验过的内核塞进正确性
-            # 路径，就是这个开关存在的理由。
-            self._block_driver = None
+        # 专家并行下这条也开着：`moe_block.cu` 现在从映射表的宽度取**全局**专家数
+        # （分派内核的边界检查要用它），并把「不属于本 rank 的槽位」的逐行权重在设备上
+        # 清零。这两条不加就是「首 token 正确、其后逐 token 变胡话」。
         self._block_w = None
         self._block_b = None
 
@@ -382,7 +382,8 @@ class SparseMoE:
             self._build_block(flat)
             if self._block_w is None:
                 return None
-        return driver(flat, *self._block_w, *self._block_b, self.top_k, 0)
+        return driver(flat, *self._block_w, *self._block_b, self.top_k, 0,
+                      0 if self._is_ep else 1)
 
     def _forward(self, x: torch.Tensor, kind: str) -> torch.Tensor:
         """MoE 的公共主体：路由、专家分组、定序归并、加共享专家。
@@ -402,7 +403,16 @@ class SparseMoE:
         if kind == "decode":
             driven = self._decode_block(flat)
             if driven is not None:
-                return driven if driven.shape == shape else driven.reshape(shape)
+                out = self._reduce(driven, driven.dtype)
+                if self._is_ep:
+                    # 共享专家用**驱动已经算好的那一份**（``_block_b[-2]`` 就是
+                    # ``shared_hidden``），不要再调一次 :meth:`_shared`：每层两次投影
+                    # 在 decode 上是实打实的浪费，而驱动无论如何都要算它（输出布局
+                    # 决定了它必须写进那个缓冲区）。
+                    shared = self._block_b[-2]
+                    out = out + (shared if shared.shape == out.shape
+                                 else shared.reshape(out.shape))
+                return out if out.shape == shape else out.reshape(shape)
         weights, index = self._route(x, kind)
         # 路由与分组按二维算（专家内核与 top-k 都只认二维），共享专家则保留原始
         # 维数交给投影：单条解码时 ``x`` 是一维，``GEMV`` 只在一维输入上给出

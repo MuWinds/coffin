@@ -50,8 +50,12 @@ torch::Tensor moe_decode_block(torch::Tensor x,
                                torch::Tensor gu_out,
                                torch::Tensor xq_dn, torch::Tensor xs_dn,
                                torch::Tensor shared_hidden, torch::Tensor out,
-                               int64_t top_k, int64_t slices) {
+                               int64_t top_k, int64_t slices, int64_t with_shared) {
   const int64_t experts = gu_w.size(0);
+  // 全局专家数取自映射表的宽度。专家并行下本 rank 只装 1/world 的专家（``experts``
+  // 是局部数），而路由给的是**全局号**，分派内核的边界检查必须用全局数——写成本地数
+  // 会把一半槽位当成越界丢掉。单卡 / PP / TP 下表宽等于局部数，两者相同。
+  const int64_t global_experts = table.size(0);
   const int64_t inter = gu_w.size(2) / 2;
   const int64_t hidden = gu_w.size(1);
 
@@ -83,7 +87,7 @@ torch::Tensor moe_decode_block(torch::Tensor x,
   // 也是在包装层做这一次转换的，所以这里逐位等价。
   torch::Tensor flat_index = idx.reshape({-1}).to(torch::kInt);
   moe_dispatch(flat_index, table, offsets, slot_pos, token_of_pos, slot_of_pos,
-               disp_scratch, flat_index.numel(), experts, experts, top_k);
+               disp_scratch, flat_index.numel(), experts, global_experts, top_k);
   torch::Tensor packed = x.index_select(0, token_of_pos);
   quant_act_i8(packed, xq_gu, xs_gu);
   torch::Tensor gu = moe_grouped_i8(xq_gu, xs_gu, gu_w, gu_scale, offsets, gu_out,
@@ -96,10 +100,28 @@ torch::Tensor moe_decode_block(torch::Tensor x,
   // Python 包装层同样做这一步转换。
   torch::Tensor flat_weights =
       rw.reshape({-1}).index_select(0, slot_of_pos).to(torch::kFloat);
+  if (global_experts != experts) {
+    // 专家并行：``[valid, slots)`` 这些行不属于本 rank。分派内核不把它们排进行序
+    // （位置表尾部清 0），但分组内核仍按 ``slots`` 行算完了它们，于是它们带着**真实
+    // 投影值**、按「槽位 0 的路由权重」加回去——恒等映射时这批行不存在，所以单卡 /
+    // PP / TP 都看不见这个坑；症状是首 token 正确、其后逐 token 变胡话。
+    //
+    // 掩码用 ``arange < offsets[experts]`` 而不是 ``offsets[-1].item()``：后者是一次
+    // D2H 同步，每层一次会把主机预取打断（qwen4exp 量到 +11.7%），而这里整个比较
+    // 都留在设备上。
+    auto rows = flat_index.numel();
+    auto keep = at::arange(rows, flat_weights.options().dtype(torch::kInt32)) <
+                offsets[experts];
+    flat_weights = flat_weights * keep.to(torch::kFloat);
+  }
   torch::Tensor merged = moe_grouped_i8_merge(xq_dn, xs_dn, dn_w, dn_scale, offsets,
                                               flat_weights, out,
                                               slices > 0 ? slices : kAutoSlices);
-  // `merged` 就是 `out`（合并核写进去的那个），再加共享专家。
-  at::add_out(out, merged, shared_hidden);
+  // `merged` 就是 `out`（合并核写进去的那个）。共享专家要不要现在加，由调用方定：
+  // 专家并行下本函数只返回**本 rank 的专家部分**，共享专家必须在跨 rank 求和之后
+  // 再加一次——这里加了的话，四个 rank 各自带一份共享贡献，求和会把它算四遍。
+  if (with_shared != 0) {
+    at::add_out(out, merged, shared_hidden);
+  }
   return out;
 }
