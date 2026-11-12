@@ -2,7 +2,7 @@
 // @brief 设备侧跨 rank 归约：核直接读写一块被多进程共享、且被 CUDA 映射过的锁页区。
 //
 // Module: coffin/backends/corex/kernels。与 ``mapped_shm.cu``（只放探针）分开成两个
-// 翻译单元是**为了绕过一个编译器内部崩溃**：把「裸主机指针 + torch 张量 + 设备核」
+// 翻译单元是为了绕过一个编译器内部崩溃：把「裸主机指针 + torch 张量 + 设备核」
 // 混在同一个 .cu 里时 ``clang-16`` 直接 ICE，拆开之后每个单元只碰一类东西。
 //
 // 与主机侧交换的根本区别：主机不调任何同步 API，只轮询锁页区里的到达计数。
@@ -98,11 +98,12 @@ __global__ void finish_wait_kernel(float* __restrict__ out,
         for (int r = 0; r < world; ++r) {
             // volatile：这份计数由别的进程写，编译器不能把它提到循环外。
             //
-            // 不要在这里加 ``__threadfence_system()``：实测加了之后 ptxas 直接
-            // 崩（``clang-16: unable to execute command: Aborted``），与文件头记的
-            // 「同一翻译单元里混裸主机指针 + torch 张量 + 设备核会 ICE」是同一个病。
-            // 要修「读不到对端写」只能把自旋搬进独立的翻译单元，而不是在这里加栅栏。
+            // 这里不能用 ``__threadfence_system()``：
+            // 这张卡没有 PTX，内联 PTX 一律 invalid instruction。所以只能退到设备
+            // 作用域栅栏 ``__threadfence()``——它至少能编过，够不够靠 volatile 读
+            // 绕 L2 来定
             while (reinterpret_cast<const volatile long long*>(counts)[r] < round) {
+                __threadfence();
             }
         }
     }

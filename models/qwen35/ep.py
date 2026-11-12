@@ -81,8 +81,9 @@ def _ep_dump() -> None:
 
 
 if _EP_TRACE:
-    # 不在 atexit 里打：服务进程被 kill，退出钩子不会跑。
-    pass
+    # 开局打一行：没有它就看不出「统计没出来」是因为环境变量没进到 serve 进程，
+    # 还是因为计数没到 640（上一次就吃了这个哑巴亏）。
+    print("[ep] trace on", flush=True)
 
 
 class EpShmReduce:
