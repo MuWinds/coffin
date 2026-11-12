@@ -56,14 +56,42 @@ def _init_tensor_parallel():
 def _run_request(srv_model: "Server", req: dict):
     """在所有 rank 上按同序执行请求，只有 rank 0 使用返回值。
 
-    Gloo 的请求广播与模型归约共享同一个进程组；锁覆盖整次生成，防止 HTTP
-    线程并发改变 collective 顺序。
+    集合操作只有两部分：请求广播（本函数外层）与模型内部的跨卡归约。归约由每个
+    rank 唯一的 engine loop 线程发出，所以多条生成线程并发只是各自等自己的输出队列，
+    不会交错集合顺序——这正是 ``pp`` 与 ``ep`` 可以并发、而 ``tp`` 不可以的原因。
     """
     if req.get("op") == "chat_stream":
         yield from srv_model.stream_chat(req)
         return
     result = srv_model.handle(req)
     yield result
+
+
+def _concurrent_parallel() -> bool:
+    """返回当前拓扑是否允许「广播循环不等生成结束」。
+
+    判据是「生成期会不会占用 gloo 进程组」，不是拓扑名字：
+
+    * ``pp`` 段间走 UDP，生成期不碰 gloo ⇒ 可以并发。
+    * ``ep`` 的跨卡归约已经搬到设备内存 P2P（:class:`models.qwen35.ep.P2pReduce`），
+      gloo 只用于请求广播与 IPC 句柄交换（后者只在建连时发生）⇒ 同样可以并发。
+      这条以前不成立：那时 EP 每层走主机暂存 + gloo 归约，多个生成线程会把不同
+      请求的归约交错在一起，所以历史上只有 ``pp`` 能并发。P2P 落地后条件变了，
+      判据没跟着改，于是 ``ep`` 一直走「整次生成独占广播循环」的老路——
+      ``--max-num-seqs`` 因此形同虚设（实测 M=1/2/4/8/16 的聚合吞吐恒为 26.5 tok/s，
+      请求严格串行）。
+    * ``tp`` 每步都要 gloo 归约 ⇒ 保持同步，多个生成线程会打乱集合顺序。
+
+    剩下的唯一风险是「同一批请求在四个 rank 上被看到的步不同」。EP 每层的 combine
+    本身是一次跨 rank 屏障，四个 rank 因此始终处在同一步的同一个层上；广播又是
+    gloo 集合操作，到达各 rank 的时间差在亚毫秒量级，而一步是 30 ms 量级。落在
+    步边界那一瞬的竞态仍然理论存在，所以 ``--max-num-seqs`` 打开时必须盯逐字一致性
+    （见 ``docs/occamy/EP4.md``），不能只看吞吐。
+
+    Returns:
+        允许并发返回 ``True``。
+    """
+    return os.environ.get("COFFIN_PARALLEL", "tp") in ("pp", "ep")
 
 
 def _tp_worker(srv_model: "Server", dist) -> None:
@@ -74,11 +102,9 @@ def _tp_worker(srv_model: "Server", dist) -> None:
     恒为 1，四路并发请求的总墙钟正好是单条的 4 倍）。所以非 0 rank 的广播循环**不能**
     等生成结束——生成交给独立线程，循环立刻回到下一次广播。
 
-    这只在流水并行下成立：``pp`` 的段间通信走 UDP（``PipeLink``），不占用 gloo 进程组，
-    生成线程因此不会和广播线程打乱集合顺序。``tp`` 每一步都要 gloo 归约，多个生成线程
-    会交错集合操作，所以它保持「整次生成独占广播循环」的老行为。
+    哪条拓扑能这么做见 :func:`_concurrent_parallel`。
     """
-    concurrent = os.environ.get("COFFIN_PARALLEL", "tp") == "pp"
+    concurrent = _concurrent_parallel()
     srv_model.start()
     pending: list[threading.Thread] = []
 
