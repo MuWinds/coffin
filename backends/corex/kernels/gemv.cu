@@ -441,6 +441,78 @@ __global__ void gemv_kn_m_kernel(const WT* __restrict__ wt,
     for (int m = 0; m < M; ++m) y[(size_t)m * N + n] = CxScalar<XT>::from_float(acc[m]);
 }
 
+// @brief ``M`` 行激活的 split-K 版本：按 K 切片，每片写自己的部分和平面。
+//
+// 为什么需要它：上面那个内核一个线程算一个输出列，网格就是 ``ceil(N/threads)`` 个块。
+// 共享专家的 ``gate_up`` 是 ``N = 512``，256 线程下只有 **2 个块**，16 个 SM 里 14 个
+// 闲着 —— 实测 40 层、每层 6.3 MB 权重共 252 MB/步，要 68.8 ms，是访存地板的 118 倍。
+// int8 的 M 行路径早就有 ``gemv_kn_i8_m_split_kernel``，bf16 这条一直没有，所以
+// split-K 就是补这个缺口。
+//
+// 分片只改变调度、不改变算术：每片仍按 K 递增累加，归约按 ``s = 0 .. split-1`` 相加，
+// 因此与不分片的结果差在 fp32 加法结合次序的末位上（判据 1e-2，同 ``gemv_kn_m``）。
+//
+// @param wt [K, N] 权重，行主序。
+// @param x [M, K] 激活。
+// @param part [M*split, N] fp32 部分和；第 ``m`` 行的平面从 ``m * split`` 开始。
+// @param N 行间距兼列数。
+// @param K 归约长度。
+// @param split K 区间个数。
+// @param per 一个 K 区间的长度；最后一个夹到 K。
+template <typename WT, typename XT, int U, int M>
+__global__ void gemv_kn_m_split_kernel(const WT* __restrict__ wt,
+                                       const XT* __restrict__ x,
+                                       float* __restrict__ part,
+                                       int N, int K, int split, int per) {
+    const int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= N) return;
+    const int s = blockIdx.y;
+    const int k0 = s * per;
+    const int k1 = min(K, k0 + per);
+    float acc[M];
+#pragma unroll
+    for (int m = 0; m < M; ++m) acc[m] = 0.f;
+    int k = k0;
+    for (; k + U <= k1; k += U) {
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const float w = CxScalar<WT>::to_float(wt[(size_t)(k + u) * N + n]);
+#pragma unroll
+            for (int m = 0; m < M; ++m) {
+                acc[m] += w * CxScalar<XT>::to_float(x[(size_t)m * K + k + u]);
+            }
+        }
+    }
+    for (; k < k1; ++k) {
+        const float w = CxScalar<WT>::to_float(wt[(size_t)k * N + n]);
+#pragma unroll
+        for (int m = 0; m < M; ++m) {
+            acc[m] += w * CxScalar<XT>::to_float(x[(size_t)m * K + k]);
+        }
+    }
+#pragma unroll
+    for (int m = 0; m < M; ++m) part[((size_t)m * split + s) * N + n] = acc[m];
+}
+
+// @brief 把 M 行的分片平面相加；每列一个线程，归约顺序固定为 ``s = 0 .. split-1``。
+//
+// @param part [M*split, N] fp32 部分和。
+// @param y [M, N] 输出，dtype 同激活。
+// @param N 输出列数。
+// @param split K 区间个数。
+// @param M 行数。
+template <typename XT>
+__global__ void gemv_kn_m_reduce_kernel(const float* __restrict__ part,
+                                        XT* __restrict__ y, int N, int split, int M) {
+    const int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= N) return;
+    for (int m = 0; m < M; ++m) {
+        float acc = 0.f;
+        for (int s = 0; s < split; ++s) acc += part[((size_t)m * split + s) * N + n];
+        y[(size_t)m * N + n] = CxScalar<XT>::from_float(acc);
+    }
+}
+
 // W8A16 的小 M 内核家族：上面那个 bf16 小 M 内核，换成 int8 权重加每列 scale。
 //
 // 它存在是因为 int8 路径根本没有批处理入口，而这个缺失不会以错误的形式暴露出来:
@@ -933,8 +1005,51 @@ torch::Tensor launch_m(const torch::Tensor& wt, const torch::Tensor& x, torch::T
     return y;
 }
 
-//: 列数达到或超过它时，``width == 0``（自动）路径选四宽内核。这只是 *默认分派*，不是正确性
-//: 下限：通过 ``width`` 参数，宽内核在任意 ``N`` 下都够得着，而扫描驱动的正是那个参数。
+// @brief 为一种 dtype 组合和一个 ``M`` 宽度启动 split-K 内核。
+template <typename WT, typename XT, int M>
+torch::Tensor launch_m_split(const torch::Tensor& wt, const torch::Tensor& x,
+                             torch::Tensor& y, int N, int K, int threads, int split) {
+    const WT* wp = reinterpret_cast<const WT*>(wt.data_ptr());
+    const XT* xp = reinterpret_cast<const XT*>(x.data_ptr());
+    XT* yp = reinterpret_cast<XT*>(y.data_ptr());
+    const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    const int per = (K + split - 1) / split;
+    auto part = torch::empty({(int64_t)M * split, (int64_t)N},
+                             x.options().dtype(torch::kFloat));
+    float* pp = part.data_ptr<float>();
+    const int blocks = (int)((N + threads - 1) / threads);
+    const dim3 grid(blocks, split);
+    gemv_kn_m_split_kernel<WT, XT, 4, M><<<grid, threads, 0, stream>>>(wp, xp, pp, N, K,
+                                                                       split, per);
+    gemv_kn_m_reduce_kernel<XT><<<blocks, threads, 0, stream>>>(pp, yp, N, split, M);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return y;
+}
+
+// @brief 一种 dtype 组合下按宽度分批跑 split-K，余数退回不分片的多行内核。
+template <typename WT, typename XT>
+torch::Tensor run_m_split(const torch::Tensor& wt, const torch::Tensor& x,
+                          torch::Tensor& y, int N, int K, int threads, int split) {
+    const int M = (int)x.size(0);
+    auto one = [&](int start, int rows) {
+        auto xs = x.narrow(0, start, rows);
+        if (!xs.is_contiguous()) xs = xs.contiguous();
+        auto ys = y.narrow(0, start, rows);
+        if (rows == 8) return launch_m_split<WT, XT, 8>(wt, xs, ys, N, K, threads, split);
+        if (rows == 4) return launch_m_split<WT, XT, 4>(wt, xs, ys, N, K, threads, split);
+        if (rows == 2) return launch_m_split<WT, XT, 2>(wt, xs, ys, N, K, threads, split);
+        // 1 行没有"分摊"可做，退回不分片的单行入口。
+        return launch_m<WT, XT, 2>(wt, xs, ys, N, K, threads);
+    };
+
+    int width = (M >= 8) ? 8 : (M >= 4 ? 4 : 2);
+    int m = 0;
+    for (; m + width <= M; m += width) one(m, width);
+    for (; m < M; ++m) one(m, 1);
+    return y;
+}
+
+//: 列数达到或超过它时，``width == 0``（自动）路径选四宽内核。这只是 *默认分派*，不是正确性//: 下限：通过 ``width`` 参数，宽内核在任意 ``N`` 下都够得着，而扫描驱动的正是那个参数。
 //:
 //: 4096 是 split 16/32 下宽度扫描给出的交叉点，而 split 很要紧：旧的 32768 下限是在
 //: ``split`` 被压到 8 时测的，那时网格很稀，于是宽内核为一个 split-K 现在能补回来的线程数
@@ -1522,4 +1637,55 @@ torch::Tensor gemv_kn_m(torch::Tensor wt, torch::Tensor x, int64_t threads,
         y[m].copy_(row);
     }
     return y;
+}
+
+// @brief M 行激活的 split-K 入口：窄 N 时用分片把网格填满。
+//
+// ``gemv_kn_m`` 的网格是 ``ceil(N / threads)`` 个块。共享专家的 ``gate_up`` 是
+// ``N = 512``：256 线程下 2 个块，16 个 SM 里 14 个空转，实测 40 层 252 MB 的权重流量
+// 要 68.8 ms（地板的 118 倍）。这里按 K 切 ``split`` 片，网格变成
+// ``blocks x split``，每一片的归约顺序仍然是 K 递增，所以结果与不分片只差 fp32
+// 结合次序的末位（判据 1e-2，与 ``gemv_kn_m`` 同一口径）。
+//
+// @param wt [K, N] 权重，连续存放，bf16 或 fp32。
+// @param x [M, K] 激活。
+// @param threads 每块线程数，``0`` 表示按 ``N`` 选。
+// @param split K 分片数；``0`` 表示自动（按 SM 数与块数补到 4 倍 SM，上限 16）。
+// @return [M, N]，dtype 同 ``x``。
+// @throws c10::Error 形状或 dtype 是内核索引不了的。
+torch::Tensor gemv_kn_m_split(torch::Tensor wt, torch::Tensor x, int64_t threads,
+                              int64_t split) {
+    TORCH_CHECK(wt.dim() == 2, "weight must be 2-D [K, N]");
+    TORCH_CHECK(x.dim() == 2, "activations must be 2-D [M, K]");
+    TORCH_CHECK(wt.is_contiguous() && x.is_contiguous(), "contiguous inputs required");
+    const int K = (int)wt.size(0), N = (int)wt.size(1), M = (int)x.size(0);
+    TORCH_CHECK(wt.size(0) == x.size(1), "K mismatch: weight ", wt.size(0),
+                " vs activation ", x.size(1));
+    const bool w16 = wt.scalar_type() == torch::kBFloat16;
+    TORCH_CHECK(w16 || wt.scalar_type() == torch::kFloat,
+                "weight must be bf16 or fp32 (an fp16 weight read as bf16 would "
+                "compute silently wrong values)");
+    const bool x16 = x.scalar_type() == torch::kBFloat16;
+    TORCH_CHECK(x16 || x.scalar_type() == torch::kFloat,
+                "activation must be bf16 or fp32");
+
+    const int th = threads > 0 ? (int)threads : pick_threads(N);
+    const int blocks = (N + th - 1) / th;
+    // 目标：网格至少铺满 4 倍 SM 数。16 个 SM 下是 64 个块；N=512/256 线程只有 2 个
+    // 块，于是 split 取 16（上限）。片长 per 不小于 64，避免切得过碎把固定开销放大。
+    int sp = (int)split;
+    if (sp <= 0) {
+        const int want = 4 * sm_count();
+        sp = (int)((want + blocks - 1) / blocks);
+        sp = std::max(1, std::min(sp, 16));
+        if (K / sp < 64) sp = std::max(1, K / 64);
+    }
+    if (M == 1 || sp <= 1) {
+        // 单行或分不出片：行为和以前完全一致。
+        return gemv_kn_m(wt, x, threads, 4);
+    }
+    auto y = torch::empty({M, N}, x.options());
+    if (w16 && x16) return run_m_split<uint16_t, uint16_t>(wt, x, y, N, K, th, sp);
+    if (w16) return run_m_split<uint16_t, float>(wt, x, y, N, K, th, sp);
+    return run_m_split<float, float>(wt, x, y, N, K, th, sp);
 }

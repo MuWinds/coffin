@@ -494,7 +494,7 @@ def _gemv_rows(w: torch.Tensor | QWeight | pack.KnWeight,
     if rows == 1:
         return _restore(module.gemv_kn(packed.wt, act[0]), dtype)
     if rows <= _ROW_CHUNK:
-        return _restore(module.gemv_kn_m(packed.wt, act), dtype)
+        return _restore(module.gemv_kn_m_split(packed.wt, act), dtype)
     out = torch.empty((rows, packed.n), dtype=act.dtype, device=act.device)
     for start in range(0, rows, _ROW_CHUNK):
         stop = min(rows, start + _ROW_CHUNK)
@@ -502,7 +502,7 @@ def _gemv_rows(w: torch.Tensor | QWeight | pack.KnWeight,
         if chunk.shape[0] == 1:
             out[start] = module.gemv_kn(packed.wt, chunk[0])
         else:
-            out[start:stop] = module.gemv_kn_m(packed.wt, chunk.contiguous())
+            out[start:stop] = module.gemv_kn_m_split(packed.wt, chunk.contiguous())
     return _restore(out, dtype)
 
 

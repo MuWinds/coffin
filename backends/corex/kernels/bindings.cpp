@@ -33,6 +33,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "small-M GEMV over [K, N] weights: x [M, K] -> y [M, N]",
           pybind11::arg("wt"), pybind11::arg("x"), pybind11::arg("threads") = 0,
           pybind11::arg("unroll") = 0);
+    // 窄 N 的 M 行投影：网格按 K 切片补齐 SM；split=0 自动选、split<=1 退化成
+    // gemv_kn_m。共享专家 gate_up 的 N=512 不分片只有 2 个块。
+    m.def("gemv_kn_m_split", &gemv_kn_m_split,
+          "small-M GEMV with split-K over [K, N] weights: x [M, K] -> y [M, N]",
+          pybind11::arg("wt"), pybind11::arg("x"), pybind11::arg("threads") = 0,
+          pybind11::arg("split") = 0);
     m.def("gemv_kn_i8", &gemv_kn_i8,
           "decode W8A16 GEMV: int8 [K, N] weights plus a per-column fp32 scale",
           pybind11::arg("wt"), pybind11::arg("x"), pybind11::arg("scale"),

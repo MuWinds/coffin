@@ -50,6 +50,11 @@ torch::Tensor gemv_kn(torch::Tensor wt, torch::Tensor x, int64_t threads,
 torch::Tensor gemv_kn_m(torch::Tensor wt, torch::Tensor x, int64_t threads,
                         int64_t unroll);
 
+// @brief 窄 N 的 M 行 split-K 变体：按 K 切片把网格补到 4 倍 SM 数。
+// split=0 自动选；split<=1 退化成 gemv_kn_m。
+torch::Tensor gemv_kn_m_split(torch::Tensor wt, torch::Tensor x, int64_t threads,
+                              int64_t split);
+
 // @brief 解码 W8A16 投影：int8 权重，外加每个输出列一个 fp32 scale。
 //
 // 相比 :func:`gemv_kn` 把每个权重读的字节数减半。scale 只乘一次，乘在算完的点积上，
