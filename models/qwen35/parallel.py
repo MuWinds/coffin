@@ -86,17 +86,22 @@ class ParallelContext:
         #: ``ep`` 的映射锁页内存归约（``mapped_reduce.cu``）。比集合通信组更省：主机
         #: 只轮询计数，连集合调用的 390 µs 固定开销都没有。
         self._mapped = None
+        #: ``ep`` 的设备内存 all-to-all 归约（``p2p_reduce.cu`` + IPC）。四条路里唯一
+        #: 主机完全不参与、且不依赖系统级栅栏的那条，实测一次 19.6-22.1 us。
+        self._p2p = None
         if mode == "ep":
             kind = os.environ.get("COFFIN_EP_COLLECTIVE", "auto")
-            if kind not in {"auto", "mapped", "nccl", "shm"}:
+            if kind not in {"auto", "p2p", "mapped", "nccl", "shm"}:
                 raise ValueError(
-                    "COFFIN_EP_COLLECTIVE must be auto / mapped / nccl / shm, got "
-                    f"{kind!r}")
-            if kind in {"auto", "mapped"}:
+                    "COFFIN_EP_COLLECTIVE must be auto / p2p / mapped / nccl / shm, "
+                    f"got {kind!r}")
+            if kind in {"auto", "p2p"}:
+                self._p2p = _ep_p2p(rank, world_size, kind)
+            if self._p2p is None and kind in {"auto", "mapped"}:
                 self._mapped = _ep_mapped(rank, world_size, kind)
-            if self._mapped is None and kind in {"auto", "nccl"}:
+            if self._p2p is None and self._mapped is None and kind in {"auto", "nccl"}:
                 self._ep_group = _ep_device_group(world_size, kind)
-            if self._mapped is None and self._ep_group is None:
+            if self._p2p is None and self._mapped is None and self._ep_group is None:
                 from models.qwen35.ep import EpShmReduce
 
                 #: 共享区由启动器预先建好，这里只负责映射；载荷容量要盖住一个预填充
@@ -260,15 +265,18 @@ class ParallelContext:
         **求和**。漏掉它得到的是「每条 token 只剩 1/4 专家」的安静错误——形状全对，
         输出是另一个模型。
 
-        三条路，按实测好坏排：
+        四条路，按实测好坏排：
 
-        1. **映射锁页内存**（``mapped_reduce.cu``）：核直接读写共享区，主机只轮询
-           一个 int64 计数，乘加在设备上。这是唯一不付「每次调用 390 µs」的那条。
-        2. **设备侧集合通信**（ixCCL/NCCL）：归约留在卡上，但每次调用有约 390 µs 的
-           固定开销（实测 10 KB 与 640 KB 同价），一步 decode 40 层就是 15.6 ms。
-        3. **主机暂存**（共享内存 barrier）：单次 30-100 µs 看着最快，但它每次都要等
-           设备把队列排空，40 层就是 40 次全流同步，实测每层多付约 445 µs——EP4 因此
-           从 19.3 掉到比 PP4 的 29.6 tok/s 还慢。
+        1. **设备内存 all-to-all**（``p2p_reduce.cu`` + IPC）：一个核完成写对端槽、
+           自旋等齐、求和，主机一次同步都不做。``[1, 2048]`` 实测 19.6-22.1 us。
+        2. **映射锁页内存**（``mapped_reduce.cu``）：核直接读写共享区，主机轮询一个
+           int64 计数。原语 106 us，但它每层都要主机的 ``cudaDeviceSynchronize`` 才能
+           看到计数，实测那一次同步在引擎里要 927 us（等于排空流水），一步 40 层就是
+           37 ms。
+        3. **设备侧集合通信**（ixCCL/NCCL）：每次调用约 390 us 固定开销（实测 10 KB 与
+           640 KB 同价），一步 decode 40 层就是 15.6 ms。
+        4. **主机暂存**（共享内存 barrier）：每次都要等设备把队列排空，40 层 40 次全流
+           同步，实测每层约 445 us——EP4 因此从 23 掉到比 PP4 的 29.6 tok/s 还慢。
 
         ``fp32`` 累加、只窄化一次，是因为四个 bf16 直接相加会丢两三位尾数。
 
@@ -279,10 +287,12 @@ class ParallelContext:
             同 dtype、同形状的跨 rank 和。
 
         Raises:
-            ValueError: ``ep`` 上下文两条路都没有建起来（配置错位）。
+            ValueError: ``ep`` 上下文所有路都没建起来（配置错位）。
         """
         if self.mode != "ep":
             return value
+        if self._p2p is not None:
+            return self._p2p.all_reduce_sum(value)
         if self._mapped is not None:
             return self._mapped.all_reduce_sum(value)
         if self._ep_group is not None:
@@ -294,6 +304,43 @@ class ParallelContext:
                 "expert parallel context has neither a mapped region, a device "
                 "collective group, nor a shared-memory arena")
         return self.ep.all_reduce_sum(value)
+
+
+def _ep_p2p(rank: int, world_size: int, kind: str):
+    """建设备内存 all-to-all 归约器（IPC 映射对端显存），拿不到就返回 ``None``。
+
+    这条路绕开了一个编译器 bug：宿主映射内存要系统级栅栏，而
+    ``__threadfence_system()`` 在 clang-16/ivcore10 上会让 llc 崩；设备内存之间只要
+    设备作用域 ``__threadfence()``。实测 ``[1, 2048]`` 一次归约 19.6-22.1 us，主机
+    全程不参与。
+
+    Args:
+        rank: 本进程编号。
+        world_size: 进程数；只支持 4。
+        kind: ``auto`` 失败时回落并打印原因；``p2p`` 失败时抛。
+
+    Returns:
+        :class:`~models.qwen35.ep.P2pReduce` 或 ``None``。
+
+    Raises:
+        RuntimeError: ``kind="p2p"`` 而 IPC 或句柄交换失败。
+    """
+    rows = int(os.environ.get("COFFIN_EP_ROWS", "2048"))
+    hidden = int(os.environ.get("COFFIN_EP_HIDDEN", "2048"))
+    try:
+        from models.qwen35.ep import P2pReduce
+
+        reducer = P2pReduce(rank, world_size, rows, hidden)
+    except Exception as exc:                                  # noqa: BLE001
+        if kind == "p2p":
+            raise
+        print(f"[ep] p2p combine unavailable ({type(exc).__name__}: "
+              f"{str(exc)[:160]}); falling back", flush=True)
+        return None
+    if rank == 0:
+        print(f"[ep] p2p combine ready: world={world_size} rows={rows} "
+              f"hidden={hidden} (device memory + IPC, host never waits)", flush=True)
+    return reducer
 
 
 def _ep_mapped(rank: int, world_size: int, kind: str):

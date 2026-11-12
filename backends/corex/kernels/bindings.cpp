@@ -312,5 +312,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "\uff08\u4e3b\u673a\u4e0d\u9700\u8981\u540c\u6b65\u6216\u8f6e\u8be2\uff09",
           pybind11::arg("out"), pybind11::arg("dev_base"), pybind11::arg("world"),
           pybind11::arg("blocks"), pybind11::arg("threads"), pybind11::arg("round"));
+    m.def("p2p_handle", &p2p_handle,
+          "\u53d6\u8bbe\u5907\u7f13\u51b2\u7684 IPC \u53e5\u67c4\uff08uint8 \u5f20\u91cf\uff09",
+          pybind11::arg("device_buffer"));
+    m.def("p2p_open", &p2p_open,
+          "\u7528\u5bf9\u7aef\u53e5\u67c4\u6620\u5c04\u5176\u663e\u5b58\uff0c"
+          "\u8fd4\u56de\u8bbe\u5907\u6307\u9488",
+          pybind11::arg("handle_bytes"));
+    m.def("p2p_combine", &p2p_combine,
+          "\u56db\u5361 all-to-all \u5f52\u7ea6\uff1a\u5199\u5bf9\u7aef\u69fd + "
+          "\u81ea\u65cb\u7b49\u9f50 + \u6c42\u548c\uff0c\u4e00\u4e2a\u6838\u5b8c\u6210",
+          pybind11::arg("x"), pybind11::arg("out"),
+          pybind11::arg("slots0"), pybind11::arg("slots1"),
+          pybind11::arg("slots2"), pybind11::arg("slots3"),
+          pybind11::arg("flags0"), pybind11::arg("flags1"),
+          pybind11::arg("flags2"), pybind11::arg("flags3"),
+          pybind11::arg("rank"), pybind11::arg("round"),
+          pybind11::arg("blocks") = 16, pybind11::arg("threads") = 256);
 }
 

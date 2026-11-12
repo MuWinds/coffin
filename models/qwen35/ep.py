@@ -533,3 +533,142 @@ class MappedReduce:
             pass
         finally:
             os.close(self._fd)
+
+
+class P2pReduce:
+    """四卡设备内存上的 all-to-all 归约，主机全程不参与。
+
+    这是 EP 归约在这颗卡上唯一能跑满的那条路。宿主机映射内存那条要系统级栅栏，
+    而 ``__threadfence_system()`` 在 clang-16/ivcore10 上会让 llc 崩（十行最小
+    复现见 ``.tmp_stage/pd/ice/fence.cu``）；设备内存之间的跨卡写只要设备作用域
+    ``__threadfence()``，它编得过。于是「写对端槽 → 置计数 → 自旋等齐 → 求和」
+    可以压成一个核，一次发射，实测 ``[1, 2048]`` 一次归约 19.6-22.1 us，而主机侧
+    同步那条即使在引擎里也要 927 us/层。
+
+    布局：每个 rank 自己的显存里有一块 ``[world, rows, hidden]`` fp32 槽区和
+    ``[world]`` int64 计数；各 rank 用 IPC 句柄互相映射，靠 :meth:`all_reduce_sum`
+    里的那一个核完成交换。
+
+    Constraints:
+        * ``world`` 必须是 4：内核把四个指针用标量传，省掉一次设备指针数组的分配。
+        * 载荷必须 bf16 且 ``rows <= rows_max``；fp32 累加在核内完成、只窄化一次。
+        * 计数单调递增，同一个 :class:`P2pReduce` 实例不能跨请求复用轮次。
+
+    Args:
+        rank: 本进程编号。
+        world: 进程数，只能是 4。
+        rows: 共享槽区能容纳的最大行数（预填充分块大小决定）。
+        hidden: 宽度。
+
+    Raises:
+        ValueError: ``world`` 不是 4，或 ``torch.distributed`` 没初始化（句柄换不出去）。
+        RuntimeError: IPC 句柄或映射失败。
+    """
+
+    #: 内核支持的进程数。改成别的值要同时改 ``p2p_reduce.cu`` 的指针参数。
+    WORLD = 4
+
+    def __init__(self, rank: int, world: int, rows: int, hidden: int) -> None:
+        if int(world) != self.WORLD:
+            raise ValueError(f"p2p combine needs world={self.WORLD}, got {world}")
+        import torch.distributed as dist
+
+        if not dist.is_initialized():
+            raise ValueError(
+                "p2p combine exchanges IPC handles over torch.distributed, but no "
+                "process group is initialized")
+        from backends.corex import _kernels
+
+        self.rank, self.world = int(rank), int(world)
+        self.rows, self.hidden = int(rows), int(hidden)
+        self._module = _kernels()
+        self._round = 0
+        total = self.rows * self.hidden
+        self._slots = torch.zeros(self.world * total, dtype=torch.float32,
+                                  device="cuda")
+        self._flags = torch.zeros(self.world, dtype=torch.int64, device="cuda")
+        self._out = torch.empty(self.rows, self.hidden, dtype=torch.float32,
+                                device="cuda")
+        self._slot_ptr = [0] * self.world
+        self._flag_ptr = [0] * self.world
+        self._slot_ptr[self.rank] = self._slots.data_ptr()
+        self._flag_ptr[self.rank] = self._flags.data_ptr()
+        slot_handles = self._exchange(self._module.p2p_handle(self._slots))
+        flag_handles = self._exchange(self._module.p2p_handle(self._flags))
+        for peer in range(self.world):
+            if peer == self.rank:
+                continue
+            self._slot_ptr[peer] = self._module.p2p_open(slot_handles[peer])
+            self._flag_ptr[peer] = self._module.p2p_open(flag_handles[peer])
+
+    def _exchange(self, handle: torch.Tensor) -> list[torch.Tensor]:
+        """把本 rank 的 IPC 句柄广播给所有人，收齐每个人的句柄。
+
+        Args:
+            handle: :meth:`p2p_handle <backends.corex._kernels.p2p_handle>` 产出的
+                CPU uint8 张量。
+
+        Returns:
+            长度 ``world`` 的句柄张量列表，下标是 rank。
+
+        Raises:
+            RuntimeError: 收回来的句柄数量或大小不对（进程组配置错位）。
+        """
+        import torch.distributed as dist
+
+        payload = [handle.clone() for _ in range(self.world)]
+        dist.all_gather_object(payload, handle.clone())
+        if len(payload) != self.world:
+            raise RuntimeError(
+                f"p2p handle exchange got {len(payload)} handles for "
+                f"world={self.world}")
+        return payload
+
+    def _grid(self, total: int) -> tuple[int, int]:
+        """按载荷大小挑网格：decode 一行也要用满 SM，预填充分块不超 64 块。
+
+        Args:
+            total: 元素数（``rows * hidden``）。
+
+        Returns:
+            ``(blocks, threads)``。
+        """
+        threads = 256
+        blocks = max(1, min(64, (total + threads * 8 - 1) // (threads * 8)))
+        return blocks, threads
+
+    def all_reduce_sum(self, x: torch.Tensor) -> torch.Tensor:
+        """把各 rank 的专家部分和加成本 rank 的完整输出。
+
+        Args:
+            x: 本 rank 的贡献，bf16 ``[rows, hidden]``，连续 CUDA。
+
+        Returns:
+            求和结果，dtype 与 ``x`` 相同。
+
+        Raises:
+            ValueError: dtype/形状超出约定，或行数超过槽区容量。
+        """
+        rows = int(x.shape[0])
+        if x.dim() != 2 or int(x.shape[1]) != self.hidden:
+            raise ValueError(
+                f"p2p combine expects [rows, {self.hidden}], got {tuple(x.shape)}")
+        if rows > self.rows:
+            raise ValueError(
+                f"p2p combine payload {rows} rows exceeds the {self.rows} the slot "
+                f"area was sized for; raise COFFIN_EP_ROWS")
+        if x.dtype != torch.bfloat16:
+            raise ValueError(f"p2p combine needs bf16, got {x.dtype}")
+        self._round += 1
+        out = self._out[:rows]
+        blocks, threads = self._grid(rows * self.hidden)
+        self._module.p2p_combine(x.contiguous(), out, *self._slot_ptr,
+                                 *self._flag_ptr, self.rank, self._round,
+                                 blocks, threads)
+        return out.to(x.dtype)
+
+    def close(self) -> None:
+        """释放槽区与计数。对端映射随进程退出一起消失。"""
+        self._slots = None
+        self._flags = None
+        self._out = None

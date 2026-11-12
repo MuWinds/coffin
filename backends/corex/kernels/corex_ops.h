@@ -942,3 +942,41 @@ void mapped_finish(torch::Tensor out, int64_t dev_base, int64_t world, int64_t b
 // @param round    本轮轮次值，核等 ``counts[r] >= round``。
 void mapped_finish_wait(torch::Tensor out, int64_t dev_base, int64_t world,
                         int64_t blocks, int64_t threads, int64_t round);
+
+// @brief 取一块设备缓冲的 IPC 句柄（``sizeof(cudaIpcMemHandle_t)`` 个 uint8）。
+//
+// 设备内存之间的跨卡同步只需要设备作用域栅栏，而宿主映射页需要系统级的
+// ``__threadfence_system()``——后者在这版 clang-16/ivcore10 上会让 llc 崩。
+// 所以专家并行的归约改走这条路：各 rank 用自己的显存做槽区，靠 IPC 互相映射。
+//
+// @param device_buffer 本 rank 的设备张量（地址即槽区基址）。
+// @return CPU uint8 张量，内容可原样发给对端。
+// @throws 无；失败走 ``TORCH_CHECK``。
+torch::Tensor p2p_handle(torch::Tensor device_buffer);
+
+// @brief 用对端发来的句柄映射其显存，返回设备指针。
+//
+// @param handle_bytes :func:`p2p_handle` 产出的 uint8 张量。
+// @return 对端缓冲在本进程里的设备指针（以 int64 传，避免跨语言指针类型）。
+int64_t p2p_open(torch::Tensor handle_bytes);
+
+// @brief 四卡 all-to-all 归约：写对端槽、等齐、本地求和，一个核完成。
+//
+// @param x       本 rank 的贡献，bf16 ``[rows, hidden]``，连续。
+// @param out     求和结果，fp32 ``[rows, hidden]``。
+// @param slots0  第 0 个 rank 的槽区基址（``[world, rows, hidden]`` fp32 设备内存）。
+// @param slots1  第 1 个 rank 的槽区基址。
+// @param slots2  第 2 个 rank 的槽区基址。
+// @param slots3  第 3 个 rank 的槽区基址。
+// @param flags0  第 0 个 rank 的到达计数基址（``[world]`` int64）。
+// @param flags1  第 1 个 rank 的到达计数基址。
+// @param flags2  第 2 个 rank 的到达计数基址。
+// @param flags3  第 3 个 rank 的到达计数基址。
+// @param rank    本进程编号。
+// @param round   本轮轮次，必须单调递增。
+// @param blocks  网格块数。
+// @param threads 每块线程数。
+void p2p_combine(torch::Tensor x, torch::Tensor out,
+                 int64_t slots0, int64_t slots1, int64_t slots2, int64_t slots3,
+                 int64_t flags0, int64_t flags1, int64_t flags2, int64_t flags3,
+                 int64_t rank, int64_t round, int64_t blocks, int64_t threads);
