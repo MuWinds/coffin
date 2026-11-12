@@ -127,6 +127,10 @@ class LinearAttn:
                                          dtype=torch.float32, device=_device)
         self.ckpt_conv = torch.zeros(CKPT, self.conv_dim, self.kernel - 1,
                                      dtype=torch.float32, device=_device)
+        #: 校验窗口里 c 个 token 的卷积输出；融合入口按 token 取一行，三算子对照路径
+        #: 不读它。逐 token 复用一块 ``conv_out`` 会让融合入口无法一次拿到整个窗口。
+        self.conv_all = torch.empty(CKPT, self.conv_dim, dtype=torch.float32,
+                                    device=_device)
         # 批量投机只在启用时分配基态与更新日志；卷积仍保留短窗口快照。
         self.verify_state_base_b: torch.Tensor | None = None
         self.verify_record_b: torch.Tensor | None = None
@@ -421,19 +425,29 @@ class LinearAttn:
         # 交替量——跨进程比较会被这张卡 3.4% 的端到端散布吃掉。
         chain = os.environ.get("COFFIN_DELTA_CHAIN") == "1"
         self.verify_state_base.copy_(state)
-        for i in range(C):
-            bops.conv1d_silu(self.conv_w, qkv[i], conv_state, conv_out)
-            q, k, v = conv_out.split([self.kdim, self.kdim, self.vdim])
-            if chain:
+        if chain:
+            for i in range(C):
+                bops.conv1d_silu(self.conv_w, qkv[i], conv_state, conv_out)
+                q, k, v = conv_out.split([self.kdim, self.kdim, self.vdim])
                 self._verify_chain(q, k, v, b[i], a[i], z[i], state, proj_in[i], i)
-            else:
-                bops.delta_normed(
-                    q.reshape(self.num_k, self.dk), k.reshape(self.num_k, self.dk),
-                    v.reshape(self.num_v, self.dv), b[i], a[i], self.neg_expA,
-                    self.dt_bias, z[i].reshape(self.num_v, self.dv), self.norm.w,
-                    state, proj_in[i].view(self.num_v, self.dv), self.qscale, self.rep,
-                    self.verify_record, i)
+                self.ckpt_conv[i].copy_(conv_state)
+            return self.out_proj.prefill(proj_in)
+
+        # 卷积仍逐 token：它推进的窗口本身就是递推的输入，而且每个位置的窗口快照要跟着
+        # 状态走。递推那一步一次跑完整个窗口——它省的不是计算量，是 ``C - 1`` 次固定
+        # 发射延迟（单次调用 1 行和 8 行都要 70–105 us，几乎不随行数变化）。
+        conv_all = self.conv_all
+        for i in range(C):
+            bops.conv1d_silu(self.conv_w, qkv[i], conv_state, conv_all[i])
             self.ckpt_conv[i].copy_(conv_state)
+        bops.delta_normed_seq(
+            conv_all[:C, :self.kdim].view(C, self.num_k, self.dk),
+            conv_all[:C, self.kdim:2 * self.kdim].view(C, self.num_k, self.dk),
+            conv_all[:C, 2 * self.kdim:].view(C, self.num_v, self.dv),
+            b, a, self.neg_expA, self.dt_bias,
+            z.view(C, self.num_v, self.dv), self.norm.w, state,
+            proj_in.view(C, self.num_v, self.dv), self.qscale, self.rep,
+            self.verify_record, 0)
         return self.out_proj.prefill(proj_in)
 
     def _verify_chain(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,

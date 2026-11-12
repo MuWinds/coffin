@@ -1380,13 +1380,23 @@ class Qwen35:
                 "sparse Top-K verify needs the masked attn_paged_multi_q kernel "
                 "(task-12); pass sparse_topk=0 for now")
         if verify_mode is None:
-            # 默认仍是 c token 校验。一次性前向校验是选项（``Q35_SPEC_VERIFY=once``）：
-            # B=8 下即便 4k 上下文实测都低于贪心（task-13 的结论），所以它作为参考路径
-            # 保留，直到出现按元素胜出 M=8 的宽 M 内核。
-
-            verify_mode = os.environ.get("Q35_SPEC_VERIFY", "token")
+            # 默认改成一次性前向校验，前提是宽 M 校验核和多查询注意力核都在。
+            #
+            # 实测（作业 5077，2026-11-12，B=8、K=1、c=2，一次校验的整步墙钟）：
+            # token 模式 95.95 ms，once 模式 82.82 ms，**0.863x**。
+            #
+            # 省下来的是发射不是权重流量：once 在 M=B*c=16 上仍然是
+            # ``ceil(16/_ROW_CHUNK)`` = 2 遍权重读取，和「跑 2 遍解码」的流量一样。
+            # 它的优势是每层只做一次宽投影、少掉一遍逐 token 的发射与中间缓冲。
+            # 原先默认 token 的理由是「B=8 下即便 4k 上下文实测都低于贪心」，那条
+            # 结论成立的是「低于贪心」，不是「token 比 once 好」——两者都低于贪心，
+            # 所以要选的只是其中更快的那个。
+            verify_mode = os.environ.get("Q35_SPEC_VERIFY", "")
             if verify_mode not in ("once", "token"):
-                verify_mode = "token"
+                verify_mode = ""
+            if not verify_mode:
+                verify_mode = ("once" if (wide_kernel_ready() and multi_q_ready()
+                                          and MULTI_Q_WIRED) else "token")
             if verify_mode == "once" and not (wide_kernel_ready() and multi_q_ready()
                                               and MULTI_Q_WIRED):
                 verify_mode = "token"

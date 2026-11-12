@@ -451,30 +451,39 @@ __global__ void prologue_batch_kernel(const float* __restrict__ q,
 // ``ZT`` 是门的存储类型，不是精度选择。算子接受 bf16（模型的门投影产出的就是它）和
 // fp32（契约也允许）；实例化在主机侧按 ``z`` 的 dtype 选。把 fp32 的 ``z`` 当 bf16 读会
 // 重新解释每两个半字，用噪声去门控输出，所以这两种情况不能共用一个实例化。
+// @brief 单个校验 token 的融合体：头预处理、秩一递推、门控输出归一化。
+//
+// 抽成设备函数是为了让单 token 入口和 c token 入口共用*同一份算术*：投机校验要求
+// 「一次跑 c 个 token」与「跑 c 次单 token」逐位一致，复制一份出来就必然会漂移，而
+// 漂移的表现是校验 logits 与贪心解码差一个 ulp——那正好是翻转 id 的量级。
+//
+// 调用方负责把该 token 的各个指针算好传进来；``st`` 是跨 token 延续的那一份，所以
+// 串行调用就是递推本身。不在本函数里的只有 ``extern __shared__`` 的切分和两个
+// ``__shared__`` 标量，因为它们的生命周期是 block 而不是 token。
+//
+// @param head_record 本 token 的更新日志起点，``nullptr`` 表示不记录。
+// @param red ``[2 * blockDim.x]`` 归约树暂存。
+// @param qs,ks ``[dk]`` 归一化后的查询与键，留在共享内存里。
+// @param rate_sh,decay_sh 每 token 由 t==0 重算的 beta 与衰减标量。
 template <typename OT, typename ZT>
-__global__ void delta_normed_kernel(const float* __restrict__ q,
-                                    const float* __restrict__ k,
-                                    const float* __restrict__ v,
-                                    const uint16_t* __restrict__ b,
-                                    const uint16_t* __restrict__ a,
-                                    const float* __restrict__ neg_expA,
-                                    const float* __restrict__ dt_bias,
-                                    const ZT* __restrict__ z,
-                                    const uint16_t* __restrict__ nw,
-                                    float* __restrict__ st, OT* __restrict__ out,
-                                    float* __restrict__ record, int record_slot,
-                                    float qscale, int nv, int dk, int dv, int rep) {
+__device__ __forceinline__ void delta_normed_body(
+        const float* __restrict__ q,
+        const float* __restrict__ k,
+        const float* __restrict__ v,
+        const uint16_t* __restrict__ b,
+        const uint16_t* __restrict__ a,
+        const float* __restrict__ neg_expA,
+        const float* __restrict__ dt_bias,
+        const ZT* __restrict__ z,
+        const uint16_t* __restrict__ nw,
+        float* __restrict__ st, OT* __restrict__ out,
+        float* __restrict__ head_record,
+        float qscale, int nv, int dk, int dv, int rep,
+        float* red, float* qs, float* ks,
+        float* rate_sh, float* decay_sh) {
     const int vh = blockIdx.x;
     const int t = (int)threadIdx.x;
     const int kh = vh / rep;
-
-    extern __shared__ float sh[];
-    float* red = sh;                          // [2 * blockDim.x] 归约树
-    float* qs = sh + 2 * (int)blockDim.x;     // [dk] 本头归一化后的查询
-    float* ks = qs + dk;                      // [dk] 本头归一化后的键
-    float* head_record = record
-        ? record + ((size_t)record_slot * nv + vh) * (dk + dv + 1)
-        : nullptr;
 
     // 头预处理：与 ``prologue_kernel`` 相同的算术、相同的单趟归约和相同的树配对。
     const float qv = t < dk ? q[(size_t)kh * dk + t] : 0.f;
@@ -490,16 +499,14 @@ __global__ void delta_normed_kernel(const float* __restrict__ q,
         ks[t] = kv * rsqrtf(ssk + L2_EPS);
         if (head_record) head_record[t] = ks[t];
     }
-    __shared__ float rate_sh;
-    __shared__ float decay_sh;
     if (t == 0) {
-        rate_sh = 1.f / (1.f + __expf(-CxScalar<uint16_t>::to_float(b[vh])));
+        *rate_sh = 1.f / (1.f + __expf(-CxScalar<uint16_t>::to_float(b[vh])));
         const float av = CxScalar<uint16_t>::to_float(a[vh]) + dt_bias[vh];
         // 那条链在预处理里存下 ``g``、在递推里对它取指数；在这里把两步合起来，两种写法
         // 都只在 fp32 下把乘积舍入一次。改成每线程各做一遍，只会把一次超越函数重复 128
         // 次而毫无收益。
-        decay_sh = __expf(neg_expA[vh] * softplus(av));
-        if (head_record) head_record[dk + dv] = decay_sh;
+        *decay_sh = __expf(neg_expA[vh] * softplus(av));
+        if (head_record) head_record[dk + dv] = *decay_sh;
     }
     __syncthreads();
 
@@ -507,9 +514,12 @@ __global__ void delta_normed_kernel(const float* __restrict__ q,
     // 之后返回。在这里返回——也就是在归一化的树之前——会让块里其余线程等一个已经不在的
     // 线程：设备侧死锁，没有 traceback，而不是一个错数字。这个风险在 ``delta.cu`` 里写过，
     // 它的第一版就踩过。
+    //
+    // c token 入口上这个 ``return`` 只退出本次 token 的体，外层循环照样进下一轮，所以
+    // 屏障在两边都配平。
     const bool active = t < dv;
-    const float rate = rate_sh;
-    const float decay = decay_sh;
+    const float rate = *rate_sh;
+    const float decay = *decay_sh;
 
     // 递推，和 ``delta_kernel`` 里一字未改：线程 ``j`` 独占值列 ``j``，在寄存器里把
     // ``i`` 走过 ``dk``，所以两次 ``dk`` 归约都是线程本地的，固定 ``i`` 时读到的状态在
@@ -566,6 +576,99 @@ __global__ void delta_normed_kernel(const float* __restrict__ q,
         CxScalar<uint16_t>::to_float(CxScalar<uint16_t>::from_float(y)));
 }
 
+// @brief 单 token 入口：解码步走这里，一个 block 一个值头。
+template <typename OT, typename ZT>
+__global__ void delta_normed_kernel(const float* __restrict__ q,
+                                    const float* __restrict__ k,
+                                    const float* __restrict__ v,
+                                    const uint16_t* __restrict__ b,
+                                    const uint16_t* __restrict__ a,
+                                    const float* __restrict__ neg_expA,
+                                    const float* __restrict__ dt_bias,
+                                    const ZT* __restrict__ z,
+                                    const uint16_t* __restrict__ nw,
+                                    float* __restrict__ st, OT* __restrict__ out,
+                                    float* __restrict__ record, int record_slot,
+                                    float qscale, int nv, int dk, int dv, int rep) {
+    extern __shared__ float sh[];
+    float* red = sh;                          // [2 * blockDim.x] 归约树
+    float* qs = sh + 2 * (int)blockDim.x;     // [dk] 本头归一化后的查询
+    float* ks = qs + dk;                      // [dk] 本头归一化后的键
+    __shared__ float rate_sh;
+    __shared__ float decay_sh;
+    float* head_record = record
+        ? record + ((size_t)record_slot * nv + blockIdx.x) * (dk + dv + 1)
+        : nullptr;
+    delta_normed_body<OT, ZT>(q, k, v, b, a, neg_expA, dt_bias, z, nw, st, out,
+                              head_record, qscale, nv, dk, dv, rep,
+                              red, qs, ks, &rate_sh, &decay_sh);
+}
+
+// @brief c token 入口：一次启动跑完校验窗口的全部 token。
+//
+// 与单 token 入口唯一的差别是外面这层循环。
+//
+// **实测没有收益，留作负结果**（作业 5077，2026-11-12，Qwen3.5-4B int8，单流 c=4、
+// max_seq 8192）：接进 ``LinearAttn.verify`` 之后 verify 一步 32.86 ms，而逐 token 的老
+// 路径在三次运行里是 30.68 / 33.64 / 34.48 ms，**全部落在 ±10% 的同进程抖动内**。
+//
+// 原因是原先的推断错了：单 token 那次调用「1 行和 8 行都要 70–105 us、几乎不随行数变化」
+// 说明的是**设备侧执行延迟**（递推要在 [nv, dk, dv] 的状态上走两趟访存），不是 host
+// 提交。把 c 步串进一个 launch 只省掉 host 那侧的 3 × ~5.5 us，而块内的 c 步仍然串行、
+// 仍然各付一次那笔延迟。也就是说：**这里的成本是每 token 的访存延迟，不是发射。**
+//
+// 保留它是因为它是「一次启动跑完 c 个 token」这个语义的现成实现，宽 M 校验核或
+// 更长窗口的校验形态可能重新需要它；重开之前先证明那笔延迟被摊掉了。
+//
+// 串行是规格的一部分：递推的状态依赖让它无法并行，而把 c 个 token 摊进一个 kernel 不
+// 改变任何一次算术。
+//
+// @param record_slot 第一个 token 在更新日志里的位置，后续 token 依次 +1。
+// @param steps 本窗口的 token 数。
+// @param stride_q,stride_k,stride_v,stride_b,stride_z 每个 token 在对应张量里的行距
+//        （元素数）。允许大于行宽，因为调用方给的是融合投影 ``split`` 出来的视图。
+template <typename OT, typename ZT>
+__global__ void delta_normed_seq_kernel(const float* __restrict__ q,
+                                        const float* __restrict__ k,
+                                        const float* __restrict__ v,
+                                        const uint16_t* __restrict__ b,
+                                        const uint16_t* __restrict__ a,
+                                        const float* __restrict__ neg_expA,
+                                        const float* __restrict__ dt_bias,
+                                        const ZT* __restrict__ z,
+                                        const uint16_t* __restrict__ nw,
+                                        float* __restrict__ st, OT* __restrict__ out,
+                                        float* __restrict__ record, int record_slot,
+                                        float qscale, int nv, int dk, int dv, int rep,
+                                        int steps, long long stride_q,
+                                        long long stride_k, long long stride_v,
+                                        long long stride_b, long long stride_z) {
+    extern __shared__ float sh[];
+    float* red = sh;
+    float* qs = sh + 2 * (int)blockDim.x;
+    float* ks = qs + dk;
+    __shared__ float rate_sh;
+    __shared__ float decay_sh;
+    const size_t vdim = (size_t)nv * dv;
+    const size_t rec = (size_t)nv * (dk + dv + 1);
+    for (int tk = 0; tk < steps; ++tk) {
+        float* head_record = record
+            ? record + (size_t)(record_slot + tk) * rec
+                  + (size_t)blockIdx.x * (dk + dv + 1)
+            : nullptr;
+        delta_normed_body<OT, ZT>(q + (size_t)tk * (size_t)stride_q,
+                                  k + (size_t)tk * (size_t)stride_k,
+                                  v + (size_t)tk * (size_t)stride_v,
+                                  b + (size_t)tk * (size_t)stride_b,
+                                  a + (size_t)tk * (size_t)stride_b,
+                                  neg_expA, dt_bias,
+                                  z + (size_t)tk * (size_t)stride_z,
+                                  nw, st, out + (size_t)tk * vdim, head_record,
+                                  qscale, nv, dk, dv, rep,
+                                  red, qs, ks, &rate_sh, &decay_sh);
+    }
+}
+
 // @brief 启动融合解码链：每个值头一个 block。
 //
 // @param out_bf16 ``out`` 是 bf16（以 ``uint16_t`` 承载）还是 fp32。
@@ -604,6 +707,43 @@ void launch_normed(const float* q, const float* k, const float* v, const uint16_
                 q, k, v, b, a, neg_expA, dt_bias, (const float*)z, nw, st,
                 reinterpret_cast<float*>(out), record, record_slot, qscale,
                 nv, dk, dv, rep);
+        }
+    }
+}
+
+// @brief 启动 c token 的融合校验链：同样一个值头一个 block，只是把 c 步串在块内。
+void launch_normed_seq(const float* q, const float* k, const float* v, const uint16_t* b,
+                       const uint16_t* a, const float* neg_expA, const float* dt_bias,
+                       const void* z, bool z_bf16, const uint16_t* nw, float* st, void* out,
+                       bool out_bf16, float* record, int record_slot, float qscale,
+                       int nv, int dk, int dv, int rep, int steps,
+                       long long stride_q, long long stride_k, long long stride_v,
+                       long long stride_b, long long stride_z,
+                       int threads, cudaStream_t stream) {
+    const size_t smem = (size_t)(2 * threads + 2 * dk) * sizeof(float);
+    if (out_bf16) {
+        if (z_bf16) {
+            delta_normed_seq_kernel<uint16_t, uint16_t><<<nv, threads, smem, stream>>>(
+                q, k, v, b, a, neg_expA, dt_bias, (const uint16_t*)z, nw, st,
+                reinterpret_cast<uint16_t*>(out), record, record_slot, qscale,
+                nv, dk, dv, rep, steps, stride_q, stride_k, stride_v, stride_b, stride_z);
+        } else {
+            delta_normed_seq_kernel<uint16_t, float><<<nv, threads, smem, stream>>>(
+                q, k, v, b, a, neg_expA, dt_bias, (const float*)z, nw, st,
+                reinterpret_cast<uint16_t*>(out), record, record_slot, qscale,
+                nv, dk, dv, rep, steps, stride_q, stride_k, stride_v, stride_b, stride_z);
+        }
+    } else {
+        if (z_bf16) {
+            delta_normed_seq_kernel<float, uint16_t><<<nv, threads, smem, stream>>>(
+                q, k, v, b, a, neg_expA, dt_bias, (const uint16_t*)z, nw, st,
+                reinterpret_cast<float*>(out), record, record_slot, qscale,
+                nv, dk, dv, rep, steps, stride_q, stride_k, stride_v, stride_b, stride_z);
+        } else {
+            delta_normed_seq_kernel<float, float><<<nv, threads, smem, stream>>>(
+                q, k, v, b, a, neg_expA, dt_bias, (const float*)z, nw, st,
+                reinterpret_cast<float*>(out), record, record_slot, qscale,
+                nv, dk, dv, rep, steps, stride_q, stride_k, stride_v, stride_b, stride_z);
         }
     }
 }
@@ -925,4 +1065,107 @@ torch::Tensor delta_normed_record(torch::Tensor q, torch::Tensor k, torch::Tenso
                                   torch::Tensor record, int64_t slot) {
     return delta_normed_impl(q, k, v, b, a, neg_expA, dt_bias, z, nw, st, out,
                              qscale, rep, record, slot);
+}
+
+static torch::Tensor delta_normed_seq_impl(
+        torch::Tensor q, torch::Tensor k, torch::Tensor v,
+        torch::Tensor b, torch::Tensor a,
+        torch::Tensor neg_expA, torch::Tensor dt_bias,
+        torch::Tensor z, torch::Tensor nw, torch::Tensor st,
+        torch::Tensor out, double qscale, int64_t rep,
+        torch::Tensor record, int64_t slot) {
+    TORCH_CHECK(q.dim() == 3 && k.dim() == 3 && v.dim() == 3,
+                "q/k/v must be [steps, heads, d]");
+    TORCH_CHECK(q.scalar_type() == torch::kFloat && k.scalar_type() == torch::kFloat
+                    && v.scalar_type() == torch::kFloat
+                    && neg_expA.scalar_type() == torch::kFloat
+                    && dt_bias.scalar_type() == torch::kFloat
+                    && st.scalar_type() == torch::kFloat,
+                "q/k/v, neg_expA, dt_bias and the state are fp32");
+    // 与单 token 入口同一个理由：这两个 logit 张量按 bf16 位模式读，更宽的 dtype 会被
+    // 重新解释而不是转换。
+    TORCH_CHECK(b.scalar_type() == torch::kBFloat16 && a.scalar_type() == torch::kBFloat16,
+                "beta and decay logits must be bf16");
+    TORCH_CHECK(z.scalar_type() == torch::kBFloat16 || z.scalar_type() == torch::kFloat,
+                "the norm gate must be bf16 or fp32");
+    TORCH_CHECK(nw.scalar_type() == torch::kBFloat16, "the norm gain must be bf16");
+    TORCH_CHECK(out.scalar_type() == torch::kBFloat16 || out.scalar_type() == torch::kFloat,
+                "output must be bf16 or fp32");
+    // q/k/v 允许行距大于行宽（调用方传的是同一块卷积输出里切出来的视图），b/a/z 同理
+    // ——它们是融合投影 ``split`` 出来的，行距是融合输出的总宽。所以传行距而不是要求
+    // 连续：要求连续就得在这里多做 c 次 ``contiguous()``，把内核省下的发射又付回去。
+    TORCH_CHECK(q.stride(2) == 1 && k.stride(2) == 1 && v.stride(2) == 1
+                    && b.stride(1) == 1 && a.stride(1) == 1 && z.stride(2) == 1,
+                "the innermost dim of q/k/v/b/a/z must be contiguous");
+    TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
+
+    const int steps = (int)q.size(0);
+    const int nv = (int)st.size(0);
+    const int dk = (int)st.size(1);
+    const int dv = (int)st.size(2);
+    TORCH_CHECK(steps >= 1, "steps must be >= 1");
+    TORCH_CHECK(k.size(0) == steps && v.size(0) == steps && b.size(0) == steps
+                    && a.size(0) == steps && z.size(0) == steps && out.size(0) == steps,
+                "every argument must have the same number of steps");
+    TORCH_CHECK(rep > 0 && nv % (int)rep == 0, "head count does not divide by rep");
+    TORCH_CHECK(q.size(1) == nv / (int)rep && q.size(2) == dk, "q must be [steps, nv / rep, dk]");
+    TORCH_CHECK(k.sizes() == q.sizes(), "k and q must have the same shape");
+    TORCH_CHECK(v.size(1) == nv && v.size(2) == dv, "v must be [steps, nv, dv]");
+    TORCH_CHECK(z.size(1) == nv && z.size(2) == dv, "norm gate must be [steps, nv, dv]");
+    TORCH_CHECK(nw.numel() == (int64_t)dv, "norm gain must have dv elements");
+    TORCH_CHECK(out.size(1) == nv && out.size(2) == dv, "out must be [steps, nv, dv]");
+    float* record_ptr = nullptr;
+    if (record.defined()) {
+        TORCH_CHECK(record.is_cuda() && record.device() == st.device()
+                    && record.is_contiguous() && record.scalar_type() == torch::kFloat
+                    && record.dim() == 3 && record.size(1) == nv
+                    && record.size(2) == dk + dv + 1
+                    && slot >= 0 && slot + steps <= record.size(0),
+                    "record must be contiguous [width, nv, dk + dv + 1] fp32 on the state device");
+        record_ptr = record.data_ptr<float>();
+    }
+    // 块大小同样由被替代的那条链固定，理由见 ``delta_normed_impl``。
+    const int threads = head_threads(dk);
+    TORCH_CHECK(dk <= threads && dv <= threads,
+                "delta_normed_seq needs dk and dv within one block (dk=", dk, " dv=", dv,
+                " threads=", threads, ")");
+    TORCH_CHECK(norm_threads(dv) == threads,
+                "delta_normed_seq needs the prologue's and the gated norm's block sizes to "
+                "agree (dk=", dk, " dv=", dv, " prologue=", threads,
+                " norm=", norm_threads(dv), ")");
+
+    launch_normed_seq(q.data_ptr<float>(), k.data_ptr<float>(), v.data_ptr<float>(),
+                      reinterpret_cast<const uint16_t*>(b.data_ptr()),
+                      reinterpret_cast<const uint16_t*>(a.data_ptr()),
+                      neg_expA.data_ptr<float>(), dt_bias.data_ptr<float>(),
+                      z.data_ptr(), z.scalar_type() == torch::kBFloat16,
+                      reinterpret_cast<const uint16_t*>(nw.data_ptr()), st.data_ptr<float>(),
+                      out.data_ptr(), out.scalar_type() == torch::kBFloat16, record_ptr,
+                      (int)slot, (float)qscale,
+                      nv, dk, dv, (int)rep, steps,
+                      (long long)q.stride(0), (long long)k.stride(0),
+                      (long long)v.stride(0), (long long)b.stride(0),
+                      (long long)z.stride(0),
+                      threads, c10::cuda::getCurrentCUDAStream());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
+torch::Tensor delta_normed_seq(torch::Tensor q, torch::Tensor k, torch::Tensor v,
+                               torch::Tensor b, torch::Tensor a,
+                               torch::Tensor neg_expA, torch::Tensor dt_bias,
+                               torch::Tensor z, torch::Tensor nw, torch::Tensor st,
+                               torch::Tensor out, double qscale, int64_t rep) {
+    return delta_normed_seq_impl(q, k, v, b, a, neg_expA, dt_bias, z, nw, st, out,
+                                 qscale, rep, torch::Tensor(), 0);
+}
+
+torch::Tensor delta_normed_seq_record(torch::Tensor q, torch::Tensor k, torch::Tensor v,
+                                      torch::Tensor b, torch::Tensor a,
+                                      torch::Tensor neg_expA, torch::Tensor dt_bias,
+                                      torch::Tensor z, torch::Tensor nw, torch::Tensor st,
+                                      torch::Tensor out, double qscale, int64_t rep,
+                                      torch::Tensor record, int64_t slot) {
+    return delta_normed_seq_impl(q, k, v, b, a, neg_expA, dt_bias, z, nw, st, out,
+                                 qscale, rep, record, slot);
 }

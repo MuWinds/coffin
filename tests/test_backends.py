@@ -114,12 +114,12 @@ class OpTableTest(unittest.TestCase):
             "conv1d_silu", "conv1d_silu_seq", "conv1d_silu_batch",
             "delta_prologue", "delta_prologue_batch", "delta_prep_seq",
             "delta", "delta_record", "delta_batch",
-            "delta_batch_record", "delta_commit", "delta_normed",
+            "delta_batch_record", "delta_commit", "delta_normed", "delta_normed_seq",
             "triangular_solve",
             "hyper_norm", "hyper_down", "hyper_up",
             "moe_grouped_i8_merge", "moe_decode_block", "shared_gate_scale",
         ))
-        self.assertEqual(len(Ops.NAMES), 40)
+        self.assertEqual(len(Ops.NAMES), 41)
 
     def test_names_match_the_dataclass_fields_in_order(self):
         """这条元组是手工维护的，可能与 dataclass 漂移；这里就是漂移报警器。"""

@@ -565,6 +565,36 @@ torch::Tensor delta_normed_record(torch::Tensor q, torch::Tensor k, torch::Tenso
                                   torch::Tensor out, double qscale, int64_t rep,
                                   torch::Tensor record, int64_t slot);
 
+// @brief c 个校验 token 的融合链，一次启动跑完整个投机窗口。
+//
+// 与 :func:`delta_normed` 逐 token 相同的一份算术，串行地走 c 步：递推的状态依赖让它
+// 无法并行，所以省下的是 ``c - 1`` 次固定发射与排空延迟，而不是计算量。
+//
+// @param q,k ``[steps, nv / rep, dk]`` fp32；最内层连续，行距可大于行宽，因为调用方传的
+//        是同一块卷积输出里切出来的视图。
+// @param v ``[steps, nv, dv]`` fp32。
+// @param b,a ``[steps, nv]`` bf16 原始 logits。
+// @param z ``[steps, nv, dv]`` 输出归一化的门，bf16 或 fp32。
+// @param st ``[nv, dk, dv]`` fp32 状态，跨 step 延续并原地更新。
+// @param out ``[steps, nv, dv]``，写入归一化后的结果。
+// @return ``out``，便于调用链串接。
+// @throws c10::Error dtype、头数、steps 或布局与状态矛盾。
+torch::Tensor delta_normed_seq(torch::Tensor q, torch::Tensor k, torch::Tensor v,
+                               torch::Tensor b, torch::Tensor a,
+                               torch::Tensor neg_expA, torch::Tensor dt_bias,
+                               torch::Tensor z, torch::Tensor nw, torch::Tensor st,
+                               torch::Tensor out, double qscale, int64_t rep);
+
+// @brief c 个校验 token 的融合链并逐 token 记录秩一更新。
+// @param record ``[width, nv, dk + dv + 1]`` fp32，``steps`` 个位置从 ``slot`` 起写。
+// @param slot 第一个 token 的日志位置。
+torch::Tensor delta_normed_seq_record(torch::Tensor q, torch::Tensor k, torch::Tensor v,
+                                      torch::Tensor b, torch::Tensor a,
+                                      torch::Tensor neg_expA, torch::Tensor dt_bias,
+                                      torch::Tensor z, torch::Tensor nw, torch::Tensor st,
+                                      torch::Tensor out, double qscale, int64_t rep,
+                                      torch::Tensor record, int64_t slot);
+
 // 三角求解：分块 delta 规则唯一需要的库操作，也是本卡 cuSOLVER 答不了的那一个。
 
 // @brief 为单位下三角 ``A`` 解 ``A X = B``。

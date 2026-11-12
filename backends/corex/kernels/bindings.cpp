@@ -173,6 +173,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "prologue + recurrence + gated norm for one decode token, one launch");
     m.def("delta_normed_record", &delta_normed_record,
           "融合 gated delta 校验步并记录秩一更新");
+    m.def("delta_normed_seq", &delta_normed_seq,
+          "c 个校验 token 的融合链，一次启动跑完整个投机窗口");
+    m.def("delta_normed_seq_record", &delta_normed_seq_record,
+          "c 个校验 token 的融合链并逐 token 记录秩一更新");
 
     // 三角求解：替代这份构建加载不了的 cuSOLVER 路径。
     m.def("triangular_solve", &triangular_solve,

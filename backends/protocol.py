@@ -83,6 +83,7 @@ _OP_NAMES: tuple[str, ...] = (
     "delta_batch_record",
     "delta_commit",
     "delta_normed",
+    "delta_normed_seq",
     # 三角求解：分块 delta 规则每个块要反解一个单位下三角方程组，那是*库*能力，
     # 不是模型数学。
     "triangular_solve",
@@ -425,6 +426,18 @@ class Ops:
     #: ``z`` 是输出归一化的门控投影，``nw`` 是它的 ``[dv]`` 增益：归一化按 value 头
     #: 做，正好一个 block 的范围，所以能并进 epilogue，不需要额外归约。
     delta_normed: OpFn | None = None
+    #: ``delta_normed_seq(q, k, v, b, a, neg_expA, dt_bias, z, nw, st, out, qscale,
+    #: rep[, record, slot]) -> out``：一次启动跑完校验窗口的 ``c`` 个 token，语义是
+    #: 对 ``steps`` 维依次调用 :attr:`delta_normed`。
+    #:
+    #: 它成为独立算子是因为发射是这里的成本：单 token 的那次调用无论一行还是八行都要
+    #: 70–105 us，几乎不随行数变化，所以投机校验每层多付的 ``c - 1`` 次调用是纯加性的。
+    #: 块内串行是规格的一部分——递推的状态依赖让它无法并行。
+    #:
+    #: ``q``/``k`` 为 ``[steps, num_k, dk]``、``v``/``z``/``out`` 为
+    #: ``[steps, num_v, dv]``、``b``/``a`` 为 ``[steps, num_v]``；``st`` 仍是
+    #: ``[num_v, dk, dv]`` 并在 step 间延续。
+    delta_normed_seq: OpFn | None = None
     #: ``triangular_solve(lower, rhs) -> out``：解 ``A X = B``，``A`` 是
     #: ``[bn, L, L]`` 单位下三角，``B`` 是 ``[bn, L, n]``，返回 ``[bn, L, n]``，
     #: dtype 跟 ``rhs`` 走。

@@ -957,6 +957,39 @@ def _delta_normed(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     return out
 
 
+def _delta_normed_seq(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                      b: torch.Tensor, a: torch.Tensor,
+                      neg_expA: torch.Tensor, dt_bias: torch.Tensor,
+                      z: torch.Tensor, nw: torch.Tensor, st: torch.Tensor,
+                      out: torch.Tensor, qscale: float, rep: int,
+                      record: torch.Tensor | None = None,
+                      slot: int = 0) -> torch.Tensor:
+    """按 step 维依次调用 :func:`_delta_normed`，状态在 step 之间延续。
+
+    参考实现就是逐 step 调用，所以它同时也是「一次启动跑完 c 个 token」这个算子
+    的规格：两者必须给出同一批数字。
+
+    Args:
+        q, k: ``[steps, num_k, dk]``。
+        v: ``[steps, num_v, dv]``。
+        b, a: ``[steps, num_v]``。
+        z: ``[steps, num_v, dv]`` 输出归一化的门。
+        st: ``[num_v, dk, dv]``，跨 step 延续并原地更新。
+        out: ``[steps, num_v, dv]``。
+        qscale: ``dk ** -0.5``。
+        rep: 每个键头对应的值头数。
+        record: 可选 ``[width, num_v, dk + dv + 1]`` 更新日志。
+        slot: 第一个 step 的日志位置。
+
+    Returns:
+        ``out``，便于调用链串接。
+    """
+    for i in range(int(q.shape[0])):
+        _delta_normed(q[i], k[i], v[i], b[i], a[i], neg_expA, dt_bias, z[i], nw, st,
+                      out[i], qscale, rep, record, slot + i)
+    return out
+
+
 def _triangular_solve(lower: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
     """Solve ``A X = B`` for a unit-lower-triangular ``A``.
 
@@ -1145,6 +1178,7 @@ def build(caps: Caps | None = None) -> Ops:
         delta_batch_record=_delta_batch_record,
         delta_commit=_delta_commit,
         delta_normed=_delta_normed,
+        delta_normed_seq=_delta_normed_seq,
         triangular_solve=_triangular_solve,
         moe_grouped=functools.partial(_moe_grouped, weight_dtype=c.weight_dtype),
     # int8 专家栈（``QWeightMoE``）走同一份参考实现：它按 ``offsets`` 逐段取专家、

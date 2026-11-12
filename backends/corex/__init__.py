@@ -92,7 +92,18 @@ _W4_DEQUANT_MAX_BYTES = int(os.environ.get("COFFIN_W4_DEQUANT_MAX_MB", "256")) <
 #: 不是随便定的。
 _ROW_CHUNK = 8
 
-#: 投机校验才启用的 W8A8 DP4A 路径；可用 0 关闭以对照原有 GEMV。
+#: 投机校验的 W8A8 DP4A 路径；``COFFIN_COREX_W8A8_DP4A_VERIFY=1`` 打开以对照原有 GEMV。
+#:
+#: **实测更慢，所以默认关**（作业 5077，2026-11-12，gpu-node-06，B=8、K=1、M=B*c=16，
+#: 一次前向校验的整步墙钟）：关 82.82 ms，开 210.88 ms，即 **2.55x 退化**。分段看是
+#: 全面退化而不只是投影：mlp 段 101.00 -> 347.15 ms（三次累计）、proj 38.39 -> 86.00。
+#: 也就是说 ``w8a8_dp4a_nk`` 省下的权重重读抵不过它自己的代价——激活要先量化一遍
+#: （``quant_act_i8``）、DP4A 的 ALU 吞吐在这张卡上不如 GEMV 路径的 FMA 摊销，
+#: 而且 M=16 本来也只是 ``_ROW_CHUNK=8`` 的 2 块、重读代价只有 2 倍。
+#:
+#: 保留这个开关是因为它描述的路径本身没被否掉：真正缺的是「一次 launch 摊掉任意 M 行
+#: 且不比 GEMV 慢」的宽 M 内核，DP4A 是现成的一个候选而不是答案。要重开它，得先让
+#: mlp 段在 M=16 上按元素胜出。
 _W8A8_DP4A_VERIFY = os.environ.get("COFFIN_COREX_W8A8_DP4A_VERIFY", "0").strip() == "1"
 
 #: 宽指令张量核 GEMM 的形状门限，按**权重字节数**而不是 K 或 N 单独判。
@@ -1994,6 +2005,49 @@ def delta_normed(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     return module.delta_normed_record(*args, record, slot)
 
 
+def delta_normed_seq(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                     b: torch.Tensor, a: torch.Tensor, neg_expA: torch.Tensor,
+                     dt_bias: torch.Tensor, z: torch.Tensor, nw: torch.Tensor,
+                     st: torch.Tensor, out: torch.Tensor, qscale: float,
+                     rep: int, record: torch.Tensor | None = None,
+                     slot: int = 0) -> torch.Tensor:
+    """c 个校验 token 的融合链，一次启动跑完整个投机窗口。
+
+    算术与逐 token 调用 :func:`delta_normed` 完全相同，只是把 c 步串进同一个内核的
+    循环里。省下来的不是计算量而是发射——单 token 那次调用无论一行还是八行都要
+    70–105 us，几乎不随行数变化，所以校验窗口里每层多付的 ``c - 1`` 次调用是纯加性
+    的固定延迟。
+
+    Args:
+        q: 原始查询，``[steps, num_k, dk]`` fp32；最内层连续，行距可大于行宽。
+        k: 原始键，形状同 ``q``。
+        v: 值，``[steps, num_v, dv]`` fp32。
+        b: beta logits，``[steps, num_v]`` bf16。
+        a: 衰减 logits，``[steps, num_v]`` bf16。
+        neg_expA: ``-exp(A_log)``，``[num_v]`` fp32。
+        dt_bias: 衰减偏置，``[num_v]`` fp32。
+        z: 输出归一化用的门投影，``[steps, num_v, dv]``。
+        nw: 门控归一化的增益，``[dv]`` bf16，按值头。
+        st: 循环状态，``[num_v, dk, dv]`` fp32，跨 step 延续并原地更新。
+        out: 输出缓冲区，``[steps, num_v, dv]``，原地写入归一化后的结果。
+        qscale: ``dk ** -0.5``。
+        rep: 每个键头对应的值头数。
+        record: 可选的 ``[width, num_v, dk + dv + 1]`` fp32 更新日志。
+        slot: 第一个 step 在日志里的位置，后续 step 依次 +1。
+
+    Returns:
+        ``out``，便于调用链串接。
+
+    Raises:
+        RuntimeError: 扩展不可用。
+    """
+    module = _kernels()
+    args = (q, k, v, b, a, neg_expA, dt_bias, z, nw, st, out, qscale, rep)
+    if record is None:
+        return module.delta_normed_seq(*args)
+    return module.delta_normed_seq_record(*args, record, slot)
+
+
 # 超连接（Gated Residual）
 #
 # 这三个适配器背后是 ``kernels/hyper.cu`` 的三个内核，它们一层里被调两套、48 层就是
@@ -2336,6 +2390,7 @@ _NATIVE: dict[str, OpFn] = {
     "delta_batch_record": delta_batch_record,
     "delta_commit": delta_commit,
     "delta_normed": delta_normed,
+    "delta_normed_seq": delta_normed_seq,
     "triangular_solve": triangular_solve,
     "moe_grouped": moe_grouped,
     "moe_grouped_gemm": moe_grouped_gemm,
@@ -2452,11 +2507,22 @@ def caps() -> Caps:
         一个记录：``device="cuda"``（CoreX 实现了那个命名空间），两种 dtype 都是
         bf16，因为预填充 GEMM 在本卡上 bf16 和 fp16 都到 32.6 TFLOP/s，转换不值
         它的流量；``weight_layout="kn"``，因为那个布局在本卡上对解码值 14-22 倍；
-        ``attn_split=8``：切片轴就是内核的 ``grid.y``，切片数由 ``part_acc.size(-2)`` 读，
-        所以改这里就够、不用改内核。实测（合成 int8 池）4k 1.407→0.827 ms、32k 11.17→3.55、
-        64k 24.49→6.22，对 split=1 的相对误差 ≤2.8e-3。取 8 不取 16：两者在 4k 与 64k 都
-        处在同一平台（0.78 / 6.2 ms），而 8 的切片缓冲只有一半。原先这里写「内核还不会按 K
-        切分」，是把「能力记录里没开」误当成「内核没实现」——那次没有实测就下了结论。
+        ``attn_split=32``：切片轴就是内核的 ``grid.y``，切片数由 ``part_acc.size(-2)`` 读，
+        所以改这里就够、不用改内核。切分是给键范围*分区*，各块读的是**不相交**的区间，所以
+        提高它不增加 KV 流量，只多出 ``part_acc``/``part_ml`` 那一趟（几十 KB）和 combine。
+
+        早先写的是 8，依据是单层孤立内核实测（合成 int8 池）4k 1.407→0.827 ms、
+        32k 11.17→3.55、64k 24.49→6.22，8 与 16 处在同一平台因此取了 8。那是**孤立内核**
+        的结论，整步是另一回事：2026-11-12 在整步上量 8 → 32（Qwen3.5-4B-int8kn、单流），
+        decode 在 4k/16k/65k 是 25.81→24.01、36.66→34.12、70.13→62.62 ms
+        （-7.0% / -6.9% / -10.7%），verify c=4 在同上下文是 47.68→44.78、76.73→72.37、
+        187.19→169.52 ms（-6.1% / -5.7% / -9.4%）。上下文越长收益越大，说明这段的瓶颈是
+        **并行度不足以掩盖访存延迟**，不是带宽、也不是 ALU 吞吐——这也解释了为什么几次
+        「省流量」的改法（折叠 draft、W8A8 宽 M）全部无效。
+
+        不要再往上加：128（16k 上下文）实测启动约 20 秒后把整个沙箱作业的 runner 卡死，
+        心跳写盘停止、作业从调度器消失，属于驱动侧不可中断等待那一类。``tuning.py`` 因此
+        把 ``COFFIN_ATTN_SPLIT`` 的上限压到后端值的 4 倍。
 
         ``graph`` 和 ``batch_attn`` 是推导出来的，不是声明的。只有当解码步碰到的
         每个算子都有自己的内核（:data:`_DECODE_OPS`）时 ``graph`` 才为真，因为参考
@@ -2479,7 +2545,7 @@ def caps() -> Caps:
         weight_dtype=pack.WEIGHT_DTYPE,
         graph=_GRAPH_VERIFIED and _DECODE_OPS <= native,
         autotune=True,
-        attn_split=8,
+        attn_split=32,
         batch_attn="attn_paged_batch" in native,
         int8_weights=True,
         recurrent_state=True,

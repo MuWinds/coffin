@@ -523,8 +523,8 @@ class FullAttn:
         self.verify_mq_width = int(width)
         self.verify_mq_out = torch.zeros(width, self.nh, self.hd,
                                          dtype=D, device=_device)
-        self.verify_mq_part_acc = torch.zeros(width, self.nh, ATTN_SPLIT, self.hd,
-                                              dtype=torch.float32, device=_device)
+        self.verify_mq_part_acc = torch.zeros(width, self.nh, ATTN_SPLIT,
+                                              self.hd, dtype=torch.float32, device=_device)
         self.verify_mq_part_ml = torch.zeros(width, self.nh, ATTN_SPLIT, 2,
                                              dtype=torch.float32, device=_device)
 
@@ -578,11 +578,10 @@ class FullAttn:
         kq, ks = self._quant_seq(k.reshape(n, self.nkv, self.hd))
         vq, vs = self._quant_seq(v.reshape(n, self.nkv, self.hd))
         slot_map = self.pool.pos2slot[row_start:row_start + b]
-        if b == 1:
-            slots = slot_map[0].index_select(0, positions[0])
-        else:
-            slots = torch.stack([slot_map[i].index_select(0, positions[i])
-                                 for i in range(b)]).reshape(n)
+        # 每行的 c 个槽位都从同一张 ``pos2slot`` 行里取，所以整个 bucket 一次 gather
+        # 就够：原先逐行 ``index_select`` 再 ``stack`` 是 b+1 次发射（b=8 时 9 次），
+        # 且 ``stack`` 还要先落一份临时。values 与逐行取法完全相同。
+        slots = slot_map.gather(1, positions).reshape(n)
         self.pool.write_rows(self.pidx, slots, kq, ks, vq, vs)
 
         kp, vp, kps, vps = self._pool_views()

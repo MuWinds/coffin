@@ -58,4 +58,18 @@ PREFILL_MTP_CHUNK = int(os.environ.get("PREFILL_MTP_CHUNK", "2048"))
 #: 所以它是*后端*的值：这一侧持有内核要写的 ``part_acc``/``part_ml`` 缓冲区，
 #: 宽度必须和内核索引它们时用的一致。值从 ``caps.attn_split`` 读取；名字保留旧的，
 #: 所有定缓冲区尺寸的调用点因此一行未改。
-ATTN_SPLIT = _caps().attn_split
+#:
+#: ``COFFIN_ATTN_SPLIT`` 只用来做同二进制 A/B：切分把键范围*分区*给不同块，各块读
+#: 不相交的区间，所以提高它不增加 KV 流量，只多出 ``part_acc`` 那一趟（几十 KB）。
+#: 默认仍取后端声明的值，不给覆盖时行为一字不变。
+#:
+#: 上限是绝对值 64，不是「后端值的几倍」：后端值是 32，倍数会把它放宽到 128，而 128 正是
+#: 实测挂掉整个沙箱作业的那个值。64 已经跑过（16k 上下文、decode+verify）没有异常。
+_BACKEND_SPLIT = _caps().attn_split
+_SPLIT_ENV = os.environ.get("COFFIN_ATTN_SPLIT")
+ATTN_SPLIT = _BACKEND_SPLIT if _SPLIT_ENV is None else int(_SPLIT_ENV)
+if not 1 <= ATTN_SPLIT <= 64:
+    raise ValueError(
+        f"COFFIN_ATTN_SPLIT={ATTN_SPLIT} is outside 1..64: the backend declares "
+        f"attn_split={_BACKEND_SPLIT}, and 128 was measured to hang the whole sandbox "
+        "job (the runner stopped writing its heartbeat and the job vanished).")
