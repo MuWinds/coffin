@@ -231,7 +231,21 @@ class ModelRunner:
         self.buckets = buckets
         # +1 那一行是预填充暂存行；没有它，分组预填充就得和一条已经在解码的
         # 序列共用行。
-        self.model.enable_batching(max(self.buckets) + 1)
+        capacity = max(self.buckets) + 1
+        if not self.graph:
+            # 不 capture 的后端（这张卡 graph=0）不受「图是固定形状」的限制：
+            # 行数可以直接开到调度器允许的 ``max_batch``，桶表也补上这个宽度，
+            # 否则 ``_decode_batch`` 里「高于最高活跃行的最小桶」会在行数超过
+            # ``BATCH_BUCKETS`` 最大值时抛 StopIteration。
+            #
+            # 这条以前是缺的：``BATCH_BUCKETS`` 只到 8，容量跟着变成 8 行，
+            # 于是 ``--max-num-seqs 16`` 虽然被接受，第 9 条序列准入时就抛
+            # "no free decode row (capacity 8)"，而那个异常会被 worker 当成
+            # 致命错误、把整个服务停掉（实测 M=16 只回 1 条结果）。
+            if max_batch > max(self.buckets):
+                self.buckets = tuple(sorted(set(self.buckets) | {max_batch}))
+                capacity = max_batch + 1
+        self.model.enable_batching(capacity)
         if self.graph:
             self.model.capture_batch(self.buckets)
         self.batching = True
