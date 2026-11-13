@@ -122,7 +122,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "wide-instruction (i8x8) tensor-core int8 GEMM with the epilogue fused: "
           "out[M, N] = (A[M, K] @ W[K, N]) scaled, in one launch",
           pybind11::arg("a"), pybind11::arg("w"), pybind11::arg("xs"),
-          pybind11::arg("ws"), pybind11::arg("out"));
+          pybind11::arg("ws"), pybind11::arg("out"), pybind11::arg("cfg") = 0);
     m.def("w8a8_dp4a_nk", &w8a8_dp4a_nk,
           "W8A8 DP4A GEMM over contiguous [N, K] int8 weights",
           pybind11::arg("a"), pybind11::arg("wt"), pybind11::arg("c"),

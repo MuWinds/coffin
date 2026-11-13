@@ -342,7 +342,10 @@ torch::Tensor w8a8_epilogue(torch::Tensor c, torch::Tensor xs, torch::Tensor ws,
 //
 // 这条内核只在宽形状上赢库（实测 4B 的真实预填充形状：``gate_up`` 1.52x、
 // ``linear_attn_qkvzba`` 1.53x、``o_proj`` 1.28x），窄 K 的 ``mlp_down``
-// （K=9216）反而输 14%，所以调用方按形状分派，不是无条件替换。
+// （K=9216）在默认块几何下输 14%，所以调用方按形状分派，不是无条件替换。
+//
+// 块几何是模板参数，``cfg`` 用来选一套（默认 256x256x64）：深 K 的形状串的 k 段多，
+// 一段 64 KB 共享内存只够一个块常驻，把 K 步长降到 32 就有两个块轮流顶延迟。
 //
 // @param a ``[M, K]`` int8 激活，行主序连续。
 // @param w ``[K, N]`` int8 权重，行主序连续。两个操作数都按引擎的原生布局吃，
@@ -350,10 +353,12 @@ torch::Tensor w8a8_epilogue(torch::Tensor c, torch::Tensor xs, torch::Tensor ws,
 // @param xs ``[M]`` 每 token 的 fp32 激活 scale。
 // @param ws ``[N]`` 每个输出列的 fp32 权重 scale。
 // @param out ``[M, N]`` 目的地，bf16 或 fp32，原地写入。
+// @param cfg 块几何：``0`` 默认 256x256x64；``1`` 256x256x32；``2`` 128x256x64；
+//        ``3`` 256x128x64。int32 累加与顺序无关，所以各档结果逐位相同，选错只慢不错。
 // @return ``out``。
-// @throws c10::Error dtype、形状或连续性与内核索引的不一致。
+// @throws c10::Error dtype、形状、连续性与内核索引的不一致，或 ``cfg`` 越界。
 torch::Tensor w8a8_gemm_tcu(torch::Tensor a, torch::Tensor w, torch::Tensor xs,
-                            torch::Tensor ws, torch::Tensor out);
+                            torch::Tensor ws, torch::Tensor out, int64_t cfg);
 
 // @brief ``out = silu(gate) * up``，即 SwiGLU 乘积，一次启动。
 //

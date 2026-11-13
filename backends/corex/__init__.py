@@ -127,8 +127,10 @@ _W8A8_DP4A_VERIFY = os.environ.get("COFFIN_COREX_W8A8_DP4A_VERIFY", "0").strip()
 #: 144 个 k-tile，TCU 的块间固定开销摊不薄；其余形状 N 宽 K 浅。所以门限落在 K 上。
 #:
 #: 这个数只决定走哪条路，两条路的**数值逐位相同**（int32 累加是精确的，epilogue 的
-#: 舍入次数也一样），所以分派错了只会慢、不会错。``COFFIN_I8_GEMM`` 可覆盖：
-#: ``tcu`` 强制走 TCU，``lib`` 强制走库做 A/B。
+#: 舍入次数也一样），所以分派错了只会慢、不会错。``COFFIN_I8_GEMM`` 可覆盖**全部**
+#: 形状（``tcu`` 强制走 TCU，``lib`` 强制走库）；只动深 K 这一档的开关是
+#: ``COFFIN_I8_GEMM_DEEP``。两者必须分开：全形状覆盖做「深 K 该走哪条」的实验时，
+#: 会把另外六个形状也一起换掉，量到的是「全部手写 vs 全部库」。
 _TCU_MAX_K = 8192
 
 
@@ -146,8 +148,8 @@ def _use_tcu_gemm(rows: int, k: int, n: int, available: bool) -> bool:
         走 TCU 时为 ``True``。
 
     Raises:
-        ValueError: ``COFFIN_I8_GEMM`` 是个不认识的值。静默回退会让一次 A/B 看起来
-            像「两边一样快」，而实际两边跑的是同一条路。
+        ValueError: ``COFFIN_I8_GEMM`` / ``COFFIN_I8_GEMM_DEEP`` 是不认识的值。静默
+            回退会让一次 A/B 看起来像「两边一样快」，而实际两边跑的是同一条路。
     """
     if not available:
         return False
@@ -159,7 +161,17 @@ def _use_tcu_gemm(rows: int, k: int, n: int, available: bool) -> bool:
     if forced:
         raise ValueError(
             f"COFFIN_I8_GEMM={forced!r} is not one of 'tcu' / 'lib'")
-    return k <= _TCU_MAX_K
+    if k > _TCU_MAX_K:
+        deep = os.environ.get("COFFIN_I8_GEMM_DEEP", "").strip().lower()
+        if deep in {"tcu", "tensor", "i8x8"}:
+            return True
+        if deep in {"lib", "cublas"}:
+            return False
+        if deep:
+            raise ValueError(
+                f"COFFIN_I8_GEMM_DEEP={deep!r} is not one of 'tcu' / 'lib'")
+        return False
+    return True
 
 
 @functools.lru_cache(maxsize=1)

@@ -174,13 +174,17 @@ __device__ __forceinline__ void mma_tile(const unsigned* a0, const unsigned* a1,
 // @param N 权重列数。
 // @param K 权重行数。
 // @param tid 本线程在线性任务表里的下标。
-template <int TBK>
+// @tparam TBK 本段的 k 步长。
+// @tparam BMw 本块在 MMA-M（= 权重 N 方向）的 tile 宽；块几何是模板参数，
+//             因为深 K 形状要换一套（见 :func:`w8a8_gemm_tcu` 的 cfg 参数）。
+// @tparam NTH 每块线程数。
+template <int TBK, int BMw, int NTH>
 __device__ __forceinline__ void stage_w(int8_t* sa, const int8_t* __restrict__ W,
                                         int n0, int k0, int N, int K, int tid) {
-    constexpr int J = BM / 4;
+    constexpr int J = BMw / 4;
 #pragma unroll
-    for (int rep = 0; rep < (TBK * J + NTHREADS - 1) / NTHREADS; ++rep) {
-        int const t = tid + rep * NTHREADS;
+    for (int rep = 0; rep < (TBK * J + NTH - 1) / NTH; ++rep) {
+        int const t = tid + rep * NTH;
         if (t >= TBK * J) break;
         int const k = t / J;
         int const j = t % J;
@@ -210,14 +214,17 @@ __device__ __forceinline__ void stage_w(int8_t* sa, const int8_t* __restrict__ W
 // @param M 激活行数。
 // @param K 激活行宽。
 // @param tid 本线程在线性任务表里的下标。
-template <int TBK>
+// @tparam TBK 本段的 k 步长。
+// @tparam BNw 本块在 MMA-N（= 激活 M 方向）的 tile 宽。
+// @tparam NTH 每块线程数。
+template <int TBK, int BNw, int NTH>
 __device__ __forceinline__ void stage_act(int8_t* sb, const int8_t* __restrict__ Ac,
                                           int m0, int k0, int M, int K, int tid) {
     constexpr int J = TBK / 4;
 #pragma unroll
-    for (int rep = 0; rep < (BN * J + NTHREADS - 1) / NTHREADS; ++rep) {
-        int const t = tid + rep * NTHREADS;
-        if (t >= BN * J) break;
+    for (int rep = 0; rep < (BNw * J + NTH - 1) / NTH; ++rep) {
+        int const t = tid + rep * NTH;
+        if (t >= BNw * J) break;
         int const m = t / J;
         int const j = t % J;
         int const gk4 = k0 + j * 4;
@@ -307,21 +314,34 @@ __device__ __forceinline__ void store_epi(const v4i32* acc, XT* __restrict__ out
 // @param M 激活行数。
 // @param N 权重列数。
 // @param K 内维。
-template <typename XT>
+// @tparam BMt 块在 MMA-M（权重 N）方向的宽，只能 64 的倍数。
+// @tparam BNt 块在 MMA-N（激活 M）方向的宽，只能 64 的倍数。
+// @tparam BKt K 方向步长，``32`` 或 ``64``（64 让共享内存 64 KB）。
+//
+// 块几何是模板参数而不是全局常量，是为了让**深 K** 形状能换一套：``BK = 64`` 时
+// 一段 64 KB 共享内存只够一个块常驻，而 ``K = 9216`` 要串 144 段，块间没有第二个
+// 块可以顶上来填延迟；``BK = 32`` 把一段降到 32 KB，占用率翻倍。这两个档的取舍在
+// 实测里是分形状的，所以参数化而不是全局改掉。
+template <typename XT, int BMt, int BNt, int BKt>
 __global__ void gemm_tcu_kernel(const int8_t* __restrict__ W, const int8_t* __restrict__ Ac,
                                 XT* __restrict__ out, const float* __restrict__ xs,
                                 const float* __restrict__ ws, int M, int N, int K, int stride) {
+    constexpr int WRt = BMt / 64;
+    constexpr int WCt = BNt / 64;
+    constexpr int NTH = WRt * WCt * 64;
+    constexpr int SAt = WRt * (BKt / 16) * 1024;
+    constexpr int SBt = WCt * (BKt / 16) * 1024;
     extern __shared__ int8_t smem[];
     int8_t* sa = smem;
-    int8_t* sb = smem + 2 * SA;
+    int8_t* sb = smem + 2 * SAt;
 
     int const tid = threadIdx.x;
     int const warp = tid >> 6;
-    int const wm = warp / WC;
-    int const wn = warp % WC;
+    int const wm = warp / WCt;
+    int const wn = warp % WCt;
     // grid.x 走 N（MMA-M）、grid.y 走 M（MMA-N）。
-    int const n0 = blockIdx.x * BM;
-    int const m0 = blockIdx.y * BN;
+    int const n0 = blockIdx.x * BMt;
+    int const m0 = blockIdx.y * BNt;
 
     v4i32 acc[16];
 #pragma unroll
@@ -329,9 +349,9 @@ __global__ void gemm_tcu_kernel(const int8_t* __restrict__ W, const int8_t* __re
         acc[i].x = 0; acc[i].y = 0; acc[i].z = 0; acc[i].w = 0;
     }
 
-    int const nk = (K + BK - 1) / BK;
-    stage_w<BK>(sa, W, n0, 0, N, K, tid);
-    stage_act<BK>(sb, Ac, m0, 0, M, K, tid);
+    int const nk = (K + BKt - 1) / BKt;
+    stage_w<BKt, BMt, NTH>(sa, W, n0, 0, N, K, tid);
+    stage_act<BKt, BNt, NTH>(sb, Ac, m0, 0, M, K, tid);
     __syncthreads();
 
     for (int kb = 0; kb < nk; ++kb) {
@@ -340,14 +360,14 @@ __global__ void gemm_tcu_kernel(const int8_t* __restrict__ W, const int8_t* __re
         // 只交换「搬」和「算」的顺序而不拆开 LDG/STS，warp 会卡在 STS 上等全局内存，
         // 那段 mma 就完全没盖住任何延迟（实测 stage + mma ≈ whole 就是这个症状）。
         if (kb + 1 < nk) {
-            stage_w<BK>(sa + (cur ^ 1) * SA, W, n0, (kb + 1) * BK, N, K, tid);
-            stage_act<BK>(sb + (cur ^ 1) * SB, Ac, m0, (kb + 1) * BK, M, K, tid);
+            stage_w<BKt, BMt, NTH>(sa + (cur ^ 1) * SAt, W, n0, (kb + 1) * BKt, N, K, tid);
+            stage_act<BKt, BNt, NTH>(sb + (cur ^ 1) * SBt, Ac, m0, (kb + 1) * BKt, M, K, tid);
         }
-        const int8_t* wa = sa + cur * SA + wm * (BK / 16) * 1024;
-        const int8_t* wb = sb + cur * SB + wn * (BK / 16) * 1024;
+        const int8_t* wa = sa + cur * SAt + wm * (BKt / 16) * 1024;
+        const int8_t* wb = sb + cur * SBt + wn * (BKt / 16) * 1024;
         unsigned a0[4], a1[4], b0[4], b1[4];
 #pragma unroll
-        for (int t = 0; t < BK / 32; ++t) {
+        for (int t = 0; t < BKt / 32; ++t) {
             ld_a(a0, wa + t * 2048);
             ld_a(a1, wa + t * 2048 + 1024);
             ld_b(b0, wb + t * 2048);
@@ -733,8 +753,59 @@ torch::Tensor w4a8_gemm_tcu(torch::Tensor a, torch::Tensor w, torch::Tensor xs,
     return out;
 }
 
+// @brief 按一套块几何发一次 ``gemm_tcu_kernel``，共享内存与网格都在这里算。
+//
+// @tparam BMt 块在 MMA-M 方向的宽。
+// @tparam BNt 块在 MMA-N 方向的宽。
+// @tparam BKt K 方向步长。
+template <typename XT, int BMt, int BNt, int BKt>
+__host__ void launch_gemm_tcu(const int8_t* __restrict__ W, const int8_t* __restrict__ A,
+                              XT* __restrict__ out, const float* __restrict__ xs,
+                              const float* __restrict__ ws, int M, int N, int K, int stride,
+                              const cudaStream_t stream) {
+    constexpr int NTH = (BMt / 64) * (BNt / 64) * 64;
+    constexpr size_t kShmem = 2 * (size_t)((BMt / 64) * (BKt / 16) * 1024
+                                           + (BNt / 64) * (BKt / 16) * 1024);
+    const dim3 grid((N + BMt - 1) / BMt, (M + BNt - 1) / BNt);
+    if (kShmem > 48 * 1024) {
+        C10_CUDA_CHECK(cudaFuncSetAttribute(gemm_tcu_kernel<XT, BMt, BNt, BKt>,
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            (int)kShmem));
+    }
+    gemm_tcu_kernel<XT, BMt, BNt, BKt><<<grid, NTH, kShmem, stream>>>(
+        W, A, out, xs, ws, M, N, K, stride);
+}
+
+// @brief 一次启动算 ``out[M, N] = W^T 作用在激活上``，epilogue 融合，块几何由 ``cfg`` 选。
+//
+// ``cfg = 0`` 是默认几何（256x256x64）；其余档是给深 K 形状留的斜体：
+// ``cfg = 1`` 把 K 步长降到 32（共享内存 32 KB，块占用翻倍）。
+//
+// @throws c10::Error ``cfg`` 不在 0..1 内。静默回退会让一次 A/B 看起来像
+//        「两档一样快」，而实际两次跑的是同一套几何。
+template <typename XT>
+__host__ void run_gemm_tcu(const int8_t* __restrict__ W, const int8_t* __restrict__ A,
+                           XT* __restrict__ out, const float* __restrict__ xs,
+                           const float* __restrict__ ws, int M, int N, int K, int stride,
+                           int64_t cfg, const cudaStream_t stream) {
+    switch (cfg) {
+        case 1:
+            launch_gemm_tcu<XT, BM, BN, 32>(W, A, out, xs, ws, M, N, K, stride, stream);
+            break;
+        case 2:
+            launch_gemm_tcu<XT, 128, BN, BK>(W, A, out, xs, ws, M, N, K, stride, stream);
+            break;
+        case 3:
+            launch_gemm_tcu<XT, BM, 128, BK>(W, A, out, xs, ws, M, N, K, stride, stream);
+            break;
+        default:
+            launch_gemm_tcu<XT, BM, BN, BK>(W, A, out, xs, ws, M, N, K, stride, stream);
+            break;
+    }
+}
+
 torch::Tensor w8a8_gemm_tcu(torch::Tensor a, torch::Tensor w, torch::Tensor xs,
-                            torch::Tensor ws, torch::Tensor out) {
+                            torch::Tensor ws, torch::Tensor out, int64_t cfg) {
     TORCH_CHECK(a.dim() == 2 && w.dim() == 2 && out.dim() == 2,
                 "activation, weight and output must all be 2-D");
     TORCH_CHECK(a.scalar_type() == torch::kChar && w.scalar_type() == torch::kChar,
@@ -764,21 +835,14 @@ torch::Tensor w8a8_gemm_tcu(torch::Tensor a, torch::Tensor w, torch::Tensor xs,
                 "out must have unit inner stride and a row stride of at least N; got "
                 "strides ", out.stride(0), " / ", out.stride(1));
 
-    const dim3 grid((N + BM - 1) / BM, (M + BN - 1) / BN);
-    const size_t shmem = 2 * (size_t)(SA + SB);
+    TORCH_CHECK(cfg >= 0 && cfg <= 3, "cfg must be 0..3, got ", cfg);
     const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
     auto run = [&](auto tag) {
         using XT = decltype(tag);
-        if (shmem > 48 * 1024) {
-            C10_CUDA_CHECK(cudaFuncSetAttribute(gemm_tcu_kernel<XT>,
-                                                cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                                (int)shmem));
-        }
-        gemm_tcu_kernel<XT><<<grid, NTHREADS, shmem, stream>>>(
-            reinterpret_cast<const int8_t*>(w.data_ptr()), 
-            reinterpret_cast<const int8_t*>(a.data_ptr()), 
-            reinterpret_cast<XT*>(out.data_ptr()), xs.data_ptr<float>(),
-            ws.data_ptr<float>(), M, N, K, out_stride);
+        run_gemm_tcu<XT>(reinterpret_cast<const int8_t*>(w.data_ptr()),
+                         reinterpret_cast<const int8_t*>(a.data_ptr()),
+                         reinterpret_cast<XT*>(out.data_ptr()), xs.data_ptr<float>(),
+                         ws.data_ptr<float>(), M, N, K, out_stride, cfg, stream);
     };
     if (out.scalar_type() == torch::kBFloat16) {
         run(uint16_t{});
