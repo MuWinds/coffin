@@ -1194,7 +1194,7 @@ class RuntimeChatMixin:
             for item in rows:
                 name = item["kernel"].lower()
                 if any(token in name for token in
-                       ("gemv_kn_m", "gemv_kn_i8_m", "gemv_i8_m")):
+                       ("gemv_kn_m", "gemv_kn_i8_m", "gemv_nk_i8_m", "gemv_i8_m")):
                     group = target_totals["gemv_m"]
                     group["calls"] += item["calls"]
                     group["us"] += item["us"]
@@ -1207,7 +1207,8 @@ class RuntimeChatMixin:
                              for name, value in target_totals.items()}
             target_rows = [item for item in rows if any(
                 name in item["kernel"].lower() for name in
-                ("gemv_kn_m", "gemv_kn_i8_m", "gemv_i8_m", "moe_grouped_i8"))]
+                ("gemv_kn_m", "gemv_kn_i8_m", "gemv_nk_i8_m", "gemv_i8_m",
+                 "moe_grouped_i8"))]
             return {"n_kernel_per_step": round(calls / steps, 1),
                     "rows": rows[:8], "targets": target_rows,
                     "target_totals": target_totals}

@@ -11,9 +11,12 @@
 //   * 每个包装层接收它要索引的形状，并 TORCH_CHECK 它假定的布局（dtype、连续性、
 //     二维性）。内核索引时不做边界检查，所以错误的布局必须在主机侧失败，而不是读穿
 //     缓冲区。
-//   * 权重全程是 ``[K, N]``——``Caps.weight_layout == "kn"`` 承诺的布局。把 ``[N, K]``
-//     张量交给这些入口，会拿错元素算出看着合理的数，所以转置归 Python 侧负责，包装层
-//     只查 dtype。
+//   * 权重主要是 ``[K, N]``——``Caps.weight_layout == "kn"`` 承诺的布局，库 GEMM 与张量核
+//     GEMM 都按它吃。唯一的例外是解码期的 int8 投影：``gemv_nk_i8`` / ``gemv_nk_i8_m``
+//     按 ``[N, K]`` 吃，因为一列一行、K 连续能一个 wavefront 每步读 128 个连续字节，实测比
+//     同字节量的 ``[K, N]`` 快 1.02-1.63 倍。两份拷贝由 ``pack`` 管，转置归 Python 侧负责。
+//     把 ``[K, N]`` 交给 nk 入口（或反过来）会拿错元素算出看着合理的数，所以包装层查
+//     dtype 与 ``K % 4``，布局本身由调用方保证。
 //   * 每个包装层都在当前 torch stream 上启动。在 legacy 默认流上跑的内核不属于
 //     ``torch.cuda.graph`` 的捕获范围，会被解码图丢掉并重放陈旧输出。
 
@@ -97,6 +100,39 @@ torch::Tensor gemv_kn_i8(torch::Tensor wt, torch::Tensor x, torch::Tensor scale,
 //         了的。
 torch::Tensor gemv_kn_i8_m(torch::Tensor wt, torch::Tensor x, torch::Tensor scale,
                             int64_t threads, int64_t unroll);
+
+// @brief 解码 W8A16 投影的 nk 版本：权重 ``[N, K]``，32 条通道持一个输出列。
+//
+// 生产路径走它。``[K, N]`` 的每个线程持一列、每步读 1 字节、相邻列相距 N 个元素，所以一个
+// wavefront 每步发出 32 个单字节请求；nk 让每个通道每步读 4 个连续字节、整组覆盖 128 字节。
+// 同一份字节量实测：2560x4096 332 GB/s（1.63x）、2560x9216 450（1.47x）、12352x2560
+// 512（1.29x）、10240x2560 497（1.25x）、18432x2560 395（1.09x）、248320x2560 460（1.02x）。
+//
+// @param wtn [N, K] int8 权重，连续存放，``K % 4 == 0``（每行基址 ``n * K`` 要保持 4 字节
+//        对齐，否则整组的读会跨进下一行）。
+// @param x [K] 激活，bf16 或 fp32。输出的 dtype 跟随它。
+// @param scale [N] fp32 absmax scale，每个输出列一个。
+// @param threads 每块线程数；``0`` 表示 128。
+// @param unroll K 循环展开，``2``/``4``/``8``；``0`` 表示 4。
+// @return [N]，dtype 同 ``x``。
+// @throws c10::Error 权重不是 int8、``K % 4 != 0``、scale 长度与 ``N`` 不符。
+torch::Tensor gemv_nk_i8(torch::Tensor wtn, torch::Tensor x, torch::Tensor scale,
+                         int64_t threads, int64_t unroll);
+
+// @brief 批处理 W8A16 投影的 nk 版本：``M`` 行激活共用一遍权重读取。
+//
+// 每一行与 :func:`gemv_nk_i8` 逐位相同（同一段完全展开的代码、同一归约顺序）。行数是
+// 1/2/4/8 之外的由上一档承接，多出来的行重读第 0 行、算完就丢。
+//
+// @param wtn [N, K] int8 权重，连续存放。
+// @param x [M, K] 激活，bf16 或 fp32。
+// @param scale [N] fp32 absmax scale，每个输出列一个。
+// @param threads 每块线程数；``0`` 表示 128。
+// @param unroll K 循环展开，``2``/``4``/``8``；``0`` 表示 4。
+// @return [M, N]，dtype 同 ``x``。
+// @throws c10::Error 同 :func:`gemv_nk_i8`。
+torch::Tensor gemv_nk_i8_m(torch::Tensor wtn, torch::Tensor x, torch::Tensor scale,
+                           int64_t threads, int64_t unroll);
 
 torch::Tensor gemv_kn_w4(torch::Tensor packed, torch::Tensor scale, torch::Tensor x,
                          int64_t k, int64_t group_size);

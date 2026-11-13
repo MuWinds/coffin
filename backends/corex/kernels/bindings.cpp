@@ -51,6 +51,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "batched W8A16 GEMV: int8 [K, N] weights, x [M, K] -> y [M, N]",
           pybind11::arg("wt"), pybind11::arg("x"), pybind11::arg("scale"),
           pybind11::arg("threads") = 0, pybind11::arg("unroll") = 0);
+    // nk 那一对与 kn 那一对分开绑定，理由同上：漏注册在卡上表现为 AttributeError，而离真正
+    // 发起分派的 Python 入口很远。
+    m.def("gemv_nk_i8", &gemv_nk_i8,
+          "decode W8A16 GEMV over [N, K] weights: int8 rows plus a per-column fp32 scale",
+          pybind11::arg("wtn"), pybind11::arg("x"), pybind11::arg("scale"),
+          pybind11::arg("threads") = 0, pybind11::arg("unroll") = 0);
+    m.def("gemv_nk_i8_m", &gemv_nk_i8_m,
+          "batched W8A16 GEMV over [N, K] weights: x [M, K] -> y [M, N]",
+          pybind11::arg("wtn"), pybind11::arg("x"), pybind11::arg("scale"),
+          pybind11::arg("threads") = 0, pybind11::arg("unroll") = 0);
     m.def("gemv_kn_w4", &gemv_kn_w4,
           "group-scaled packed W4 GEMV with bf16/fp32 activations",
           pybind11::arg("packed"), pybind11::arg("scale"), pybind11::arg("x"),

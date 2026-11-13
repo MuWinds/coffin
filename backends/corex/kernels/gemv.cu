@@ -698,6 +698,184 @@ __global__ void gemv_i8_m_reduce_kernel(const float* __restrict__ part,
     }
 }
 
+// nk 布局的解码投影：一列一行，K 在本行内连续，32 条通道认领一列。
+//
+// 为什么换布局。上面每个内核都是一个线程持一列，第 ``n`` 列与第 ``n + 1`` 列相距 ``N`` 个
+// 元素，于是一个 wavefront 每步发出的是 32 个单字节请求、落在 32 个不同的行上。实测这个形状
+// 族卡在 202-305 GB/s（``o_proj`` 51.4 us、``mlp_down`` 77.2 us），把所有旋钮（threads /
+// unroll / split / width，共 180+96 格）一起拧也只值 2-6%，因为瓶颈是"每个线程每步能搬多少
+// 连续字节"，不是块数。换成"一列一行、K 连续"之后，同一份字节量：2560x4096 31.6 us
+// (332 GB/s，1.63x)、2560x9216 52.4 us (450 GB/s，1.47x)、2560x5120 35.4 us (371 GB/s，
+// 1.60x)、12352x2560 61.8 us (512 GB/s，1.29x)、10240x2560 52.8 us (497 GB/s，1.25x)、
+// 18432x2560 119.5 us (395 GB/s，1.09x)、248320x2560 1380.7 us (460 GB/s，1.02x)。512 GB/s
+// 已经贴住这张卡 D2D copy 的 597.7 GB/s。
+//
+// 布局怎么来的：``pack.KnQWeight.wt`` 是 ``[K, N]``，投影一次得到 ``[N, K]``（每个权重一次，
+// 十来 MB，几十 us），与 ``dp4a_weight`` 共用同一份副本。kn 那份不扔，因为预填充的库 GEMM 与
+// 张量核 GEMM 都按 ``[K, N]`` 吃。
+//
+// Constraints:
+//   * 32 条通道一组，不是整个 warp。本部件实测 ``warpSize == 32``，所以 ``__shfl_down_sync``
+//     的默认宽度正好是一组；哪天真换到 64 宽 wavefront 的部件，这份归约要重写而不是调参数。
+//   * ``K % 4 == 0``。每组每步读 4 个字节，而第 ``n`` 行的基址是 ``n * K``，K 不是 4 的倍数
+//     时这些读会跨进下一行；入口直接拒绝，不猜。
+//   * 累加 fp32、scale 在整列 K 和之后乘一次——与 kn 路径同一份契约，绝不逐元素乘、绝不折进
+//     激活。
+//   * 归约是树形的，所以与 kn 的长链累加不逐位相同（实测相对差 1e-3 量级，是 fp32 重结合的
+//     正常范围）。验收按参考实现和 greedy ids，不按 kn 逐位相等。
+//   * 不分片。列数就是块数：最窄的 ``N = 2560`` 在 128 线程下也有 640 个块，远超这张卡的 16
+//     个 SM，再切 K 只是多一趟归约和一块分片缓冲区。
+
+// @brief 4 个相邻元素的激活加载：bf16 是一次 8 字节读，fp32 逐元素读。
+//
+// fp32 不用 ``float4``：那要求 16 字节对齐，而激活可以是别的张量的切片，行基址
+// ``r * K + off`` 只保证 16 字节对齐当 ``K % 4 == 0``，指针本身没有这个承诺。逐元素读让编译器
+// 自己决定要不要向量化，代价只是 fp32 解码路径（不是这条路径的目标形状）。bf16 的 8 字节读
+// 只要求 8 字节对齐，那是 ``K % 4 == 0`` 就能保证的。
+template <typename XT>
+struct NkLoad;
+
+template <>
+struct NkLoad<uint16_t> {
+    static __device__ __forceinline__ void four(const uint16_t* p, uint16_t* o) {
+        *reinterpret_cast<unsigned long long*>(o) =
+            *reinterpret_cast<const unsigned long long*>(p);
+    }
+};
+
+template <>
+struct NkLoad<float> {
+    static __device__ __forceinline__ void four(const float* p, float* o) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) o[i] = p[i];
+    }
+};
+
+// @brief ``M`` 行激活对 ``[N, K]`` int8 权重，32 条通道持一个输出列。
+//
+// @param wtn [N, K] int8 权重，行主序；一行就是一个输出列，K 在本行内连续。
+// @param x [M, K] 激活，行主序。
+// @param y [M, N] 输出，按激活 dtype。
+// @param scale [N] fp32 每列 scale，在该列完整 K 和之后乘一次。
+// @param N 输出列数，即权重的行数。
+// @param K 归约长度，且 ``K % 4 == 0``。
+// @param rows 真实行数；模板 ``M`` 里多出来的行重读第 0 行，算完就丢。
+template <typename XT, int U, int M>
+__global__ void gemv_nk_i8_kernel(const int8_t* __restrict__ wtn,
+                                  const XT* __restrict__ x, XT* __restrict__ y,
+                                  const float* __restrict__ scale, int N, int K,
+                                  int rows) {
+    const int lane = threadIdx.x & 31;
+    const int grp = threadIdx.x >> 5;
+    const int n = blockIdx.x * (blockDim.x >> 5) + grp;
+    if (n >= N) return;
+    const int8_t* row = wtn + (size_t)n * K;
+    float acc[M];
+#pragma unroll
+    for (int m = 0; m < M; ++m) acc[m] = 0.f;
+    const int step = 32 * 4;
+    const int steps = K / step;
+    int s = 0;
+    for (; s + U <= steps; s += U) {
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const int off = (s + u) * step + lane * 4;
+            // 一个 32 位字就是 4 个权重字节：本布局里它们连续，所以不需要任何重排。
+            alignas(4) int8_t w4[4];
+            *reinterpret_cast<int*>(w4) = *reinterpret_cast<const int*>(row + off);
+#pragma unroll
+            for (int m = 0; m < M; ++m) {
+                alignas(8) XT x4[4];
+                NkLoad<XT>::four(x + (size_t)(m < rows ? m : 0) * K + off, x4);
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    acc[m] = fmaf((float)w4[i], CxScalar<XT>::to_float(x4[i]), acc[m]);
+                }
+            }
+        }
+    }
+    for (; s < steps; ++s) {
+        const int off = s * step + lane * 4;
+        alignas(4) int8_t w4[4];
+        *reinterpret_cast<int*>(w4) = *reinterpret_cast<const int*>(row + off);
+#pragma unroll
+        for (int m = 0; m < M; ++m) {
+            alignas(8) XT x4[4];
+            NkLoad<XT>::four(x + (size_t)(m < rows ? m : 0) * K + off, x4);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                acc[m] = fmaf((float)w4[i], CxScalar<XT>::to_float(x4[i]), acc[m]);
+            }
+        }
+    }
+    // K 不是 128 的整数倍时，尾巴按通道跨步走标量，保证任何 K 都正确。
+    for (int k = steps * step + lane; k < K; k += 32) {
+#pragma unroll
+        for (int m = 0; m < M; ++m) {
+            acc[m] = fmaf((float)row[k],
+                          CxScalar<XT>::to_float(x[(size_t)(m < rows ? m : 0) * K + k]),
+                          acc[m]);
+        }
+    }
+#pragma unroll
+    for (int m = 0; m < M; ++m) {
+        float v = acc[m];
+        for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
+        if (lane == 0 && m < rows) {
+            y[(size_t)m * N + n] = CxScalar<XT>::from_float(scale[n] * v);
+        }
+    }
+}
+
+// @brief 启动一个 ``M`` 行的 nk 单趟内核，``U`` 是编译期常量。
+template <typename XT, int M, int U>
+void launch_nk_i8_one(const int8_t* wp, const XT* xp, XT* yp, const float* sp,
+                      int N, int K, int rows, int threads) {
+    const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    const int grps = threads / 32;
+    const int blocks = (int)((N + grps - 1) / grps);
+    gemv_nk_i8_kernel<XT, U, M><<<blocks, threads, 0, stream>>>(wp, xp, yp, sp, N, K, rows);
+}
+
+// @brief 按展开度启动 ``M`` 行的 nk 内核。
+template <typename XT, int M>
+void launch_nk_i8(const int8_t* wp, const XT* xp, XT* yp, const float* sp,
+                  int N, int K, int rows, int threads, int unroll) {
+    if (unroll == 2) {
+        launch_nk_i8_one<XT, M, 2>(wp, xp, yp, sp, N, K, rows, threads);
+    } else if (unroll == 8) {
+        launch_nk_i8_one<XT, M, 8>(wp, xp, yp, sp, N, K, rows, threads);
+    } else {
+        launch_nk_i8_one<XT, M, 4>(wp, xp, yp, sp, N, K, rows, threads);
+    }
+}
+
+// @brief 按行数与激活 dtype 分派 nk 内核。
+//
+// 行数取 1/2/4/8 四档，与 kn 的批处理入口同一套桶：批处理解码与投机校验记录要的就是这几档，
+// 其它行数由上一档承接，多出来的行重读第 0 行。
+template <typename XT>
+void launch_nk_i8_rows(const int8_t* wp, const XT* xp, XT* yp, const float* sp,
+                       int N, int K, int rows, int threads, int unroll) {
+    const int padded = rows <= 1 ? 1 : (rows <= 2 ? 2 : (rows <= 4 ? 4 : 8));
+    if (padded == 1) {
+        launch_nk_i8<XT, 1>(wp, xp, yp, sp, N, K, rows, threads, unroll);
+    } else if (padded == 2) {
+        launch_nk_i8<XT, 2>(wp, xp, yp, sp, N, K, rows, threads, unroll);
+    } else if (padded == 4) {
+        launch_nk_i8<XT, 4>(wp, xp, yp, sp, N, K, rows, threads, unroll);
+    } else {
+        launch_nk_i8<XT, 8>(wp, xp, yp, sp, N, K, rows, threads, unroll);
+    }
+}
+
+// @brief 每块线程数：128 就是 4 组。实测这一档在所有七个形状上都与最好档差 1-3%，而它给最窄
+//        的 ``N = 2560`` 留出 640 个块，所以不按 ``N`` 再分一档。
+int pick_nk_threads(int N) {
+    (void)N;
+    return 128;
+}
+
 // @brief SM 数量，只查询一次。Split-K 按卡自身定尺寸，而不是写死 16，所以 BI-V150 或
 //        SM 数不同的分区也能拿到同样的占用率目标。
 int sm_count() {
@@ -1464,6 +1642,119 @@ torch::Tensor gemv_kn_i8_m(torch::Tensor wt, torch::Tensor x, torch::Tensor scal
     if (padded == 2) return launch_i8_m<float, 2>(wt, x, y, M, scale, N, K, th, sp);
     if (padded == 4) return launch_i8_m<float, 4>(wt, x, y, M, scale, N, K, th, sp);
     return launch_i8_m<float, 8>(wt, x, y, M, scale, N, K, th, sp);
+}
+
+// @brief 解码期 W8A16 投影，权重按 ``[N, K]``（nk）给：一行就是一个输出列。
+//
+// 这是解码路径的生产入口。投影按 nk 存放之后，一组 32 条通道每步读 128 字节连续权重，实测
+// 比同字节量的 ``[K, N]`` 入口快 1.02-1.63 倍（见本文件 nk 段头部的形状表）。
+//
+// @param wtn [N, K] int8 权重，连续存放，每行连续。
+// @param x [K] 激活，bf16 或 fp32。输出的 dtype 跟随它。
+// @param scale [N] fp32 absmax scale，每个输出列一个，每列施加一次。
+// @param threads 每块线程数，``0`` 表示 128（见 :func:`pick_nk_threads`）。
+// @param unroll K 循环展开，``2``、``4`` 或 ``8``；``0`` 表示 4。
+// @return [N]，dtype 同 ``x``。
+// @throws c10::Error 权重不是 int8、``K % 4 != 0``、scale 长度与 ``N`` 不符，或激活长度与
+//         ``K`` 不符——这几种都会读错元素而不是失败。
+torch::Tensor gemv_nk_i8(torch::Tensor wtn, torch::Tensor x, torch::Tensor scale,
+                         int64_t threads, int64_t unroll) {
+    TORCH_CHECK(wtn.dim() == 2, "weight must be 2-D [N, K]");
+    TORCH_CHECK(x.dim() == 1, "activation must be 1-D [K]");
+    TORCH_CHECK(wtn.scalar_type() == torch::kChar,
+                "int8 weight required (a bf16 weight here would be read one byte per "
+                "value and produce plausible garbage)");
+    TORCH_CHECK(scale.scalar_type() == torch::kFloat, "scale must be fp32");
+    TORCH_CHECK(wtn.is_contiguous() && x.is_contiguous() && scale.is_contiguous(),
+                "contiguous inputs required");
+    const int N = (int)wtn.size(0), K = (int)wtn.size(1);
+    TORCH_CHECK(K == x.size(0), "K mismatch: weight ", K, " vs activation ", x.size(0));
+    TORCH_CHECK(scale.numel() == N, "scale must hold one value per output column: got ",
+                scale.numel(), " for N = ", N);
+    // 每组每步读 4 个连续字节，而第 n 行的基址是 n*K：K 不是 4 的倍数时这些读会跨进下一行。
+    TORCH_CHECK(K % 4 == 0, "nk GEMV needs K % 4 == 0 (rows would not stay 4-byte aligned "
+                           "across the warp's loads); got K = ", K);
+    const bool x16 = x.scalar_type() == torch::kBFloat16;
+    TORCH_CHECK(x16 || x.scalar_type() == torch::kFloat,
+                "activation must be bf16 or fp32");
+    // bf16 每步把 4 个相邻的半字当一个 8 字节字读，所以基址必须 8 字节对齐；K % 4 已经保证
+    // 行内偏移守得住。
+    TORCH_CHECK(!x16 || reinterpret_cast<uintptr_t>(x.data_ptr()) % 8 == 0,
+                "bf16 activation must be 8-byte aligned (the nk kernel reads four "
+                "adjacent halves as one word)");
+    auto y = torch::empty({N}, x.options());
+    const int th = threads > 0 ? (int)threads : pick_nk_threads(N);
+    TORCH_CHECK(th % 32 == 0, "threads must be a multiple of 32 (one group per output "
+                              "column); got ", th);
+    const int u = unroll > 0 ? (int)unroll : 4;
+    if (x16) {
+        // 用 reinterpret_cast 而不是 data_ptr<uint16_t>()：bf16 在 torch 里是
+        // c10::BFloat16，这个模板实例在扩展里没有导出（data_ptr<uint16_t> 会变成
+        // 一个未定义符号，表现为整份扩展 import 失败）。
+        launch_nk_i8_rows<uint16_t>(
+            reinterpret_cast<const int8_t*>(wtn.data_ptr()),
+            reinterpret_cast<const uint16_t*>(x.data_ptr()),
+            reinterpret_cast<uint16_t*>(y.data_ptr()), scale.data_ptr<float>(),
+            N, K, 1, th, u);
+    } else {
+        launch_nk_i8_rows<float>(
+            reinterpret_cast<const int8_t*>(wtn.data_ptr()), x.data_ptr<float>(),
+            y.data_ptr<float>(), scale.data_ptr<float>(), N, K, 1, th, u);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return y;
+}
+
+// @brief 批处理 W8A16 投影，权重按 ``[N, K]`` 给：``M`` 行激活共用一遍权重读取。
+//
+// 每一行都与同一权重、同一激活上的单行 nk 入口逐位相同：行内是同一段完全展开的代码，归约
+// 顺序也一样。行数不是 1/2/4/8 时由上一档承接，多出来的行重读第 0 行。
+//
+// @param wtn [N, K] int8 权重，连续存放。
+// @param x [M, K] 激活，bf16 或 fp32；输出的 dtype 跟随它。
+// @param scale [N] fp32 absmax scale，每个输出列一个。
+// @param threads 每块线程数，``0`` 表示 128。
+// @param unroll K 循环展开，``2``、``4`` 或 ``8``；``0`` 表示 4。
+// @return [M, N]，dtype 同 ``x``。
+// @throws c10::Error 同 :func:`gemv_nk_i8`。
+torch::Tensor gemv_nk_i8_m(torch::Tensor wtn, torch::Tensor x, torch::Tensor scale,
+                           int64_t threads, int64_t unroll) {
+    TORCH_CHECK(wtn.dim() == 2, "weight must be 2-D [N, K]");
+    TORCH_CHECK(x.dim() == 2, "activations must be 2-D [M, K]");
+    TORCH_CHECK(wtn.scalar_type() == torch::kChar, "int8 weight required");
+    TORCH_CHECK(scale.scalar_type() == torch::kFloat, "scale must be fp32");
+    TORCH_CHECK(wtn.is_contiguous() && x.is_contiguous() && scale.is_contiguous(),
+                "contiguous inputs required");
+    const int N = (int)wtn.size(0), K = (int)wtn.size(1), M = (int)x.size(0);
+    TORCH_CHECK(K == x.size(1), "K mismatch: weight ", K, " vs activation ", x.size(1));
+    TORCH_CHECK(scale.numel() == N, "scale must hold one value per output column: got ",
+                scale.numel(), " for N = ", N);
+    TORCH_CHECK(K % 4 == 0, "nk GEMV needs K % 4 == 0 (rows would not stay 4-byte aligned "
+                           "across the warp's loads); got K = ", K);
+    const bool x16 = x.scalar_type() == torch::kBFloat16;
+    TORCH_CHECK(x16 || x.scalar_type() == torch::kFloat,
+                "activation must be bf16 or fp32");
+    TORCH_CHECK(!x16 || reinterpret_cast<uintptr_t>(x.data_ptr()) % 8 == 0,
+                "bf16 activation must be 8-byte aligned (the nk kernel reads four "
+                "adjacent halves as one word)");
+    auto y = torch::empty({M, N}, x.options());
+    const int th = threads > 0 ? (int)threads : pick_nk_threads(N);
+    TORCH_CHECK(th % 32 == 0, "threads must be a multiple of 32 (one group per output "
+                              "column); got ", th);
+    const int u = unroll > 0 ? (int)unroll : 4;
+    if (x16) {
+        launch_nk_i8_rows<uint16_t>(
+            reinterpret_cast<const int8_t*>(wtn.data_ptr()),
+            reinterpret_cast<const uint16_t*>(x.data_ptr()),
+            reinterpret_cast<uint16_t*>(y.data_ptr()), scale.data_ptr<float>(),
+            N, K, M, th, u);
+    } else {
+        launch_nk_i8_rows<float>(
+            reinterpret_cast<const int8_t*>(wtn.data_ptr()), x.data_ptr<float>(),
+            y.data_ptr<float>(), scale.data_ptr<float>(), N, K, M, th, u);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return y;
 }
 
 template <typename XT>

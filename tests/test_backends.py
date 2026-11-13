@@ -956,6 +956,42 @@ class Int8BatchKernelTest(unittest.TestCase):
                       "gemv_kn_i8_m has no kernel body, so the entry has nothing to "
                       "launch")
 
+    def test_the_nk_int8_pair_exists_in_header_binding_and_kernel(self):
+        """解码走 nk 之后，这一对同样是「声明、注册、定义」三处缺一不可。
+
+        它与 kn 那一对并存：kn 仍在预填充与 MoE 的路径上，nk 是解码投影。少了任一处的
+        表现和 kn 那次一样——在卡上表现为 AttributeError 或内核无处可启动，而且离真正
+        发起分派的 Python 入口很远。
+        """
+        src = self._sources()
+        for name in ("gemv_nk_i8", "gemv_nk_i8_m"):
+            self.assertIn(name, src["corex_ops.h"],
+                          f"{name} is not declared in corex_ops.h")
+            self.assertIn(f'm.def("{name}"', src["bindings.cpp"],
+                          f"{name} is not registered in bindings.cpp")
+        self.assertIn("gemv_nk_i8_kernel", src["gemv.cu"],
+                      "the nk entry has no kernel body, so it has nothing to launch")
+
+    def test_the_nk_kernel_reads_four_contiguous_bytes_per_lane(self):
+        """nk 的全部收益来自「一组 32 条通道每步覆盖 128 个连续字节」。
+
+        在源码里查，因为这是编译器的产物：没有卡时任何单元测试都观察不到。改成逐字节读
+        （或者退回一列一线程的跨行步长）会静默丢掉 1.02-1.63 倍，而结果仍然正确。
+        """
+        src = self._sources()["gemv.cu"]
+        start = src.index("gemv_nk_i8_kernel")
+        body = src[start:src.index(chr(10) + "}" + chr(10), start)]
+        self.assertIn("threadIdx.x & 31", body,
+                      "the nk kernel does not group 32 lanes per output column")
+        self.assertIn("reinterpret_cast<const int*>(row + off)", body,
+                      "the weight is not read as one 32-bit word of four adjacent bytes")
+        self.assertIn("__shfl_down_sync", body,
+                      "the group does not reduce across lanes, so one lane would have "
+                      "to walk the whole K range alone")
+        self.assertNotIn("wt[", body,
+                      "the nk kernel still indexes a [K, N] weight: this entry takes "
+                      "[N, K], and a stray wt[] index means the layout was mixed up")
+
     def test_the_batched_int8_kernel_accumulates_m_rows_per_weight_load(self):
         """只有 M 条累加链在一次权重读取期间一直活着，这个内核才划算。
 
@@ -982,10 +1018,25 @@ class Int8BatchKernelTest(unittest.TestCase):
         from backends import corex
 
         source = inspect.getsource(corex._gemv_rows)
-        self.assertIn("gemv_kn_i8_m", source,
+        self.assertIn("gemv_nk_i8_m", source,
                       "linear_m does not call the batched int8 entry: an int8 row "
                       "batch falls back to one weight read per row, the regression "
                       "that made speculative decoding unable to break even")
+
+    def test_decode_int8_uses_the_nk_entry(self):
+        """解码投影必须按 nk 取权重，否则那 1.02-1.63 倍立刻没了。"""
+        import inspect
+
+        from backends import corex
+
+        source = inspect.getsource(corex.linear)
+        self.assertIn("gemv_nk_i8", source,
+                      "linear does not call the nk int8 entry: decode falls back to the "
+                      "[K, N] kernel, which measures 202-305 GB/s on the shapes that "
+                      "dominate the step")
+        self.assertIn("nk_weight", source,
+                      "linear does not ask for the [N, K] copy, so the nk kernel would "
+                      "be fed a [K, N] tensor and read the wrong elements")
 
 
 if __name__ == "__main__":

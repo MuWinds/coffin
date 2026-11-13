@@ -14,10 +14,13 @@ Module: ``coffin/backends/corex``。import ``backends.protocol``、
 而不被索要工具链。
 
 Constraints:
-    * ``caps.weight_layout == "kn"`` 是一句承诺：本后端跑的每个投影都要
-      ``[K, N]``。契约里的 ``w`` 仍然是 ``[N, K]``（那是 checkpoint），所以
-      :func:`pack.as_kn` 每个权重转置一次并记忆化；调用
-      :func:`pack.repack_state_dict` 的加载器只付这一次代价，之后常驻一份拷贝。
+    * ``caps.weight_layout == "kn"`` 是一句承诺：加载器交出的每份权重是 ``[K, N]``。契约里
+      的 ``w`` 仍然是 ``[N, K]``（那是 checkpoint），所以 :func:`pack.as_kn` 每个权重转置
+      一次并记忆化；调用 :func:`pack.repack_state_dict` 的加载器只付这一次代价，之后常驻
+      一份拷贝。预填充的库 GEMM 与张量核 GEMM 按 ``[K, N]`` 吃，解码的 int8 GEMV 按
+      ``[N, K]`` 吃（``pack.KnQWeight.nk_weight``，同一份权重转置而来的第二份拷贝）：一列
+      一行、K 连续让一组 32 条通道每步读 128 个连续字节，实测比 ``[K, N]`` 快 1.02-1.63 倍，
+      而 ``[K, N]`` 的四个旋钮全拧只值 2-6%。
     * 输出列超过 ``pack.LIB_MAX_N`` 时不许用库 GEMM。本卡在 ``N = 248320`` 实测
       NaN，在 ``N = 131072`` 结果正确，所以预填充路径沿 ``N`` 分块，解码路径则完全
       不调库。这是 ``lm_head`` 算错还是算慢的分界。
@@ -382,7 +385,10 @@ def linear(w: torch.Tensor | QWeight | pack.KnWeight, x: torch.Tensor) -> torch.
     dtype = x.dtype
     act = _compute_dtype(x).contiguous()
     if packed.int8:
-        return _restore(module.gemv_kn_i8(packed.wt, act, packed.scale), dtype)
+        # 解码走 nk：一列一行、K 连续，于是一组 32 条通道每步读 128 字节连续权重。同一份
+        # 字节量下 nk 比 kn 快 1.02-1.63 倍（窄的 2560 列形状受益最大），而 kn 那条路
+        # 四个旋钮一起拧也只值 2-6%，所以这里不再按形状挑，全部走 nk。
+        return _restore(module.gemv_nk_i8(packed.nk_weight(), act, packed.scale), dtype)
     return _restore(module.gemv_kn(packed.wt, act), dtype)
 
 
@@ -474,21 +480,25 @@ def _gemv_rows(w: torch.Tensor | QWeight | pack.KnWeight,
     act = _compute_dtype(x).contiguous()
     rows = act.shape[0]
     if packed.int8:
-        # 每个分块只读一遍权重。在 gemv_kn_i8_m 出现之前，这个循环走的是单行内核，
+        # 每个分块只读一遍权重。在批处理 int8 入口出现之前，这个循环走的是单行内核，
         # 于是一批行每行都把整个权重读一遍：实测 M=8 是 M=1 的 8.19 倍
         # （probe_row_cost.py，五个解码形状），这就是为什么一次 c-token 投机校验要付
         # c 遍完整权重读取，在任何草稿深度都无法打平（docs/qwen4/QWEN4-PERF.md）。
+        #
+        # nk 版本与单行入口同构，所以批处理也换到 nk：权重按 [N, K] 读，一组 32 条通道每步
+        # 读 128 个连续字节，M 行共用这一遍读取。
         #
         # 内核只接受它有实例化的宽度，而本辅助函数会被以不超过 _ROW_CHUNK 的任意行数
         # 调用（比如某个退回这里的分块预填充），所以下面 bf16 分支做的分块这里也必须
         # 做：把 24 行交给 TORCH_CHECK 写着 [1, 8] 的内核会抛异常，这正是加分块循环
         # 之前这个分支的行为。
+        nkw = packed.nk_weight()
         if rows <= _ROW_CHUNK:
-            return _restore(module.gemv_kn_i8_m(packed.wt, act, packed.scale), dtype)
+            return _restore(module.gemv_nk_i8_m(nkw, act, packed.scale), dtype)
         out = torch.empty((rows, packed.n), dtype=act.dtype, device=act.device)
         for start in range(0, rows, _ROW_CHUNK):
             stop = min(rows, start + _ROW_CHUNK)
-            out[start:stop] = module.gemv_kn_i8_m(packed.wt, act[start:stop].contiguous(),
+            out[start:stop] = module.gemv_nk_i8_m(nkw, act[start:stop].contiguous(),
                                                   packed.scale)
         return _restore(out, dtype)
     if rows == 1:
@@ -2506,7 +2516,10 @@ def caps() -> Caps:
     Returns:
         一个记录：``device="cuda"``（CoreX 实现了那个命名空间），两种 dtype 都是
         bf16，因为预填充 GEMM 在本卡上 bf16 和 fp16 都到 32.6 TFLOP/s，转换不值
-        它的流量；``weight_layout="kn"``，因为那个布局在本卡上对解码值 14-22 倍；
+        它的流量；``weight_layout="kn"``：加载器存的每份权重是 ``[K, N]``，库 GEMM 与张量核
+        GEMM 都要这个布局（当初选它是因为**库**的 ``[N, K]`` 解码 GEMV 只有 16-30 GB/s，而
+        库的 ``[K, N]`` 有 360-406 GB/s，那是一次库对库的比较，不是布局对布局）。解码的 int8
+        投影另取一份 ``[N, K]`` 副本走手写 nk 内核，实测 1.02-1.63 倍；
         ``attn_split=32``：切片轴就是内核的 ``grid.y``，切片数由 ``part_acc.size(-2)`` 读，
         所以改这里就够、不用改内核。切分是给键范围*分区*，各块读的是**不相交**的区间，所以
         提高它不增加 KV 流量，只多出 ``part_acc``/``part_ml`` 那一趟（几十 KB）和 combine。

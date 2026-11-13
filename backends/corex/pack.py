@@ -99,8 +99,14 @@ class KnQWeight:
         self.scale = scale
         self._wt_nk: torch.Tensor | None = None
 
-    def dp4a_weight(self) -> torch.Tensor:
-        """按需缓存 ``[N, K]`` 连续权重，供 ``__dp4a`` 归约连续 K。
+    def nk_weight(self) -> torch.Tensor:
+        """按需缓存 ``[N, K]`` 连续 int8 权重，解码 GEMV 与 dp4a 共用这一份。
+
+        解码投影走 nk 布局：一列一行、K 在行内连续，于是一组 32 条通道每步读 128 个连续
+        字节，实测比同字节量的 ``[K, N]`` 快 1.02-1.63 倍（窄的 2560 列形状受益最大，见
+        ``kernels/gemv.cu`` 的 nk 段与 ``.scratch-perf/gemv-dispatch-and-nk-2026-11-13.md``）。
+        ``[K, N]`` 那份不扔：预填充的库 GEMM 与张量核 GEMM 都按它吃，所以两份同时常驻，
+        每份是 ``K * N`` 字节。
 
         Returns:
             与 ``wt`` 同设备的 ``[N, K]`` int8 矩阵。副本随打包权重一同释放。
@@ -108,6 +114,17 @@ class KnQWeight:
         if self._wt_nk is None:
             self._wt_nk = self.wt.t().contiguous()
         return self._wt_nk
+
+    def dp4a_weight(self) -> torch.Tensor:
+        """``[N, K]`` 连续权重，供 ``__dp4a`` 归约连续 K。
+
+        与 :func:`nk_weight` 是同一份张量：dp4a 的 M 行 GEMM 和 nk 解码 GEMV 要的是同一个
+        布局，所以这里不再单独缓存一份，否则同一份权重会常驻三份。
+
+        Returns:
+            与 :func:`nk_weight` 相同的 ``[N, K]`` int8 矩阵。
+        """
+        return self.nk_weight()
 
     def nbytes(self) -> int:
         """常驻字节数：int8 矩阵加它的 fp32 列 scale。
