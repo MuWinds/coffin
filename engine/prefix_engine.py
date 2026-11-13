@@ -207,13 +207,15 @@ class PrefixCacheEngine:
     def export_state(self) -> dict:
         """把当前序列在本 rank 上的状态打包成可以跨进程搬运的纯 CPU 字典。
 
-        预填充/解码分离时，预填充实例跑完 prompt 就把状态交给解码实例。两个实例
-        用同一个 PP 切法，所以 rank r 只导出自己那几层，接收端 rank r 原样装回去，
-        中间没有任何跨 rank 聚合。
+        预填充/解码分离时，预填充实例跑完 prompt 就把状态交给解码实例。切法相同
+        时 rank r 只导出自己那几层，接收端 rank r 原样装回去；切法不同（例如 PP2
+        预填充对 EP4 解码）时用 :meth:`adopt_merged`，按这里给的全局层号把几份
+        导出拼成一份。
 
         导出的是「池里已经写好的内容」，不是模型权重：线性注意力层的递推态按
-        模型局部层号，全注意力层的 KV 按池的层轴下标。两者不是同一套编号，见
-        :meth:`adopt` 的校验。
+        模型局部层号，全注意力层的 KV 按池的层轴下标。两者不是同一套编号，所以
+        除了局部键还带上 ``linear_global`` / ``kv_global`` 两张换算表，跨切法
+        拼装只认全局层号。
 
         Returns:
             ``pos``/``n_tokens``/``block_size``/``layer_begin``/``layer_end``/
@@ -221,8 +223,9 @@ class PrefixCacheEngine:
             ``linear`` 是 ``{局部层号: (递推态, 卷积态)}`` 的 CPU fp32 张量；
             ``kv`` 是 ``{池层轴下标: (k, v, kscale, vscale)}``，其中 ``k``/``v``
             是 ``[nkv, pos, hd]`` 的 int8、scale 是 ``[nkv, pos]`` 的 fp32；
-            模型带 ``rope_delta`` 时多一个同名字段。整份字典可以直接
-            ``torch.save``。
+            ``linear_global`` 是 ``{局部层号: 全局层号}``、``kv_global`` 是
+            ``{池层轴下标: 全局全注意力层序}``；模型带 ``rope_delta`` 时多一个
+            同名字段。整份字典可以直接 ``torch.save``。
 
         Raises:
             RuntimeError: 没有活跃序列；或模型没有暴露 ``layer_begin``/
@@ -267,6 +270,10 @@ class PrefixCacheEngine:
             "hd": int(pool.hd),
             "linear": linear,
             "kv": kv,
+            # 跨切法拼装只认这两张表：局部编号在 PP 各段里从 0 重来一遍，按局部
+            # 编号合并会把 20..39 层状态装到 0..19 层上，而且不会报错。
+            "linear_global": {int(i): _global_linear(model, i) for i in linear},
+            "kv_global": {int(idx): _global_pooled(model, idx) for idx in kv},
         }
         rope = getattr(model, "rope_delta", None)
         if torch.is_tensor(rope):
@@ -331,6 +338,83 @@ class PrefixCacheEngine:
             model.rope_delta[0].copy_(state["rope_delta"])
         self.pending_logits = logits.to(model.pos1.device)
         self.last_matched = 0
+
+    @torch.inference_mode()
+    def adopt_merged(self, parts: list[dict], logits: torch.Tensor,
+                     tokens: list[int]) -> None:
+        """把来自另一种切法的几份预填充状态拼成一份，装回本引擎。
+
+        与 :meth:`adopt` 的差别只有一处：那边要求对面是这个实例的镜像，
+        这里只认全局层号，所以 PP2 预填充可以直接交给 EP4 解码：
+        每份 ``part`` 的``linear``/``kv`` 用 ``linear_global``/``kv_global``
+        换算成全局层号后取并集，四个解码 rank 各自把同一份并集写进自己的池。
+
+        装完之后的 :meth:`decode_iter` 等价于「本地刚用同一份 prompt 预填充
+        完」，因为搬的正是解码要读的四样东西：池里的 KV、线性注意力递推态、
+        位置计数器和块表。
+
+        块号不搬：``part["blocks"]`` 只用来核对长度，接收端自己 ``alloc``。
+
+        Args:
+            parts: 若干份 :meth:`export_state` 的产物，覆盖互补的层区间；同一
+                个全局层号出现两次视为切法写错。
+            logits: 预填充端给出的下一个 token logits（PP 各段都算 logits，取
+                第一段的即可）。
+            tokens: 那条序列的完整 prompt；长度必须等于状态里的 ``n_tokens``。
+
+        Raises:
+            KeyError: 某份 ``part`` 缺字段。
+            ValueError: 长度/块大小/头数/头维在各份之间不一致，并集与本地模型的
+                线性层或池化层对不上，张量形状或 dtype 不符，prompt 长度与状态
+                不符。
+        """
+        model, pool, bm = self.model, self.pool, self.bm
+        pos, linear, kv, rope_delta = merge_parts(parts, tokens, model, pool)
+        if not torch.is_tensor(logits) or logits.numel() != model.vocab:
+            raise ValueError(
+                f"logits must hold {model.vocab} values, got "
+                f"{getattr(logits, 'shape', type(logits))}")
+        n_blocks = _blocks_for(pos, pool.bs)
+        if self.seq is not None:
+            self.seq.free()
+            self.seq = None
+        _trace = bool(os.environ.get("COFFIN_PD_TRACE")) and self._pd_rank() == 0
+
+        def _say(tag: str) -> None:
+            """逐段打点：卡住时能一眼看出是分配、写 KV 还是恢复状态。"""
+            if _trace:
+                print(f"[adopt] {tag} t={time.time():.2f}", flush=True)
+
+        _say(f"start pos={pos} blocks={n_blocks}")
+        bm.reserve(n_blocks)
+        blocks = [pool.alloc() for _ in range(n_blocks)]
+        pool.assign_table(blocks, 0)
+        self.seq = SeqKV(pool, blocks, pos)
+        _say("blocks assigned")
+        slots = pool.slots_for(torch.arange(pos, device=pool.pos2slot.device))
+        for idx, (k, v, sk, sv) in kv.items():
+            # 与 :meth:`adopt` 同一条契约：导出是 [nkv, pos, hd]，池要
+            # [pos, nkv, hd]。
+            pool.write_range(
+                int(idx), slots,
+                k.to(pool.k.device).transpose(0, 1).contiguous(),
+                sk.to(pool.kscale.device).transpose(0, 1).contiguous(),
+                v.to(pool.v.device).transpose(0, 1).contiguous(),
+                sv.to(pool.vscale.device).transpose(0, 1).contiguous())
+        _say("kv written")
+        states = {int(i): (st.to(model.pos1.device), conv.to(model.pos1.device))
+                  for i, (st, conv) in linear.items()}
+        model.restore_linear_states(states)
+        model.pos1.fill_(pos)
+        if rope_delta is not None:
+            model.rope_delta[0].copy_(rope_delta)
+        self.pending_logits = logits.to(model.pos1.device)
+        self.last_matched = 0
+        _say("done")
+
+    def _pd_rank(self) -> int:
+        """本进程的张量并行 rank，供 :meth:`adopt_merged` 的追踪用。"""
+        return int(os.environ.get("RANK", 0))
 
     @torch.inference_mode()
     def decode_iter(self, logits: torch.Tensor, max_new: int,
@@ -509,6 +593,50 @@ def _linear_layers(model) -> set[int]:
             if hasattr(getattr(layer, "mix", None), "state")}
 
 
+#: :meth:`PrefixCacheEngine.adopt_merged` 要求的字段；跨切法拼装靠
+#: ``linear_global``/``kv_global`` 两列，缺了就退化成按局部编号对齐。
+_PD_REQUIRED = ("pos", "n_tokens", "block_size", "nkv", "hd", "linear", "kv",
+                "linear_global", "kv_global")
+
+
+def _global_linear(model, local_i: int) -> int:
+    """局部线性层号换算成全模型层号。
+
+    Args:
+        model: 一个 ``PagedModel``，带 ``layer_begin``。
+        local_i: 本实例的局部层号。
+
+    Returns:
+        全模型的层号，也就是 ``layer_begin + local_i``。
+    """
+    begin, _ = _layer_span(model)
+    return begin + int(local_i)
+
+
+def _global_pooled(model, local_pidx: int) -> int:
+    """池层轴下标换算成全模型的全注意力层序。
+
+    池的层轴只数全注意力层，而且从本实例的第一层开始数；全局层序要把本实例
+    之前的所有全注意力层算进去，否则 PP 第二段会把第 6 个全注意力层当成第 1 个。
+
+    Args:
+        model: 一个 ``PagedModel``，带 ``layer_begin`` 和 checkpoint 配置。
+        local_pidx: 池的层轴下标。
+
+    Returns:
+        全模型口径的全注意力层序号。
+    """
+    begin, _ = _layer_span(model)
+    if begin == 0:
+        return int(local_pidx)
+    types = (getattr(model, "cfg", None) or {}).get("layer_types") or []
+    if len(types) <= begin:
+        raise RuntimeError(
+            "checkpoint exposes no layer_types before layer "
+            f"{begin}; the global pooled-layer index cannot be computed")
+    return sum(1 for t in types[:begin] if t == "full_attention") + int(local_pidx)
+
+
 def _blocks_for(n_tokens: int, block_size: int) -> int:
     """``n_tokens`` 个位置要几个整块，口径与 ``SeqKV.reserve`` 一致。
 
@@ -620,3 +748,127 @@ def _check_state(state: dict, model, pool, tokens: list[int]) -> None:
         if not torch.is_tensor(rope) or not torch.is_tensor(got) \
                 or got.shape != rope[0].shape or got.dtype != rope[0].dtype:
             raise ValueError("state carries a rope_delta this model cannot take")
+
+
+def merge_parts(parts: list[dict], tokens: list[int], model, pool
+                ) -> tuple[int, dict[int, tuple[torch.Tensor, torch.Tensor]],
+                           dict[int, tuple[torch.Tensor, ...]], torch.Tensor | None]:
+    """把几种切法导出的状态按**全局层号**并成一份，并逐项校验。
+
+    单流引擎把它装进自己的池（``adopt_merged``），批处理引擎把它按行装进
+    批槽（``runtime_parts._pd_decode_batch``，每一行一次）。两处唯一的差别是
+    往哪个行号写，所以合并与校验只留这一份。
+
+    Args:
+        parts: 若干份 :meth:`PrefixCacheEngine.export_state` 的产物，覆盖互补的
+            层区间。
+        tokens: 那条序列的完整 prompt。
+        model: 目标实例的 ``PagedModel``。
+        pool: 目标实例的池。
+
+    Returns:
+        ``(pos, linear, kv, rope_delta)``：位置数；按全局层号索引的线性态；
+        按全局全注意力层序索引的 ``(k, v, kscale, vscale)``（``[nkv, pos, hd]``）；
+        以及可选的位置偏置。
+
+    Raises:
+        KeyError: 某份 ``part`` 缺字段。
+        ValueError: 各份之间长度/块大小/头数/头维不一致，并集与本地模型的线性层
+            或池化层对不上，张量形状或 dtype 不符，prompt 长度与状态不符。
+    """
+    if not parts:
+        raise ValueError("no prefill states to adopt")
+    pos = None
+    linear: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+    kv: dict[int, tuple[torch.Tensor, ...]] = {}
+    rope_delta = None
+    for part in parts:
+        missing = [key for key in _PD_REQUIRED if key not in part]
+        if missing:
+            raise KeyError(f"prefill state is missing {missing}")
+        if int(part["block_size"]) != int(pool.bs):
+            raise ValueError(
+                f"block_size {int(part['block_size'])} != local {int(pool.bs)}; "
+                "the block tables are not interchangeable")
+        if (int(part["nkv"]), int(part["hd"])) != (int(pool.nkv), int(pool.hd)):
+            raise ValueError(
+                f"state is {int(part['nkv'])}x{int(part['hd'])} per head, "
+                f"local pool is {int(pool.nkv)}x{int(pool.hd)}")
+        if int(part["pos"]) != int(part["n_tokens"]):
+            raise ValueError(
+                f"state disagrees with itself: pos {int(part['pos'])} vs "
+                f"n {int(part['n_tokens'])}")
+        here = int(part["n_tokens"])
+        if pos is None:
+            pos = here
+        elif pos != here:
+            raise ValueError(
+                f"stages disagree on length: {here} vs {pos}; they cannot "
+                "describe the same request")
+        if set(map(int, part["linear_global"])) != set(map(int, part["linear"])):
+            raise ValueError("linear_global does not cover the linear layers")
+        if set(map(int, part["kv_global"])) != set(map(int, part["kv"])):
+            raise ValueError("kv_global does not cover the pooled layers")
+        for i, pair in part["linear"].items():
+            g = int(part["linear_global"][i])
+            if g in linear:
+                raise ValueError(f"linear layer {g} appears in two parts")
+            linear[g] = pair
+        for idx, quad in part["kv"].items():
+            g = int(part["kv_global"][idx])
+            if g in kv:
+                raise ValueError(f"pooled layer {g} appears in two parts")
+            kv[g] = quad
+        if "rope_delta" in part:
+            rope_delta = part["rope_delta"]
+    assert pos is not None
+    if pos < 1:
+        raise ValueError("state carries no tokens; nothing to decode from")
+    if pos > pool.max_seq:
+        raise ValueError(
+            f"state holds {pos} tokens, beyond the local max_seq "
+            f"{int(pool.max_seq)}")
+    if len(tokens) != pos:
+        raise ValueError(
+            f"state holds {pos} tokens but the prompt has {len(tokens)}; "
+            "logits would be decoded from the wrong position")
+    local_linear = _linear_layers(model)
+    if set(linear) != local_linear:
+        raise ValueError(
+            f"merged state covers linear layers {sorted(linear)}, local "
+            f"model has {sorted(local_linear)}")
+    for i, (st, conv) in linear.items():
+        want = model.layers[int(i)].mix
+        for name, got, ref in (("state", st, want.state[0]),
+                               ("conv", conv, want.conv_state[0])):
+            if (not torch.is_tensor(got) or got.shape != ref.shape
+                    or got.dtype != ref.dtype):
+                raise ValueError(
+                    f"linear layer {int(i)} {name} must be {tuple(ref.shape)} "
+                    f"{ref.dtype}, got "
+                    f"{tuple(got.shape) if torch.is_tensor(got) else type(got)} "
+                    f"{getattr(got, 'dtype', None)}")
+    if set(kv) != set(_pool_layers(model)):
+        raise ValueError(
+            f"merged state covers pooled layers {sorted(kv)}, local model has "
+            f"{sorted(_pool_layers(model))}")
+    for idx, (k, v, sk, sv) in kv.items():
+        for name, got, want_dtype, want_shape in (
+                ("k", k, pool.k.dtype, (pool.nkv, pos, pool.hd)),
+                ("v", v, pool.v.dtype, (pool.nkv, pos, pool.hd)),
+                ("kscale", sk, pool.kscale.dtype, (pool.nkv, pos)),
+                ("vscale", sv, pool.vscale.dtype, (pool.nkv, pos))):
+            if (not torch.is_tensor(got) or tuple(got.shape) != want_shape
+                    or got.dtype != want_dtype):
+                raise ValueError(
+                    f"pooled layer {int(idx)} {name} must be {want_shape} "
+                    f"{want_dtype}, got "
+                    f"{tuple(got.shape) if torch.is_tensor(got) else type(got)} "
+                    f"{getattr(got, 'dtype', None)}")
+    if rope_delta is not None:
+        rope = getattr(model, "rope_delta", None)
+        if not torch.is_tensor(rope) or not torch.is_tensor(rope_delta) \
+                or rope_delta.shape != rope[0].shape \
+                or rope_delta.dtype != rope[0].dtype:
+            raise ValueError("state carries a rope_delta this model cannot take")
+    return pos, linear, kv, rope_delta

@@ -124,13 +124,22 @@ def _tp_worker(srv_model: "Server", dist) -> None:
         payload = [None]
         dist.broadcast_object_list(payload, src=0)
         req = payload[0]
-        if not concurrent:
+        if not concurrent or req.get("op") in _SYNCHRONOUS_OPS:
             _generate(req)
             continue
         thread = threading.Thread(target=_generate, args=(req,), daemon=True)
         thread.start()
         pending = [t for t in pending if t.is_alive()] + [thread]
     dist.destroy_process_group()
+
+
+#: 必须整组跑完才允许下一条广播的操作。它们同步调用模型、不经引擎循环，占着
+#: 同一份 EP combine 轮次；如果像生成那样丢进线程就回来收下一条广播，两段
+#: 归约会交错进同一个轮次计数器，四个 rank 会互相等一个永远不会到的对端。
+_SYNCHRONOUS_OPS = frozenset((
+    "pd_prefill", "pd_decode", "pd_decode_batch", "bench", "profile", "ops",
+    "spec", "verify", "reload", "reset",
+))
 
 def serve(model_dir: str, max_seq: int, bench: bool, sock_path: str,
           spec_k: int = 0, int8: bool = True, prefix_cache: bool = True,

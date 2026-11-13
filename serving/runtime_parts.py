@@ -30,7 +30,8 @@ import backends
 import engine_api
 from engine import llm_engine
 from engine.config import EngineConfig
-from engine.sequence import SamplingParams
+from engine.prefix_engine import merge_parts
+from engine.sequence import SamplingParams, Sequence, SequenceStatus
 from utils.tool_call import parse_tool_calls, split_thinking
 
 from .runtime_support import (MMError, _decode_image, allocated_gib, empty_cache,
@@ -863,12 +864,16 @@ class RuntimeChatMixin:
             不是异常：传输层会把它变成一行客户端能读的普通 JSON。
         """
         op = req.get("op", "ping")
-        debug = op in ("reload", "reset", "bench", "profile", "ops", "spec", "verify")
+        debug = op in ("reload", "reset", "bench", "profile", "ops", "spec",
+                       "verify", "pd_prefill", "pd_decode", "pd_decode_batch")
         if not debug:
             return self._handle_impl(req, on_submitted=on_submitted)
         engine = self.engine
-        if op in ("bench", "profile", "ops", "spec", "verify") and engine is not None \
-                and engine.batching:
+        # ``pd_decode_batch`` 是唯一**要求**开批的 op：它按行装状态，行是批处理
+        # 才有的东西。其余诊断仍然只在单流引擎上成立。
+        if op != "pd_decode_batch" and op in (
+                "bench", "profile", "ops", "spec", "verify", "pd_prefill",
+                "pd_decode") and engine is not None and engine.batching:
             return {"ok": False, "error": "diagnostic ops need the single-stream "
                                           "engine (run without --max-num-seqs)"}
         if engine is not None and (engine.scheduler.waiting or engine.scheduler.running):
@@ -950,6 +955,9 @@ class RuntimeChatMixin:
                     and self.engine.bm.radix is not None:
                 out["prefix"] = self.engine.bm.stats()
             return out
+        if op == "tokenize":
+            # 只做编码：PD 探针要在两端喂**同一串** token，而客户端没有分词器。
+            return {"ok": True, "tokens": self.tok.encode(req.get("prompt", ""))}
         if op == "reload":
             self._reload()
             return {"ok": True, "build_s": round(self.build_s, 1), "n_reload": self.n_reload,
@@ -1031,6 +1039,12 @@ class RuntimeChatMixin:
                     "speedup": round((len(spec) / t_b) / (len(plain) / t_a), 3),
                     "exact": f"{same}/{min(len(plain), len(spec))}",
                     "accept": self.model.spec_stats}
+        if op == "pd_prefill":
+            return self._pd_prefill(req)
+        if op == "pd_decode":
+            return self._pd_decode(req)
+        if op == "pd_decode_batch":
+            return self._pd_decode_batch(req)
         if op == "bench":
             n = int(req.get("n", 30))
             ids = self.tok.encode(req.get("prompt") or "The quick brown fox")
@@ -1090,6 +1104,328 @@ class RuntimeChatMixin:
         if op == "verify":
             return self._verify_ab(req)
         return {"ok": False, "error": f"unknown op {op!r}"}
+
+    def _pd_prefill(self, req: dict) -> dict:
+        """预填充端：跑一遍 prompt，把本 rank 的状态落盘，交给解码端。
+
+        每个 rank 只导出自己那几十层，所以 PP2 的两段各写一份 ``rank<i>.pt``；
+        解码端按全局层号合并（见 ``PrefixCacheEngine.adopt_merged``）。目录由
+        调用方给，必须是两端都能看到的路径（同机时放 ``/dev/shm`` 最省事）。
+
+        Args:
+            req: ``tokens`` 或 ``prompt``、``out_dir``，以及可选的 ``tag``。
+
+        Returns:
+            ``{ok, rank, n_tokens, layer_begin, layer_end, prefill_ms,
+            export_ms, state_bytes, out_dir}``；失败时是 ``{ok: False, error}``。
+        """
+        pc = self.pc
+        if pc is None:
+            return {"ok": False,
+                    "error": "pd_prefill needs the single-stream prefix engine "
+                             "(run without --max-num-seqs and with prefix cache)"}
+        tokens = list(req.get("tokens") or self.tok.encode(req.get("prompt", "")))
+        out_dir = str(req.get("out_dir") or "")
+        if not tokens:
+            return {"ok": False, "error": "empty prompt"}
+        if not out_dir:
+            return {"ok": False, "error": "pd_prefill needs out_dir"}
+        rank = int(os.environ.get("RANK", 0))
+        # 块大小在池上（pool.bs），不在 BlockManager 上。之前取 pc.bm.bs 拿到 0，
+        # aligned 恒为真，下面的判断根本不执行——这一条差点让一段错的补齐逻辑上线。
+        bs = int(getattr(getattr(pc, "pool", None), "bs", 0) or 0)
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
+        t0 = time.time()
+        # 预填充就是一条路：prompt 多长就按多长跑，不做补齐、不做拒绝。
+        # 实测（6038 之后的多轮）补齐后的状态与原始状态并不相同：KV 的量化尺度是
+        # 按整块算的，往尾巴塞填充 token 会把真实位置的重化分范围一起改掉，等于
+        # 引入扰动而不是修复。「未对齐就复读」的真因是块表缓存去重（见
+        # _pd_decode_batch 里改走 model._assign_row_table），与长度无关。
+        logits = pc.prefill(tokens)
+        t_pre = time.time() - t0
+        t1 = time.time()
+        state = pc.export_state()
+        path = Path(out_dir) / f"rank{rank}.pt"
+        torch.save(state, path)
+        if rank == 0:
+            # 各段的 logits 是同一个张量的同一次重放（末段把 hidden 回给各段），
+            # 只存一份就够；解码端每轮都要它当第一步的起点。
+            torch.save({"logits": logits.detach().to("cpu").contiguous()},
+                       Path(out_dir) / "logits.pt")
+        t_exp = time.time() - t1
+        sync()
+        if int(os.environ.get("WORLD_SIZE", 1)) > 1:
+            # 别让 rank 0 先回：解码端会立刻去读所有 rank 的文件，晚到的 rank 还没
+            # 落盘就会被读成半截 zip。
+            import torch.distributed as dist
+
+            dist.barrier()
+        return {"ok": True, "rank": rank, "n_tokens": int(state["n_tokens"]),
+                "layer_begin": int(state["layer_begin"]),
+                "layer_end": int(state["layer_end"]), "out_dir": out_dir,
+                "matched": int(pc.last_matched), "tokens": tokens,
+                # 交接的第一步就是 argmax 这份 logits，所以把它一起报出来：解码端
+                # 可能一个 token 都不产（首个采样就是 EOS），那时只有这里能看出
+                # 是预填充端的 logits 就不对，还是装回去之后才不对。
+                "top1": int(logits.argmax()),
+                "top1_val": float(logits.max()),
+                "prefill_ms": round(t_pre * 1000, 1),
+                "export_ms": round(t_exp * 1000, 1),
+                "state_bytes": int(path.stat().st_size)}
+
+    def _pd_decode(self, req: dict) -> dict:
+        """解码端：装回预填充端给的状态，然后接着解码。
+
+        所有 rank 都装同一份合并状态（EP 下每个 rank 持全层，专家只是切片，
+        激活/KV 是复制的），所以这里必须整组一起跑，和一次普通解码步一样。
+
+        Args:
+            req: ``out_dir``、完整 ``tokens``（用来核对长度）、``max_new``，
+                可选 ``eos``。
+
+        Returns:
+            ``{ok, tokens, text, n_new, load_ms, adopt_ms, decode_ms,
+            decode_tok_s, first_token_ms}``；失败时是 ``{ok: False, error}``。
+        """
+        pc = self.pc
+        if pc is None:
+            return {"ok": False,
+                    "error": "pd_decode needs the single-stream prefix engine "
+                             "(run without --max-num-seqs and with prefix cache)"}
+        out_dir = str(req.get("out_dir") or "")
+        tokens = list(req.get("tokens") or [])
+        max_new = int(req.get("max_new", 16))
+        _pd_trace = bool(os.environ.get("COFFIN_PD_TRACE"))
+        if not out_dir:
+            return {"ok": False, "error": "pd_decode needs out_dir"}
+        if not tokens:
+            return {"ok": False, "error": "pd_decode needs the prompt tokens"}
+        t0 = time.time()
+        rank = int(os.environ.get("RANK", 0))
+        if _pd_trace:
+            print(f"[pd] rank={rank} enter pos_tokens={len(tokens)} "
+                  f"max_new={max_new} dir={out_dir}", flush=True)
+        parts = [torch.load(str(p), map_location="cpu")
+                 for p in sorted(Path(out_dir).glob("rank*.pt"))]
+        logits = torch.load(str(Path(out_dir) / "logits.pt"),
+                            map_location="cpu")["logits"]
+        t_load = time.time() - t0
+        if _pd_trace:
+            print(f"[pd] rank={rank} load {t_load * 1000:.1f}ms "
+                  f"parts={len(parts)}", flush=True)
+        t1 = time.time()
+        pc.adopt_merged(parts, logits, tokens)
+        t_adopt = time.time() - t1
+        if _pd_trace:
+            print(f"[pd] rank={rank} adopt {t_adopt * 1000:.1f}ms "
+                  f"pos={int(pc.model.pos1)}", flush=True)
+        t2 = time.time()
+        limit = float(req.get("step_limit_s", 120.0))
+        # 解码端第一步采样的就是预填充端交过来的 logits；把它单独报出来，
+        # 「一个 token 都没产」时才能分清是 EOS 提前收尾还是根本没开始。
+        first_choice = int(pc.pending_logits.argmax())
+        if _pd_trace:
+            print(f"[pd] rank={rank} first_choice={first_choice}", flush=True)
+        out: list[int] = []
+        first_ms = None
+        for nxt in pc.decode_iter(pc.pending_logits, max_new, eos=self.eos):
+            if first_ms is None:
+                first_ms = (time.time() - t2) * 1000
+            out.append(nxt)
+            if int(os.environ.get("RANK", 0)) == 0:
+                print(f"[pd] step {len(out)} tok={nxt} "
+                      f"t={(time.time() - t2) * 1000:.0f}ms", flush=True)
+            if time.time() - t2 > limit:
+                raise RuntimeError(
+                    f"pd_decode exceeded {limit:.0f}s at token {len(out)}; "
+                    "the decode side is not converging")
+        t_dec = time.time() - t2
+        return {"ok": True, "tokens": out, "text": self.tok.decode(out),
+                "n_new": len(out), "n_parts": len(parts),
+                "first_choice": first_choice,
+                "load_ms": round(t_load * 1000, 1),
+                "adopt_ms": round(t_adopt * 1000, 1),
+                "decode_ms": round(t_dec * 1000, 1),
+                "first_token_ms": round(first_ms, 1) if first_ms is not None else None,
+                "decode_tok_s": round(len(out) / t_dec, 2) if t_dec else None}
+
+    def _pd_decode_batch(self, req: dict) -> dict:
+        """解码端开批：把若干份交接状态**按行**装进批处理引擎，然后一起解码。
+
+        与 :meth:`_pd_decode` 的差别是状态装进哪个行：那条走单流前缀引擎
+        （``self.pc``），行恒为 0；这里走批处理引擎，每份状态认领一个解码行，
+        KV 写进该行的块表槽位、线性注意力递推态写进该行。两条路径因此不能
+        共用同一个实例：开批时 ``self.pc`` 是 ``None``。
+
+        装完之后这批序列以「已预填充 ``pos`` 个 token」的身份直接进解码循环，
+        不再过调度器：块在装配阶段一次分够（prompt + ``max_new``），所以循环里
+        不会有人回来要块。
+
+        Args:
+            req: ``items``（每项 ``{"dir": 状态目录, "tokens": prompt tokens,
+                "max_new": 可选}``）、``max_new``（批默认值）；``eos`` 不生效，
+                这里一律跑满 ``max_new``——吞吐测量不该被早停改变样本量。
+
+        Returns:
+            ``{ok, n, items[].tokens/text/n_new, adopt_ms, decode_ms,
+            decode_tok_s, steps}``；失败时是 ``{ok: False, error}``。
+        """
+        eng = self.engine
+        if eng is None or not eng.batching or eng.bm is None:
+            return {"ok": False,
+                    "error": "pd_decode_batch needs the batched engine "
+                             "(run with --max-num-seqs > 1)"}
+        items = list(req.get("items") or [])
+        max_new = max(1, int(req.get("max_new", 32)))
+        if not items:
+            return {"ok": False, "error": "pd_decode_batch needs items"}
+        runner, bm = eng.runner, eng.bm
+        model, pool = runner.model, bm.pool
+        rank = int(os.environ.get("RANK", 0))
+        _trace = bool(os.environ.get("COFFIN_PD_TRACE"))
+        _verify = bool(os.environ.get("COFFIN_PD_VERIFY"))
+        device = model.pos.device
+
+        def _say(tag: str) -> None:
+            if _trace:
+                print(f"[pdbatch] rank={rank} {tag}", flush=True)
+
+        t0 = time.time()
+        seqs: list[Sequence] = []
+        for i, it in enumerate(items):
+            out_dir = str(it.get("dir") or "")
+            tokens = list(it.get("tokens") or [])
+            if not out_dir or not tokens:
+                return {"ok": False, "error": f"item {i} needs dir and tokens"}
+            parts = [torch.load(str(p), map_location="cpu")
+                     for p in sorted(Path(out_dir).glob("rank*.pt"))]
+            logits = torch.load(str(Path(out_dir) / "logits.pt"),
+                                map_location="cpu")["logits"]
+            pos, linear, kv, rope_delta = merge_parts(parts, tokens, model, pool)
+            n_new = max(1, int(it.get("max_new", max_new)))
+            params = SamplingParams(max_tokens=n_new, ignore_eos=True,
+                                    temperature=0.0)
+            seq = Sequence(tokens, params)
+            seq.status = SequenceStatus.RUNNING
+            seq.dense = False
+            seq.prefill_started = True
+            row = runner._claim_row(seq)
+            # 一次分够：prompt 的块 + 本次生成要写的块。解码循环里再要块就得
+            # 打断整批，而这里拿不到别的可回收对象。
+            span = pos + n_new
+            bm.reserve((span + pool.bs - 1) // pool.bs)
+            bm.ensure_blocks(seq, span)
+            # 块表必须走模型自己的记账入口：``_assign_row_table`` 除了写池的槽位
+            # 表，还更新它自己的去重缓存（``_row_tables``）。直接调
+            # ``bm.assign`` 只写池，缓存留在上一轮的块表上，之后 ``set_rows``
+            # 会认为「表没变」而跳过重建——池和缓存指向两张不同的表，解码读到
+            # 的是上一个序列的槽位。这一步不是优化，是正确性。
+            model._assign_row_table(row, seq.block_table)
+            slots = pool.slots_for(torch.arange(pos, device=pool.pos2slot.device),
+                                   row=row)
+            for idx, (k, v, sk, sv) in kv.items():
+                # 与单流同一条契约：导出是 [nkv, pos, hd]，池要 [pos, nkv, hd]。
+                pool.write_range(
+                    int(idx), slots,
+                    k.to(pool.k.device).transpose(0, 1).contiguous(),
+                    sk.to(pool.kscale.device).transpose(0, 1).contiguous(),
+                    v.to(pool.v.device).transpose(0, 1).contiguous(),
+                    sv.to(pool.vscale.device).transpose(0, 1).contiguous())
+            states = {int(j): (st.to(device), conv.to(device))
+                      for j, (st, conv) in linear.items()}
+            model.restore_linear_states(states, row=row)
+            model.pos[row:row + 1].fill_(pos)
+            if rope_delta is not None:
+                model.rope_delta[row] = int(rope_delta.reshape(-1)[0])
+            seq.num_cached_tokens = pos
+            seq.prefill_cursor = pos
+            seq.num_scheduled_tokens = pos
+            seq.prefill_logits = logits.to(device)
+            seqs.append(seq)
+            _say(f"row={row} pos={pos} blocks={len(seq.block_table)} item={i}")
+            if _verify:
+                self._verify_row(model, pool, pos, kv, linear, row)
+        t_adopt = time.time() - t0
+
+        t1 = time.time()
+        finished: list[Sequence] = []
+        for seq in seqs:
+            tok = runner.sample(seq.prefill_logits, 0.0)
+            if self._push(seq, tok):
+                finished.append(seq)
+        steps = 0
+        while steps < max_new:
+            active = [s for s in seqs if s not in finished]
+            if not active:
+                break
+            tokens = runner.decode(active)
+            for seq, tok in zip(active, tokens):
+                if self._push(seq, tok):
+                    finished.append(seq)
+            steps += 1
+        t_dec = time.time() - t1
+        out_items = []
+        for it, seq in zip(items, seqs):
+            head = len(it["tokens"])
+            new = seq.token_ids[head:]
+            out_items.append({"tokens": new, "n_new": len(new),
+                              "text": self.tok.decode(new),
+                              "row": seq.row})
+        for seq in seqs:
+            bm.release(seq)
+            runner.release_row(seq)
+        total = sum(x["n_new"] for x in out_items)
+        return {"ok": True, "n": len(seqs), "items": out_items,
+                "adopt_ms": round(t_adopt * 1000, 1),
+                "decode_ms": round(t_dec * 1000, 1),
+                "steps": steps, "n_new": total,
+                "decode_tok_s": round(total / t_dec, 2) if t_dec else None}
+
+    @staticmethod
+    def _push(seq: Sequence, tok: int) -> bool:
+        """追加一个 token，返回这条序列是否已经跑到 ``max_tokens``。
+
+        这里不借 ``LLMEngine._commit``：那条路会走 ``scheduler.finish``，而这条
+        路径上的序列根本没经过调度器。早停条件只有长度一处，因为
+        ``ignore_eos`` 恒为真——吞吐测量的样本量必须固定。
+
+        Args:
+            seq: 要推进的序列。
+            tok: 本次采样出的 token。
+
+        Returns:
+            ``True`` 表示这条已经满了，应当退出批。
+        """
+        seq.append_token(tok)
+        return seq.num_completion_tokens >= seq.params.max_tokens
+
+    @staticmethod
+    def _verify_row(model, pool, pos: int, kv: dict, linear: dict, row: int) -> None:
+        """回读校验：池里第 ``row`` 行读回来的 KV / 循环态与刚写进去的是否一致。
+
+        「输出复读」既可能是写错了（KV 没进池）也可能是读错了（槽位表指到别处），
+        这两件事在输出上长得一模一样。这里把刚写的内容原路读回来比一遍，就能
+        把两者分开。
+
+        Args:
+            model: 本实例的模型，用来取线性态参考行。
+            pool: 池。
+            pos: 写进去的位置数。
+            kv: 刚写的 ``{全局池化层: (k, v, kscale, vscale)}``。
+            linear: 刚写的 ``{全局线性层: (state, conv)}``。
+            row: 写入的目标行。
+        """
+        for idx, (k, _, _, _) in kv.items():
+            got = pool.gather(int(idx), pos, row=row)[0]
+            bad = int((got.to("cpu") != k.to("cpu")).sum())
+            print(f"[pdverify] kv layer={idx} row={row} pos={pos} "
+                  f"mismatch={bad}/{int(k.numel())}", flush=True)
+        for j, (st, _) in linear.items():
+            ref = model.layers[int(j)].mix.state[row]
+            bad = int((ref.to("cpu").to(st.dtype) != st.to("cpu")).sum())
+            print(f"[pdverify] linear layer={j} row={row} "
+                  f"mismatch={bad}/{int(st.numel())}", flush=True)
+
 
     def _verify_ab(self, req: dict) -> dict:
         """量一次整模型校验前向（``c`` 个候选 token）的融合开/关差异。

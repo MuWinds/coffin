@@ -139,6 +139,14 @@ def main() -> None:
     from serving.runtime_transport import call, serve
 
     if args.serve:
+        # 挂死取证：EP4 的 combine 是设备侧会合（各 rank 写自己的槽、然后在核里
+        # 自旋等对端轮次），一旦轮次错开就只有设备侧能看到，宿主栈全在等核。
+        # `dump_traceback_later` 跑在独立的看门狗线程上，所以即使所有请求线程
+        # 都卡在 cuda 调用里，也能按固定间隔把每个线程的栈打到 stderr。
+        _fd = os.environ.get("COFFIN_FAULT_DUMP")
+        if _fd:
+            import faulthandler
+            faulthandler.dump_traceback_later(float(_fd), repeat=True)
         serve(args.model, args.max_seq, not args.no_bench, args.sock, args.spec_k,
               args.int8, args.prefix_cache, args.block_size, args.snapshots,
               args.snapshot_interval, args.max_seconds, args.max_num_seqs,

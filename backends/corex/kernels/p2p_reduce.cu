@@ -26,6 +26,15 @@
 
 #define COFFIN_P2P_WORLD 4
 
+/// @brief 自旋迭代上限，约等于零点几秒。超过就说明轮次真的错开了（有 rank 已经
+///        退出会合，永远不会写这一轮），再等下去只会把整张卡焊死。
+#define COFFIN_P2P_SPIN_LIMIT 50000000LL
+
+/// @brief 中止槽的下标：``flags[world]``。与到达计数分开，绝不写进 ``[0, world)``，
+///        否则被污染的那一轮之后 ``mine[r] < round`` 永远为假，各 rank 会带着
+///        半截载荷继续算下去（静默错数比挂死更难查）。
+#define COFFIN_P2P_ABORT_SLOT COFFIN_P2P_WORLD
+
 namespace {
 
 /// @brief 写对端槽 → 栅栏 → 置计数 → 自旋等齐 → 本地求和。
@@ -51,6 +60,20 @@ __global__ void p2p_combine_kernel(const __nv_bfloat16* __restrict__ x,
     const long long stride = static_cast<long long>(gridDim.x) * blockDim.x;
     const long long start = blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x;
 
+    // 中止是锁存的：一旦有人写过中止槽，本进程之后的每一轮都不再自旋，直接出零
+    // 结果返回。宁可让输出变成垃圾，也不能把卡停在核心里等一个永远不来的写。
+    __shared__ int failed;
+    if (threadIdx.x == 0) {
+        failed = (flg[rank][COFFIN_P2P_ABORT_SLOT] != 0) ? 1 : 0;
+    }
+    __syncthreads();
+    if (failed) {
+        for (long long i = start; i < total; i += stride) {
+            out[i] = 0.0F;
+        }
+        return;                     // 全块同时走到这里，不会有线程落在 __syncthreads 上
+    }
+
     // 本 rank 的载荷写进每个对端的第 rank 段（含自己）：这一步就是 all-to-all。
     for (int p = 0; p < COFFIN_P2P_WORLD; ++p) {
         float* dst = base[p] + static_cast<long long>(rank) * total;
@@ -67,15 +90,39 @@ __global__ void p2p_combine_kernel(const __nv_bfloat16* __restrict__ x,
     }
     __syncthreads();
     // 自旋等所有 rank 到达。计数在设备内存里，volatile 读就能看到对端刚写的值。
+    // 注意：这里试过用原子（atomicExch 发布 + atomicAdd 读）来绕开跨卡可见性，
+    // 实测在这套 corex 卡上第 4 轮就必挂——对端内存的原子不参与会合，比 volatile
+    // 更糟，所以退回 volatile。
     if (threadIdx.x == 0) {
         volatile long long* mine = flg[rank];
+        long long spins = 0;
+        int bad = 0;
         for (int r = 0; r < COFFIN_P2P_WORLD; ++r) {
             while (mine[r] < round) {
+                // 对端把自己放出去时写的是我这个 rank 的槽：它也会同时叫醒我。
+                if (mine[COFFIN_P2P_ABORT_SLOT] != 0) { bad = 1; break; }
                 __threadfence();
+                if (++spins > COFFIN_P2P_SPIN_LIMIT) { bad = 1; break; }
             }
+            if (bad) break;
+        }
+        if (bad) {
+            // 给所有人写我这一轮的中止号，把正在等我的人一起放出来。
+            for (int p = 0; p < COFFIN_P2P_WORLD; ++p) {
+                flg[p][COFFIN_P2P_ABORT_SLOT] = round;
+            }
+            failed = 1;
+        } else {
+            failed = 0;
         }
     }
     __syncthreads();
+    if (failed) {
+        for (long long i = start; i < total; i += stride) {
+            out[i] = 0.0F;
+        }
+        return;
+    }
     // fp32 累加、最后只窄化一次：四个 bf16 直接相加会丢两三位尾数。
     const float* my = base[rank];
     for (long long i = start; i < total; i += stride) {

@@ -47,6 +47,8 @@ import torch
 #: 它回答的是「那 428 us/层到底花在 stage、同步、轮询还是 finish 上」——没有这个，
 #: 只能靠改代码猜，而每改一次都要重编 20 多个内核。
 _EP_TRACE = os.environ.get("COFFIN_EP_TRACE", "").strip() == "1"
+#: 每层校验一次会合是否被超时闸门放掉。只在排查挂死时打开：代价是每层一次同步。
+_EP_CHECK = os.environ.get("COFFIN_EP_CHECK", "").strip() == "1"
 _EP_STATS: dict[str, list[float]] = {}
 
 
@@ -586,7 +588,7 @@ class P2pReduce:
         total = self.rows * self.hidden
         self._slots = torch.zeros(self.world * total, dtype=torch.float32,
                                   device="cuda")
-        self._flags = torch.zeros(self.world, dtype=torch.int64, device="cuda")
+        self._flags = torch.zeros(self.world + 1, dtype=torch.int64, device="cuda")
         self._out = torch.empty(self.rows, self.hidden, dtype=torch.float32,
                                 device="cuda")
         self._slot_ptr = [0] * self.world
@@ -662,9 +664,24 @@ class P2pReduce:
         self._round += 1
         out = self._out[:rows]
         blocks, threads = self._grid(rows * self.hidden)
+        if _EP_TRACE and (self._round <= 4 or self._round % 40 in (0, 1)):
+            # 会合是按轮次号对齐的：四个 rank 各自打印自己这一轮的序号，
+            # 谁多跑/少跑一轮立刻能看出来（挂死时就靠这个定位）。
+            print(f"[ep] rank={self.rank} round={self._round} rows={rows}",
+                  flush=True)
         self._module.p2p_combine(x.contiguous(), out, *self._slot_ptr,
                                  *self._flag_ptr, self.rank, self._round,
                                  blocks, threads)
+        # 会合超时不再让卡停在核心里：内核把中止号写进 ``flags[world]`` 并锁存，
+        # 之后的轮次直接出零结果返回。宿主每 200 轮查一次这个槽（一步 40 层，
+        # 约等于每 5 步一次同步，对吞吐无感），把「静默错数」变成一次明确异常，
+        # 进程能正常退出，不需要再 kill -9。
+        if self._round % 200 == 0 or _EP_CHECK:
+            if int(self._flags[self.world]) != 0:
+                raise RuntimeError(
+                    f"p2p combine rendezvous aborted at round {self._round} "
+                    f"(abort published at round {int(self._flags[self.world])}) "
+                    f"on rank {self.rank}: a peer left the barrier")
         return out.to(x.dtype)
 
     def close(self) -> None:

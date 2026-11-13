@@ -1,5 +1,5 @@
 // @file moe_block.cu
-// @brief 把 decode 一层的 MoE 块（11 次原生调用）合成一次主机侧驱动。
+// @brief 把 decode 一层的 MoE 块合成一次主机侧驱动。
 //
 // Module: coffin/kernels。由 corex 后端作为 torch 扩展的一部分加载。
 //
