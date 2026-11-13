@@ -529,11 +529,14 @@ class Qwen35:
                                       _device, D).view(-1)
         ctx = (self.pos1, self.cos_tbl, self.sin_tbl, self.mask_idx,
                self.rope_delta1)
+        # 层与层之间的残差相加留给下一层的 ``in_ln`` 折进同一次发射；只有最后一层的
+        # MLP 输出没人接了，在这里补一次相加。
+        carry = None
         for layer in self.layers:
-            x = layer(x, ctx)
+            x, carry = layer.step(x, ctx, carry)
         self.pos1.add_(1)
         if self.pipe is None:
-            self.logits_single.copy_(self.lm_head(self.norm(x)))
+            self.logits_single.copy_(self.lm_head(self.norm(x + carry)))
             return
         # 段间只传激活：中间段把 hidden 交给下一段，末段把 logits 送回 rank 0。
         # 末段必须在这里早退，否则它会去等一个永远不会来的回包。
@@ -543,6 +546,8 @@ class Qwen35:
         # 段间只传 4 KB 的 hidden；末段把 hidden 回给各段，各段用自己的头算 logits。
         # 这样每段都能在等对端的时候把自己的头 GEMV 藏在等待里，实测比「末段算、
         # 广播 logits」快 22%（26.24 vs 21.48 tok/s）。
+        # 段间传的是**完整**残差流，所以末层的 MLP 输出必须先加回去。
+        x = x + carry
         nxt = self.pipe.rank + 1
         if nxt >= self.pipe.world_size:
             for dst in range(self.pipe.world_size - 1):
@@ -1019,8 +1024,7 @@ class Qwen35:
                     pieces.append(layer.prefill_group_state(
                         mix, proj_k, positions[k], ctx_k, tiles[k], rows[i]))
                 out = layer.prefill_group_out(mix, torch.cat(pieces, dim=0))
-                x = x + out
-                x = x + layer.mlp.prefill(layer.post_ln(x))
+                x = x + layer.mlp.prefill(layer.norm_after_add(x, out))
 
             if stage + 1 < world:
                 pipe.relay(x, stage + 1)

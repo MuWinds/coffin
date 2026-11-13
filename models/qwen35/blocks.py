@@ -139,13 +139,90 @@ class Layer:
         # 完全一致，所以层里再往下就没有分支了。
         self.mlp = (SparseMoE(sd, f"{p}.mlp", cfg, bench)
                     if cfg.get("num_experts") else MLP(sd, f"{p}.mlp", bench))
+        #: ``in_ln`` 折叠残差相加时的归一化目标。在这里就分配好，不要在捕获图里分配。
+        self._norm_buf: torch.Tensor = torch.empty_like(self.in_ln.g)
         if self.type == "linear_attention":
             self.mix = LinearAttn(sd, f"{p}.linear_attn", cfg, bench)
         else:
             self.mix = FullAttn(sd, f"{p}.self_attn", cfg, bench, max_seq, paged)
 
+    def _add_then_norm(self, ln: RMSNorm, x: torch.Tensor, add: torch.Tensor,
+                       out: torch.Tensor | None = None) -> torch.Tensor:
+        """``x += add`` 紧接 ``ln(x)``：折成一次发射，返回归一化后的和。
+
+        拆开跑是两次发射、三趟 global（相加读 ``x`` 读 ``add`` 写 ``x``，归一化再
+        读 ``x`` 写结果）；融合版两趟、一次发射。这张卡一次发射的下限是 5.75 us，
+        而 ``[hidden]`` 上的一次相加实测 13.2 us 已经全在发射里，所以省下来的就是
+        一次发射本身。
+
+        ``out`` 缺省时用本层自己的一个缓冲区：每一处折叠的归一化目标都会被 mixer
+        在下一次折叠之前消费掉，所以一层一个就够。
+
+        Args:
+            ln: 消费这次相加的归一化，``in_ln`` 或 ``post_ln``。
+            x: 残差流，``[..., hidden]``。**会被就地改写**成和，调用方必须独占它。
+            add: 要累加的输出，形状同 ``x``；可以就是返回的目标缓冲区。
+            out: 归一化后的和要写入的稠密缓冲区；``None`` 用本层缓冲区。
+
+        Returns:
+            ``[..., hidden]``，归一化后的和。
+
+        激活不是 bf16 时退回拆开的两步：残差是就地累加的，没有更宽的缓冲区可退，
+        在这里转换会把和困在临时对象里。
+        """
+        if x.dtype != ln.g.dtype or add.dtype != ln.g.dtype:
+            return ln(x + add)
+        if out is None:
+            out = self._norm_buf
+            if out is None or out.shape != x.shape:
+                out = torch.empty_like(x)
+                self._norm_buf = out
+        return ln.add_residual(x, add, out)
+
+    def norm_after_add(self, x: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+        """``x += h`` 紧接 ``post_ln(x)``，归一化写进 ``h`` 本身——相加在写之前
+        已经把它读走，于是连缓冲区都不用分配。
+
+        预填充、校验、批解码三条入口每层都先加残差、紧接着归一化，拆开跑是两次
+        发射、三趟 global；解码的 ``__call__`` 早就是这条，这三条是补上的同一处。
+
+        Args:
+            x: 残差流，``[..., hidden]``。**会被就地改写**成和。
+            h: 要累加的 mixer 输出，形状同 ``x``。
+
+        Returns:
+            ``[..., hidden]``，归一化后的和。
+        """
+        return self._add_then_norm(self.post_ln, x, h, h)
+
+    def step(self, x: torch.Tensor, ctx, carry: torch.Tensor | None = None):
+        """让一个解码步穿过本层，并把跨层的那处残差相加折进本层 ``in_ln``。
+
+        层与层之间唯一的相加是上一层的 MLP 输出，而它唯一的消费者是本层的
+        ``in_ln``：拆开跑是「相加 + 归一化」两次发射（``[hidden]`` 上实测 13.2 +
+        15.8 us），折成 ``add_rms_norm`` 只有 17.9 us。33 层一步步省 32 次发射，
+        约 0.36 ms，占每步 17.3 ms 的 2%。
+
+        残差流 ``x`` 一路就地累加，所以同一块缓冲区要跨层传下去；本层 MLP 的输出
+        不加，交给下一层——加在哪一层的 ``in_ln`` 里不影响数字，因为相加仍然先把和
+        舍入成 bf16，均方也仍按那个舍入后的值算。
+
+        Args:
+            x: 残差流，``[hidden]``，bf16；返回时已含本层 mixer 那处相加。
+            ctx: mixer 的输入（缓存槽位、位置以及本层自己的状态）。
+            carry: 上一层留下的 MLP 输出，尚未加进 ``x``；``None`` 表示 ``x``
+                已经是完整的残差流（第一层）。
+
+        Returns:
+            ``(x, mlp 输出)``：残差流与本层 MLP 的结果，后者留给下一层累加。
+        """
+        normed = (self.in_ln(x) if carry is None
+                  else self._add_then_norm(self.in_ln, x, carry))
+        h = self.mix(normed, *ctx)
+        return x, self.mlp(self.post_ln.add_residual(x, h, h))
+
     def __call__(self, x: torch.Tensor, ctx) -> torch.Tensor:
-        """让一个解码步穿过本层。
+        """让一个完整解码步穿过本层（自己不持有残差流的调用方用这个）。
 
         Args:
             x: 隐含状态，``[hidden]``。
@@ -155,16 +232,8 @@ class Layer:
         Returns:
             ``[hidden]`` 的输出状态。
         """
-        h = self.mix(self.in_ln(x), *ctx)
-        # 残差相加折进消费它的归一化：``post_ln`` 就地累加 ``x += h``，并把和归一化
-        # 写进 ``h``——相加刚刚就读走了 mixer 的输出，那个值随即失效。一次 launch
-        # 代替两次，也不用分配缓冲区。
-        #
-        # 只有这一处相加在这里折叠。本层的*另一处*相加 ``x + mlp(...)`` 由下一层的
-        # ``in_ln`` 消费，而不是本层任何东西，要折它就得有跨层携带的缓冲区，那属于
-        # ``model._forward``，不在这里。
-        normed = self.post_ln.add_residual(x, h, h)
-        return x + self.mlp(normed)
+        x, carry = self.step(x, ctx)
+        return x + carry
 
     def prefill(self, x: torch.Tensor, positions: torch.Tensor, ctx,
                 tiles: list | None = None) -> torch.Tensor:
@@ -184,8 +253,7 @@ class Layer:
         """
         proj = self.mix.prefill_project(self.in_ln(x))
         h = self.prefill_state(proj, positions, ctx, tiles, self.mix.prefill_row)
-        x = x + h
-        return x + self.mlp.prefill(self.post_ln(x))
+        return x + self.mlp.prefill(self.norm_after_add(x, h))
 
     def prefill_state(self, proj, positions: torch.Tensor, ctx,
                       tiles: list | None, row: int) -> torch.Tensor:
@@ -274,8 +342,7 @@ class Layer:
             h = self.mix.verify(self.in_ln(x))
         else:
             h = self.mix.verify(self.in_ln(x), positions, *ctx)
-        x = x + h
-        return x + self.mlp.prefill(self.post_ln(x))
+        return x + self.mlp.prefill(self.norm_after_add(x, h))
 
     def batch(self, x: torch.Tensor, positions: torch.Tensor, ctx,
               verify_slot: int | None = None) -> torch.Tensor:
@@ -297,8 +364,7 @@ class Layer:
             h = self.mix.batch(self.in_ln(x), record_slot=verify_slot)
         else:
             h = self.mix.batch(self.in_ln(x), positions, ctx)
-        x = x + h
-        return x + self.mlp.batch(self.post_ln(x))
+        return x + self.mlp.batch(self.norm_after_add(x, h))
 
     def reset(self) -> None:
         """清空本层的循环状态，让模型可以接新请求。"""
