@@ -580,8 +580,11 @@ class Qwen35:
         positions = self.pos[:rows]
         ctx = (self.cos_tbl, self.sin_tbl, self.mask_idx, self.ctx_lens,
                self.rope_delta)
+        carry = None
         for layer in self.layers:
-            x = layer.batch(x, positions, ctx)
+            x, carry = layer.step_batch(x, positions, ctx, carry)
+        # 末层的 MLP 输出没人接，补一次相加；段间传的必须是完整残差流。
+        x = x + carry
         if self.pipe is not None:
             # 与 ``_verify_impl`` 同一套走法：末段把 hidden 回给各段、各段自己算 logits。
             # 让末段算完再广播 logits 实测慢 22%（文档 §8.8），因为各段算 logits 的
@@ -1582,9 +1585,10 @@ class Qwen35:
             poss = self.verify_pos_b[:rows, j]
             self.ctx_lens[:rows].copy_(poss.to(torch.int32).add_(1))
             x = self.embed.lookup(toks)
+            carry = None
             for layer in self.layers:
-                x = layer.batch(x, poss, ctx, verify_slot=j)
-            x = self.norm(x)
+                x, carry = layer.step_batch(x, poss, ctx, carry, verify_slot=j)
+            x = self.norm(x + carry)
             self.verify_hidden_b[:rows, j].copy_(x)
             self.verify_logits_b[:rows, j].copy_(batch_proj(self.embed.gemv, x))
 
@@ -1760,8 +1764,10 @@ class Qwen35:
         # 第 4 项：本请求的 mRoPE 偏移（是个缓冲区，图因此原样重放；``verify_pos``
         # 继续寻址 KV 槽位）。
         ctx = (self.cos_tbl, self.sin_tbl, self.mask_idx, self.rope_delta1)
+        carry = None
         for layer in self.layers:
-            x = layer.verify(x, self.verify_pos, ctx)
+            x, carry = layer.step_verify(x, self.verify_pos, ctx, carry)
+        x = x + carry
         if self.pipe is None:
             self.verify_hidden.copy_(x)
             self.verify_logits.copy_(self.lm_head.prefill(self.norm(x)))

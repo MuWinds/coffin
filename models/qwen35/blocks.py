@@ -139,15 +139,13 @@ class Layer:
         # 完全一致，所以层里再往下就没有分支了。
         self.mlp = (SparseMoE(sd, f"{p}.mlp", cfg, bench)
                     if cfg.get("num_experts") else MLP(sd, f"{p}.mlp", bench))
-        #: ``in_ln`` 折叠残差相加时的归一化目标。在这里就分配好，不要在捕获图里分配。
-        self._norm_buf: torch.Tensor = torch.empty_like(self.in_ln.g)
         if self.type == "linear_attention":
             self.mix = LinearAttn(sd, f"{p}.linear_attn", cfg, bench)
         else:
             self.mix = FullAttn(sd, f"{p}.self_attn", cfg, bench, max_seq, paged)
 
     def _add_then_norm(self, ln: RMSNorm, x: torch.Tensor, add: torch.Tensor,
-                       out: torch.Tensor | None = None) -> torch.Tensor:
+                       out: torch.Tensor) -> torch.Tensor:
         """``x += add`` 紧接 ``ln(x)``：折成一次发射，返回归一化后的和。
 
         拆开跑是两次发射、三趟 global（相加读 ``x`` 读 ``add`` 写 ``x``，归一化再
@@ -155,14 +153,12 @@ class Layer:
         而 ``[hidden]`` 上的一次相加实测 13.2 us 已经全在发射里，所以省下来的就是
         一次发射本身。
 
-        ``out`` 缺省时用本层自己的一个缓冲区：每一处折叠的归一化目标都会被 mixer
-        在下一次折叠之前消费掉，所以一层一个就够。
-
         Args:
             ln: 消费这次相加的归一化，``in_ln`` 或 ``post_ln``。
             x: 残差流，``[..., hidden]``。**会被就地改写**成和，调用方必须独占它。
-            add: 要累加的输出，形状同 ``x``；可以就是返回的目标缓冲区。
-            out: 归一化后的和要写入的稠密缓冲区；``None`` 用本层缓冲区。
+            add: 要累加的输出，形状同 ``x``。
+            out: 归一化后的和要写入的稠密缓冲区。可以就是 ``add``——相加在写之前
+                已经把它读走，于是省掉一次分配；编码捕获路径因此不需要新缓冲区。
 
         Returns:
             ``[..., hidden]``，归一化后的和。
@@ -172,11 +168,6 @@ class Layer:
         """
         if x.dtype != ln.g.dtype or add.dtype != ln.g.dtype:
             return ln(x + add)
-        if out is None:
-            out = self._norm_buf
-            if out is None or out.shape != x.shape:
-                out = torch.empty_like(x)
-                self._norm_buf = out
         return ln.add_residual(x, add, out)
 
     def norm_after_add(self, x: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
@@ -217,7 +208,7 @@ class Layer:
             ``(x, mlp 输出)``：残差流与本层 MLP 的结果，后者留给下一层累加。
         """
         normed = (self.in_ln(x) if carry is None
-                  else self._add_then_norm(self.in_ln, x, carry))
+                  else self._add_then_norm(self.in_ln, x, carry, carry))
         h = self.mix(normed, *ctx)
         return x, self.mlp(self.post_ln.add_residual(x, h, h))
 
@@ -326,6 +317,32 @@ class Layer:
             return mix.out_proj.prefill(pre_out)
         return mix.o_proj.prefill(pre_out)
 
+    def step_verify(self, x: torch.Tensor, positions: torch.Tensor, ctx,
+                    carry: torch.Tensor | None = None):
+        """为一步里的 ``c`` 个投机 token 重放本层，跨层相加折进 ``in_ln``。
+
+        与 :meth:`step` 同一条折叠，只是行数是校验窗口宽度 ``c``；残差流同样就地
+        累加、跨层传同一块缓冲区，归一化写进 ``carry`` 本身（它在相加读走之后就没
+        人用了），所以捕获图里也不会多出缓冲区。
+
+        Args:
+            x: 校验窗口的隐含状态，``[c, hidden]``；返回时已含本层 mixer 那处相加。
+            positions: 那些 token 的绝对位置，``[c]``。
+            ctx: 窗口对应的 mixer 输入；线性注意力 mixer 不接收位置，因为它携带
+                的是自己的状态。
+            carry: 上一层留下的 MLP 输出，尚未加进 ``x``；``None`` 是第一层。
+
+        Returns:
+            ``(x, mlp 输出)``，后者留给下一层累加。
+        """
+        normed = (self.in_ln(x) if carry is None
+                  else self._add_then_norm(self.in_ln, x, carry, carry))
+        if self.type == "linear_attention":
+            h = self.mix.verify(normed)
+        else:
+            h = self.mix.verify(normed, positions, *ctx)
+        return x, self.mlp.prefill(self.post_ln.add_residual(x, h, h))
+
     def verify(self, x: torch.Tensor, positions: torch.Tensor, ctx) -> torch.Tensor:
         """为一步里的 ``c`` 个投机 token 重放本层。
 
@@ -338,11 +355,34 @@ class Layer:
         Returns:
             ``[c, hidden]`` 的输出状态。
         """
+        x, carry = self.step_verify(x, positions, ctx)
+        return x + carry
+
+    def step_batch(self, x: torch.Tensor, positions: torch.Tensor, ctx,
+                   carry: torch.Tensor | None = None,
+                   verify_slot: int | None = None):
+        """为静态批解码步运行本层，跨层相加折进 ``in_ln``。
+
+        与 :meth:`step` 同一条折叠，行数是批宽 ``B``；投影仍走批处理，有状态的
+        mixer 仍逐行跑现有内核。
+
+        Args:
+            x: 每个解码序列一行，``[B, hidden]``；返回时已含本层 mixer 那处相加。
+            positions: 每行下一个绝对位置，``[B]``。
+            ctx: 该批对应的 mixer 输入。
+            carry: 上一层留下的 MLP 输出，尚未加进 ``x``；``None`` 是第一层。
+            verify_slot: 仅校验时传入当前日志位置，让线性注意力保存秩一更新。
+
+        Returns:
+            ``(x, mlp 输出)``，后者留给下一层累加。
+        """
+        normed = (self.in_ln(x) if carry is None
+                  else self._add_then_norm(self.in_ln, x, carry, carry))
         if self.type == "linear_attention":
-            h = self.mix.verify(self.in_ln(x))
+            h = self.mix.batch(normed, record_slot=verify_slot)
         else:
-            h = self.mix.verify(self.in_ln(x), positions, *ctx)
-        return x + self.mlp.prefill(self.norm_after_add(x, h))
+            h = self.mix.batch(normed, positions, ctx)
+        return x, self.mlp.batch(self.post_ln.add_residual(x, h, h))
 
     def batch(self, x: torch.Tensor, positions: torch.Tensor, ctx,
               verify_slot: int | None = None) -> torch.Tensor:
@@ -360,11 +400,8 @@ class Layer:
         Returns:
             ``[B, hidden]`` 的输出状态。
         """
-        if self.type == "linear_attention":
-            h = self.mix.batch(self.in_ln(x), record_slot=verify_slot)
-        else:
-            h = self.mix.batch(self.in_ln(x), positions, ctx)
-        return x + self.mlp.batch(self.norm_after_add(x, h))
+        x, carry = self.step_batch(x, positions, ctx, verify_slot=verify_slot)
+        return x + carry
 
     def reset(self) -> None:
         """清空本层的循环状态，让模型可以接新请求。"""
