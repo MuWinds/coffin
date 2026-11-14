@@ -266,6 +266,20 @@ class SparseMoE:
                               if ("moe_grouped_i8_merge_tokens" in native
                                   and isinstance(self.gate_up, QWeightMoE))
                               else None)
+        #: 取行 + 量化的合成入口与「乘积 + 量化」的合成入口。只在 int8 栈上成立：
+        #: 它们省的是 int8 投影前的两次量化发射，别的栈不消费 int8 激活。
+        self._gather_quant = (getattr(bops, "gather_quant_i8", None)
+                              if ("gather_quant_i8" in native
+                                  and isinstance(self.gate_up, QWeightMoE))
+                              else None)
+        self._silu_quant = (getattr(bops, "silu_mul_quant", None)
+                            if ("silu_mul_quant" in native
+                                and isinstance(self.gate_up, QWeightMoE))
+                            else None)
+        #: 多流那一路的复用缓冲：``(rows, width, dtype, device)`` → 张量。三块分别是
+        #: gate/up 的输出、激活乘积、以及归并核的 ``[tokens, H]`` 目的地。按层复用，
+        #: 因为它们只在层内活，而每层新建等于每步白付 120 次分配。
+        self._act_bufs: dict = {}
         self._grouped_gemm = (getattr(bops, "moe_grouped_gemm", None)
                               if "moe_grouped_gemm" in native else None)
         #: 全局专家号 → 本地号；``ep`` 下不归本 rank 的专家是 -1。见 :meth:`_expert_table`。
@@ -546,6 +560,28 @@ class SparseMoE:
             offsets, slot_pos, token_of_pos, slot_of_pos = self._dispatch(
                 flat_index, self._expert_table(flat_index.device), flat_index.numel(),
                 self.local_experts, self.num_experts, top_k)
+            if (grouped_i8 is not None and self._gather_quant is not None
+                    and self._silu_quant is not None
+                    and self._merge_tokens is not None):
+                # 整条链上不再出现单独的量化发射：取行与量化合成一次、SwiGLU 乘积与
+                # 量化合成一次，两次分组投影直接吃 int8 激活。gate/up 的输出仍按 bf16
+                # 落盘（``silu_mul_quant`` 的 amax 就是按落盘的 bf16 算的），所以与
+                # 「index_select → quant_act → grouped → silu_mul → quant_act → grouped」
+                # 逐位相同；省下的是每层 5 次启动，以及 ``[rows, K]`` bf16 中间结果的
+                # 一写一读。
+                xq, xs = self._gather_quant(x, token_of_pos)
+                rows = int(token_of_pos.numel())
+                gu = self._act_buf(rows, 2 * self.inter, x.dtype, x.device)
+                gate_up = self._grouped_i8(self.gate_up, xq, offsets, 0, xs, gu)
+                gate, up = gate_up.chunk(2, dim=-1)
+                act = self._act_buf(rows, self.inter, x.dtype, x.device)
+                act, aq, a_s = self._silu_quant(gate, up, act)
+                out = self._act_buf(tokens, self.hidden, x.dtype, x.device)
+                return self._reduce(
+                    self._merge_tokens(self.down, aq, offsets, weights.reshape(-1),
+                                       slot_pos, slot_of_pos, tokens, top_k,
+                                       scales=a_s, out=out),
+                    x.dtype)
             # 收拢成「按专家排好序」的行，然后两次分组投影：gate/up 一次出中间量，
             # 过 SwiGLU 之后再投一次 down。两次都必须用分组内核——按专家分组的意义
             # 就是让每个专家 2 MB 的权重在一个解码步里只被读一遍。
@@ -625,6 +661,28 @@ class SparseMoE:
             return self._reduce(buf.view(tokens, top_k, self.hidden).sum(dim=1), x.dtype)
         return self._reduce(
             self._experts_dense(x, index, weights, tokens, top_k), x.dtype)
+
+    def _act_buf(self, rows: int, width: int, dtype: torch.dtype,
+                 device: torch.device) -> torch.Tensor:
+        """取（必要时分配）一块按调用形状复用的激活缓冲。
+
+        Args:
+            rows: 行数。
+            width: 列数。
+            dtype: 元素类型；跟随输入激活，别写死 bf16——投机校验的宽路径可以是 fp32。
+            device: 目标设备。
+
+        Returns:
+            ``[rows, width]`` 的连续张量；同形状同类型同设备的后续调用复用同一块。
+        """
+        key = (rows, width, dtype, device)
+        buf = self._act_bufs.get(key)
+        if buf is None:
+            if len(self._act_bufs) > 24:
+                self._act_bufs.clear()
+            self._act_bufs[key] = buf = torch.empty((rows, width), dtype=dtype,
+                                                   device=device)
+        return buf
 
     def _reduce(self, value: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
         """把各 rank 的部分和加起来；单卡 / 流水并行直接返回。

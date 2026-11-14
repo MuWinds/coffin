@@ -762,7 +762,8 @@ def shared_gate_scale(x: torch.Tensor, w: torch.Tensor, src: torch.Tensor,
 
 
 def moe_grouped_i8(w, x: torch.Tensor, offsets: torch.Tensor,
-                   slices: int = 0) -> torch.Tensor:
+                   slices: int = 0, scales: torch.Tensor | None = None,
+                   out: torch.Tensor | None = None) -> torch.Tensor:
     """按专家分组做 int8 投影，一整栈权重在一次启动里读完。
 
     与 :func:`moe_grouped` 的区别是权重的量化格式：那个吃 packed W4 加逐 (weight-group,
@@ -777,11 +778,16 @@ def moe_grouped_i8(w, x: torch.Tensor, offsets: torch.Tensor,
     Args:
         w: int8 专家栈，:class:`~int8_weights.QWeightMoE`（``[E, K, N]`` int8 加
             ``[E, N]`` fp32）。
-        x: 激活，``[tokens, K]``，已按专家号排序。
+        x: 激活，``[tokens, K]``，已按专家号排序。bf16 时本函数就地量化；int8 时必须
+            同时给出 ``scales``（上游已经量化过，例如 :func:`gather_quant_i8`、
+            :func:`silu_mul_quant` 的输出），这样一次量化只做一次。
         offsets: ``[E+1]`` 前缀和，int32 或 int64；空段表示该专家没有行。
+        slices: K 方向分片数；``<= 0`` 自动。
+        scales: 逐行激活 scale，``[tokens]`` fp32；``x`` 已是 int8 时必填。
+        out: 可选目的地，``[tokens, N]``；不给则分配。
 
     Returns:
-        ``[tokens, N]``，dtype 同 ``x``。
+        ``[tokens, N]``，dtype 同 ``x``（int8 输入时为 fp32）。
 
     Raises:
         ValueError: 激活或前缀和的形状与权重不自洽。
@@ -796,22 +802,107 @@ def moe_grouped_i8(w, x: torch.Tensor, offsets: torch.Tensor,
     if tokens == 0:
         return torch.empty((0, w.n), dtype=dtype, device=x.device)
 
-    act = x if x.dtype in (torch.bfloat16, torch.float32) else x.float()
-    if act.shape != (tokens, w.k) or not act.is_contiguous():
-        act = act.reshape(tokens, w.k).contiguous()
-    xq, xs = _moe_scratch(tokens, w.k, act.device)
+    if x.dtype == torch.int8:
+        # 上游刚量化过的情形（``gather_quant_i8`` / ``silu_mul_quant``）：直接用它的
+        # int8 与 scale，量化一次只付一次。结果口径与在这里现量化逐位相同——两个量化
+        # 核用的是同一套 absmax/127、下限 1e-5 与 ``__float2int_rn``。
+        if scales is None:
+            raise ValueError("int8 activations need their per-row scales")
+        xq, xs = x, scales
+        act_dtype = torch.float32
+    else:
+        act_dtype = x.dtype if x.dtype in (torch.bfloat16, torch.float32) else torch.float32
+        act = x if x.dtype == act_dtype else x.float()
+        if act.shape != (tokens, w.k) or not act.is_contiguous():
+            act = act.reshape(tokens, w.k).contiguous()
+        xq, xs = _moe_scratch(tokens, w.k, act.device)
+        module.quant_act_i8(act, xq, xs)
     # 内核覆盖每一行的每一列（网格的 y 维就是行数），所以这里用 ``empty`` 而不是
     # ``zeros``：一行清零的发射在 decode 一步里要付 80 次。
-    out = torch.empty((tokens, w.n), dtype=act.dtype, device=act.device)
+    #
+    # ``out`` 的 dtype 由调用方定，不跟着激活走：int8 输入时可以指定 bf16 目的地
+    # （下游核只吃 bf16，而 fp32 会把逐位口径改掉），内核在写回时才窄化。
+    if out is None or out.shape != (tokens, w.n) or out.device != x.device \
+            or out.dtype not in (torch.bfloat16, torch.float32):
+        out = torch.empty((tokens, w.n), dtype=act_dtype, device=x.device)
     if offsets.dtype == torch.int32 and offsets.is_contiguous():
         bounds = offsets
     else:
-        bounds = offsets.to(dtype=torch.int32, device=act.device).contiguous()
-    module.quant_act_i8(act, xq, xs)
+        bounds = offsets.to(dtype=torch.int32, device=x.device).contiguous()
     module.moe_grouped_i8(xq, xs, w.wq, w.scale, bounds, out, slices)
-    return _restore(out, dtype)
+    return out if x.dtype == torch.int8 else _restore(out, dtype)
 
 
+def gather_quant_i8(x: torch.Tensor, index: torch.Tensor,
+                    out_q: torch.Tensor | None = None,
+                    out_s: torch.Tensor | None = None):
+    """按索引表取行，并在同一次启动里完成激活量化。
+
+    原本是 ``index_select`` 加 ``quant_act_i8`` 两次发射：前者还要为 ``[rows, K]``
+    的中间结果付一次写回（EP4 的 MoE 上就是每层 64 x 2048 的 bf16 往返），后者再把它
+    读回来算 absmax。合起来之后中间结果不出共享内存，发射也少一次。
+
+    Args:
+        x: 源激活，``[tokens, K]`` 连续。
+        index: ``[rows]`` 的行号表，int32；``rows`` 是取出的行数（MoE 里是
+            ``tokens * top_k``），元素可重复也可越序。
+        out_q: 可选目的地，``[rows, K]`` int8；不给时用分组 MoE 的激活暂存。
+        out_s: 可选目的地，``[rows]`` fp32；不给时用分组 MoE 的激活暂存。
+
+    Returns:
+        ``(xq, xs)``：``[rows, K]`` int8 与 ``[rows]`` fp32。量化口径与
+        :func:`quant_act_i8` 逐位相同（absmax/127、下限 1e-5、``__float2int_rn``）。
+
+    Raises:
+        ValueError: 源激活不是二维连续张量，或索引表的 dtype 不是 int32。
+    """
+    module = _kernels()
+    if x.dim() != 2 or not x.is_contiguous():
+        raise ValueError("gather_quant_i8 expects a contiguous [tokens, K] source")
+    if index.dtype != torch.int32:
+        raise ValueError("gather_quant_i8 needs an int32 index table")
+    rows = int(index.numel())
+    if out_q is None or out_s is None:
+        out_q, out_s = _moe_scratch(rows, x.shape[1], x.device)
+    module.gather_quant_i8(x, index, out_q, out_s)
+    return out_q, out_s
+
+
+def silu_mul_quant(gate: torch.Tensor, up: torch.Tensor,
+                   out: torch.Tensor | None = None,
+                   out_q: torch.Tensor | None = None,
+                   out_s: torch.Tensor | None = None):
+    """``silu(gate) * up`` 落成 bf16，并顺手量化成 int8。
+
+    替掉 ``silu_mul`` 加 ``quant_act_i8`` 两次发射：乘积只算一遍，amax 直接在寄存器里
+    归约，不必把 bf16 结果写回再读回来。
+
+    舍入口径与 ``silu_mul`` 相同（fp32 算 sigmoid、窄化一次、乘积再窄化一次），
+    amax 按**落盘的 bf16** 算，所以与「先 ``silu_mul`` 再 ``quant_act_i8``」逐位相同。
+
+    Args:
+        gate: ``[rows, K]``，已按专家号排序的门投影。
+        up: 同形，同上投影。
+        out: 可选目的地，``[rows, K]`` bf16；不给时新建。
+        out_q: 可选目的地，``[rows, K]`` int8；不给时用分组 MoE 的激活暂存。
+        out_s: 可选目的地，``[rows]`` fp32；不给时用分组 MoE 的激活暂存。
+
+    Returns:
+        ``(product, xq, xs)``：bf16 乘积、int8 激活与逐行 fp32 scale。
+
+    Raises:
+        ValueError: 两个输入形状不一致。
+    """
+    module = _kernels()
+    if gate.shape != up.shape or gate.dim() != 2:
+        raise ValueError("silu_mul_quant needs two same-shaped [rows, K] inputs")
+    rows, width = int(gate.shape[0]), int(gate.shape[1])
+    if out is None:
+        out = torch.empty_like(gate)
+    if out_q is None or out_s is None:
+        out_q, out_s = _moe_scratch(rows, width, gate.device)
+    module.silu_mul_quant(gate, up, out, out_q, out_s)
+    return out, out_q, out_s
 
 
 def moe_grouped_i8_merge(w, x: torch.Tensor, offsets: torch.Tensor,
@@ -913,7 +1004,8 @@ def moe_grouped_i8_merge_tokens(w, x: torch.Tensor, offsets: torch.Tensor,
         raise ValueError("row_weight needs one entry per row")
     if rows == 0:
         n = w.n
-        return torch.empty((tokens, n), dtype=torch.float32, device=x.device)
+        return out if out is not None else torch.empty(
+            (tokens, n), dtype=torch.float32, device=x.device)
     dtype = x.dtype
     if x.dtype == torch.int8:
         if scales is None:
@@ -939,8 +1031,11 @@ def moe_grouped_i8_merge_tokens(w, x: torch.Tensor, offsets: torch.Tensor,
         slot_pos = slot_pos.to(dtype=torch.int32, device=x.device).contiguous()
     if slot_of_pos.dtype != torch.int32 or not slot_of_pos.is_contiguous():
         slot_of_pos = slot_of_pos.to(dtype=torch.int32, device=x.device).contiguous()
-    if out is None or out.shape != (tokens, w.n) or out.dtype != act_dtype \
-            or out.device != x.device:
+    # ``out`` 的 dtype 由调用方定，与 :func:`moe_grouped_i8` 同一条理由：int8 输入时
+    # 上游给的可能是 bf16 目的地，而 fp32 会一路漏到 EP 的 p2p 归约上（那个核只收
+    # bf16，报「p2p combine needs bf16, got torch.float32」）。
+    if out is None or out.shape != (tokens, w.n) or out.device != x.device \
+            or out.dtype not in (torch.bfloat16, torch.float32):
         out = torch.empty((tokens, w.n), dtype=act_dtype, device=x.device)
     module.moe_grouped_i8_merge_tokens(xq, xs, w.wq, w.scale, bounds, row_weight,
                                        slot_pos, slot_of_pos, int(tokens), int(top_k),
@@ -2480,6 +2575,8 @@ _NATIVE: dict[str, OpFn] = {
     "rms_norm_gated": rms_norm_gated,
     "kv_quant": kv_quant,
     "silu_mul": silu_mul,
+    "silu_mul_quant": silu_mul_quant,
+    "gather_quant_i8": gather_quant_i8,
     "rope_apply": rope_apply,
     "attn_decode": attn_decode,
     "attn_paged": attn_paged,

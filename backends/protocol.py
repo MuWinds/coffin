@@ -62,6 +62,8 @@ _OP_NAMES: tuple[str, ...] = (
     "rms_norm_gated",
     "kv_quant",
     "silu_mul",
+    "silu_mul_quant",     # 同上，外加把乘积按行量化，喂给下游的 int8 投影
+    "gather_quant_i8",    # 按索引取行 + 按行量化，一次启动
     "rope_apply",
     # int8 KV cache 上的全注意力。
     "attn_decode",
@@ -295,6 +297,15 @@ class Ops:
     #: 乘积写回 ``up`` 那一半，反正后面没人再读它——这也是为什么缓冲区参数是显式的，
     #: 而不是让条目返回一个新张量。
     silu_mul: OpFn | None = None
+    #: ``silu_mul_quant(gate, up, out, out_q, out_s) -> out``：同一件事，外加把乘积按
+    #: 行量化成 int8（``out_q`` + 逐行 ``out_s``）。下游是 int8 投影时用它，省掉一次
+    #: 「把 bf16 乘积写回去、再由量化核读回来算 absmax」的往返。``out`` 仍按 bf16
+    #: 落盘，amax 就是按落盘的 bf16 算的，所以与拆成两步逐位相同。
+    silu_mul_quant: OpFn | None = None
+    #: ``gather_quant_i8(x, index, out_q, out_s) -> None``：按 ``index`` 取 ``x`` 的行
+    #: 并就地量化。替掉 ``index_select`` + ``quant_act_i8``：中间结果留在共享内存里，
+    #: 不需要为 ``[rows, K]`` 的 bf16 付一次写回与一次读回。
+    gather_quant_i8: OpFn | None = None
     #: ``rope_apply(q, k, cos, sin, q_out, k_out, rotary_dim) -> q_out``：把每个
     #: q/k 头的前 ``rotary_dim`` 个通道按该位置的角旋转，尾部
     #: ``head_dim - rotary_dim`` 个通道原样拷过。
