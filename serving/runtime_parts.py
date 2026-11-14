@@ -1104,7 +1104,7 @@ class RuntimeChatMixin:
             return {"ok": True, "total_us": round(total / n, 1),
                     "launches": None if launch is None else launch // n,
                     "listed": len(rows), "all": len(ka),
-                    "rows": [{"kernel": r.key[:60], "calls": r.count // n,
+                    "rows": [{"kernel": r.key[:120], "calls": r.count // n,
                               "us": round(_self_device_us(r) / n, 1),
                               "pct": round(100 * _self_device_us(r) / max(total, 1e-9), 1)}
                              for r in rows]}
@@ -1163,6 +1163,14 @@ class RuntimeChatMixin:
         bs = int(getattr(getattr(pc, "pool", None), "bs", 0) or 0)
         Path(out_dir).mkdir(parents=True, exist_ok=True)
         t0 = time.time()
+        # ``profile`` 只为一件事存在：预填充的逐内核归因。``profile`` op 量的是解码，
+        # 而预填充的 M、分块边界与流水等待在解码上都不出现。窗口包住整次
+        # ``pc.prefill``，所以它同时含「算」和「等对端」两段——两者的比例正是要看的东西。
+        prof = None
+        if req.get("profile"):
+            prof = torch.profiler.profile(
+                activities=profiler_activities(device=True))
+            prof.start()
         # 预填充就是一条路：prompt 多长就按多长跑，不做补齐、不做拒绝。
         # 实测（6038 之后的多轮）补齐后的状态与原始状态并不相同：KV 的量化尺度是
         # 按整块算的，往尾巴塞填充 token 会把真实位置的重化分范围一起改掉，等于
@@ -1170,6 +1178,26 @@ class RuntimeChatMixin:
         # _pd_decode_batch 里改走 model._assign_row_table），与长度无关。
         logits = pc.prefill(tokens)
         t_pre = time.time() - t0
+        report = None
+        if prof is not None:
+            prof.stop()
+            sync()
+            ka = prof.key_averages()
+            total = sum(_self_device_us(r) for r in ka)
+            launch = next((r.count for r in ka
+                           if r.key.endswith("cudaLaunchKernel")), None)
+            rows = sorted(ka, key=_self_device_us, reverse=True)[:16]
+            report = {"total_us": round(total, 1),
+                      "launches": launch,
+                      "rows": [{"kernel": r.key[:120], "calls": r.count,
+                                "us": round(_self_device_us(r), 1)}
+                               for r in rows]}
+            print(f"[ppprof] rank={rank} n={int(os.environ.get('WORLD_SIZE', 1))} "
+                  f"pf_ms={t_pre * 1e3:.1f} launches={launch} total_us={total:.0f}",
+                  flush=True)
+            for row in report["rows"]:
+                print(f"[ppprof] {row['us']:9.1f}us calls={row['calls']:5d} "
+                      f"{row['kernel']}", flush=True)
         t1 = time.time()
         state = pc.export_state()
         path = Path(out_dir) / f"rank{rank}.pt"
@@ -1198,7 +1226,8 @@ class RuntimeChatMixin:
                 "top1_val": float(logits.max()),
                 "prefill_ms": round(t_pre * 1000, 1),
                 "export_ms": round(t_exp * 1000, 1),
-                "state_bytes": int(path.stat().st_size)}
+                "state_bytes": int(path.stat().st_size),
+                "profile": report}
 
     def _pd_decode(self, req: dict) -> dict:
         """解码端：装回预填充端给的状态，然后接着解码。
@@ -1712,3 +1741,4 @@ class RuntimeChatMixin:
                 "host_us_per_step": round(sum(host) / max(len(host), 1), 1),
                 "dev_us_per_step": round(sum(dev) / max(len(dev), 1), 1),
                 "raw": [[round(h, 1), round(d, 1)] for h, d in zip(host, dev)]}
+

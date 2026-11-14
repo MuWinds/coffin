@@ -48,6 +48,19 @@ from w4a8_weights import W4A8MoEWeight, W4A8Weight
 #: 同一块卡上扫出来的门限，本族每专家宽度更窄（512 对 640），只会更早转入 GEMM。
 _GEMM_ROWS = 64
 
+#: 「按专家跨行」预填充核的启用门限（激活行数）。低于它时每专家只有一两行，跨行复用
+#: 换不到东西，逐行核（块与行一一对应）反而更省地址运算；高于它时权重按行重读的放大
+#: 已经超过一切固定成本——512 token 的预填充块 = 4096 行、每专家 16 行，就是 16 倍的
+#: 权重流量。256 行（32 token）是两种几何的交叉点。
+_EXPERT_ROW_MIN = 256
+
+#: 「按专家跨行」核每步沿 K 走 32 条通道 x 16 字节 = 512，所以两个投影的 K 必须是它的整数倍
+#: （本族 2048 / 512）。不满足时不接这个入口，回到逐行核——那条路对任意 K 都成立。
+_EXPERT_K_ALIGN = 512
+
+#: 张量核版的专家核按 64 行 / 64 k 分片，所以只要求 K 是 64 的整数倍（比 dp4a 版宽松）。
+_EXPERT_TCU_ALIGN = 64
+
 
 def _fuse_experts(sd: dict, p: str, num_experts: int):
     """把 256 个逐专家投影融合成两整栈，并删掉 state dict 里的源条目。
@@ -254,6 +267,24 @@ class SparseMoE:
         self._grouped_i8 = (getattr(bops, "moe_grouped_i8", None)
                             if ("moe_grouped_i8" in native
                                 and isinstance(self.gate_up, QWeightMoE)) else None)
+        #: 预填充那一档的入口：按专家切块、把他的行一趟扫完，权重每层每专家只读一遍。
+        #: 只在 **nk 原生**栈上接（``layout == "nk"``）：那个核是一条线程认领一整列，
+        #: 要求 K 在这一列里连续；kn 栈要走它得先付一份整模型的转置副本。
+        self._grouped_i8_expert = (getattr(bops, "moe_grouped_i8_expert", None)
+                                   if ("moe_grouped_i8_expert" in native
+                                       and isinstance(self.gate_up, QWeightMoE)
+                                       and self.gate_up.layout == "nk"
+                                       and self.hidden % _EXPERT_K_ALIGN == 0
+                                       and self.inter % _EXPERT_K_ALIGN == 0) else None)
+        #: 同一个「按专家跨行」形态、但把专家 GEMM 交给张量核。同一张卡同一形状上实测
+        #: 19.2 TMAC/s 对 dp4a 的 0.96，预填充的 4000 tps 只能靠这条；入口缺席时上面的
+        #: dp4a 版本仍然是正确的结果，只是慢。
+        self._grouped_i8_tcu = (getattr(bops, "moe_grouped_i8_tcu", None)
+                                if ("moe_grouped_i8_tcu" in native
+                                    and isinstance(self.gate_up, QWeightMoE)
+                                    and self.gate_up.layout == "nk"
+                                    and self.hidden % _EXPERT_TCU_ALIGN == 0
+                                    and self.inter % _EXPERT_TCU_ALIGN == 0) else None)
         #: int8 栈的**归并**入口：down 的输出对单条解码来说要的是 top_k 行加权之和，
         #: 让归约核顺手做完，省掉一轮 ``[top_k, H]`` 激活往返（见 :meth:`_experts`）。
         self._grouped_i8_merge = (getattr(bops, "moe_grouped_i8_merge", None)
@@ -357,6 +388,12 @@ class SparseMoE:
         sd_proj = getattr(self.shared_down, "g", self.shared_down)
         sd = getattr(sd_proj, "q", None)
         if not isinstance(self.gate_up, QWeightMoE) or sg is None or sd is None:
+            self._block_driver = None
+            return
+        if self.gate_up.layout != "kn":
+            # nk 原生栈上 ``wq`` 是一次**整栈转置**（40 层 32 GB、每段 16 GB）。这条
+            # 整块驱动只服务单流解码，而 PP2 的预填充根本不进它；为一个用不到的路由
+            # 常驻一份和权重等大的副本，等于把一张 32 GB 的卡撑爆。
             self._block_driver = None
             return
         router_w = self.router.w
@@ -560,9 +597,15 @@ class SparseMoE:
             offsets, slot_pos, token_of_pos, slot_of_pos = self._dispatch(
                 flat_index, self._expert_table(flat_index.device), flat_index.numel(),
                 self.local_experts, self.num_experts, top_k)
-            if (grouped_i8 is not None and self._gather_quant is not None
+            rows = int(token_of_pos.numel())
+            # 预填充那一档（每专家十几行）换「按专家跨行」核：它把该专家的行一趟扫完，
+            # 权重每层每专家只读一遍。行数少（decode 的 1-2 行）时逐行核才是最优的。
+            expert_rows = (rows >= _EXPERT_ROW_MIN
+                           and (self._grouped_i8_tcu is not None
+                                or self._grouped_i8_expert is not None))
+            if ((grouped_i8 is not None or expert_rows) and self._gather_quant is not None
                     and self._silu_quant is not None
-                    and self._merge_tokens is not None):
+                    and (expert_rows or self._merge_tokens is not None)):
                 # 整条链上不再出现单独的量化发射：取行与量化合成一次、SwiGLU 乘积与
                 # 量化合成一次，两次分组投影直接吃 int8 激活。gate/up 的输出仍按 bf16
                 # 落盘（``silu_mul_quant`` 的 amax 就是按落盘的 bf16 算的），所以与
@@ -570,13 +613,37 @@ class SparseMoE:
                 # 逐位相同；省下的是每层 5 次启动，以及 ``[rows, K]`` bf16 中间结果的
                 # 一写一读。
                 xq, xs = self._gather_quant(x, token_of_pos)
-                rows = int(token_of_pos.numel())
                 gu = self._act_buf(rows, 2 * self.inter, x.dtype, x.device)
-                gate_up = self._grouped_i8(self.gate_up, xq, offsets, 0, xs, gu)
+                grouped = ((self._grouped_i8_tcu or self._grouped_i8_expert)
+                           if expert_rows else self._grouped_i8)
+                gate_up = grouped(self.gate_up, xq, offsets, 0, xs, gu)
                 gate, up = gate_up.chunk(2, dim=-1)
                 act = self._act_buf(rows, self.inter, x.dtype, x.device)
                 act, aq, a_s = self._silu_quant(gate, up, act)
                 out = self._act_buf(tokens, self.hidden, x.dtype, x.device)
+                if expert_rows:
+                    # down 也走同一个核，收尾用一次 ``index_add_``：它搬的是
+                    # rows x H 的激活（16 MB），相对 down 那份 268 MB 的权重流量可以忽略。
+                    # ``merge_tokens`` 那条路是逐行分块核的收尾，吃不到这里的跨行复用。
+                    hid = self._act_buf(rows, self.hidden, x.dtype, x.device)
+                    grouped(self.down, aq, offsets, 0, a_s, hid)
+                    # 收尾按 token **收集**再归约，而不是 ``index_add_`` 散写。
+                    # 实测（2048 token 一块、每卡 rows=4096）那一对
+                    # ``hid * w`` + ``index_add_`` 在 20 层上是 167 ms：``indexFuncLargeIndex``
+                    # 走的是带原子加的散写，对 16 MB 的激活只有几十 GB/s，而这一步的总流量
+                    # 按带宽算只要几毫秒。``slot_pos`` 是 [tokens, top_k] 的行号，先
+                    # ``index_select`` 成 [tokens, top_k, H]（整行连续读）再在 k 上求和，
+                    # 两个方向都是稠密访存。
+                    sl = slot_pos.reshape(-1)
+                    if sl.numel() == rows:
+                        g = hid.index_select(0, sl).view(tokens, top_k, self.hidden)
+                        g.mul_(weights.reshape(tokens, top_k)[:, :, None])
+                        out.copy_(g.sum(1))
+                        return self._reduce(out, x.dtype)
+                    out.zero_()
+                    out.index_add_(0, token_of_pos.long(),
+                                   hid * weights.reshape(-1)[:, None])
+                    return self._reduce(out, x.dtype)
                 return self._reduce(
                     self._merge_tokens(self.down, aq, offsets, weights.reshape(-1),
                                        slot_pos, slot_of_pos, tokens, top_k,

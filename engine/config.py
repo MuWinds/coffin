@@ -48,7 +48,14 @@ class EngineConfig:
     #: 其实是缓存那笔显存预算的另一种写法。
     snapshots: int = 8
     #: 每 N 个 token 打一次快照（向上取整到整块）。
-    snapshot_interval: int = 512
+    #:
+    #: 它同时是**一次 ``prefill`` 调用能拿到的 token 数**的上限：``model_runner`` 用
+    #: ``max(block_size, 本值 / block_size * block_size)`` 分段，段长就是那次调用的 M。
+    #: 所以这个数字直接决定预填充的权重摊薄倍数——一轮 MoE 摊到 256 个专家后，专家
+    #: 权重只在段内复用，每 token 的权重流量与段长成反比。512 时每专家十几行、一层
+    #: 805 MB 的权重只服务 512 个 token；2048 时每专家 64 行，正好填满张量核的 64 行
+    #: 分片，同一份权重服务 4 倍 token。快照本身因此变少（每段一个），显存更省。
+    snapshot_interval: int = 2048
     #: 每个投机步的草稿数（0 = 关闭）。需要 checkpoint 里带 MTP 头。
     spec_k: int = 0
     #: 允许在*批处理*引擎里做投机。默认关闭：批处理的验证每个候选 token 都要

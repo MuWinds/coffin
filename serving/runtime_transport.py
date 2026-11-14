@@ -20,6 +20,8 @@ import socket
 import threading
 import time
 
+import torch
+
 import backends
 
 from .runtime_service import Server
@@ -211,7 +213,10 @@ def serve(model_dir: str, max_seq: int, bench: bool, sock_path: str,
           f"{' (batched)' if srv_model.cfg.spec_batch else ''}"
           f"  max_seconds={max_seconds or 'none'}"
           f"  vision={'off' if not srv_model.vision else ('int8' if srv_model.vision_int8 else 'fp16')}"
-          f" (max {srv_model.image_max_pixels} px, {srv_model.max_images} imgs)",
+          f" (max {srv_model.image_max_pixels} px, {srv_model.max_images} imgs)"
+          # 权重账：专家栈的布局（kn / nk 原生）会差出一整份转置副本，而那张卡只有
+          # 31.7 GiB——记一行，下一回 OOM 时不必再猜是谁占的。
+          f"  gpu_after_load={torch.cuda.memory_allocated() / 2**30:.2f}GiB",
           flush=True)
     if tp is not None and tp[0] != 0:
         _tp_worker(srv_model, tp[2])

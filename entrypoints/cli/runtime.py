@@ -57,8 +57,10 @@ def main() -> None:
     ap.add_argument("--snapshots", type=int, default=8,
                     help="recurrent-state snapshot budget (~50 MB each); the join "
                          "points a later request can reuse")
-    ap.add_argument("--snapshot-interval", type=int, default=512,
-                    help="snapshot every N tokens (rounded to a block)")
+    ap.add_argument("--snapshot-interval", type=int, default=2048,
+                    help="snapshot every N tokens (rounded to a block). This is also "
+                         "the most tokens one prefill call gets, so it sets how thinly "
+                         "the MoE expert weights are amortised per token")
     ap.add_argument("--fp16", dest="int8", action="store_false",
                     help="keep the 2D weights in fp16 instead of int8: ~4 GiB more VRAM "
                          "and a slower decode, in exchange for ~0.3%% better perplexity "

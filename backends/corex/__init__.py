@@ -863,6 +863,143 @@ def moe_grouped_i8(w, x: torch.Tensor, offsets: torch.Tensor,
     return out if x.dtype == torch.int8 else _restore(out, dtype)
 
 
+def moe_grouped_i8_expert(w, x: torch.Tensor, offsets: torch.Tensor, slices: int = 0,
+                          scales: torch.Tensor | None = None,
+                          out: torch.Tensor | None = None) -> torch.Tensor:
+    """按专家分组做 int8 投影，**一个专家一趟**地把它那些行一起算完。
+
+    与 :func:`moe_grouped_i8` 的算术逐位相同（int32 部分和、最后一次性乘激活与权重两个
+    scale），差别只在并行切法：那个入口的块与激活行一一对应，一行一个块，于是一层
+    805 MB 的专家权重会被按行重读。decode 每专家 1-2 行时那是最优；预填充一个 512 token
+    的块摊到 256 个专家是每专家 16 行，权重流量放大 16 倍（实测单次 10.6 ms、700 GB/s，
+    带宽已经打满，只是全花在重复字节上）。这里按专家切块，行在块内成趟复用权重。
+
+    只接受 **nk 原生**专家栈（``[E, N, n]``，一列的 K 连续）：这条几何是一条线程认领
+    一整列、一个 32 字节步铺满一个扇区，kn 栈要先转置一份整模型的副本才谈得上。
+
+    Args:
+        w: int8 专家栈，:class:`~int8_weights.QWeightMoE`，``layout == "nk"``。
+        x: 激活，``[tokens, K]``，已按专家号排序；int8 时必须同时给出 ``scales``。
+        offsets: ``[E+1]`` 前缀和，int32 或 int64。
+        slices: 与 :func:`moe_grouped_i8` 同形保留，本形态忽略（并行度来自列块 x 专家）。
+        scales: 逐行激活 scale，``[tokens]`` fp32。
+        out: 可选目的地，``[tokens, N]``。
+
+    Returns:
+        ``[tokens, N]``，dtype 同 ``x``（int8 输入时为 fp32）。
+
+    Raises:
+        ValueError: 权重不是 nk 布局，或激活、前缀和与权重不自洽。
+    """
+    module = _kernels()
+    if getattr(w, "layout", "kn") != "nk":
+        raise ValueError("moe_grouped_i8_expert needs an nk-native expert stack [E, N, K]")
+    if x.dim() != 2 or x.shape[-1] != w.k:
+        raise ValueError("grouped MoE expects [tokens, K] activations")
+    if int(offsets.numel()) != len(w) + 1:
+        raise ValueError(f"offsets must have {len(w) + 1} entries")
+    tokens = x.shape[0]
+    dtype = x.dtype
+    if tokens == 0:
+        return torch.empty((0, w.n), dtype=dtype, device=x.device)
+
+    if x.dtype == torch.int8:
+        if scales is None:
+            raise ValueError("int8 activations need their per-row scales")
+        xq, xs = x, scales
+        act_dtype = torch.float32
+    else:
+        act_dtype = x.dtype if x.dtype in (torch.bfloat16, torch.float32) else torch.float32
+        act = x if x.dtype == act_dtype else x.float()
+        if act.shape != (tokens, w.k) or not act.is_contiguous():
+            act = act.reshape(tokens, w.k).contiguous()
+        xq, xs = _moe_scratch(tokens, w.k, act.device)
+        module.quant_act_i8(act, xq, xs)
+
+    if out is None or out.shape != (tokens, w.n) or out.device != x.device \
+            or out.dtype not in (torch.bfloat16, torch.float32):
+        out = torch.empty((tokens, w.n), dtype=act_dtype, device=x.device)
+    if offsets.dtype == torch.int32 and offsets.is_contiguous():
+        bounds = offsets
+    else:
+        bounds = offsets.to(dtype=torch.int32, device=x.device).contiguous()
+    # ``nk_stack()`` 在 nk 原生栈上是零拷贝：直接就是 checkpoint 里那一份。
+    module.moe_grouped_i8_expert(xq, xs, w.nk_stack(), w.scale, bounds, out)
+    return out if x.dtype == torch.int8 else _restore(out, dtype)
+
+
+def moe_grouped_i8_tcu(w, x: torch.Tensor, offsets: torch.Tensor, slices: int = 0,
+                       scales: torch.Tensor | None = None,
+                       out: torch.Tensor | None = None) -> torch.Tensor:
+    """按专家分组、但把专家 GEMM 交给**张量核**的 int8 投影。
+
+    与 :func:`moe_grouped_i8_expert` 的算术逐位相同，差别在算力：同一张卡上同一形状
+    （4096 x 2048 -> 1024）实测 ``moe_grouped_i8_expert`` 8.99 ms（0.96 TMAC/s，dp4a
+    的天花板），而稠密 ``w8a8_gemm_tcu`` 只要 0.446 ms（19.2 TMAC/s）。PP2 预填充要
+    4000 tps，每卡需要约 2 TMAC/s，所以预填充必须走这条。
+
+    nk 原生栈在这里**不需要转置**：内核把两个操作数互换（mat-a 吃激活、mat-b 吃权重），
+    于是 ``[E, N, K]`` 里「固定 n 的 4 个相邻 k 连续」正好是 mat-b 要的字。代价是激活
+    要按 k 主序再摆一份，即下面那次 ``t().contiguous()``。
+
+    Args:
+        w: int8 专家栈，:class:`~int8_weights.QWeightMoE`，``layout == "nk"``。
+        x: 激活，``[tokens, K]``，已按专家号排序；int8 时必须同时给出 ``scales``。
+        offsets: ``[E+1]`` 前缀和，int32 或 int64。
+        slices: 保留同形，本形态忽略。
+        scales: 逐行激活 scale，``[tokens]`` fp32。
+        out: 可选目的地，``[tokens, N]``。
+
+    Returns:
+        ``[tokens, N]``，dtype 同 ``x``。
+
+    Raises:
+        ValueError: 权重不是 nk 布局，或 K 不是 64 的整数倍。
+    """
+    module = _kernels()
+    if getattr(w, "layout", "kn") != "nk":
+        raise ValueError("moe_grouped_i8_tcu needs an nk-native expert stack [E, N, K]")
+    if w.k % 64 != 0:
+        raise ValueError("moe_grouped_i8_tcu needs K to be a multiple of 64")
+    if x.dim() != 2 or x.shape[-1] != w.k:
+        raise ValueError("grouped MoE expects [tokens, K] activations")
+    if int(offsets.numel()) != len(w) + 1:
+        raise ValueError(f"offsets must have {len(w) + 1} entries")
+    tokens = x.shape[0]
+    dtype = x.dtype
+    if tokens == 0:
+        return torch.empty((0, w.n), dtype=dtype, device=x.device)
+
+    if x.dtype == torch.int8:
+        if scales is None:
+            raise ValueError("int8 activations need their per-row scales")
+        xq, xs = x, scales
+        act_dtype = torch.float32
+    else:
+        act_dtype = x.dtype if x.dtype in (torch.bfloat16, torch.float32) else torch.float32
+        act = x if x.dtype == act_dtype else x.float()
+        if act.shape != (tokens, w.k) or not act.is_contiguous():
+            act = act.reshape(tokens, w.k).contiguous()
+        xq, xs = _moe_scratch(tokens, w.k, act.device)
+        module.quant_act_i8(act, xq, xs)
+
+    if out is None or out.shape != (tokens, w.n) or out.device != x.device \
+            or out.dtype not in (torch.bfloat16, torch.float32):
+        out = torch.empty((tokens, w.n), dtype=act_dtype, device=x.device)
+    if offsets.dtype == torch.int32 and offsets.is_contiguous():
+        bounds = offsets
+    else:
+        bounds = offsets.to(dtype=torch.int32, device=x.device).contiguous()
+    # 激活按 k 主序再摆一份：内核的 mat-a 字是「同 k 的 4 个相邻行」。这份拷贝是
+    # 每投影一次（8 MB 量级），相对于省下的算力可以忽略。
+    # 用分块转置核而不是 ``xq.t().contiguous()``：后者实测只有 15.7 GB/s，占掉张量核
+    # 那条路两成的时间。
+    at = torch.empty((w.k, tokens), dtype=torch.int8, device=x.device)
+    module.transpose_i8(xq, at)
+    module.moe_grouped_i8_tcu(at, xs, w.nk_stack(), w.scale, bounds, out)
+    return out if x.dtype == torch.int8 else _restore(out, dtype)
+
+
 def gather_quant_i8(x: torch.Tensor, index: torch.Tensor,
                     out_q: torch.Tensor | None = None,
                     out_s: torch.Tensor | None = None):

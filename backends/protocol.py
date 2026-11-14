@@ -189,7 +189,32 @@ class Ops:
     #: 会让「哪一套算术」变成运行期才知道的事。
     #:
     #: ``None`` 表示后端没有 int8 分组内核，模型侧退回逐专家的 ``linear``。
-    moe_grouped_i8: OpFn | None = None    #: ``moe_dispatch(expert_idx, local_table, slots, local_experts, num_experts,
+    moe_grouped_i8: OpFn | None = None
+    #: ``moe_grouped_i8_expert(w, x, offsets, slices=0, scales=None, out=None) -> y``：
+    #: 预填充形态的 int8 分组投影，``w`` 是**nk 原生**专家栈 ``[E, N, K]``。
+    #:
+    #: 算术与 :attr:`moe_grouped_i8` 逐位相同，差别只在并行切法：那个入口的块与激活行
+    #: 一一对应，decode（每专家一行）时最优；预填充每专家有 ``tokens*top_k/E`` 行
+    #: （512 token 一个块 = 每专家 16 行），同一份权重就被按行重读那么多遍——一层两个
+    #: 投影从 805 MB 变成 12.9 GB。这个入口按专家切块、把该专家的行一次扫完。
+    #:
+    #: ``slices`` 只为与 :attr:`moe_grouped_i8` 同一个调用形状而留着，实现可以忽略：
+    #: 并行度来自「列块 x 专家」，不需要沿 K 再切。``None`` 表示后端没有这一形态，
+    #: 模型侧退回 :attr:`moe_grouped_i8`。
+    moe_grouped_i8_expert: OpFn | None = None
+    #: ``moe_grouped_i8_tcu(w, x, offsets, slices=0, scales=None, out=None) -> y``：
+    #: 与 :attr:`moe_grouped_i8_expert` 同一算术（逐位相同）、同一调用形状，差别只在
+    #: **算力**——这个入口把专家 GEMM 交给张量核。
+    #:
+    #: 为什么非它不可：同一张卡、同一形状（4096 x 2048 -> 1024）上，dp4a 那条路实测
+    #: 8.99 ms（0.96 TMAC/s，已经贴着 SIMT int8 的天花板），稠密张量核只要 0.446 ms
+    #: （19.2 TMAC/s）。PP2 预填充要 4000 tps，每卡需要约 2 TMAC/s，只有后者够。
+    #:
+    #: 它同样只吃 **nk 原生**栈 ``[E, N, K]``：实现里把 mat-a/mat-b 互换，nk 的
+    #: 「固定 n 的 4 个相邻 k 连续」正好是 mat-b 要的字，一次转置都不做（激活另摆一份
+    #: k 主序副本的代价由后端自己承担）。``None`` 表示后端没有这一形态。
+    moe_grouped_i8_tcu: OpFn | None = None
+    #: ``moe_dispatch(expert_idx, local_table, slots, local_experts, num_experts,
     #: top_k) -> (offsets, slot_pos, token_of_pos)``：一次内核算出分组要的前缀和与行序。
     #:
     #: 存在的理由是把「路由结果 → 分组偏移」这段从十来个 torch 小算子压成一次发射。

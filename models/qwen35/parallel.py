@@ -941,11 +941,20 @@ def load_weights(model_dir: str | Path, device: torch.device,
                 # 805 MB、40 层 32 GB，先读进来再切会把一张 31.7 GiB 的卡撑爆，而
                 # 这也正是「连续切专家」而不是「交错切」的理由（见 expert_range）。
                 ep_slice = (parallel.mode == "ep" and meta["kind"] == "q8-moe")
+                # 专家栈在盘上有两种落盘形态：kn 原生 ``[E, K, N]``，以及 nk 原生
+                # ``[E, N, K]``（``nkfull`` 产物把后者单独存在 ``#nk`` 键上，前者也留着）。
+                # ``COFFIN_MOE_STACK=nk`` 时读 nk 那一份：预填充走的就是 nk 几何，栈本身
+                # 即所需，省掉在内存里为整模型转置一份副本（40 层 = 32 GB，一张卡装不下
+                # 两份）。键必须在**读盘前**挑好——先读 kn 再读 nk 等于把 63 GB 读两遍。
+                read_key = key
+                if meta["kind"] == "q8-moe" and "nk_key" in meta \
+                        and os.environ.get("COFFIN_MOE_STACK", "kn") == "nk":
+                    read_key = meta["nk_key"]
                 if ep_slice:
                     lo, hi = parallel.expert_range(int(cfg["num_experts"]))
-                    value = handle.get_slice(key)[lo:hi]
+                    value = handle.get_slice(read_key)[lo:hi]
                 else:
-                    value = handle.get_tensor(key)
+                    value = handle.get_tensor(read_key)
                 kind = meta["kind"]
                 if kind == "q4":
                     scale = handle.get_tensor(meta["scale_key"])
@@ -957,19 +966,24 @@ def load_weights(model_dir: str | Path, device: torch.device,
                     # 下面的 "else"，被当成稠密张量原样搬到设备——形状合法、MoE 一跑
                     # 就 mat1/mat2 形状不匹配，而引擎把那次异常当成「这一步没产出」，
                     # 原地空转到看门狗报 KV pool 太小。
+                    # 布局由读盘时挑的键决定：``#nk`` 那份是 ``[E, N, K]``，另一份是
+                    # ``[E, K, N]``；两种都要按各自的 shape 校验，混着比会把 1024 当 K。
+                    nk_native = read_key != key
+                    wshape = list(meta["nk_shape"]) if nk_native else meta["shape"]
                     if ep_slice:
                         scale = handle.get_slice(meta["scale_key"])[lo:hi]
-                        expect = (hi - lo, *meta["shape"][1:])
+                        expect = (hi - lo, *wshape[1:])
                         if tuple(value.shape) != expect:
                             raise ValueError(
                                 f"{key}: expert slice shape {tuple(value.shape)} "
                                 f"does not match {expect}")
                     else:
                         scale = handle.get_tensor(meta["scale_key"])
-                        if (list(value.shape) != meta.get("shape")
+                        if (list(value.shape) != wshape
                                 or list(scale.shape) != meta.get("scale_shape")):
                             raise ValueError(f"{key}: moe int8 stack shape mismatch")
-                    value = QWeightMoE(value, scale, k=int(meta["k"]))
+                    value = QWeightMoE(value, scale, k=int(meta["k"]),
+                                       layout="nk" if nk_native else "kn")
                 elif kind == "q8":
                     # 盘上 int8 是 ``[K, N]`` 加逐输出列的 fp32 scale；``from_kn`` 只
                     # 取一个转置视图，不复制也不转置，所以这一趟仍然是「读文件、装箱」。
@@ -985,8 +999,13 @@ def load_weights(model_dir: str | Path, device: torch.device,
                 elif isinstance(value, QWeight):
                     value = QWeight(value.wq.to(device), value.scale.to(device))
                 elif isinstance(value, QWeightMoE):
-                    value = QWeightMoE(value.wq.to(device), value.scale.to(device),
-                                       k=value.k)
+                    # 搬去设备时必须**保住布局**：nk 原生栈上 ``wq`` 是一次整栈转置
+                    # （每层 805 MB），用它重建等于把省掉的那份副本又造回来，还会把栈
+                    # 换成 kn，预填充的 nk 核随之消失、运行时再按层转一次（一张 31.7 GiB
+                    # 的卡上就是 20 层 16 GB 的 OOM）。
+                    raw = value.nk_stack() if value.layout == "nk" else value.wq
+                    value = QWeightMoE(raw.to(device), value.scale.to(device),
+                                       k=value.k, layout=value.layout)
                 else:
                     value = value.to(device)
                 sd[key] = value

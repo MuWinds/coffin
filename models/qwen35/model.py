@@ -727,11 +727,21 @@ class Qwen35:
             ctx = (self.cos_tbl, self.sin_tbl, self.mask_idx)
             # 块宽按段间载荷定：C 行 hidden 是 C*H*4 字节，C=512 时 4 MB，接收缓冲
             # （32 MB）装得下整批分片，不用等对端边收边放。
-            step = max(1, min(int(chunk), 512))
+            #
+            # 上限从 512 抬到 2048：**这是预填充吞吐的主开关**。一个块摊到 256 个专家
+            # 是每专家 ``C*top_k/256`` 行，专家权重只在块内复用，所以每 token 的权重
+            # 流量与块宽成反比——C=512 时每专家 16 行，一层 805 MB 的权重只服务 512
+            # 个 token；C=2048 时每专家 64 行，同一份权重服务 4 倍 token。实测（PP2、
+            # 512 token 一块）rank0 每块 layers ≈ 500 ms，八块就是 4 s。
+            # 载荷按 32 MB 核算：2048 行 x 2048 x 4 B = 16 MB，接收缓冲仍装得下整批。
+            # 多块路径实测已通（4096 token 的 prompt 就是八块，输出正常）。
+            step = max(1, min(int(chunk), 2048))
             comm_before = self.pipe.comm_calls
             last_row = None
             for c0 in range(0, n, step):
                 c1 = min(c0 + step, n)
+                _cc = self.pipe.comm_calls
+                _cs = self.pipe.comm_s
                 if self.pipe.rank == 0:
                     x = self.embed.lookup(toks[c0:c1])
                 else:
@@ -746,9 +756,12 @@ class Qwen35:
                 if nxt < self.pipe.world_size:
                     self.pipe.relay(x, nxt)
                 if os.environ.get("COFFIN_PREFILL_TRACE") == "1":
+                    # 逐块的「算」与「等」必须分开看：两者在墙钟上是同一副面孔，而
+                    # 只有分开才知道该加块宽还是该改段间协议。
                     print(f"[pp-prefill] rank={self.pipe.rank} n={n} c=[{c0},{c1}) "
-                          f"layers={_tlayers:.1f}ms comm={self.pipe.comm_calls}",
-                          flush=True)
+                          f"layers={_tlayers:.1f}ms "
+                          f"comm_ms={(self.pipe.comm_s - _cs) * 1e3:.1f} "
+                          f"comm_calls={self.pipe.comm_calls - _cc}", flush=True)
                 last_row = x[-1]
             if os.environ.get("COFFIN_PP_DEBUG"):
                 # 多块失步时唯一能定位的东西就是「每个 rank 各发/收了几次」。期望值：

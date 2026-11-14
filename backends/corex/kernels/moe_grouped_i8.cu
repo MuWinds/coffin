@@ -1237,6 +1237,188 @@ torch::Tensor moe_grouped_i8_merge(torch::Tensor a, torch::Tensor xs, torch::Ten
     return out;
 }
 
+// @brief 预填充的「一个专家一趟」核：nk 栈 ``[E, N, K]``，同一专家的全部行共用一次权重读取。
+//
+// 为什么需要它：``moe_grouped_i8`` 的块与激活行一一对应（blockIdx.y 是行），一行一个块
+// 只算一行，于是每个专家的权重会按**行**重读。decode 每专家 1-2 行时这就是最优；预填充
+// 一个 512 token 的块摊到 256 个专家是每专家 16 行，权重流量被放大 16 倍——一层两个投影
+// 805 MB 变成 12.9 GB。实测 ``moe_grouped_i8_kernel`` 单次 10.6 ms（约 700 GB/s，带宽
+// 已经打满，只是全部花在重复字节上），20 层 425 ms，占 PP2 预填充墙钟的八成。
+//
+// 这里把 ``blockIdx.y`` 从「行」换成「专家」：一个块把该专家那十几行按 8 行一趟扫完，
+// 权重只沿列读一次，激活按趟装进共享内存后在各行之间复用。块数是
+// ``ceil(N / (warps x WCOL)) x E``（gate_up 32 x 256、down 64 x 256），远多于这张卡
+// 的 16 个 SM，所以不需要再切 K 换并行度，也就没有分片缓冲与归约那一趟。
+//
+// 算术与 ``moe_grouped_i8`` 逐位一致：int32 累加、最后一次性乘两个 scale，
+// ``out[r, n] = xs[r] * ws[e, n] * sum_k a_q[r, k] * w[e, n, k]``。
+//
+// Constraints:
+//   * **一个 warp 认领一列**，32 条通道每步读同一列的 512 个连续字节。改成「一线程一列」
+//     会让相邻线程的地址相距 K 字节，一条 warp 指令被拆成 32 个扇区请求——实测
+//     gate_up 单次 14 ms（38 GB/s），比修之前的逐行核还慢。
+//   * 16 字节的 ``int4`` 读要求列起点与步长按 16 对齐，所以只接受 ``K % 512 == 0``
+//     （本族 K=2048/512）；用补齐凑整会把下一列的字节算进这一列。
+//   * 一列的结果要跨 32 条通道求和（每列每行 5 级 shfl），所以 K 越浅归约占比越高：
+//     ``down``（K=512）一趟只有 4 个 dp4a 却仍要 5 级 shfl，这是这条几何的固定成本。
+//   * ``rows >= offsets[E]`` 的行本来就不在任何专家的区间里（EP4 的无效尾行），专家循环
+//     天然不碰它们，所以 ``out`` 的尾行保持调用方写下的值。
+constexpr int I8_EXP_THREADS = 128;
+constexpr int I8_EXP_COLS = 8;
+
+//: 一趟覆盖的行数。一个 512 token 的预填充块摊到 256 个专家正好每专家 16 行，所以一趟
+//: 取 16 行才让每层每专家的权重真的只读一遍；取 8 行时 16 行被拆成两趟，权重读两遍
+//: （gate_up 实测 12.0 ms / 45 GB/s，而同一份 536 MB 整份读只要 3.3 ms）。
+constexpr int I8_EXP_MT = 16;
+
+//: 一个 warp 认领的列数。2 列让每通道的累加器压到 32 个 int32：4 列时要 64 个，
+//: 寄存器就顶到 96 以上，每 SM 只剩两个块。（列少则同一份激活要被更多列块重读，
+//: 但那份重读落在 L1/L2 里——同一专家的 32 KB 激活块在这张卡上会被十几条 warp 同时读。）
+constexpr int I8_EXP_WCOL = 2;
+
+//: 一步的 K 跨度 = 32 条通道 x 16 字节。
+constexpr int I8_EXP_STEPK = 512;
+
+template <typename XT>
+__global__ void moe_grouped_i8_expert_nk_kernel(const int8_t* __restrict__ a,
+                                                const int8_t* __restrict__ wn,
+                                                const float* __restrict__ ws,
+                                                const float* __restrict__ xs,
+                                                const int* __restrict__ offsets,
+                                                XT* __restrict__ out,
+                                                int K, int N) {
+    const int expert = (int)blockIdx.y;
+    const int r0 = offsets[expert];
+    const int r1 = offsets[expert + 1];
+    if (r0 >= r1) return;
+
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    const int warps = (int)(blockDim.x >> 5);
+    const int colbase = ((int)blockIdx.x * warps + warp) * I8_EXP_WCOL;
+    if (colbase >= N) return;
+    const int nc = min(I8_EXP_WCOL, N - colbase);
+
+    const int8_t* ebase = wn + (size_t)expert * (size_t)N * (size_t)K;
+
+    for (int rt = r0; rt < r1; rt += I8_EXP_MT) {
+        const int rows = min(I8_EXP_MT, r1 - rt);
+        int acc[I8_EXP_WCOL][I8_EXP_MT];
+#pragma unroll
+        for (int c = 0; c < I8_EXP_WCOL; ++c) {
+#pragma unroll
+            for (int m = 0; m < I8_EXP_MT; ++m) acc[c][m] = 0;
+        }
+
+        for (int kb = 0; kb < K; kb += I8_EXP_STEPK) {
+            const int k0 = kb + lane * 16;
+            int4 w[I8_EXP_WCOL];
+#pragma unroll
+            for (int c = 0; c < I8_EXP_WCOL; ++c) {
+                if (c < nc) {
+                    w[c] = *reinterpret_cast<const int4*>(
+                        ebase + (size_t)(colbase + c) * K + k0);
+                }
+            }
+            // 激活直接从全局读，不再经共享内存过一道：一趟 16 行要 32 KB 共享内存，
+            // 那会把每 SM 的常驻块压到 1 个（8 条 warp），延迟就藏不住——实测同一条
+            // 几何带共享内存只有 59 GB/s，而这份 16 行 x K 的激活块被同一专家的所有
+            // 列块重读，落在 L1/L2 里，不占 HBM。
+#pragma unroll
+            for (int m = 0; m < I8_EXP_MT; ++m) {
+                if (m < rows) {
+                    const int4 av = *reinterpret_cast<const int4*>(
+                        a + (size_t)(rt + m) * K + k0);
+#pragma unroll
+                    for (int c = 0; c < I8_EXP_WCOL; ++c) {
+                        if (c < nc) {
+                            acc[c][m] = __dp4a(w[c].x, av.x, acc[c][m]);
+                            acc[c][m] = __dp4a(w[c].y, av.y, acc[c][m]);
+                            acc[c][m] = __dp4a(w[c].z, av.z, acc[c][m]);
+                            acc[c][m] = __dp4a(w[c].w, av.w, acc[c][m]);
+                        }
+                    }
+                }
+            }
+        }
+
+#pragma unroll
+        for (int c = 0; c < I8_EXP_WCOL; ++c) {
+            if (c >= nc) continue;
+            const float wscale = ws[(size_t)expert * N + colbase + c];
+#pragma unroll
+            for (int m = 0; m < I8_EXP_MT; ++m) {
+                if (m < rows) {
+                    int v = acc[c][m];
+#pragma unroll
+                    for (int off = 16; off > 0; off >>= 1) {
+                        v += __shfl_down_sync(0xffffffffu, v, off);
+                    }
+                    if (lane == 0) {
+                        out[(size_t)(rt + m) * N + colbase + c] = CxScalar<XT>::from_float(
+                            (float)v * xs[rt + m] * wscale);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// @brief 上面那个核的主机入口；契约里叫 ``moe_grouped_i8_expert``。
+torch::Tensor moe_grouped_i8_expert(torch::Tensor a, torch::Tensor xs, torch::Tensor w,
+                                    torch::Tensor ws, torch::Tensor offsets,
+                                    torch::Tensor out) {
+    TORCH_CHECK(a.is_cuda() && a.dim() == 2 && a.scalar_type() == torch::kChar
+                && a.is_contiguous(), "activation must be contiguous CUDA int8 [tokens, K]");
+    TORCH_CHECK(xs.is_cuda() && xs.dim() == 1 && xs.scalar_type() == torch::kFloat
+                && xs.is_contiguous() && xs.size(0) == a.size(0),
+                "activation scale must be contiguous fp32 [tokens]");
+    TORCH_CHECK(w.is_cuda() && w.dim() == 3 && w.scalar_type() == torch::kChar
+                && w.is_contiguous(), "weight must be contiguous CUDA int8 [E, N, K]");
+    TORCH_CHECK(ws.is_cuda() && ws.dim() == 2 && ws.scalar_type() == torch::kFloat
+                && ws.is_contiguous(), "weight scale must be contiguous fp32 [E, N]");
+    TORCH_CHECK(offsets.is_cuda() && offsets.dim() == 1
+                && offsets.scalar_type() == torch::kInt && offsets.is_contiguous(),
+                "offsets must be contiguous CUDA int32 [E+1]");
+    TORCH_CHECK(out.is_cuda() && out.dim() == 2 && out.is_contiguous()
+                && out.size(0) == a.size(0),
+                "destination must be contiguous CUDA [tokens, N]");
+    TORCH_CHECK(out.scalar_type() == torch::kBFloat16 || out.scalar_type() == torch::kFloat,
+                "destination must be bf16 or fp32");
+
+    const int tokens = (int)a.size(0);
+    const int K = (int)a.size(1);
+    const int N = (int)out.size(1);
+    const int experts = (int)w.size(0);
+    TORCH_CHECK((int)w.size(1) == N && (int)w.size(2) == K,
+                "nk weight must be [E, N, K] matching activation and destination");
+    TORCH_CHECK((int)ws.size(0) == experts && (int)ws.size(1) == N,
+                "weight scale must be [E, N]");
+    TORCH_CHECK((int)offsets.size(0) == experts + 1, "offsets must have E+1 entries");
+    TORCH_CHECK(K > 0 && N > 0 && experts > 0, "sizes must be positive");
+    TORCH_CHECK(K % I8_EXP_STEPK == 0,
+                "prefilling grouped kernel needs K to be a multiple of 512");
+    if (tokens == 0) return out;
+
+    const c10::cuda::CUDAGuard guard(a.device());
+    const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    // 一个块 = 4 个 warp = 4 x WCOL 列；块小、不占共享内存，是为了让每 SM 常住的块数
+    // 由寄存器而不是共享内存决定（同一条几何带 32 KB 共享内存时只剩 1 个块 / 8 条 warp）。
+    const dim3 block(I8_EXP_THREADS);
+    const dim3 grid((unsigned)((N + I8_EXP_COLS - 1) / I8_EXP_COLS), (unsigned)experts);
+    auto launch = [&](auto tag) {
+        using XT = decltype(tag);
+        XT* dst = reinterpret_cast<XT*>(out.data_ptr());
+        moe_grouped_i8_expert_nk_kernel<XT><<<grid, block, 0, stream>>>(
+            a.data_ptr<int8_t>(), w.data_ptr<int8_t>(), ws.data_ptr<float>(),
+            xs.data_ptr<float>(), offsets.data_ptr<int>(), dst, K, N);
+    };
+    if (out.scalar_type() == torch::kBFloat16) launch(uint16_t{});
+    else launch(float{});
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
 // 绑定写在内核旁边：名字、参数名与默认值只有这一份，`bindings.cpp` 只遍历注册表。
 COFFIN_BIND(moe_grouped_i8,
             "\u5206\u7ec4 int8 \u6295\u5f71\uff1a\u4e13\u5bb6\u6808 [E, K, N] \u6216 nk "
@@ -1255,3 +1437,7 @@ COFFIN_BIND(moe_grouped_i8_merge_tokens,
             pybind11::arg("offsets"), pybind11::arg("rw"), pybind11::arg("slot_pos"),
             pybind11::arg("slot_of_pos"), pybind11::arg("tokens"), pybind11::arg("top_k"),
             pybind11::arg("out"), pybind11::arg("slices") = 0, pybind11::arg("nk") = 0);
+COFFIN_BIND(moe_grouped_i8_expert,
+            "预填充的分组 int8 投影：nk 栈 [E, N, K]，一个专家一趟、权重只读一遍",
+            pybind11::arg("a"), pybind11::arg("xs"), pybind11::arg("w"), pybind11::arg("ws"),
+            pybind11::arg("offsets"), pybind11::arg("out"));

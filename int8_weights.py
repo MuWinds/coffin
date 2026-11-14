@@ -40,6 +40,8 @@ Constraints:
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 #: 本地复制一份激活 dtype，而不是 import ``ops.dtypes``：``ops/`` 会 import 本
@@ -165,6 +167,13 @@ class QWeightMoE:
             return self._wq
         kn = self._kn
         if kn is None:
+            # 诊断钩子：nk 原生栈上这一次转置是**整栈**的（每层 805 MB，40 层 32 GB），
+            # 在 31.7 GiB 的卡上等于直接 OOM。要查是谁在预填充里摸到它，开
+            # ``COFFIN_WQ_TRACE=1`` 就会把调用栈打出来。
+            if os.environ.get("COFFIN_WQ_TRACE") == "1":
+                import traceback
+                print("[wq-transpose]", tuple(self._wq.shape), flush=True)
+                print("".join(traceback.format_stack()[-5:]), flush=True)
             kn = self._kn = self._wq.transpose(1, 2).contiguous()
         return kn
 
