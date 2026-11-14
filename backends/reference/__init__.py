@@ -1144,7 +1144,7 @@ def build(caps: Caps | None = None) -> Ops:
             backend's weight dtype rather than to the reference's.
 
     Returns:
-        A table with all 27 entries callable. The reference never leaves a gap:
+        A table with every contract entry callable. The reference never leaves a gap:
         a missing entry here would be a hole in the safety net that every other
         backend relies on.
     """

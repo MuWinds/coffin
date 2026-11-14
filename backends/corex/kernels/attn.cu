@@ -42,6 +42,7 @@
 //   * ``B * c`` 个草稿查询被压平到网格的 z 轴上，因为网格是三维的。传入 ``draft`` 是为了
 //     让内核能从那个平坦下标还原 ``(行, 查询)``，而不必在主机侧做除法。
 
+#include "corex_bindings.h"
 #include "corex_ops.h"
 #include "corex_scalar.h"
 
@@ -1048,3 +1049,44 @@ torch::Tensor silu_mul_quant(torch::Tensor gate, torch::Tensor up, torch::Tensor
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
+
+// 绑定写在内核旁边：名字、参数名与默认值只有这一份，``bindings.cpp`` 只遍历注册表。
+COFFIN_BIND(silu_mul, "out = silu(gate) * up, the SwiGLU product, out may alias up",
+            pybind11::arg("gate"), pybind11::arg("up"), pybind11::arg("out"));
+COFFIN_BIND(rope_apply,
+            "rotate the leading rotary_dim channels of every q/k head, one launch",
+            pybind11::arg("q"), pybind11::arg("k"), pybind11::arg("cos"),
+            pybind11::arg("sin"), pybind11::arg("q_out"), pybind11::arg("k_out"),
+            pybind11::arg("rotary_dim"));
+
+// 绑定写在内核旁边：名字、参数名与默认值只有这一份，`bindings.cpp` 只遍历注册表。
+COFFIN_BIND(kv_quant, "symmetric int8 quantisation of [M, N], one fp32 scale per row, one launch");
+//``silu_mul`` 与 ``rope_apply`` 在 ``attn.cu`` 里自注册。
+COFFIN_BIND(silu_mul_quant,
+            "SwiGLU product written to bf16 and quantised to int8, in one launch",
+            pybind11::arg("gate"), pybind11::arg("up"), pybind11::arg("out"), pybind11::arg("out_q"),
+            pybind11::arg("out_s"));
+//在 int8 KV 缓存上做注意力。
+COFFIN_BIND(attn_decode, "single-token attention over the dense int8 KV cache");
+COFFIN_BIND(attn_paged,
+            "\u5206\u9875\u6ce8\u610f\u529b\uff1a\u7ed9\u5b9a\u4f4d\u7f6e\u5728 int8 KV \u6c60\u4e0a\u7b97\u4e00\u4e2a\u89e3\u7801 token",
+            pybind11::arg("q"), pybind11::arg("gate"), pybind11::arg("kpool"),
+            pybind11::arg("vpool"), pybind11::arg("kscale"), pybind11::arg("vscale"),
+            pybind11::arg("pos2slot"), pybind11::arg("out"), pybind11::arg("pos"),
+            pybind11::arg("max_pos"), pybind11::arg("rep"), pybind11::arg("scale"),
+            pybind11::arg("part_acc"), pybind11::arg("part_ml"), pybind11::arg("head_major") = false);
+COFFIN_BIND(attn_paged_multi_q,
+            "\u6295\u673a\u6821\u9a8c\u5f62\u6001\uff1a\u6bcf\u884c c \u4e2a\u8349\u7a3f\u67e5\u8be2\u5171\u7528\u4e00\u904d\u5386\u53f2\u8bfb\u53d6",
+            pybind11::arg("q"), pybind11::arg("gate"), pybind11::arg("kpool"),
+            pybind11::arg("vpool"), pybind11::arg("kscale"), pybind11::arg("vscale"),
+            pybind11::arg("slots"), pybind11::arg("ctx_lens"), pybind11::arg("out"),
+            pybind11::arg("max_seq"), pybind11::arg("rep"), pybind11::arg("scale"),
+            pybind11::arg("part_acc"), pybind11::arg("part_ml"), pybind11::arg("block_mask"),
+            pybind11::arg("mask_block"), pybind11::arg("head_major") = false);
+COFFIN_BIND(attn_paged_batch,
+            "分页注意力的批形态：一个桶的行各带自身上下文长度，一次算一个解码 token",
+            pybind11::arg("q"), pybind11::arg("gate"), pybind11::arg("kpool"),
+            pybind11::arg("vpool"), pybind11::arg("kscale"), pybind11::arg("vscale"),
+            pybind11::arg("slots"), pybind11::arg("context_lens"), pybind11::arg("out"),
+            pybind11::arg("max_seq"), pybind11::arg("rep"), pybind11::arg("scale"),
+            pybind11::arg("part_acc"), pybind11::arg("part_ml"), pybind11::arg("head_major") = false);

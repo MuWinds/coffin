@@ -341,7 +341,7 @@ def status() -> str:
     """渲染所选后端的一行启动横幅。
 
     Returns:
-        ``backend=hip device=cuda:0 native=17/17 graph=1 autotune=1``。它替代传输层
+        ``backend=hip device=cuda:0 native=17/44 graph=1 autotune=1``。它替代传输层
         原先打印的 ``hip=...`` 字段：没有这一行，一次悄悄回退到参考实现的运行看起来
         就像模型慢，而不是内核没编出来。
 

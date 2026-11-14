@@ -18,6 +18,7 @@
 //   * 归约是 warp shuffle 加一次跨 warp 合并（两次 ``__syncthreads()``），不是共享内存
 //     归约树：这些内核经常只跑一个 block，那种情况下同步链就是主要开销。
 
+#include "hip_bindings.h"
 #include "hip_ops.h"
 
 #include <c10/cuda/CUDAStream.h>
@@ -165,3 +166,7 @@ torch::Tensor rms_norm_gated(torch::Tensor x, torch::Tensor w, torch::Tensor gat
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return y;
 }
+
+// 绑定写在内核旁边：名字、参数名与默认值只有一份，``bindings.cpp`` 只剩模块入口。
+COFFIN_BIND(rms_norm, "fused RMSNorm over strided [M, N] rows");
+COFFIN_BIND(rms_norm_gated, "fused gated RMSNorm");

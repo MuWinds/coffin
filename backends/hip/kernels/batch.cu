@@ -32,6 +32,7 @@
 //                  beta/g [B, nv] fp32
 //   delta update   state [B, nv, dk, dv]，out [B, nv, dv] fp32
 
+#include "hip_bindings.h"
 #include "hip_ops.h"
 
 #include <c10/cuda/CUDAStream.h>
@@ -740,3 +741,14 @@ torch::Tensor attn_paged_multi_q(torch::Tensor q, torch::Tensor gate,
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
+
+// 绑定写在内核旁边：名字、参数名与默认值只有一份，``bindings.cpp`` 只剩模块入口。
+COFFIN_BIND(attn_paged_batch,
+            "batched single-token attention over per-row paged int8 pool windows");
+COFFIN_BIND(attn_paged_multi_q,
+            "multi-query verify attention: one history pass serves c queries");
+COFFIN_BIND(conv1d_silu_batch, "batched fused depthwise causal conv1d + SiLU");
+COFFIN_BIND(delta_prologue_batch,
+            "batched fused q/k norm + head expand + beta/g for the gated delta rule");
+COFFIN_BIND(delta_batch,
+            "batched gated delta rule decode step, updates [B, heads, dk, dv]");

@@ -22,10 +22,14 @@
 //   * 探针分配的内存要显式释放，且一个进程只调一次（`torch.utils.cpp_extension`
 //     的静态初始化顺序不保证，所以不做全局对象）。
 
+#include "corex_bindings.h"
 #include <cuda_runtime.h>
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <string>
+#include <tuple>
 #include <mutex>
 
 namespace {
@@ -100,3 +104,17 @@ int mapped_pinned_probe(char* detail, int detail_len) {
                   "ok: dev=%p differs from host, magic 0x%08X", dev, seen);
     return 1;
 }
+
+// 绑定写在内核旁边：这条要把 ``char*`` 缓冲折成 ``(int, 结论文本)``，所以绑定体是一个
+// lambda，用 ``COFFIN_BIND_LAMBDA``（它不要求可调用体与算子同名）。
+COFFIN_BIND_LAMBDA(mapped_pinned_probe,
+                   [](int64_t detail_len) {
+                       std::string detail(static_cast<size_t>(detail_len > 0 ? detail_len : 256), 0x00);
+                       const int ok = mapped_pinned_probe(
+                           detail.data(), static_cast<int>(detail.size()));
+                       detail.resize(std::strlen(detail.c_str()));
+                       return std::make_tuple(ok, detail);
+                   },
+                   "探测映射锁页内存是否可用："
+                   "返回 (1/0, 结论文本)",
+                   pybind11::arg("detail_len") = 256);

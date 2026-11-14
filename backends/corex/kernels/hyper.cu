@@ -35,6 +35,7 @@
 //   * 权重按 ``[K, N]`` 给（``Caps.weight_layout == "kn"``）。``[N, K]`` 会算出
 //     看着合理的错数，所以主机侧只校验 dtype / 连续性 / 二维性，转置归 Python 侧。
 
+#include "corex_bindings.h"
 #include "corex_ops.h"
 #include "corex_scalar.h"
 
@@ -771,3 +772,17 @@ torch::Tensor hyper_up(torch::Tensor normed, torch::Tensor up_wt, torch::Tensor 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return mixed;
 }
+
+// 绑定写在内核旁边：名字、参数名与默认值只有这一份，`bindings.cpp` 只遍历注册表。
+COFFIN_BIND(hyper_norm,
+            "分组 RMSNorm：hc 路残差流各自在 hidden 维上归一化",
+            pybind11::arg("x"), pybind11::arg("w"), pybind11::arg("out"), pybind11::arg("hidden"),
+            pybind11::arg("hc"), pybind11::arg("eps"));
+COFFIN_BIND(hyper_down,
+            "Gated Residual 的 down 投影加 silu 门",
+            pybind11::arg("normed"), pybind11::arg("wt"), pybind11::arg("out"), pybind11::arg("hc"));
+COFFIN_BIND(hyper_up,
+            "Gated Residual 的 up 投影加读门塌缩与写门",
+            pybind11::arg("normed"), pybind11::arg("up_wt"), pybind11::arg("low"),
+            pybind11::arg("inj_wt"), pybind11::arg("mixed"), pybind11::arg("inject"),
+            pybind11::arg("hidden"), pybind11::arg("hc"), pybind11::arg("lowrank"));

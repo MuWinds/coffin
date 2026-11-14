@@ -35,6 +35,7 @@
 //     所以那里归一化的输入是 bf16。因此一个 block 需要 ``dv <= head_threads(dk)``；值轴
 //     更宽就继续走三算子链，包装层用形状错误拒绝，而不是悄悄改变算术。
 
+#include "corex_bindings.h"
 #include "corex_ops.h"
 #include "corex_scalar.h"
 
@@ -1169,3 +1170,18 @@ torch::Tensor delta_normed_seq_record(torch::Tensor q, torch::Tensor k, torch::T
     return delta_normed_seq_impl(q, k, v, b, a, neg_expA, dt_bias, z, nw, st, out,
                                  qscale, rep, record, slot);
 }
+
+// 绑定写在内核旁边：名字、参数名与默认值只有这一份，`bindings.cpp` 只遍历注册表。
+//门控 DeltaNet。
+COFFIN_BIND(conv1d_silu,
+            "depthwise causal conv1d + SiLU for one token, shifts the window in place");
+COFFIN_BIND(conv1d_silu_seq, "the same conv over a prefill chunk [T, C]");
+COFFIN_BIND(conv1d_silu_batch, "batched depthwise causal conv1d + SiLU, one window per row");
+COFFIN_BIND(delta_prologue, "q/k L2 norm, head expansion and the beta/g gates for one token");
+COFFIN_BIND(delta_prologue_batch,
+            "batched gated-delta prologue, leading row dim on every argument");
+COFFIN_BIND(delta_prep_seq, "prefill head prep into the head-major [H, T, d] layout");
+COFFIN_BIND(delta_normed, "prologue + recurrence + gated norm for one decode token, one launch");
+COFFIN_BIND(delta_normed_record, "融合 gated delta 校验步并记录秩一更新");
+COFFIN_BIND(delta_normed_seq, "c 个校验 token 的融合链，一次启动跑完整个投机窗口");
+COFFIN_BIND(delta_normed_seq_record, "c 个校验 token 的融合链并逐 token 记录秩一更新");

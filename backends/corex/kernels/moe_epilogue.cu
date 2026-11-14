@@ -14,6 +14,7 @@
 //     所以点积先窄化到存储 dtype、sigmoid 的输出再窄化一次。门是逐 token 一个标量，
 //     少窄化一次就是整行按另一条曲线缩放，且不会让任何形状检查失败。
 
+#include "corex_bindings.h"
 #include "corex_ops.h"
 #include "corex_scalar.h"
 
@@ -98,3 +99,8 @@ torch::Tensor shared_gate_scale(torch::Tensor x, torch::Tensor w, torch::Tensor 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
+
+// 绑定写在内核旁边：名字、参数名与默认值只有这一份，`bindings.cpp` 只遍历注册表。
+COFFIN_BIND(shared_gate_scale,
+            "out = src * sigmoid(x . w), one launch for the shared-expert gate",
+            pybind11::arg("x"), pybind11::arg("w"), pybind11::arg("src"), pybind11::arg("out"));

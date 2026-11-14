@@ -13,6 +13,7 @@
 //     设备核」混在一个翻译单元里的写法会触发编译器 ICE，验证过两次。
 //   * world 固定 4：指针用标量传，省掉一次设备指针数组的分配与解析。
 
+#include "corex_bindings.h"
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -34,6 +35,10 @@
 ///        否则被污染的那一轮之后 ``mine[r] < round`` 永远为假，各 rank 会带着
 ///        半截载荷继续算下去（静默错数比挂死更难查）。
 #define COFFIN_P2P_ABORT_SLOT COFFIN_P2P_WORLD
+
+/// @brief 探针环的格数：每格存 3 个 int64（载荷写完 / flag 发出 / 等到齐）。
+///        紧接在 abort 槽之后，宿主侧 `ep.py` 在 close() 时一次读回。
+#define COFFIN_P2P_PROF_SLOTS 64
 
 namespace {
 
@@ -63,6 +68,10 @@ __global__ void p2p_combine_kernel(const __nv_bfloat16* __restrict__ x,
     // 中止是锁存的：一旦有人写过中止槽，本进程之后的每一轮都不再自旋，直接出零
     // 结果返回。宁可让输出变成垃圾，也不能把卡停在核心里等一个永远不来的写。
     __shared__ int failed;
+    //: 探针本地量：载荷写完 / flag 发出 / 等到齐（各自本卡 clock64）。
+    long long t_write = 0;
+    long long t_pub = 0;
+    long long t_done = 0;
     if (threadIdx.x == 0) {
         failed = (flg[rank][COFFIN_P2P_ABORT_SLOT] != 0) ? 1 : 0;
     }
@@ -83,16 +92,34 @@ __global__ void p2p_combine_kernel(const __nv_bfloat16* __restrict__ x,
     }
     // 载荷对设备可见之后才置计数。对端是设备内存，设备作用域就够。
     __threadfence();
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
-        for (int p = 0; p < COFFIN_P2P_WORLD; ++p) {
-            flg[p][rank] = round;
-        }
+    // 探针：三个时刻落在本 rank 自己的 flags 尾部 `[world+1, world+3]`（宿主按
+    // COFFIN_P2P_PROF=1 打出来）。三个值都是本卡自己的 clock64，所以只能算段内
+    // 差值，不能跨卡比绝对时刻；但把四个 rank 的三段并排放，就能看出「谁的等最长」，
+    // 而「等最长」正是到达偏斜的定义（最后到的那个 rank 等得最短）。
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        t_write = clock64();
+    }
+    // 2026-11-14：**四个对端的 flag 由四个线程并行发**，不再是单线程 for 串行发。
+    // 依据：把自旋里的栅栏从「每次空转」改成「每 256 次」后，`p2p_combine` 一点没快
+    // （104.62 → 106.38 ms/step），说明 266 µs 不是自旋指令的开销；而发布侧是
+    // 一条线程串行做 3 次跨卡 posted write（0 号卡到其余三张，实测卡间 7~11 GB/s、
+    // 单次可见延迟数十 µs），3 次串起来正好是这个量级。改成 4 个线程各写一个对端，
+    // 语义不变（载荷已由上面的栅栏排在 flag 之前），只是把 3 段延迟叠成 1 段。
+    if (blockIdx.x == 0 && threadIdx.x < COFFIN_P2P_WORLD) {
+        flg[threadIdx.x][rank] = round;
+    }
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        t_pub = clock64();
     }
     __syncthreads();
     // 自旋等所有 rank 到达。计数在设备内存里，volatile 读就能看到对端刚写的值。
     // 注意：这里试过用原子（atomicExch 发布 + atomicAdd 读）来绕开跨卡可见性，
     // 实测在这套 corex 卡上第 4 轮就必挂——对端内存的原子不参与会合，比 volatile
     // 更糟，所以退回 volatile。
+    // 2026-11-14 试过把循环里的栅栏改成每 256 次才发一条（意图省掉跨卡会合里最贵的
+    // 指令）：编出来的 v53 与 v51 同机对照 104.62 → 106.38 ms/step（无收益），**且两轮
+    // 的 token 校验和不一致**，说明周期栅栏下对端载荷可能读到旧值。因此撤回，
+    // 恢复成每次空转都发栅栏——正确性优先，这条微调不成立。
     if (threadIdx.x == 0) {
         volatile long long* mine = flg[rank];
         long long spins = 0;
@@ -117,6 +144,17 @@ __global__ void p2p_combine_kernel(const __nv_bfloat16* __restrict__ x,
         }
     }
     __syncthreads();
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        t_done = clock64();
+        // 环形槽：第 round 轮落在 (round % COFFIN_P2P_PROF_SLOTS) 这一格。**不做任何
+        // 设备→主机拷贝**——每轮取回会强制同步，把四个 rank 的会合节奏打散（实测
+        // 每 40 轮取一次，下一轮就有 peer 掉出 barrier）。宿主在 close() 时一次读回。
+        const int slot = static_cast<int>(round % COFFIN_P2P_PROF_SLOTS);
+        long long* dst = flg[rank] + COFFIN_P2P_WORLD + 1 + 3 * slot;
+        dst[0] = t_write;
+        dst[1] = t_pub;
+        dst[2] = t_done;
+    }
     if (failed) {
         for (long long i = start; i < total; i += stride) {
             out[i] = 0.0F;
@@ -194,3 +232,20 @@ void p2p_combine(torch::Tensor x, torch::Tensor out,
         static_cast<long long>(round));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
+
+// 绑定写在内核旁边：名字、参数名与默认值只有这一份，`bindings.cpp` 只遍历注册表。
+COFFIN_BIND(p2p_handle,
+            "\u53d6\u8bbe\u5907\u7f13\u51b2\u7684 IPC \u53e5\u67c4\uff08uint8 \u5f20\u91cf\uff09",
+            pybind11::arg("device_buffer"));
+COFFIN_BIND(p2p_open,
+            "\u7528\u5bf9\u7aef\u53e5\u67c4\u6620\u5c04\u5176\u663e\u5b58\uff0c"
+          "\u8fd4\u56de\u8bbe\u5907\u6307\u9488",
+            pybind11::arg("handle_bytes"));
+COFFIN_BIND(p2p_combine,
+            "\u56db\u5361 all-to-all \u5f52\u7ea6\uff1a\u5199\u5bf9\u7aef\u69fd + "
+          "\u81ea\u65cb\u7b49\u9f50 + \u6c42\u548c\uff0c\u4e00\u4e2a\u6838\u5b8c\u6210",
+            pybind11::arg("x"), pybind11::arg("out"), pybind11::arg("slots0"),
+            pybind11::arg("slots1"), pybind11::arg("slots2"), pybind11::arg("slots3"),
+            pybind11::arg("flags0"), pybind11::arg("flags1"), pybind11::arg("flags2"),
+            pybind11::arg("flags3"), pybind11::arg("rank"), pybind11::arg("round"),
+            pybind11::arg("blocks") = 16, pybind11::arg("threads") = 256);

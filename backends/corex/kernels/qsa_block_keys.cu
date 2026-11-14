@@ -51,6 +51,7 @@
 //     任何取值都不影响结果，而 clamp 换掉了逐块判空的分支。
 //   * 不用 CUDA graph、不用 cp.async（``platform/scow/AGENTS.md`` 第 1、5 条）。
 
+#include "corex_bindings.h"
 #include "corex_ops.h"
 #include "corex_scalar.h"
 
@@ -265,3 +266,11 @@ torch::Tensor qsa_block_keys(torch::Tensor flat_keys, torch::Tensor table,
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
+
+// 绑定写在内核旁边：名字、参数名与默认值只有这一份，`bindings.cpp` 只遍历注册表。
+COFFIN_BIND(qsa_block_keys,
+            "QSA \u5757 key\uff1agather + \u6c60\u5316 + RMSNorm + partial RoPE",
+            pybind11::arg("flat_keys"), pybind11::arg("table"), pybind11::arg("weight"),
+            pybind11::arg("flat_cos"), pybind11::arg("flat_sin"), pybind11::arg("block_row"),
+            pybind11::arg("block_batch"), pybind11::arg("out"), pybind11::arg("seq"),
+            pybind11::arg("tokens"), pybind11::arg("rotary_dim"), pybind11::arg("eps"));

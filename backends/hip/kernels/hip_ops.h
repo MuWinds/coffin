@@ -1,7 +1,7 @@
 #pragma once
 
 // @file hip_ops.h
-// @brief 在 bindings.cpp 里绑定的 HIP 扩展入口的声明。
+// @brief 在各自的 ``.cu`` 里用 ``COFFIN_BIND`` 绑定的 HIP 扩展入口的声明。
 //
 // Module: coffin/kernels。内核与 ``hip_ops.py`` 共享的唯一头文件；它是纯接口，所以必须
 // 不含内核实现，也不含任何会把第二个 HIP 编译单元拖进构建的东西。

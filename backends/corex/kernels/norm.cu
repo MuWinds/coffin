@@ -24,6 +24,7 @@
 //   * 门控变体只在最后一轴上归一化，即按头。它不是展平后的宽度：门缩放的是已经归一化
 //     的结果，让它进归约会拿所有头的 RMS 去除每一个头。
 
+#include "corex_bindings.h"
 #include "corex_ops.h"
 #include "corex_scalar.h"
 
@@ -658,3 +659,27 @@ torch::Tensor rms_norm_gated(torch::Tensor x, torch::Tensor w, torch::Tensor gat
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return y;
 }
+
+// 绑定写在内核旁边：名字、参数名与默认值只有这一份，``bindings.cpp`` 只遍历注册表。
+COFFIN_BIND(rms_norm, "fused zero-centred RMSNorm over pitched [M, N] rows",
+            pybind11::arg("x"), pybind11::arg("w"), pybind11::arg("stride") = 0,
+            pybind11::arg("eps") = 1e-6);
+COFFIN_BIND(rms_norm_gated, "fused gated RMSNorm: rms(x) * w * silu(gate)",
+            pybind11::arg("x"), pybind11::arg("w"), pybind11::arg("gate"),
+            pybind11::arg("eps") = 1e-6);
+
+// 绑定写在内核旁边：名字、参数名与默认值只有这一份，`bindings.cpp` 只遍历注册表。
+//归一化。``rms_norm`` 与 ``rms_norm_gated`` 在 ``norm.cu`` 里自注册。
+COFFIN_BIND(add_rms_norm,
+            "residual add followed by the zero-centred RMSNorm, in one launch",
+            pybind11::arg("x"), pybind11::arg("add"), pybind11::arg("w"), pybind11::arg("out"),
+            pybind11::arg("stride") = 0, pybind11::arg("eps") = 1e-6);
+COFFIN_BIND(rms_norm_i8,
+            "zero-centred RMSNorm quantised straight to int8, one launch",
+            pybind11::arg("x"), pybind11::arg("w"), pybind11::arg("out_q"), pybind11::arg("out_s"),
+            pybind11::arg("stride") = 0, pybind11::arg("eps") = 1e-6, pybind11::arg("threads") = 0);
+COFFIN_BIND(add_rms_norm_i8,
+            "residual add + zero-centred RMSNorm, quantised straight to int8, one launch",
+            pybind11::arg("x"), pybind11::arg("add"), pybind11::arg("w"), pybind11::arg("out_q"),
+            pybind11::arg("out_s"), pybind11::arg("stride") = 0, pybind11::arg("eps") = 1e-6,
+            pybind11::arg("threads") = 0);

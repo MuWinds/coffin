@@ -56,6 +56,7 @@
 //   * ``hd`` 必须是 32 的倍数，且 ``hd / 32 <= ATT_SPARSE_LANES``。
 //   * 不用 CUDA graph、不用 cp.async（``platform/scow/AGENTS.md`` 第 1、5 条）。
 
+#include "corex_bindings.h"
 #include "corex_ops.h"
 #include "corex_scalar.h"
 
@@ -308,3 +309,10 @@ torch::Tensor attn_sparse(torch::Tensor q, torch::Tensor kcache, torch::Tensor v
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
+
+// 绑定写在内核旁边：名字、参数名与默认值只有这一份，`bindings.cpp` 只遍历注册表。
+COFFIN_BIND(attn_sparse,
+            "QSA \u7684\u7a00\u758f\u6ce8\u610f\u529b\uff1a\u53ea\u8bfb\u7d22\u5f15\u5668\u9009\u4e2d\u7684\u4f4d\u7f6e",
+            pybind11::arg("q"), pybind11::arg("kcache"), pybind11::arg("vcache"),
+            pybind11::arg("sel_idx"), pybind11::arg("sel_len"), pybind11::arg("ctx"),
+            pybind11::arg("out"), pybind11::arg("scale"));

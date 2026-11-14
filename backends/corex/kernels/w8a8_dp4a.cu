@@ -37,6 +37,7 @@
 //   * 内核不做边界检查：形状、dtype、连续性、对齐条件全部在主机侧判掉。
 //   * 全程不用 fp64：本设备对它返回 0（docs/qwen4/COREX-PLATFORM.md），设备侧 fp64 参考等于零。
 
+#include "corex_bindings.h"
 #include "corex_i8.h"
 #include "corex_scalar.h"
 #include "w8a8_dp4a.h"
@@ -961,3 +962,9 @@ torch::Tensor w8a8_dp4a_rate(torch::Tensor out, int64_t iters, int64_t mode, int
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
+
+// 绑定写在内核旁边：名字、参数名与默认值只有这一份，`bindings.cpp` 只遍历注册表。
+COFFIN_BIND(w8a8_dp4a_nk,
+            "W8A8 DP4A GEMM over contiguous [N, K] int8 weights",
+            pybind11::arg("a"), pybind11::arg("wt"), pybind11::arg("c"), pybind11::arg("out"),
+            pybind11::arg("xs"), pybind11::arg("ws"), pybind11::arg("threads") = 0);

@@ -28,6 +28,7 @@
 //     ``ceil(N / threads)`` 不足一个 wave 时占用率才是约束；在宽 ``N`` 上它只会给一个
 //     本来就被带宽限制的形状增加流量。
 
+#include "corex_bindings.h"
 #include "corex_ops.h"
 #include "corex_scalar.h"
 
@@ -1980,3 +1981,46 @@ torch::Tensor gemv_kn_m_split(torch::Tensor wt, torch::Tensor x, int64_t threads
     if (w16) return run_m_split<uint16_t, float>(wt, x, y, N, K, th, sp);
     return run_m_split<float, float>(wt, x, y, N, K, th, sp);
 }
+
+// 绑定写在内核旁边：名字、参数名与默认值只有这一份，`bindings.cpp` 只遍历注册表。
+//投影。
+COFFIN_BIND(gemv_kn,
+            "decode GEMV over [K, N] weights: x [K] -> y [N]",
+            pybind11::arg("wt"), pybind11::arg("x"), pybind11::arg("threads") = 0,
+            pybind11::arg("unroll") = 0, pybind11::arg("split") = 0);
+COFFIN_BIND(gemv_kn_m,
+            "small-M GEMV over [K, N] weights: x [M, K] -> y [M, N]",
+            pybind11::arg("wt"), pybind11::arg("x"), pybind11::arg("threads") = 0,
+            pybind11::arg("unroll") = 0);
+//窄 N 的 M 行投影：网格按 K 切片补齐 SM；split=0 自动选、split<=1 退化成
+//gemv_kn_m。共享专家 gate_up 的 N=512 不分片只有 2 个块。
+COFFIN_BIND(gemv_kn_m_split,
+            "small-M GEMV with split-K over [K, N] weights: x [M, K] -> y [M, N]",
+            pybind11::arg("wt"), pybind11::arg("x"), pybind11::arg("threads") = 0,
+            pybind11::arg("split") = 0);
+COFFIN_BIND(gemv_kn_i8,
+            "decode W8A16 GEMV: int8 [K, N] weights plus a per-column fp32 scale",
+            pybind11::arg("wt"), pybind11::arg("x"), pybind11::arg("scale"),
+            pybind11::arg("threads") = 0, pybind11::arg("unroll") = 0, pybind11::arg("split") = 0,
+            pybind11::arg("width") = 0);
+//和单行入口分开绑定：这里漏了注册在卡上没人调用之前是看不见的，一旦调用就显示
+//为 AttributeError，而且离真正发起分派的地方很远（docs/qwen4/QWEN4-PERF.md 记录的
+//那个坑）。
+COFFIN_BIND(gemv_kn_i8_m,
+            "batched W8A16 GEMV: int8 [K, N] weights, x [M, K] -> y [M, N]",
+            pybind11::arg("wt"), pybind11::arg("x"), pybind11::arg("scale"),
+            pybind11::arg("threads") = 0, pybind11::arg("unroll") = 0);
+//nk 那一对与 kn 那一对分开绑定，理由同上：漏注册在卡上表现为 AttributeError，而离真正
+//发起分派的 Python 入口很远。
+COFFIN_BIND(gemv_nk_i8,
+            "decode W8A16 GEMV over [N, K] weights: int8 rows plus a per-column fp32 scale",
+            pybind11::arg("wtn"), pybind11::arg("x"), pybind11::arg("scale"),
+            pybind11::arg("threads") = 0, pybind11::arg("unroll") = 0);
+COFFIN_BIND(gemv_nk_i8_m,
+            "batched W8A16 GEMV over [N, K] weights: x [M, K] -> y [M, N]",
+            pybind11::arg("wtn"), pybind11::arg("x"), pybind11::arg("scale"),
+            pybind11::arg("threads") = 0, pybind11::arg("unroll") = 0);
+COFFIN_BIND(gemv_kn_w4,
+            "group-scaled packed W4 GEMV with bf16/fp32 activations",
+            pybind11::arg("packed"), pybind11::arg("scale"), pybind11::arg("x"), pybind11::arg("k"),
+            pybind11::arg("group_size"));

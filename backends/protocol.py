@@ -26,7 +26,7 @@ Constraints:
     * 各后端签名完全一致，包括纯 torch 路径忽略的那些参数：调用点不得按当前
       后端分支。
     * ``Caps`` 只承载模型会据以分支的事实。某个算子是否原生实现看
-      ``native_ops``；回退的答案永远是「照常调用」，所以表本身从不告诉调用方
+      :attr:`Caps.native`；回退的答案永远是「照常调用」，所以表本身从不告诉调用方
       跳过工作。
 """
 
@@ -41,64 +41,6 @@ import torch
 #: 一个算子条目。签名按 :class:`Ops` 的字段逐个文档化；后端绑的是闭包和
 #: partial，所以这里的可调用类型保持不透明。
 OpFn = Callable[..., Any]
-
-
-#: 规范算子名，按 :class:`Ops` 字段顺序排列，分组方式与 :class:`Ops` 的
-#: 表格一致。有测试保证它与 dataclass 同步。
-_OP_NAMES: tuple[str, ...] = (
-    # 投影：按激活行数的档位命名，不是按内核命名。
-    "linear",            # 1 行或少数几行
-    "linear_m",          # 小 M 的批，一次权重读取
-    "linear_m_verify",   # 投机校验批投影，可由后端选专用量化路径
-    "linear_prefill",    # 预填充分块的 GEMM（大 M）
-    "moe_grouped",       # 稀疏专家：并行维是"专家 × 行"，与上面三档切法不同
-    "moe_grouped_gemm",  # 同一件事的大 M 形态：按专家分段各做一次张量核 GEMM
-    "moe_grouped_i8",
-    "moe_dispatch",      # 路由结果 → 前缀和 + 行序（替掉十来个 torch 小算子）
-    "moe_router",        # 路由自身：softmax -> top-k -> 归一化（替掉 512 元素的排序网络）
-    # 归一化。
-    "rms_norm",
-    "add_rms_norm",
-    "rms_norm_gated",
-    "kv_quant",
-    "silu_mul",
-    "silu_mul_quant",     # 同上，外加把乘积按行量化，喂给下游的 int8 投影
-    "gather_quant_i8",    # 按索引取行 + 按行量化，一次启动
-    "rope_apply",
-    # int8 KV cache 上的全注意力。
-    "attn_decode",
-    "attn_paged",
-    "attn_paged_batch",
-    "attn_paged_multi_q",
-    "attn_sparse",       # QSA 稀疏注意力：只读索引器选中的位置
-    "qsa_block_keys",    # QSA 块 key：gather + 池化 + RMSNorm + partial RoPE
-    # Gated DeltaNet：深度卷积 + SiLU，然后是循环。
-    "conv1d_silu",
-    "conv1d_silu_seq",
-    "conv1d_silu_batch",
-    "delta_prologue",
-    "delta_prologue_batch",
-    "delta_prep_seq",
-    "delta",
-    "delta_record",
-    "delta_batch",
-    "delta_batch_record",
-    "delta_commit",
-    "delta_normed",
-    "delta_normed_seq",
-    # 三角求解：分块 delta 规则每个块要反解一个单位下三角方程组，那是*库*能力，
-    # 不是模型数学。
-    "triangular_solve",
-    # 超连接（Gated Residual）：Qwen4-Exp 每层两套、48 层，参考实现的八次 torch
-    # 调用折算到一步 decode 是 768 次发射。三个名字按数据依赖切开，见 Ops 的字段注释。
-    "hyper_norm",
-    "hyper_down",
-    "hyper_up",
-    "moe_grouped_i8_merge",    # 同一件事的 int8 形态：权重 [E, K, N] int8，激活按行量化
-    "moe_grouped_i8_merge_tokens",  # 它的逐 token 形态：单流与多流共用一个收尾核
-    "moe_decode_block",        # decode 单行路径的 MoE 融合入口
-    "shared_gate_scale",       # 共享专家门：sigmoid(x·w) 乘到投影输出上，一次启动
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -523,8 +465,9 @@ class Ops:
     #: 参考链要六次启动才得到一个标量，这个入口一次启动完成，``out`` 由调用方按形状复用。
     shared_gate_scale: OpFn | None = None
 
-    #: 规范算子名，按字段顺序。
-    NAMES: ClassVar[tuple[str, ...]] = _OP_NAMES
+    #: 规范算子名，按字段顺序。只声明不赋值：名字的唯一来源是上面的字段，元组在类
+    #: 定义之后派生，见模块级的 ``_OP_NAMES``。
+    NAMES: ClassVar[tuple[str, ...]]
 
     def __post_init__(self) -> None:
         """拒绝既不可调用也不是 ``None`` 的条目。
@@ -558,12 +501,12 @@ class Ops:
                 错误会产出一张悄悄少了那个算子的表，看起来和一个没有该内核的平台
                 一模一样。
         """
-        unknown = sorted(set(mapping) - set(_OP_NAMES))
+        unknown = sorted(set(mapping) - set(cls.NAMES))
         if unknown:
             raise ValueError(
                 f"unknown op(s): {', '.join(unknown)}; "
-                f"known: {', '.join(_OP_NAMES)}")
-        return cls(**{name: mapping.get(name) for name in _OP_NAMES})
+                f"known: {', '.join(cls.NAMES)}")
+        return cls(**{name: mapping.get(name) for name in cls.NAMES})
 
     def as_dict(self) -> dict[str, OpFn | None]:
         """按规范顺序把表返回成 ``{name: callable-or-None}``。
@@ -573,7 +516,7 @@ class Ops:
             ``dataclasses.fields``，这样类型检查器还能保住「可调用或 ``None``」的
             形态。
         """
-        return {name: getattr(self, name) for name in _OP_NAMES}
+        return {name: getattr(self, name) for name in self.NAMES}
 
     def implemented(self) -> tuple[str, ...]:
         """列出这张表自己就能回答的算子名。
@@ -590,6 +533,50 @@ class Ops:
             解析器必须从参考后端补的名字，按规范顺序。为空表示表已经是全的。
         """
         return tuple(name for name, fn in self.as_dict().items() if fn is None)
+
+
+#: 规范算子名，按字段顺序。名字只在上面的字段里写一次，这里从 ``fields`` 派生，所以
+#: 两张清单不可能漂移——原先手写的元组在三次提交里漏掉了 ``silu_mul_quant``、
+#: ``gather_quant_i8`` 和 ``moe_grouped_i8_merge_tokens``，而它恰好是「漏一个名字」的
+#: 报警器。反过来，删掉一个字段不会悄悄缩小契约：后端手里的旧名字会被
+#: :meth:`Ops.from_mapping` 当成未知名拒绝，import 时就炸。
+_OP_NAMES: tuple[str, ...] = tuple(field.name for field in fields(Ops))
+
+# 字段在类体里写，元组只能在类建好之后才存在；``NAMES`` 声明成 ClassVar，所以这次赋值
+# 不会变成第 45 个 dataclass 字段，也不会进 ``fields``。
+Ops.NAMES = _OP_NAMES
+
+
+def native_ops(namespace: Mapping[str, Any]) -> dict[str, OpFn]:
+    """按「适配器与算子同名」的约定，从后端模块的名字空间收集它的原生条目。
+
+    手写 ``name -> adapter`` 字典是第三个注册点，也是这里唯一会静默失败的一个：漏掉
+    一条既不报错也不改变日志，那个算子从此在本后端上跑参考实现，同时报告成功——测出来
+    是一个干净的零提升，与「这个融合没赚到」无法区分。约定把名字本身变成注册动作：
+    为某个契约名写了适配器（模块级同名函数）就是原生条目，没写就自然是 ``None``，交给
+    :func:`coffin.backends.reference.fill` 补齐。
+
+    Args:
+        namespace: 后端模块的全局命名空间，通常就是 ``globals()``。契约名之外的条目
+            一律不看，所以私有的辅助函数不会被误收。
+
+    Returns:
+        ``{契约名: 适配器}``，按 :attr:`Ops.NAMES` 的顺序，只含本模块确实提供可调用
+        对象的名字。这个顺序没有语义作用，表本身就是字典。
+
+    Raises:
+        无。缺席的条目留给解析器补。
+
+    Constraints:
+        * 反过来说，契约名不能被一个私有辅助占用：谁能 ``getattr`` 到那个名字，谁就会
+          被当成该算子的内核。名字即注册，不该原生实现的算子只能不写同名函数。
+    """
+    table: dict[str, OpFn] = {}
+    for name in Ops.NAMES:
+        fn = namespace.get(name)
+        if callable(fn):
+            table[name] = fn
+    return table
 
 
 @runtime_checkable

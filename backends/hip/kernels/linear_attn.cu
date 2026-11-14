@@ -23,6 +23,7 @@
 //     的投影输出提升成 fp32。
 //   * q/k 归一化里的 1e-6 epsilon 属于 checkpoint 的数值约定；改动它就会改变模型输出。
 
+#include "hip_bindings.h"
 #include "hip_ops.h"
 
 #include <c10/cuda/CUDAStream.h>
@@ -318,3 +319,12 @@ void delta_prep_seq(torch::Tensor qkv, torch::Tensor b, torch::Tensor a,
         (int)b.stride(0), (int)a.stride(0));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
+
+// 绑定写在内核旁边：名字、参数名与默认值只有一份，``bindings.cpp`` 只剩模块入口。
+COFFIN_BIND(delta_prologue,
+            "fused q/k norm + head expand + beta/g for the gated delta rule");
+COFFIN_BIND(conv1d_silu,
+            "fused depthwise causal conv1d + SiLU for the linear-attn layers");
+COFFIN_BIND(conv1d_silu_seq, "same conv over a whole prefill chunk [T, C]");
+COFFIN_BIND(delta_prep_seq,
+            "fused prefill q/k norm + head expand + beta/g into [H, T, d]");

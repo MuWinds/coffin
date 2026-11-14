@@ -19,6 +19,7 @@
 //   * 到达计数不能用 ``atomicAdd``：实测它写映射系统内存不生效（计数恒为 0）。
 //     只有一个线程写、且写的是递增轮次值，普通 ``volatile`` 存储即可。
 
+#include "corex_bindings.h"
 #include <c10/cuda/CUDAException.h>
 #include <torch/extension.h>
 
@@ -26,6 +27,9 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <string>
+#include <tuple>
 
 namespace {
 
@@ -249,3 +253,36 @@ void mapped_finish_wait(torch::Tensor out, int64_t dev_base, int64_t world,
 }
 
 
+
+// 绑定写在内核旁边：名字、参数名与默认值只有这一份，`bindings.cpp` 只遍历注册表。
+COFFIN_BIND(mapped_release,
+            "\u89e3\u6ce8\u518c\u6620\u5c04\uff0c\u5fc5\u987b\u5728 munmap \u4e4b\u524d\u8c03\u7528",
+            pybind11::arg("host_ptr"));
+COFFIN_BIND(mapped_stage,
+            "\u672c rank \u5c40\u90e8\u548c\u5199\u8fdb\u5171\u4eab\u69fd\u5e76\u7f6e\u5230\u8fbe\u8ba1\u6570",
+            pybind11::arg("x"), pybind11::arg("dev_base"), pybind11::arg("world"),
+            pybind11::arg("rank"), pybind11::arg("threads"), pybind11::arg("round"));
+COFFIN_BIND(mapped_finish,
+            "\u4ece\u6240\u6709 rank \u7684\u69fd\u6c42\u548c\u5230\u8bbe\u5907 out",
+            pybind11::arg("out"), pybind11::arg("dev_base"), pybind11::arg("world"),
+            pybind11::arg("blocks"), pybind11::arg("threads"));
+COFFIN_BIND(mapped_finish_wait,
+            "\u8bbe\u5907\u4fa7\u7b49\u6240\u6709 rank \u5230\u8fbe\u540e\u6c42\u548c"
+          "\uff08\u4e3b\u673a\u4e0d\u9700\u8981\u540c\u6b65\u6216\u8f6e\u8be2\uff09",
+            pybind11::arg("out"), pybind11::arg("dev_base"), pybind11::arg("world"),
+            pybind11::arg("blocks"), pybind11::arg("threads"), pybind11::arg("round"));
+
+// 绑定写在内核旁边：这条要把 ``char*`` 缓冲折成 ``(int64, 结论文本)``，所以绑定体是
+// 一个 lambda，用 ``COFFIN_BIND_LAMBDA``。
+COFFIN_BIND_LAMBDA(mapped_register,
+                   [](int64_t host_ptr, int64_t bytes) {
+                       std::string detail(256, 0x00);
+                       const int64_t dev = mapped_register(
+                           reinterpret_cast<void*>(static_cast<uintptr_t>(host_ptr)), bytes,
+                           detail.data(), static_cast<int>(detail.size()));
+                       detail.resize(std::strlen(detail.c_str()));
+                       return std::make_tuple(dev, detail);
+                   },
+                   "注册 mmap 区为可映射锁页内存，"
+                   "返回 (dev_ptr, 结论文本)",
+                   pybind11::arg("host_ptr"), pybind11::arg("bytes"));

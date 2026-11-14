@@ -38,6 +38,26 @@ from .runtime_support import (MMError, _decode_image, allocated_gib, empty_cache
                               profiler_activities, reserved_gib, sync)
 
 
+def _self_device_us(row) -> float:
+    """取一个 ``FunctionEventAvg`` 的自有设备时间，单位 µs。
+
+    这套 torch（fork28/34）上的属性名仍是 ``self_cuda_time_total``；上游改名为
+    ``self_device_time_total`` 之后，直接读新名字会抛 AttributeError，而
+    ``profile`` 是诊断 op，抛出去会把四个 rank 的锁步一起带崩。两个名字都试。
+
+    Args:
+        row: ``prof.key_averages()`` 的元素。
+
+    Returns:
+        自有设备时间；两个名字都不存在时按 0 处理。
+    """
+    for attr in ("self_device_time_total", "self_cuda_time_total"):
+        value = getattr(row, attr, None)
+        if value is not None:
+            return float(value)
+    return 0.0
+
+
 
 class RuntimeLifecycleMixin:
     """启动、拆解和 reload：模型、引擎和视觉塔。
@@ -1074,12 +1094,19 @@ class RuntimeChatMixin:
                     logits = self._decode_one(logits)
                 sync()
             ka = prof.key_averages()
-            total = sum(r.self_device_time_total for r in ka)
-            rows = sorted(ka, key=lambda r: r.self_device_time_total, reverse=True)[:18]
+            total = sum(_self_device_us(r) for r in ka)
+            rows = sorted(ka, key=_self_device_us, reverse=True)[:18]
+            # 整步的**发射次数**：直接读 ``cudaLaunchKernel`` 这一条的调用数（主机侧真正
+            # 发下去的次数，与逐核表里各内核 ``calls`` 之和同源）。不能拿「自有设备时间 > 0
+            # 的条目计数」去凑：这张卡上的 ``key_averages`` 把内核事件重复计了一份，凑出
+            # 来的数会虚高一倍多（实测单流 2844，而真值是这里读到的那个）。
+            launch = next((r.count for r in ka if r.key.endswith("cudaLaunchKernel")), None)
             return {"ok": True, "total_us": round(total / n, 1),
+                    "launches": None if launch is None else launch // n,
+                    "listed": len(rows), "all": len(ka),
                     "rows": [{"kernel": r.key[:60], "calls": r.count // n,
-                              "us": round(r.self_device_time_total / n, 1),
-                              "pct": round(100 * r.self_device_time_total / total, 1)}
+                              "us": round(_self_device_us(r) / n, 1),
+                              "pct": round(100 * _self_device_us(r) / max(total, 1e-9), 1)}
                              for r in rows]}
         if op == "ops":
             # 走 eager（不经过图）的前向，每个 aten 算子才各自可见；按算子名归组
@@ -1094,12 +1121,12 @@ class RuntimeChatMixin:
                     self.model.logits(tok)
                 sync()
             ka = prof.key_averages()
-            total = sum(r.self_device_time_total for r in ka)
-            rows = sorted(ka, key=lambda r: r.self_device_time_total, reverse=True)[:25]
+            total = sum(_self_device_us(r) for r in ka)
+            rows = sorted(ka, key=_self_device_us, reverse=True)[:25]
             return {"ok": True, "n": n, "total_us": round(total / n, 1),
                     "rows": [{"op": r.key[:70], "calls": r.count // n,
-                              "us": round(r.self_device_time_total / n, 1),
-                              "pct": round(100 * r.self_device_time_total / total, 1)}
+                              "us": round(_self_device_us(r) / n, 1),
+                              "pct": round(100 * _self_device_us(r) / max(total, 1e-9), 1)}
                              for r in rows]}
         if op == "verify":
             return self._verify_ab(req)
@@ -1353,16 +1380,44 @@ class RuntimeChatMixin:
             tok = runner.sample(seq.prefill_logits, 0.0)
             if self._push(seq, tok):
                 finished.append(seq)
+        # 逐内核归因只能在这里做：批处理引擎不接受 ``profile`` 这个诊断 op（它要求
+        # 单流引擎），而 EP 的归约是四个 rank 的锁步，进程外的 profiler 抓不到
+        # 「本 rank 花了多少设备时间」。开关跟着请求走，所以同一批里只有要量的那一轮
+        # 付 profiler 的钱。
+        prof = None
+        if req.get("profile"):
+            prof = torch.profiler.profile(
+                activities=profiler_activities(device=True))
+            prof.__enter__()
         steps = 0
-        while steps < max_new:
-            active = [s for s in seqs if s not in finished]
-            if not active:
-                break
-            tokens = runner.decode(active)
-            for seq, tok in zip(active, tokens):
-                if self._push(seq, tok):
-                    finished.append(seq)
-            steps += 1
+        try:
+            while steps < max_new:
+                active = [s for s in seqs if s not in finished]
+                if not active:
+                    break
+                tokens = runner.decode(active)
+                for seq, tok in zip(active, tokens):
+                    if self._push(seq, tok):
+                        finished.append(seq)
+                steps += 1
+        finally:
+            if prof is not None:
+                sync()
+                prof.__exit__(None, None, None)
+        if prof is not None:
+            per = max(steps, 1)
+            ka = prof.key_averages()
+            total = sum(_self_device_us(r) for r in ka)
+            # 同上：发射次数直接读 ``cudaLaunchKernel`` 那一条，别用设备侧条目计数去凑
+            # （这个 fork 的 ``key_averages`` 会把内核事件重复计一份）。
+            launch = next((r.count for r in ka if r.key.endswith("cudaLaunchKernel")), None)
+            print(f"[pdprof] rank={rank} steps={per} rows={len(seqs)} "
+                  f"total_us={total / per:.1f} "
+                  f"launches/step={None if launch is None else launch // per} "
+                  f"all={len(ka)}", flush=True)
+            for r in sorted(ka, key=_self_device_us, reverse=True)[:22]:
+                print(f"[pdprof] {_self_device_us(r) / per:9.1f}us "
+                      f"calls/step={r.count // per:5d} {r.key[:56]}", flush=True)
         t_dec = time.time() - t1
         out_items = []
         for it, seq in zip(items, seqs):

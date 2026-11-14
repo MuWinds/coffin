@@ -27,6 +27,7 @@
 // 共享内存开销变成常数，256k 也装得下。计算量没变：老内核为了累加 V 本来就要走遍每个
 // 有效 key，只是它把整个窗口当一个循环走，而不是一块一块走。
 
+#include "hip_bindings.h"
 #include "hip_ops.h"
 
 #include <c10/cuda/CUDAStream.h>
@@ -290,3 +291,8 @@ torch::Tensor attn_paged_decode(torch::Tensor q, torch::Tensor gate,
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
+
+// 绑定写在内核旁边：名字、参数名与默认值只有一份，``bindings.cpp`` 只剩模块入口。
+COFFIN_BIND(attn_decode, "fused single-token attention over the int8 KV cache");
+COFFIN_BIND(attn_paged_decode,
+            "fused single-token attention over the paged int8 KV pool");

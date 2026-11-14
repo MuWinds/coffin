@@ -33,6 +33,7 @@
 //   * 不用 CUDA graph、不用 cp.async：两者在这张卡上都能过编译，然后静默挂死。
 //   * 全程不用 fp64
 
+#include "corex_bindings.h"
 #include "corex_ops.h"
 #include "corex_scalar.h"
 
@@ -705,3 +706,21 @@ torch::Tensor moe_grouped_i8_merge(torch::Tensor a, torch::Tensor xs, torch::Ten
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
+
+// 绑定写在内核旁边：名字、参数名与默认值只有这一份，`bindings.cpp` 只遍历注册表。
+COFFIN_BIND(moe_grouped_i8,
+            "\u5206\u7ec4 int8 \u6295\u5f71\uff1a\u4e13\u5bb6\u6808 [E, K, N] int8 "
+          "+ \u9010 (\u4e13\u5bb6, \u5217) scale",
+            pybind11::arg("a"), pybind11::arg("xs"), pybind11::arg("w"), pybind11::arg("ws"),
+            pybind11::arg("offsets"), pybind11::arg("out"), pybind11::arg("slices") = 0);
+COFFIN_BIND(moe_grouped_i8_merge,
+            "分组 int8 投影的归并形态：各行按路由权重加权累加成一行",
+            pybind11::arg("a"), pybind11::arg("xs"), pybind11::arg("w"), pybind11::arg("ws"),
+            pybind11::arg("offsets"), pybind11::arg("rw"), pybind11::arg("out"),
+            pybind11::arg("slices") = 0);
+COFFIN_BIND(moe_grouped_i8_merge_tokens,
+            "归并形态的多流版本：每个 token 只累加自己的 top_k 行，权重按槽位号直取",
+            pybind11::arg("a"), pybind11::arg("xs"), pybind11::arg("w"), pybind11::arg("ws"),
+            pybind11::arg("offsets"), pybind11::arg("rw"), pybind11::arg("slot_pos"),
+            pybind11::arg("slot_of_pos"), pybind11::arg("tokens"), pybind11::arg("top_k"),
+            pybind11::arg("out"), pybind11::arg("slices") = 0);

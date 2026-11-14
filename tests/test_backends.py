@@ -99,30 +99,26 @@ def _run_py(code: str, env: dict | None = None) -> subprocess.CompletedProcess:
 
 
 class OpTableTest(unittest.TestCase):
-    """``Ops`` 就是契约：40 个名字、固定顺序、不许有被悄悄丢掉的条目。"""
+    """``Ops`` 就是契约：固定顺序、没有重复名字、没有会悄悄消失的条目。"""
 
-    def test_names_are_the_contract_ops(self):
-        """改名或漏名对每个调用点都是契约破坏，所以元组按字面钉死。"""
-        self.assertEqual(Ops.NAMES, (
-            "linear", "linear_m", "linear_m_verify", "linear_prefill",
-            "moe_grouped",
-            "moe_grouped_gemm", "moe_grouped_i8", "moe_dispatch", "moe_router",
-            "rms_norm", "add_rms_norm", "rms_norm_gated", "kv_quant", "silu_mul",
-            "rope_apply",
-            "attn_decode", "attn_paged", "attn_paged_batch", "attn_paged_multi_q",
-            "attn_sparse", "qsa_block_keys",
-            "conv1d_silu", "conv1d_silu_seq", "conv1d_silu_batch",
-            "delta_prologue", "delta_prologue_batch", "delta_prep_seq",
-            "delta", "delta_record", "delta_batch",
-            "delta_batch_record", "delta_commit", "delta_normed", "delta_normed_seq",
-            "triangular_solve",
-            "hyper_norm", "hyper_down", "hyper_up",
-            "moe_grouped_i8_merge", "moe_decode_block", "shared_gate_scale",
-        ))
-        self.assertEqual(len(Ops.NAMES), 41)
+    def test_names_are_unique_lowercase_snake_case(self):
+        """契约名就是调用点写下的标识符；重名或带前缀的名字会让派生出来的表错位。
+
+        名字只写在 dataclass 字段上（``Ops.NAMES`` 从 ``fields`` 派生），所以这里查的是
+        「字段本身合法」：后端按同名约定 ``getattr`` 自己的适配器，任何不以小写开头的
+        名字都会把一个私有辅助误认成内核。
+        """
+        self.assertEqual(len(set(Ops.NAMES)), len(Ops.NAMES))
+        for name in Ops.NAMES:
+            self.assertRegex(name, r"^[a-z][a-z0-9_]*$")
 
     def test_names_match_the_dataclass_fields_in_order(self):
-        """这条元组是手工维护的，可能与 dataclass 漂移；这里就是漂移报警器。"""
+        """名字只写在字段上，元组派生而来；这条断言守的是「有人又把元组写成字面量」。
+
+        写回字面量的代价不是多一行，而是两份清单开始各自漂移——上一版就是这么在三次提交
+        里漏掉 ``silu_mul_quant``、``gather_quant_i8`` 和 ``moe_grouped_i8_merge_tokens``
+        的，而那个元组本该是漏名字的报警器。
+        """
         from dataclasses import fields
 
         self.assertEqual(tuple(f.name for f in fields(Ops)), Ops.NAMES)
@@ -318,31 +314,31 @@ class ReferenceTotalityTest(unittest.TestCase):
 
 
 class NativeRegistrationTest(unittest.TestCase):
-    """后端的 ``_NATIVE`` 字典必须列出它为每个算子写的适配器。
+    """后端的原生条目按「适配器同名」派生，这里守的是那个约定本身。
 
-    这里守的失效模式在其他任何检查里都看不见。``_NATIVE`` 是手工维护的
-    name -> adapter 字典，从它里面漏掉的算子会被 ``reference.fill`` 用*参考实现*
-    补上。于是适配器、头文件声明、绑定、协议字段、参考实现可以全都落地，整棵树
-    也是绿的，那个算子却始终没在这个后端上跑过内核——它跑着 torch 参考实现，同时
-    报告成功。在这种状态下测出来的性能会读成一个干净的零提升，与「融合没赚到」
-    无法区分。
+    手写的 ``name -> adapter`` 字典曾是这套结构里唯一会静默失败的注册点：漏一条既不报错
+    也不改变任何日志，那个算子从此在本后端上跑参考实现、同时报告成功——测出来是一个
+    干净的零提升，与「这个融合没赚到」无法区分。约定把名字变成注册动作
+    （``protocol.native_ops``），所以这里不再逐条比对两份清单，只查约定本身。
 
     检查针对适配器而不是内核符号：内核以自己的扩展层名字绑定（``gemv_kn``、
-    ``silu_mul``），不必与算子名一致，所以这里只问一件事：模块为一个算子定义了
-    适配器，却把它漏在注册之外。
+    ``silu_mul``），不必与算子名一致，所以这里只问一件事：``NATIVE`` 里的每个名字是不是
+    本模块自己定义的适配器，而不是顺手 import 进来的参考实现。
     """
 
-    def test_every_op_with_an_adapter_is_registered_native(self):
-        """后端为某个算子定义了可调用的适配器，它就必须出现在 ``_NATIVE`` 里。"""
+    def test_native_entries_are_adapters_defined_by_the_backend(self):
+        """没有同名适配器的名字进不了 ``NATIVE``；进来的都必须是本模块定义的函数。"""
         from backends import corex
 
-        missing = sorted(name for name in Ops.NAMES
-                         if callable(getattr(corex, name, None))
-                         and name not in corex.NATIVE)
-        self.assertEqual(missing, [], (
-            "these ops have an adapter in backends/corex but are absent from _NATIVE, so "
-            "they silently resolve to the reference implementation and never run on the "
-            f"card: {missing}"))
+        self.assertTrue(set(corex.NATIVE) <= set(Ops.NAMES),
+                        sorted(set(corex.NATIVE) - set(Ops.NAMES)))
+        foreign = sorted(
+            name for name in corex.NATIVE
+            if getattr(getattr(corex, name, None), "__module__", None) != corex.__name__)
+        self.assertEqual(foreign, [], (
+            "these names are listed native but do not resolve to an adapter this module "
+            f"defines, so the card would run something that is not the backend's own code: "
+            f"{foreign}"))
 
     def test_decode_op_set_is_a_subset_of_native(self):
         """``_DECODE_OPS`` 把守 ``caps.graph``；里面混进一个没有内核的名字，就可能捕获到 cuBLAS。"""
@@ -351,7 +347,7 @@ class NativeRegistrationTest(unittest.TestCase):
         self.assertEqual(sorted(_DECODE_OPS - set(NATIVE)), [])
 
     def test_every_native_op_is_bound_in_the_extension(self):
-        """写在 ``.cu`` 文件里的内核，在 ``bindings.cpp`` 注册之前都取不到。
+        """写在 ``.cu`` 文件里的内核，在注册之前都取不到。
 
         这是上面 ``_NATIVE`` 那条守卫同一个陷阱的另一半，而且已经咬过一次：
         ``delta_normed`` 有声明、有定义、有协议字段、有参考实现、有适配器、也有
@@ -366,11 +362,19 @@ class NativeRegistrationTest(unittest.TestCase):
         import re
 
         from backends import corex
+        from backends.corex import kernels
 
-        bound_path = corex.kernels.KERNEL_DIR / "bindings.cpp"
-        if not bound_path.is_file():
-            self.skipTest("corex bindings not present")
-        bound = set(re.findall(r'm\.def\(\s*"([a-z0-9_]+)"', bound_path.read_text(encoding="utf-8")))
+        # 注册有两种写法：``bindings.cpp`` 里的 ``m.def("name", ...)``，以及内核自己的
+        # ``.cu`` 里同名约定下的 ``COFFIN_BIND(name, ...)``（lambda 包装的那两条用
+        # ``COFFIN_BIND_LAMBDA``）。三种都扫，而且扫整个 ``_SOURCES``：只读
+        # ``bindings.cpp`` 的话，搬走的那几十条会假阳性。
+        texts = [path.read_text(encoding="utf-8")
+                 for path in (kernels.KERNEL_DIR / name for name in kernels._SOURCES)
+                 if path.is_file()]
+        bound = set()
+        for text in texts:
+            bound |= set(re.findall(r'm\.def\(\s*"([a-z0-9_]+)"', text))
+            bound |= set(re.findall(r'COFFIN_BIND(?:_LAMBDA)?\(\s*([a-z0-9_]+)', text))
 
         # 融合工作新增的算子，后端层算子名都由同名的扩展条目提供；内核以别的名字绑定
         # 的算子（``linear`` -> ``gemv_kn``）按设计不在本检查范围内，所以这里只对扩展
@@ -382,8 +386,8 @@ class NativeRegistrationTest(unittest.TestCase):
         native_and_declared = (set(corex.NATIVE) & declared) | (declared & bound)
         missing = sorted(native_and_declared - bound)
         self.assertEqual(missing, [], (
-            "these kernels are declared and listed native but never registered in "
-            f"bindings.cpp, so calling them raises AttributeError on the card: {missing}"))
+            "these kernels are declared and listed native but never registered with "
+            f"pybind, so calling them raises AttributeError on the card: {missing}"))
 
 
 class VendorSpecTest(unittest.TestCase):
@@ -943,15 +947,41 @@ class Int8BatchKernelTest(unittest.TestCase):
             self.skipTest("corex kernel sources not present")
         return {n: (kernel_dir / n).read_text(encoding="utf-8") for n in wanted}
 
+    def _registered(self, name: str) -> bool:
+        """这个名字是否被注册成扩展条目：扫整个 ``_SOURCES``，两种写法都认。
+
+        Args:
+            name: 扩展侧的绑定名。
+
+        Returns:
+            在 ``bindings.cpp`` 的 ``m.def("name", ...)`` 或某个 ``.cu`` 的
+            ``COFFIN_BIND(name, ...)`` 里出现过时为 ``True``。
+        """
+        import re
+
+        from backends import corex
+
+        kernel_dir = corex.kernels.KERNEL_DIR
+        for src_name in corex.kernels._SOURCES:
+            path = kernel_dir / src_name
+            if not path.is_file():
+                continue
+            text = path.read_text(encoding="utf-8")
+            if re.search(rf'm\.def\(\s*"{name}"', text):
+                return True
+            if re.search(rf"COFFIN_BIND(?:_LAMBDA)?\(\s*{name}\b", text):
+                return True
+        return False
+
     def test_the_batched_int8_entry_exists_in_header_binding_and_kernel(self):
         """声明、注册、定义是三处改动，必须全部落地。"""
         src = self._sources()
         self.assertIn("gemv_kn_i8_m", src["corex_ops.h"],
                       "the batched int8 entry is not declared in corex_ops.h")
-        self.assertIn('m.def("gemv_kn_i8_m"', src["bindings.cpp"],
-                      "the batched int8 entry is not registered in bindings.cpp, so "
-                      "calling it raises AttributeError on the card instead of failing "
-                      "the build")
+        self.assertTrue(self._registered("gemv_kn_i8_m"),
+                        "the batched int8 entry is not registered with pybind, so "
+                        "calling it raises AttributeError on the card instead of failing "
+                        "the build")
         self.assertIn("gemv_kn_i8_m_kernel", src["gemv.cu"],
                       "gemv_kn_i8_m has no kernel body, so the entry has nothing to "
                       "launch")
@@ -967,8 +997,8 @@ class Int8BatchKernelTest(unittest.TestCase):
         for name in ("gemv_nk_i8", "gemv_nk_i8_m"):
             self.assertIn(name, src["corex_ops.h"],
                           f"{name} is not declared in corex_ops.h")
-            self.assertIn(f'm.def("{name}"', src["bindings.cpp"],
-                          f"{name} is not registered in bindings.cpp")
+            self.assertTrue(self._registered(name),
+                            f"{name} is not registered with pybind")
         self.assertIn("gemv_nk_i8_kernel", src["gemv.cu"],
                       "the nk entry has no kernel body, so it has nothing to launch")
 

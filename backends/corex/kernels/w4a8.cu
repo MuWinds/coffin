@@ -12,6 +12,7 @@
 //   * 分片缓冲区是 ``[split, M, N]`` fp32：归约要能按 ``s = 0 .. split-1`` 累加，所以
 //     分片不能共用输出缓冲区。
 
+#include "corex_bindings.h"
 #include "corex_ops.h"
 #include "corex_scalar.h"
 
@@ -524,3 +525,16 @@ torch::Tensor w4a8_gemv(torch::Tensor a, torch::Tensor w, torch::Tensor xs,
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
+
+// 绑定写在内核旁边：名字、参数名与默认值只有这一份，`bindings.cpp` 只遍历注册表。
+//调优旋钮全部带默认值 ``0``（= 沿用已发布的规则），所以不传它们时这一条与
+//引入旋钮之前逐位相同。名字与 ``gemv_kn_i8`` 保持同一套：同一个概念在两个核上
+//换名字，扫描脚本就没法共用一份形状表。
+COFFIN_BIND(w4a8_gemv,
+            "分组 W4 与 int8 激活的整数点积，int32 逐组累加",
+            pybind11::arg("a"), pybind11::arg("w"), pybind11::arg("xs"), pybind11::arg("ws"),
+            pybind11::arg("out"), pybind11::arg("group_size"), pybind11::arg("threads") = 0,
+            pybind11::arg("unroll") = 0, pybind11::arg("split") = 0, pybind11::arg("width") = 0);
+COFFIN_BIND(quant_act_i8_scaled,
+            "按跨 rank 共享的逐行 scale 量化激活",
+            pybind11::arg("x"), pybind11::arg("out"), pybind11::arg("xs"));

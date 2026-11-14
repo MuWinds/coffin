@@ -21,6 +21,7 @@
 //   * 输入是 fp32 且连续存放：prologue 已经把 q/k 归一化和缩放好了，所以本内核不做任何
 //     逐元素修补。
 
+#include "hip_bindings.h"
 #include "hip_ops.h"
 
 #include <c10/cuda/CUDAStream.h>
@@ -132,3 +133,6 @@ torch::Tensor delta_step(torch::Tensor q, torch::Tensor k, torch::Tensor v,
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
+
+// 绑定写在内核旁边：名字、参数名与默认值只有一份，``bindings.cpp`` 只剩模块入口。
+COFFIN_BIND(delta_step, "gated delta rule decode step, updates the state in place");

@@ -60,6 +60,7 @@
 //   * 不属于本 rank 的槽位（``local_table[e] < 0``）丢弃，不占桶、不写进行序。
 //   * 不用 CUDA graph、不用 cp.async
 
+#include "corex_bindings.h"
 #include "corex_ops.h"
 
 #include <c10/cuda/CUDAGuard.h>
@@ -248,3 +249,11 @@ void moe_dispatch(torch::Tensor expert_idx, torch::Tensor local_table,
         (int)slots, (int)local_experts, (int)num_experts, (int)top_k);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
+
+// 绑定写在内核旁边：名字、参数名与默认值只有这一份，`bindings.cpp` 只遍历注册表。
+COFFIN_BIND(moe_dispatch,
+            "\u5206\u6d3e\uff1a\u8def\u7531\u7ed3\u679c \u2192 \u524d\u7f00\u548c + \u884c\u5e8f",
+            pybind11::arg("expert_idx"), pybind11::arg("local_table"), pybind11::arg("out_offsets"),
+            pybind11::arg("out_slot_pos"), pybind11::arg("out_tokens"), pybind11::arg("out_slots"),
+            pybind11::arg("scratch"), pybind11::arg("slots"), pybind11::arg("local_experts"),
+            pybind11::arg("num_experts"), pybind11::arg("top_k"));

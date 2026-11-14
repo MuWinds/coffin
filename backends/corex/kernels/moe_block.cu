@@ -9,6 +9,7 @@
 //     否则驱动只是把 Python 的分配搬进 C++，省不下那笔钱。
 //   * 数值必须与 `models/qwen35/moe.py` 的 Python 路径逐位相同，包括 `_shared` 的两次窄化。
 
+#include "corex_bindings.h"
 #include <torch/extension.h>
 
 #include "corex_ops.h"
@@ -110,3 +111,17 @@ torch::Tensor moe_decode_block(torch::Tensor x,
   }
   return out;
 }
+
+// 绑定写在内核旁边：名字、参数名与默认值只有这一份，`bindings.cpp` 只遍历注册表。
+COFFIN_BIND(moe_decode_block,
+            "decode 一层的 MoE 块：路由 → 共享专家 → 分派 → 两次分组 int8 → 合并 → 残差",
+            pybind11::arg("x"), pybind11::arg("router_wt"), pybind11::arg("router_scale"),
+            pybind11::arg("gu_w"), pybind11::arg("gu_scale"), pybind11::arg("dn_w"),
+            pybind11::arg("dn_scale"), pybind11::arg("sg_wt"), pybind11::arg("sg_scale"),
+            pybind11::arg("sd_wt"), pybind11::arg("sd_scale"), pybind11::arg("gate_w"),
+            pybind11::arg("table"), pybind11::arg("idx"), pybind11::arg("rw"),
+            pybind11::arg("offsets"), pybind11::arg("slot_pos"), pybind11::arg("token_of_pos"),
+            pybind11::arg("slot_of_pos"), pybind11::arg("disp_scratch"), pybind11::arg("xq_gu"),
+            pybind11::arg("xs_gu"), pybind11::arg("gu_out"), pybind11::arg("xq_dn"),
+            pybind11::arg("xs_dn"), pybind11::arg("shared_hidden"), pybind11::arg("out"),
+            pybind11::arg("top_k"), pybind11::arg("slices") = 0, pybind11::arg("with_shared") = 1);

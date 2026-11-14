@@ -1,9 +1,10 @@
 // @file corex_ops.h
-// @brief 在 ``bindings.cpp`` 里绑定的 CoreX 扩展入口声明。
+// @brief 在各自的 ``.cu`` 里用 ``COFFIN_BIND`` 绑定的 CoreX 扩展入口声明。
 //
-// Module: coffin/backends/corex/kernels。内核和绑定共享的唯一头文件；它是纯接口，
-// 所以必须不含设备代码——``bindings.cpp`` 由主机编译器编译，那里没有 ``__device__``。
-// bf16 转换因此放在 ``corex_scalar.h``。
+// Module: coffin/backends/corex/kernels。内核与绑定共享的唯一头文件；它是纯接口，所以
+// 必须不含设备代码——``bindings.cpp``（模块入口，只由主机编译器编）经由
+// ``corex_bindings.h`` 包含它，设备代码一进来那里就编不过。bf16 转换因此放在
+// ``corex_scalar.h``。
 //
 // Constraints:
 //   * 这里的声明就是绑定名：``backends/corex/kernels/__init__.py`` 按字符串查找它们。

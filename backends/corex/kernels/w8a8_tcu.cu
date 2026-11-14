@@ -33,6 +33,7 @@
 //   * 每次启动都在 ``c10::cuda::getCurrentCUDAStream()`` 上。
 //   * 全程不用 fp64：本设备对它返回 0。
 
+#include "corex_bindings.h"
 #include "corex_i8.h"
 #include "corex_ops.h"
 #include "corex_scalar.h"
@@ -854,3 +855,22 @@ torch::Tensor w8a8_gemm_tcu(torch::Tensor a, torch::Tensor w, torch::Tensor xs,
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
+
+// 绑定写在内核旁边：名字、参数名与默认值只有这一份，`bindings.cpp` 只遍历注册表。
+COFFIN_BIND(w4a8_gemm_tcu,
+            "分组 packed W4 与 int8 激活的张量核投影",
+            pybind11::arg("a"), pybind11::arg("w"), pybind11::arg("xs"), pybind11::arg("ws"),
+            pybind11::arg("out"), pybind11::arg("group_size"),
+            // M 方向 tile：0 表示默认 128，64 / 256 是另外两档；db 非 0 时走
+          // 「双缓冲 + k 步长 32」那一档。两个参数都只用于扫参与稠密路径调优。
+          pybind11::arg("m_tile") = 0,
+            pybind11::arg("db") = 0);
+COFFIN_BIND(w8a8_gemm_tcu,
+            "wide-instruction (i8x8) tensor-core int8 GEMM with the epilogue fused: "
+          "out[M, N] = (A[M, K] @ W[K, N]) scaled, in one launch",
+            pybind11::arg("a"), pybind11::arg("w"), pybind11::arg("xs"), pybind11::arg("ws"),
+            pybind11::arg("out"), pybind11::arg("cfg") = 0);
+COFFIN_BIND(moe_grouped_gemm,
+            "\u5206\u7ec4 MoE \u7684\u5927 M \u5f62\u6001\uff1a\u6309\u4e13\u5bb6\u5206\u6bb5\u5404\u505a\u4e00\u6b21\u5f20\u91cf\u6838 GEMM",
+            pybind11::arg("a"), pybind11::arg("xs"), pybind11::arg("w"), pybind11::arg("ws"),
+            pybind11::arg("offsets"), pybind11::arg("out"), pybind11::arg("group_size"));

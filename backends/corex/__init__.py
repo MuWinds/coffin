@@ -48,7 +48,7 @@ import torch
 
 from backends import reference
 from backends.corex import kernels, pack
-from backends.protocol import Backend, Caps, Ops, OpFn, make_device
+from backends.protocol import Backend, Caps, Ops, OpFn, make_device, native_ops
 from int8_weights import QWeight
 from w4a8_weights import W4A8Weight
 
@@ -2557,61 +2557,17 @@ def triangular_solve(lower: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
     return module.triangular_solve(lower.contiguous(), rhs.contiguous())
 
 
-#: 本后端用内核承担的算子，按 :class:`Ops` 字段顺序。缺席的都由 :func:`ops` 从参考
-#: 后端补齐，这就是只实现了一半的平台仍然能应答每个名字的原因。
+#: 本后端用内核承担的算子。按「适配器与算子同名」的约定从本模块收集，所以写了适配器
+#: 就是原生条目，没写就自然交给 :func:`ops` 从参考后端补齐。
 #:
-#: 这个 dict 是手工维护的，而这正是值得点名的陷阱：一个适配器、一条头文件声明、一个
-#: 绑定、一个协议字段和一份参考实现都可以先落地，而算子在这里仍然缺席——然后它就会
-#: 在本后端上悄悄跑 *参考* 实现。那种状态下的测量读出来是一个干净的零，正是本仓库
-#: 用另一种伪装记录过两次的「陈旧缓存是看不见的」失败。``tests/test_backends.py``
-#: 把它和已存在的适配器钉在一起，所以新内核不可能不带注册就跑起来。
-_NATIVE: dict[str, OpFn] = {
-    "linear": linear,
-    "linear_m": linear_m,
-    "linear_m_verify": linear_m_verify,
-    "linear_prefill": linear_prefill,
-    "rms_norm": rms_norm,
-    "add_rms_norm": add_rms_norm,
-    "rms_norm_gated": rms_norm_gated,
-    "kv_quant": kv_quant,
-    "silu_mul": silu_mul,
-    "silu_mul_quant": silu_mul_quant,
-    "gather_quant_i8": gather_quant_i8,
-    "rope_apply": rope_apply,
-    "attn_decode": attn_decode,
-    "attn_paged": attn_paged,
-    "attn_paged_batch": attn_paged_batch,
-    "attn_paged_multi_q": attn_paged_multi_q,
-    "conv1d_silu": conv1d_silu,
-    "conv1d_silu_seq": conv1d_silu_seq,
-    "conv1d_silu_batch": conv1d_silu_batch,
-    "delta_prologue": delta_prologue,
-    "delta_prologue_batch": delta_prologue_batch,
-    "delta_prep_seq": delta_prep_seq,
-    "delta": delta,
-    "delta_record": delta_record,
-    "delta_batch": delta_batch,
-    "delta_batch_record": delta_batch_record,
-    "delta_commit": delta_commit,
-    "delta_normed": delta_normed,
-    "delta_normed_seq": delta_normed_seq,
-    "triangular_solve": triangular_solve,
-    "moe_grouped": moe_grouped,
-    "moe_grouped_gemm": moe_grouped_gemm,
-    "moe_grouped_i8": moe_grouped_i8,    "moe_grouped_i8_merge": moe_grouped_i8_merge,
-    "moe_grouped_i8_merge_tokens": moe_grouped_i8_merge_tokens,
-    "moe_decode_block": moe_decode_block,
-    "shared_gate_scale": shared_gate_scale,
-    "attn_sparse": attn_sparse,
-    "qsa_block_keys": qsa_block_keys,
-    "moe_dispatch": moe_dispatch,
-    # 路由的一条融合路径：替掉 softmax/topk/div/sum/to 五个内核，其中 topk 走的是
-    # 512 元素的 bitonic 排序网络。没有它这一层会退回参考实现（慢但对）。
-    "moe_router": moe_router,
-    "hyper_norm": hyper_norm,
-    "hyper_down": hyper_down,
-    "hyper_up": hyper_up,
-}
+#: 手写清单曾经是第三个注册点，而且它是这里唯一会静默失败的一个：一个适配器、一条头文件
+#: 声明、一个绑定、一个协议字段和一份参考实现都可以先落地，而算子在这里仍然缺席——然后
+#: 它就会在本后端上悄悄跑 *参考* 实现。那种状态下的测量读出来是一个干净的零，正是本仓库
+#: 用另一种伪装记录过两次的「陈旧缓存是看不见的」失败。现在名字即注册：``tests``
+#: 只需检查同名约定本身，而不是逐条比对两份清单。
+#:
+#: 顺序来自 :attr:`Ops.NAMES`，与旧手写 dict 的插入顺序不同；表按名字取值，顺序无语义。
+_NATIVE: dict[str, OpFn] = native_ops(globals())
 
 #: 本后端所有内核的表；缺席的由解析器补齐。
 _OPS = Ops.from_mapping(_NATIVE)
@@ -2801,7 +2757,7 @@ def ops() -> Ops:
     不必写分支。
 
     Returns:
-        一张 17 个名字都可调用的表：有内核的地方用本后端的内核，其余用参考实现。
+        一张每个契约名字都可调用的表：有内核的地方用本后端的内核，其余用参考实现。
         没有设备或构建失败时整张表都是参考实现，诊断调用方仍然可以检查它；
         :func:`usable` 是拦住这种表进不了请求的那道关。
     """
@@ -2816,7 +2772,7 @@ def describe() -> str:
     """把本后端渲染成一行诊断信息。
 
     Returns:
-        ``"corex: <state> device=... arch=... native=N/17"``，启动横幅打印的就是
+        ``"corex: <state> device=... arch=... native=N/M"``，启动横幅打印的就是
         这一行，诊断转储可以 grep 它。和 ``backends.status()`` 不同，它还报告设备名
         和内核被构建时针对的 ISA，而一个错的架构构建只能从这两项诊断出来。
     """

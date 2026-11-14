@@ -288,7 +288,6 @@ class LinearAttn:
         B = x.shape[0]
         qkv, z, b, a = batch_proj(self.qkvzb_a, x)
         z = z.reshape(B, self.num_v, self.dv)
-        proj_in = torch.empty(B, self.vdim, dtype=D, device=_device)
         # 批处理入口要求刚好 [B, ...] 的缓冲区；状态/临时行住在按容量定尺寸的缓冲区
         # 里，所以把行前缀交给它们。
         conv_out = self.conv_out[:B]
@@ -319,12 +318,12 @@ class LinearAttn:
                 self.g[:B], self.state[:B], self.delta_out[:B],
                 self.verify_record_b[:B], record_slot)
             self.snapshot_conv_batch(B, record_slot)
-        # 门控归一化按 (行, value 头) 做，权重是 [dv]，所以折不进批处理入口——这个
-        # 循环是每行一次 launch，不是每个头一次。
-        for i in range(B):
-            proj_in[i] = self.norm(self.delta_out[i],
-                                   z[i].reshape(self.num_v, self.dv)).reshape(self.vdim)
-        return batch_proj(self.out_proj, proj_in)
+        # 门控归一化按 (行, value 头) 做，权重是 [dv]；但「按头」不等于「按行」：
+        # 归约轴是 dv，`rms_norm_gated` 的并行轴就是行，所以整个 bucket 一次
+        # launch 就够。原来这里按行循环（B 次 launch + B 次视图构造），24 个
+        # delta 层累计 24*(B-1) 次纯浪费的发射。
+        proj_in = self.norm(self.delta_out[:B].view(B, self.num_v, self.dv), z)
+        return batch_proj(self.out_proj, proj_in.reshape(B, self.vdim))
 
     def _plan_for(self, pr: int):
         """按行号缓存本层用到的持久缓冲切片与 q/k/v 视图。

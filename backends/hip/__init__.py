@@ -39,7 +39,7 @@ import torch
 import torch.nn.functional as F
 
 from backends import reference
-from backends.protocol import Caps, Ops, OpFn, make_device
+from backends.protocol import Caps, Ops, OpFn, make_device, native_ops
 from int8_weights import QWeight
 
 #: 后端标识符，即 ``COFFIN_BACKEND=hip`` 选中的那个。
@@ -811,27 +811,10 @@ def delta_batch(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     return _hip().delta_batch(q, k, v, beta, g, st, out)
 
 
-#: 本后端用内核提供的 17 个名字。``_NATIVE`` 就是 :func:`caps` 报告的内容；这里逐个
-#: 写出来，好让缺失的内核在横幅里表现为更短的 ``native=N/17``，而不是悄悄降级。
-_NATIVE: dict[str, OpFn] = {
-    "linear": linear,
-    "linear_m": linear_m,
-    "linear_prefill": linear_prefill,
-    "rms_norm": rms_norm,
-    "rms_norm_gated": rms_norm_gated,
-    "attn_decode": attn_decode,
-    "attn_paged": attn_paged,
-    "attn_paged_batch": attn_paged_batch,
-    "attn_paged_multi_q": attn_paged_multi_q,
-    "conv1d_silu": conv1d_silu,
-    "conv1d_silu_seq": conv1d_silu_seq,
-    "conv1d_silu_batch": conv1d_silu_batch,
-    "delta_prologue": delta_prologue,
-    "delta_prologue_batch": delta_prologue_batch,
-    "delta_prep_seq": delta_prep_seq,
-    "delta": delta,
-    "delta_batch": delta_batch,
-}
+#: 本后端用内核提供的算子。按「适配器与算子同名」的约定从本模块收集：写了适配器就是
+#: 原生条目，没写就由 :func:`ops` 用参考实现补齐，缺失的内核因此在横幅里表现为更短的
+#: ``native=N/M``，而不是悄悄降级。名字即注册，所以私有辅助函数不得占用契约名。
+_NATIVE: dict[str, OpFn] = native_ops(globals())
 
 #: 本后端已有的全部内核组成的表；解析器会补齐缺席的部分。
 _OPS = Ops.from_mapping(_NATIVE)
@@ -846,7 +829,7 @@ def ops() -> Ops:
     因此保持完整。
 
     Returns:
-        17 个条目全部可调用的表：有内核的地方是本后端的实现，其余是参考实现。没有
+        每个契约名字都可调用的表：有内核的地方是本后端的实现，其余是参考实现。没有
         设备或编译失败时，整张表都是参考实现，诊断调用方仍能检查它；:func:`usable`
         才是拦着这张表进入请求的东西。
     """

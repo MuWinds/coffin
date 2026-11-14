@@ -35,6 +35,7 @@
 // 因此单独看一行，无论用哪个 U、R 或 MW，结果都与对该行的 8 激活切片调用
 // ``gemv_w8a16_m`` 逐位一致（U 只改变预取多少块，不改变块的顺序）。
 
+#include "hip_bindings.h"
 #include "hip_ops.h"
 
 #include <c10/cuda/CUDAStream.h>
@@ -646,3 +647,13 @@ torch::Tensor gemv_w8a16_wide_dot2_dbg(torch::Tensor W, torch::Tensor S,
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return Y;
 }
+
+// 绑定写在内核旁边：名字、参数名与默认值只有一份，``bindings.cpp`` 只剩模块入口。
+COFFIN_BIND(gemv_w8a16_wide,
+            "wide-M int8 W8A16 GEMV for verify (M in 16/24/32, one weight pass)");
+COFFIN_BIND(gemv_w8a16_wide_dbg,
+            "A/B entry for gemv_w8a16_wide: rows/mw tiling exposed");
+COFFIN_BIND(gemv_w8a16_wide_dot2,
+            "wide-M int8-weight GEMV with packed fp16 dot2 math (M in 16/24/32)");
+COFFIN_BIND(gemv_w8a16_wide_dot2_dbg,
+            "A/B entry for gemv_w8a16_wide_dot2: rows/mw tiling exposed");

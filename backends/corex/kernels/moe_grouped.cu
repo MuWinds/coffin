@@ -48,6 +48,7 @@
 //   * 分组编号用 ``blockIdx.z``（专家）与 ``blockIdx.x``（输出列）：一个三维网格
 //     让"哪块算哪个专家"由硬件分发，不需要内核里查表。
 
+#include "corex_bindings.h"
 #include "corex_ops.h"
 #include "corex_scalar.h"
 
@@ -882,3 +883,19 @@ void moe_router(torch::Tensor logits, torch::Tensor out_idx, torch::Tensor out_w
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
+
+// 绑定写在内核旁边：名字、参数名与默认值只有这一份，`bindings.cpp` 只遍历注册表。
+COFFIN_BIND(moe_grouped,
+            "\u5206\u7ec4 W4A8 \u6295\u5f71\uff1a\u6bcf\u4e2a\u4e13\u5bb6\u53ea\u7b97\u8def\u7531\u5230\u5b83\u7684\u884c",
+            pybind11::arg("a"), pybind11::arg("xs"), pybind11::arg("w"), pybind11::arg("ws"),
+            pybind11::arg("offsets"), pybind11::arg("out"), pybind11::arg("group_size"),
+            // 紧凑非空专家表，可为 None。decode 一个 token 只碰约 10 个专家，而每卡
+          // 持 128 个；按全量开 z 维会让 92% 的 block 一进来就退出。
+          pybind11::arg("active") = pybind11::none());
+//路由融合：替掉 ``softmax -> topk -> div -> sum -> to`` 五个内核，其中 topk 对
+//``[1, 512]`` 取 top-10 在本卡上走 bitonic 排序网络、单次 38 us。
+COFFIN_BIND(moe_router,
+            "\u8def\u7531\uff1a\u878d\u5408 softmax -> top-k -> \u5f52\u4e00\u5316\uff0c"
+          "\u4e00\u6b21\u53d1\u5c04\u5199\u51fa\u4e0b\u6807\u4e0e\u6743\u91cd",
+            pybind11::arg("logits"), pybind11::arg("out_idx"), pybind11::arg("out_w"),
+            pybind11::arg("top_k"), pybind11::arg("normalize"));

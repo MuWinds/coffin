@@ -37,6 +37,7 @@
 //     在做归约之前把 fp32 的 ``delta_out`` 转成 bf16。贪心 id 是验收标准，这正是保住它们
 //     的东西。
 
+#include "corex_bindings.h"
 #include "corex_ops.h"
 #include "corex_scalar.h"
 
@@ -392,3 +393,13 @@ torch::Tensor delta_commit(torch::Tensor base, torch::Tensor record,
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return st;
 }
+
+// 绑定写在内核旁边：名字、参数名与默认值只有这一份，``bindings.cpp`` 只遍历注册表。
+COFFIN_BIND(delta, "gated delta decode step, updates the state in place");
+
+// 绑定写在内核旁边：名字、参数名与默认值只有这一份，`bindings.cpp` 只遍历注册表。
+//``delta`` 在 ``delta.cu`` 里自注册。
+COFFIN_BIND(delta_record, "记录秩一更新的 gated delta 解码步");
+COFFIN_BIND(delta_batch, "batched gated delta decode step, one state row per batch entry");
+COFFIN_BIND(delta_batch_record, "批量记录秩一更新的 gated delta 解码步");
+COFFIN_BIND(delta_commit, "从初始状态重放秩一更新");

@@ -7,14 +7,13 @@ Module: ``coffin/models/qwen35``。EP 的通信底座：``moe.py`` 每个 MoE �
 两条路的差别只有一个：**主机搬不搬数据**。
 
 * :class:`EpShmReduce` 把载荷 D2H 进 mmap、主机累加、再 H2D。单次 30-100 µs，但它
-  每次都等设备把队列排空，一步 decode 40 层就是 40 次全流同步，实测每层多付约
-  445 µs（EP4 因此从 19.3 掉到比 PP4 的 29.6 tok/s 还慢）。
+  每次都等设备把队列排空，一步 decode 40 层就是 40 次全流同步
 * :class:`MappedReduce` 让核直接读写同一块物理页（``/dev/shm`` 文件 +
   ``cudaHostRegister``），主机只轮询到达计数、求和由 ``mapped_finish`` 在设备上做完。
   这才是 EP 想要的东西；前提是这张卡支持映射锁页内存（``mapped_pinned_probe`` 验）。
 
 Constraints:
-    * 所有 rank 必须以**完全相同的顺序**调用同一个实例。协议里没有序号校验（省一次读），
+    * 所有 rank 必须以完全相同的顺序调用同一个实例。协议里没有序号校验（省一次读），
       调用错开时不报错，只是把两轮的数据混在一起。
     * 一个板文件只给一个实例用。两个实例共用一个文件时，它们往同一组 arrival 格子上各写
       自己的 round，某一个 rank 的 ``want`` 会被另一块板提前满足，于是读到别人那一轮的数据
@@ -49,6 +48,13 @@ import torch
 _EP_TRACE = os.environ.get("COFFIN_EP_TRACE", "").strip() == "1"
 #: 每层校验一次会合是否被超时闸门放掉。只在排查挂死时打开：代价是每层一次同步。
 _EP_CHECK = os.environ.get("COFFIN_EP_CHECK", "").strip() == "1"
+#: 打内核探针：每个 rank 每 N 轮把「载荷写完 / flag 发出 / 等到齐」三个 clock64 打印出来。
+#: 三个值都是本卡自己的时钟，只能算段内差值；但四个 rank 并排就能看出谁的「等」最长
+#: （最后到的那个等得最短），这正好区分「到达偏斜」与「可见延迟」。
+_P2P_PROF = os.environ.get("COFFIN_P2P_PROF", "").strip() == "1"
+_P2P_PROF_EVERY = int(os.environ.get("COFFIN_P2P_PROF_EVERY", "40") or 40)
+#: 在这一轮（四个 rank 同一轮）各做一次 D2H 读回探针；0 表示不触发。
+_P2P_PROF_AT = int(os.environ.get("COFFIN_P2P_PROF_AT", "0") or 0)
 _EP_STATS: dict[str, list[float]] = {}
 
 
@@ -588,7 +594,9 @@ class P2pReduce:
         total = self.rows * self.hidden
         self._slots = torch.zeros(self.world * total, dtype=torch.float32,
                                   device="cuda")
-        self._flags = torch.zeros(self.world + 1, dtype=torch.int64, device="cuda")
+        #: 尾部留一个 abort 槽 + 探针环（64 格 × 3 个 int64），见 ``_P2P_PROF``。
+        self._flags = torch.zeros(self.world + 1 + 3 * 64, dtype=torch.int64,
+                                  device="cuda")
         self._out = torch.empty(self.rows, self.hidden, dtype=torch.float32,
                                 device="cuda")
         self._slot_ptr = [0] * self.world
@@ -672,6 +680,12 @@ class P2pReduce:
         self._module.p2p_combine(x.contiguous(), out, *self._slot_ptr,
                                  *self._flag_ptr, self.rank, self._round,
                                  blocks, threads)
+        # 探针只在 close() 时读回：轮内做任何 D2H 都会强制同步、把四个 rank 的会合
+        # 打散（实测每 40 轮取一次，下一轮就有 peer 掉出 barrier，落到 abort 锁存）。
+        # 例外：`COFFIN_P2P_PROF_AT=N` 让四个 rank 在**同一轮**（同一层刚会合完）各取一次。
+        # 它们本来就对齐在 barrier 上，一起暂停不会产生偏斜，取完继续跑。
+        if _P2P_PROF and _P2P_PROF_AT and self._round == _P2P_PROF_AT:
+            self._dump_prof()
         # 会合超时不再让卡停在核心里：内核把中止号写进 ``flags[world]`` 并锁存，
         # 之后的轮次直接出零结果返回。宿主每 200 轮查一次这个槽（一步 40 层，
         # 约等于每 5 步一次同步，对吞吐无感），把「静默错数」变成一次明确异常，
@@ -686,6 +700,37 @@ class P2pReduce:
 
     def close(self) -> None:
         """释放槽区与计数。对端映射随进程退出一起消失。"""
+        if _P2P_PROF:
+            self._dump_prof()
         self._slots = None
         self._flags = None
         self._out = None
+
+    def _dump_prof(self) -> None:
+        """把内核环形探针一次读回，按「载荷写完 / flag 发出 / 等到齐」两段统计。
+
+        单位是各卡自己的 SM 时钟 tick，所以只能比**段内差**与**同一轮跨 rank 的差**：
+        最早到的 rank 等得最长，最后到的等得最短，两者的差就是到达偏斜。
+        """
+        slots = 64
+        try:
+            flat = self._flags[self.world + 1:self.world + 1 + 3 * slots]
+            vals = flat.reshape(slots, 3).tolist()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[p2pprof] rank={self.rank} dump_failed {exc}", flush=True)
+            return
+        rows = [v for v in vals if v[2] > 0 and v[2] >= v[0] > 0]
+        if not rows:
+            print(f"[p2pprof] rank={self.rank} empty (rounds={self._round})",
+                  flush=True)
+            return
+
+        def _med(xs: list[float]) -> float:
+            xs = sorted(xs)
+            return xs[len(xs) // 2]
+
+        w = [r[1] - r[0] for r in rows]
+        wd = [r[2] - r[1] for r in rows]
+        print(f"[p2pprof] rank={self.rank} rounds={self._round} n={len(rows)} "
+              f"write_med={_med(w):.0f} wait_med={_med(wd):.0f} "
+              f"write_max={max(w)} wait_max={max(wd)} ticks", flush=True)

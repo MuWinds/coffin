@@ -33,6 +33,7 @@
 //   * ``out`` 是新分配，从不与输入重叠，所以调用方可以把同一个张量同时当 ``lower`` 和
 //     ``rhs`` 传进来，求解过程不会把它中途改坏。
 
+#include "corex_bindings.h"
 #include "corex_ops.h"
 #include "corex_scalar.h"
 
@@ -161,3 +162,9 @@ torch::Tensor triangular_solve(torch::Tensor lower, torch::Tensor rhs) {
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
+
+// 绑定写在内核旁边：名字、参数名与默认值只有这一份，`bindings.cpp` 只遍历注册表。
+//三角求解：替代这份构建加载不了的 cuSOLVER 路径。
+COFFIN_BIND(triangular_solve,
+            "unit-lower-triangular solve A X = B over a batch of [L, L] systems",
+            pybind11::arg("lower"), pybind11::arg("rhs"));

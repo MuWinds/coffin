@@ -22,6 +22,7 @@
 //     内核不属于捕获范围。
 //   * 全程不用 fp64：本设备对它返回 0（docs/qwen4/COREX-PLATFORM.md）。
 
+#include "corex_bindings.h"
 #include "corex_i8.h"
 #include "corex_ops.h"
 #include "corex_scalar.h"
@@ -369,3 +370,20 @@ torch::Tensor w8a8_epilogue(torch::Tensor c, torch::Tensor xs, torch::Tensor ws,
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
+
+// 绑定写在内核旁边：名字、参数名与默认值只有这一份，``bindings.cpp`` 只遍历注册表。
+COFFIN_BIND(quant_act_i8,
+            "per-token symmetric int8 quantisation of [M, K], one fp32 scale per row");
+
+// 绑定写在内核旁边：名字、参数名与默认值只有这一份，`bindings.cpp` 只遍历注册表。
+COFFIN_BIND(gather_quant_i8,
+            "gather one row by index table and quantise it, in one launch",
+            pybind11::arg("x"), pybind11::arg("index"), pybind11::arg("out_q"),
+            pybind11::arg("out_s"));
+COFFIN_BIND(w8a8_gemm,
+            "int8 GEMM C[M, N] = A[M, K] @ W[K, N], int32 accumulate",
+            pybind11::arg("a"), pybind11::arg("w"), pybind11::arg("c"));
+COFFIN_BIND(w8a8_epilogue,
+            "apply both W8A8 scales to an int32 accumulator and narrow once",
+            pybind11::arg("c"), pybind11::arg("xs"), pybind11::arg("ws"), pybind11::arg("out"),
+            pybind11::arg("stride") = 0);

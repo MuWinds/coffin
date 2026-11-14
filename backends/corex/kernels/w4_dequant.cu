@@ -34,6 +34,7 @@
 //     常驻是 4.5 GB，会把显存打爆。
 //   * 每次启动都在 ``c10::cuda::getCurrentCUDAStream()`` 上。
 
+#include "corex_bindings.h"
 #include "corex_ops.h"
 #include "corex_scalar.h"
 #include <c10/cuda/CUDAGuard.h>
@@ -154,3 +155,9 @@ torch::Tensor w4_dequant(torch::Tensor packed, torch::Tensor scale, int64_t k, i
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
+
+// 绑定写在内核旁边：名字、参数名与默认值只有这一份，`bindings.cpp` 只遍历注册表。
+COFFIN_BIND(w4_dequant,
+            "packed W4 权重一趟反量化成 bf16（大 M 的厂商 GEMM 前置）",
+            pybind11::arg("packed"), pybind11::arg("scale"), pybind11::arg("k"), pybind11::arg("n"),
+            pybind11::arg("group"));

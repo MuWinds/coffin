@@ -19,6 +19,7 @@
 //   * 只实例化列出的 (R, U) / (M, U) 组合；别的组合一律 TORCH_CHECK 失败。
 //   * 尾部处理：K % 8 用标量尾循环收掉，所以任意 K 都是对的。
 
+#include "hip_bindings.h"
 #include "hip_ops.h"
 
 #include <c10/cuda/CUDAStream.h>
@@ -262,3 +263,8 @@ torch::Tensor gemv_w8a16_m(torch::Tensor W, torch::Tensor S, torch::Tensor X, in
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return Y;
 }
+
+// 绑定写在内核旁边：名字、参数名与默认值只有一份，``bindings.cpp`` 只剩模块入口。
+COFFIN_BIND(gemv_w8a16,
+            "int8-weight bf16-activation GEMV (per-row scale, R rows/warp, U unroll)");
+COFFIN_BIND(gemv_w8a16_m, "batched small-M int8-weight GEMV");

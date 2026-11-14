@@ -24,6 +24,7 @@
 //   * 每个 (R, U) 和 (M, U) 组合都是编译期实例化的；不在列表里的组合是 TORCH_CHECK
 //     失败，而不是慢路径。
 
+#include "hip_bindings.h"
 #include "hip_ops.h"
 
 #include <c10/cuda/CUDAStream.h>
@@ -323,3 +324,11 @@ torch::Tensor gemv_bf16_m(torch::Tensor W, torch::Tensor X, int64_t U) {
 torch::Tensor gemv_f16_m(torch::Tensor W, torch::Tensor X, int64_t U) {
     return gemv_m_entry<true>(W, X, U);
 }
+
+// 绑定写在内核旁边：名字、参数名与默认值只有一份，``bindings.cpp`` 只剩模块入口。
+COFFIN_BIND(gemv_bf16, "bf16 GEMV (R rows per warp, U-way K-loop unroll)");
+COFFIN_BIND(gemv_f16,
+            "fp16-weight GEMV, bf16 activations (same layout as gemv_bf16)");
+COFFIN_BIND(gemv_bf16_m,
+            "batched small-M bf16 GEMV (M input vectors share one weight pass)");
+COFFIN_BIND(gemv_f16_m, "batched small-M fp16-weight GEMV");
