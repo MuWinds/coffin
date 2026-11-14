@@ -88,35 +88,20 @@ torch::Tensor moe_decode_block(torch::Tensor x,
   torch::Tensor flat_index = idx.reshape({-1}).to(torch::kInt);
   moe_dispatch(flat_index, table, offsets, slot_pos, token_of_pos, slot_of_pos,
                disp_scratch, flat_index.numel(), experts, global_experts, top_k);
-  torch::Tensor packed = x.index_select(0, token_of_pos);
-  quant_act_i8(packed, xq_gu, xs_gu);
-  torch::Tensor gu = moe_grouped_i8(xq_gu, xs_gu, gu_w, gu_scale, offsets, gu_out,
+  torch::Tensor packed_q = gather_quant_i8(x, token_of_pos, xq_gu, xs_gu);
+  torch::Tensor gu = moe_grouped_i8(packed_q, xs_gu, gu_w, gu_scale, offsets, gu_out,
                                     slices > 0 ? slices : kAutoSlices);
   torch::Tensor gate = gu.narrow(1, 0, inter);
   torch::Tensor up = gu.narrow(1, inter, inter);
-  silu_mul(gate, up, up);
-  quant_act_i8(up, xq_dn, xs_dn);
-  // ``moe_grouped_i8_merge`` 的逐行权重契约是 fp32；``rw`` 的 dtype 跟着 logits（bf16）。
-  // Python 包装层同样做这一步转换。
-  torch::Tensor flat_weights =
-      rw.reshape({-1}).index_select(0, slot_of_pos).to(torch::kFloat);
-  if (global_experts != experts) {
-    // 专家并行：``[valid, slots)`` 这些行不属于本 rank。分派内核不把它们排进行序
-    // （位置表尾部清 0），但分组内核仍按 ``slots`` 行算完了它们，于是它们带着**真实
-    // 投影值**、按「槽位 0 的路由权重」加回去——恒等映射时这批行不存在，所以单卡 /
-    // PP / TP 都看不见这个坑；症状是首 token 正确、其后逐 token 变胡话。
-    //
-    // 掩码用 ``arange < offsets[experts]`` 而不是 ``offsets[-1].item()``：后者是一次
-    // D2H 同步，每层一次会把主机预取打断（qwen4exp 量到 +11.7%），而这里整个比较
-    // 都留在设备上。
-    auto rows = flat_index.numel();
-    auto keep = at::arange(rows, flat_weights.options().dtype(torch::kInt32)) <
-                offsets[experts];
-    flat_weights = flat_weights * keep.to(torch::kFloat);
-  }
-  torch::Tensor merged = moe_grouped_i8_merge(xq_dn, xs_dn, dn_w, dn_scale, offsets,
-                                              flat_weights, out,
-                                              slices > 0 ? slices : kAutoSlices);
+  // SwiGLU 乘积与它的 int8 版本在同一次启动里出：down 投影要的就是这份量化结果，
+  // 拆开就是「写一遍 bf16 再整条读回来求 amax」——中间量只有 ``[top_k, inter]``。
+  silu_mul_quant(gate, up, up, xq_dn, xs_dn);
+  // ``moe_grouped_i8_merge_tokens`` 自己按槽位号取路由权重，也自己在设备上按
+  // ``offsets[E]`` 判掉不属于本 rank 的尾部行；这里因此既不用把 ``rw`` 摊成逐行表、
+  // 也不用算 ``arange < valid`` 的掩码——那两步原本是每层 6 次发射与一次 4 KB 往返。
+  torch::Tensor merged = moe_grouped_i8_merge_tokens(
+      xq_dn, xs_dn, dn_w, dn_scale, offsets, rw.reshape({-1}), slot_pos, slot_of_pos,
+      /*tokens=*/1, top_k, out, slices > 0 ? slices : kAutoSlices);
   // `merged` 就是 `out`（合并核写进去的那个）。共享专家要不要现在加，由调用方定：
   // 专家并行下本函数只返回**本 rank 的专家部分**，共享专家必须在跨 rank 求和之后
   // 再加一次——这里加了的话，四个 rank 各自带一份共享贡献，求和会把它算四遍。

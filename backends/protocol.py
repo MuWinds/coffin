@@ -93,6 +93,7 @@ _OP_NAMES: tuple[str, ...] = (
     "hyper_down",
     "hyper_up",
     "moe_grouped_i8_merge",    # 同一件事的 int8 形态：权重 [E, K, N] int8，激活按行量化
+    "moe_grouped_i8_merge_tokens",  # 它的逐 token 形态：单流与多流共用一个收尾核
     "moe_decode_block",        # decode 单行路径的 MoE 融合入口
     "shared_gate_scale",       # 共享专家门：sigmoid(x·w) 乘到投影输出上，一次启动
 )
@@ -495,6 +496,12 @@ class Ops:
     #: ``moe_grouped_i8_merge(w, x, offsets, row_weight) -> y``：同一件事的归并形态，
     #: 把各行按路由权重加权累加成一行。``None`` 表示后端没有这个入口。
     moe_grouped_i8_merge: OpFn | None = None
+    #: ``moe_grouped_i8_merge_tokens(w, x, offsets, row_weight, slot_pos, slot_of_pos,
+    #: tokens, top_k) -> y``：归并形态的逐 token 版本，单流与多流共用一个入口。与
+    #: ``moe_grouped_i8_merge`` 的区别只有三处，都是把外层的三次发射搬进核里：路由权重
+    #: 按槽位号直接寻址、有效行按 ``offsets[E]`` 在设备上判掉、多流的累加直接写
+    #: ``[tokens, N]``。``None`` 表示后端没有这个入口。
+    moe_grouped_i8_merge_tokens: OpFn | None = None
     #: 把 decode 一层的 MoE 块合成一次调用：路由投影、`moe_router`、共享专家的两个投影
     #: 与门标量、`moe_dispatch`、两次分组 int8 投影与合并核。**中间缓冲全部由调用方
     #: 预分配**，所以这个入口在稳态下不分配内存；它存在的唯一理由是省掉十余次 pybind

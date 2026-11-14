@@ -241,6 +241,8 @@ class SparseMoE:
         self._gate_scale = (getattr(bops, "shared_gate_scale", None)
                             if "shared_gate_scale" in native else None)
         self._gate_buf: torch.Tensor | None = None
+        #: 多行解码收尾的 ``[tokens, H]`` 累加缓冲；按第一次用到的行数定尺，之后复用。
+        self._tail_buf: torch.Tensor | None = None
         self._router = getattr(bops, "moe_router", None) if "moe_router" in native else None
         #: 分组投影只有 W4A8 栈能用：内核消费的是 packed 缓冲区和分组 scale，
         #: 稠密栈在 ``backends.reference`` 里另有实现，但本卡上它不是原生路径，
@@ -258,6 +260,12 @@ class SparseMoE:
                                   if ("moe_grouped_i8_merge" in native
                                       and isinstance(self.gate_up, QWeightMoE))
                                   else None)
+        #: int8 栈的**逐 token 归并**入口：单流与多流共用一个入口，权重按槽位号直取、
+        #: 有效行掩码在核里判、累加直接写 ``[tokens, H]``（见 :meth:`_experts`）。
+        self._merge_tokens = (getattr(bops, "moe_grouped_i8_merge_tokens", None)
+                              if ("moe_grouped_i8_merge_tokens" in native
+                                  and isinstance(self.gate_up, QWeightMoE))
+                              else None)
         self._grouped_gemm = (getattr(bops, "moe_grouped_gemm", None)
                               if "moe_grouped_gemm" in native else None)
         #: 全局专家号 → 本地号；``ep`` 下不归本 rank 的专家是 -1。见 :meth:`_expert_table`。
@@ -535,7 +543,7 @@ class SparseMoE:
             # 第四、五个实参依次是**本 rank**的专家数与全局专家数：分派内核要按局部
             # 桶数做前缀和，按全局数建表。ep 下两者差 world_size 倍，写反了不会报错，
             # 只会把一半槽位塞进不存在的桶。
-            offsets, _slot_pos, token_of_pos, slot_of_pos = self._dispatch(
+            offsets, slot_pos, token_of_pos, slot_of_pos = self._dispatch(
                 flat_index, self._expert_table(flat_index.device), flat_index.numel(),
                 self.local_experts, self.num_experts, top_k)
             # 收拢成「按专家排好序」的行，然后两次分组投影：gate/up 一次出中间量，
@@ -548,6 +556,17 @@ class SparseMoE:
             packed = x.index_select(0, token_of_pos.long())
             gate, up = self._group(self.gate_up, packed, offsets).chunk(2, dim=-1)
             activated = bops.silu_mul(gate, up, up)
+            if self._merge_tokens is not None:
+                # 收尾整段并进归并核：路由权重按槽位号在核里取（省一次
+                # ``index_select`` 与一次 fp32 转换）、专家并行的有效行掩码按
+                # ``offsets[E]`` 在设备上判（省 ``arange``/``lt``/``to``/``mul`` 四次）、
+                # 多流的累加直接在核里写成 ``[tokens, H]``（省 ``zero_``/``mul``/
+                # ``index_add_`` 与两次 ``.long()``）。单流与多流都走这一个入口。
+                return self._reduce(
+                    self._merge_tokens(self.down, activated, offsets,
+                                       weights.reshape(-1), slot_pos, slot_of_pos,
+                                       tokens, top_k),
+                    x.dtype)
             # ``slot_of_pos`` 是**展平后的**槽位号（``token * top_k + slot``），不是槽位内的
             # 0..top_k-1 —— 实测 tokens=8、slots=64 时它的取值范围是 0..63。所以逐行权重
             # 和回写位置用的都是它本身；再叠一次 ``token * top_k`` 会让下标飞出缓冲区
@@ -575,6 +594,29 @@ class SparseMoE:
                     self._grouped_i8_merge(self.down, activated, offsets, flat_weights),
                     x.dtype)
             hidden = self._group(self.down, activated, offsets)
+            if os.environ.get("COFFIN_MOE_TAIL_FAST", "1") != "0":
+                # 多行解码的收尾：直接把 64 行按**token** 累加到 ``[tokens, H]``，而不是
+                # 先落到 ``[tokens*top_k, H]`` 再 ``view(...).sum(1)``。
+                #
+                # 省掉的是两个内核：``aten::sum`` 与 ``reduce_kernel``，稳态实测各
+                # 38 µs/层（= 1.54 ms/step 各）。它们只搬 32 KB，38 µs 全是小 grid 的
+                # 固定成本（折算 0.86 GB/s），纯属发射与并行度浪费。换成同一个
+                # ``index_add_`` 里的 8 路原子加之后，40 层一共少 80 次发射、
+                # 少 3.1 ms/step，缓冲也从 256 KB 缩到 32 KB。
+                #
+                # 数值：8 路原子加与原来「先散写 64 行、再按 top_k 归约」是同一个加法的
+                # 不同结合顺序，bf16 下都可能差末位；这条路径本来就走 ``index_add_``
+                # （见本文件开头的定序说明），所以口径没有变化。
+                # ``COFFIN_MOE_TAIL_FAST=0`` 可回到旧写法做 A/B。
+                n = tokens
+                buf = self._tail_buf
+                if (buf is None or buf.shape[0] != n or buf.shape[1] != self.hidden
+                        or buf.dtype != x.dtype or buf.device != x.device):
+                    self._tail_buf = buf = torch.zeros(
+                        (n, self.hidden), dtype=x.dtype, device=x.device)
+                buf.zero_()
+                buf.index_add_(0, token_of_pos.long(), hidden * flat_weights[:, None])
+                return self._reduce(buf, x.dtype)
             # 分派内核把有效行紧密排在前缀里、尾部清 0，所以尾部那几个位置会带着
             # 全零贡献落到槽位 0 上——加法里加 0 不改值，写法比切片简单且不需要同步。
             buf = torch.zeros((tokens * top_k, self.hidden),

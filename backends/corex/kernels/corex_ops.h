@@ -296,6 +296,21 @@ torch::Tensor kv_quant(torch::Tensor x, torch::Tensor out_q, torch::Tensor out_s
 // @throws c10::Error dtype、形状或连续性与目的地不一致。
 torch::Tensor quant_act_i8(torch::Tensor x, torch::Tensor out_q, torch::Tensor out_s);
 
+// @brief 按索引表搬一行并量化：``index_select`` 与 ``quant_act_i8`` 合成一次启动。
+//
+// MoE 分派之后被收拢的那些行来自 ``token_of_pos`` 指向的原行。两条内核搬的是同一批
+// 字节，而中间那份 bf16 缓冲除了喂给量化没有第二个读者；一步 decode 里 40 层各一次。
+// 量化口径与 ``quant_act_i8`` 逐位相同。
+//
+// @param x [M, K] 源激活，bf16 或 fp32。
+// @param index [rows] int32 行号表，连续。
+// @param out_q [rows, K] int8 目的地，连续。
+// @param out_s [rows] fp32 逐行 scale，连续。
+// @return ``out_q``。
+// @throws c10::Error 表长、形状、dtype 或连续性与目的地不一致。
+torch::Tensor gather_quant_i8(torch::Tensor x, torch::Tensor index,
+                              torch::Tensor out_q, torch::Tensor out_s);
+
 // @brief int8 GEMM：``C[M, N] = A[M, K] @ W[K, N]``，int32 累加。
 //
 // 本卡实测 int8 GEMM 49.07 TINT8-OPS/s，bf16 42.71 TFLOP/s（27B-4CARD-PLAN.md §3.2），
@@ -373,6 +388,22 @@ torch::Tensor w8a8_gemm_tcu(torch::Tensor a, torch::Tensor w, torch::Tensor xs,
 // @return ``out``，便于调用链串接。
 // @throws c10::Error 形状、dtype 或重叠是内核服务不了的。
 torch::Tensor silu_mul(torch::Tensor gate, torch::Tensor up, torch::Tensor out);
+
+// @brief 与 :func:`silu_mul` 同一套舍入写 bf16，并顺手把结果量化成 int8 与逐行 scale。
+//
+// MoE 的 down 投影吃的是 SwiGLU 之后那份激活的 int8 版本，原来要 ``silu_mul`` 写一遍
+// 再 ``quant_act_i8`` 读回来求 amax。中间量只有 ``[slots, I]``（decode 8 行 = 8 KiB），
+// 两趟搬的是同一片字节。amax 按**落盘的那个 bf16** 算，所以与拆开跑逐位相同。
+//
+// @param gate [M, W]（或一维一行）门那一半，最内层步长 1。
+// @param up 另一半，形状同 ``gate``。
+// @param out 同形状目的地，可与 ``up`` 重叠（MoE 就是原地写）。
+// @param out_q [rows, W] 连续 int8。
+// @param out_s [rows] fp32 逐行 scale，连续。
+// @return ``out``。
+// @throws c10::Error 形状、dtype 或布局是内核服务不了的。
+torch::Tensor silu_mul_quant(torch::Tensor gate, torch::Tensor up, torch::Tensor out,
+                             torch::Tensor out_q, torch::Tensor out_s);
 
 // @brief 共享专家的门标量：``sigmoid(x·w)`` 乘到 ``src`` 上写进 ``out``，一次启动。
 //
@@ -766,6 +797,37 @@ torch::Tensor moe_grouped_i8(torch::Tensor a, torch::Tensor xs, torch::Tensor w,
 torch::Tensor moe_grouped_i8_merge(torch::Tensor a, torch::Tensor xs, torch::Tensor w,
                                    torch::Tensor ws, torch::Tensor offsets,
                                    torch::Tensor rw, torch::Tensor out, int64_t slices);
+
+// @brief 归并形态的多流版本：每个 token 把自己的 top_k 行加权累加到自己那一行。
+//
+// 与 :func:`moe_grouped_i8_merge` 的差别只有两处，都是为了把外层的三次发射搬进来：
+// 路由权重按**槽位号**直接寻址（不再由调用方先 gather 成逐行表），以及不属于本 rank 的
+// 尾部行在这里按 `offsets[E]` 判掉（不再由调用方先算 `arange < valid` 的掩码并相乘）。
+//
+// `tokens == 1` 时走行序累加，与 :func:`moe_grouped_i8_merge` 逐位相同；`tokens > 1`
+// 时按槽位序累加，每行的加法顺序是确定的（不含原子），所以同一输入两次运行一致。
+//
+// @param a           int8 激活，[rows, K] 连续，已按专家号排序。
+// @param xs          逐行激活 scale，[rows] fp32 连续。
+// @param w           专家栈，[E, K, N] 连续 int8。
+// @param ws          专家栈 scale，[E, N] 连续 fp32。
+// @param offsets     [E+1] 前缀和，int32 连续；`offsets[E]` 就是有效行数。
+// @param rw          路由权重，[tokens * top_k] 连续 bf16 或 fp32，按槽位号索引。
+// @param slot_pos    槽位 → 收拢后行号，int32 [tokens * top_k]，丢弃的为 -1。
+// @param slot_of_pos 收拢后行 → 槽位号，int32 [tokens * top_k]。
+// @param tokens      行数 `rows / top_k`；决定走行序还是槽位序。
+// @param top_k       每 token 的专家数。
+// @param out         [tokens, N] 连续，bf16 或 fp32，dtype 由它决定。
+// @param slices      K 方向分片数；<= 0 自动，本形态至少用 2 片。
+// @return out。
+// @throws c10::Error 布局、设备、dtype 或形状不自洽。
+torch::Tensor moe_grouped_i8_merge_tokens(torch::Tensor a, torch::Tensor xs,
+                                          torch::Tensor w, torch::Tensor ws,
+                                          torch::Tensor offsets, torch::Tensor rw,
+                                          torch::Tensor slot_pos,
+                                          torch::Tensor slot_of_pos,
+                                          int64_t tokens, int64_t top_k,
+                                          torch::Tensor out, int64_t slices);
 
 // @brief 把 decode 一层的 MoE 块合成一次主机侧驱动，省掉十余次 pybind 往返。
 //

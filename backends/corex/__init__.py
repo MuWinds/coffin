@@ -861,6 +861,91 @@ def moe_grouped_i8_merge(w, x: torch.Tensor, offsets: torch.Tensor,
     module.moe_grouped_i8_merge(xq, xs, w.wq, w.scale, bounds, row_weight, out,
                                 slices)
     return _restore(out, dtype)
+
+
+def moe_grouped_i8_merge_tokens(w, x: torch.Tensor, offsets: torch.Tensor,
+                                row_weight: torch.Tensor,
+                                slot_pos: torch.Tensor, slot_of_pos: torch.Tensor,
+                                tokens: int, top_k: int,
+                                scales: torch.Tensor | None = None,
+                                out: torch.Tensor | None = None,
+                                slices: int = 0) -> torch.Tensor:
+    """归并形态的多流版本：每个 token 只累加自己那 ``top_k`` 行。
+
+    与 :func:`moe_grouped_i8_merge` 是同一个数学，区别在于三件外层原本要先做的事现在
+    都在核里：路由权重按槽位号直接寻址（不再 ``index_select`` 成逐行表、也不再转 fp32）、
+    专家并行的有效行掩码由内核按 ``offsets[E]`` 自己判（不再算 ``arange < valid`` 再相乘）、
+    多流的累加写进 ``[tokens, N]``（不再 ``zero_`` / ``mul`` / ``index_add_`` 三步）。
+
+    Args:
+        w: int8 专家栈，``[E, K, N]`` 加 ``[E, N]`` fp32 scale。
+        x: 激活，``[rows, K]``，已按专家号排序。bf16 时本函数就地量化；int8 时必须同时
+            给出 ``scales``。
+        offsets: ``[E+1]`` 前缀和。
+        row_weight: ``[rows]`` 的路由权重，bf16 或 fp32，第 ``r`` 行对应槽位
+            ``slot_of_pos[r]``。
+        slot_pos: ``[rows]``，槽位 → 行号，路由到别的 rank 的槽位为 ``-1``。
+        slot_of_pos: ``[rows]``，行号 → 槽位。
+        tokens: 解码行数，即 ``rows / top_k``。``1`` 时走行序，与
+            :func:`moe_grouped_i8_merge` 逐位相同。
+        top_k: 每 token 的专家数。
+        scales: 逐行激活 scale，``[rows]`` fp32；``x`` 已是 int8 时必填。
+        out: 可选目的地，``[tokens, N]`` bf16 或 fp32；不给则分配。
+        slices: K 方向分片数；``<= 0`` 自动。
+
+    Returns:
+        ``[tokens, N]``，dtype 同 ``x``（int8 输入时为 fp32 的同形结果）。
+
+    Raises:
+        ValueError: 激活行数、权重形状或两张位置表的长度与 ``tokens * top_k`` 不自洽。
+    """
+    module = _kernels()
+    if x.dim() != 2 or x.shape[-1] != w.k:
+        raise ValueError("grouped MoE expects [rows, K] activations")
+    rows = int(x.shape[0])
+    if int(offsets.numel()) != len(w) + 1:
+        raise ValueError("offsets must have " + str(len(w) + 1) + " entries")
+    if rows != tokens * top_k:
+        raise ValueError(f"{rows} activation rows do not split into {tokens} x {top_k}")
+    if int(slot_pos.numel()) != rows or int(slot_of_pos.numel()) != rows:
+        raise ValueError("slot tables need one entry per row")
+    if int(row_weight.numel()) != rows:
+        raise ValueError("row_weight needs one entry per row")
+    if rows == 0:
+        n = w.n
+        return torch.empty((tokens, n), dtype=torch.float32, device=x.device)
+    dtype = x.dtype
+    if x.dtype == torch.int8:
+        if scales is None:
+            raise ValueError("int8 activations need their per-row scales")
+        xq, xs = x, scales
+        act_dtype = torch.float32
+    else:
+        act_dtype = x.dtype if x.dtype in (torch.bfloat16, torch.float32) else torch.float32
+        act = x if x.dtype == act_dtype else x.float()
+        if not act.is_contiguous():
+            act = act.reshape(rows, w.k).contiguous()
+        xq, xs = _moe_scratch(rows, w.k, act.device)
+        module.quant_act_i8(act, xq, xs)
+    if not row_weight.is_contiguous():
+        row_weight = row_weight.contiguous()
+    if row_weight.dtype not in (torch.bfloat16, torch.float32):
+        row_weight = row_weight.float()
+    if offsets.dtype == torch.int32 and offsets.is_contiguous():
+        bounds = offsets
+    else:
+        bounds = offsets.to(dtype=torch.int32, device=x.device).contiguous()
+    if slot_pos.dtype != torch.int32 or not slot_pos.is_contiguous():
+        slot_pos = slot_pos.to(dtype=torch.int32, device=x.device).contiguous()
+    if slot_of_pos.dtype != torch.int32 or not slot_of_pos.is_contiguous():
+        slot_of_pos = slot_of_pos.to(dtype=torch.int32, device=x.device).contiguous()
+    if out is None or out.shape != (tokens, w.n) or out.dtype != act_dtype \
+            or out.device != x.device:
+        out = torch.empty((tokens, w.n), dtype=act_dtype, device=x.device)
+    module.moe_grouped_i8_merge_tokens(xq, xs, w.wq, w.scale, bounds, row_weight,
+                                       slot_pos, slot_of_pos, int(tokens), int(top_k),
+                                       out, slices)
+    return out if x.dtype == torch.int8 else _restore(out, dtype)
 #: ``(tokens, k, device)`` → ``(xq, xs)`` 的分组 MoE 激活暂存。
 #:
 #: 一步 decode 里 ``moe_grouped`` 被调 96 次（48 层 x gate_up/down），原来每次新建
@@ -2417,6 +2502,7 @@ _NATIVE: dict[str, OpFn] = {
     "moe_grouped": moe_grouped,
     "moe_grouped_gemm": moe_grouped_gemm,
     "moe_grouped_i8": moe_grouped_i8,    "moe_grouped_i8_merge": moe_grouped_i8_merge,
+    "moe_grouped_i8_merge_tokens": moe_grouped_i8_merge_tokens,
     "moe_decode_block": moe_decode_block,
     "shared_gate_scale": shared_gate_scale,
     "attn_sparse": attn_sparse,

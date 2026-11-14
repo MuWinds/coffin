@@ -105,6 +105,61 @@ __global__ void quant_act_i8_kernel(const XT* __restrict__ x, int8_t* __restrict
     }
 }
 
+// @brief 按索引表搬一行、顺手量化：``index_select`` + ``quant_act_i8`` 合成一次启动。
+//
+// MoE 分派之后，收拢进分组投影的那些行来自 ``token_of_pos`` 指向的原行。原来那是两次
+// 启动：先 ``index_select`` 把行搬进 ``[slots, K]`` 的 bf16 缓冲，再 ``quant_act_i8``
+// 把它整条读一遍写成 int8 与 scale。两个内核搬的是同一批字节，而中间那份 bf16 缓冲
+// 除了喂给量化没有第二个读者——一步 decode 里 40 层各一次，每次 8 行 x 4 KiB。
+//
+// 量化口径与 ``quant_act_i8`` **逐位相同**：amax 只在 K 上归约、下限 ``1e-5``、
+// ``__float2int_rn`` 后截断到 ``[-127, 127]``。差别只有源行按索引表取，以及那一行进
+// 共享内存——一行只有 ``K * sizeof(XT)`` 字节，第二趟（量化）因此不必回全局读。
+//
+// @param x [M, K] 源激活，bf16 或 fp32。
+// @param index [rows] int32 行号表（分派写出的 ``token_of_pos``）。
+// @param out_q [rows, K] int8 目的地。
+// @param out_s [rows] 每行 fp32 scale 目的地。
+// @param K 行宽。
+template <typename XT>
+__global__ void gather_quant_i8_kernel(const XT* __restrict__ x,
+                                       const int* __restrict__ index,
+                                       int8_t* __restrict__ out_q,
+                                       float* __restrict__ out_s, int K) {
+    const int row = blockIdx.x;
+    const XT* src = x + (size_t)index[row] * K;
+    int8_t* qr = out_q + (size_t)row * K;
+
+    __shared__ float smax[QUANT_THREADS];
+    extern __shared__ int8_t sraw[];
+    XT* srow = reinterpret_cast<XT*>(sraw);
+    for (int i = (int)threadIdx.x; i < K; i += (int)blockDim.x) srow[i] = src[i];
+    __syncthreads();
+
+    float amax = 0.f;
+    for (int i = (int)threadIdx.x; i < K; i += (int)blockDim.x) {
+        amax = fmaxf(amax, fabsf(CxScalar<XT>::to_float(srow[i])));
+    }
+    smax[threadIdx.x] = amax;
+    __syncthreads();
+    // 关闭屏障不可省：下一次归约或同一块里再进同一个内核时，``smax[0] = v`` 的写
+    // 必须晚于别人对它的读。
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            smax[threadIdx.x] = fmaxf(smax[threadIdx.x], smax[threadIdx.x + s]);
+        }
+        __syncthreads();
+    }
+    const float sc = fmaxf(smax[0], 1e-5f) / 127.0f;
+    const float inv = 1.0f / sc;
+    if (threadIdx.x == 0) out_s[row] = sc;
+    for (int i = (int)threadIdx.x; i < K; i += (int)blockDim.x) {
+        int q = __float2int_rn(CxScalar<XT>::to_float(srow[i]) * inv);
+        q = max(-127, min(127, q));
+        qr[i] = (int8_t)q;
+    }
+}
+
 // @brief 施加两个 W8A8 scale 并窄化一次：一块负责若干行，块内线程沿 ``N`` 扫。
 //
 // 两个 scale 在同一个 fp32 表达式里乘完再窄化，与稠密路径的舍入次数一致。
@@ -186,6 +241,45 @@ torch::Tensor quant_act_i8(torch::Tensor x, torch::Tensor out_q, torch::Tensor o
         quant_act_i8_kernel<uint16_t><<<M, QUANT_THREADS, 0, stream>>>(
             reinterpret_cast<const uint16_t*>(xc.data_ptr()), out_q.data_ptr<int8_t>(),
             out_s.data_ptr<float>(), K);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out_q;
+}
+
+torch::Tensor gather_quant_i8(torch::Tensor x, torch::Tensor index,
+                              torch::Tensor out_q, torch::Tensor out_s) {
+    TORCH_CHECK(x.dim() == 2, "source activation must be 2-D [M, K], got ", x.dim());
+    TORCH_CHECK(index.is_cuda() && index.dim() == 1
+                && index.scalar_type() == torch::kInt && index.is_contiguous(),
+                "row index must be contiguous CUDA int32 [rows]");
+    TORCH_CHECK(out_q.is_contiguous() && out_s.is_contiguous(),
+                "quant destinations must be contiguous");
+    TORCH_CHECK(out_q.scalar_type() == torch::kChar, "out_q must be int8, got ",
+                out_q.scalar_type());
+    TORCH_CHECK(out_s.scalar_type() == torch::kFloat, "out_s must be fp32, got ",
+                out_s.scalar_type());
+    const int rows = (int)index.size(0);
+    const int K = (int)x.size(1);
+    TORCH_CHECK(out_q.sizes() == torch::IntArrayRef({rows, K}),
+                "out_q shape ", out_q.sizes(), " does not match ", rows, "x", K);
+    TORCH_CHECK(out_s.numel() == rows, "out_s must hold one value per row: got ",
+                out_s.numel(), " for ", rows, " rows");
+    const bool x32 = x.scalar_type() == torch::kFloat;
+    TORCH_CHECK(x32 || x.scalar_type() == torch::kBFloat16,
+                "activation must be bf16 or fp32, got ", x.scalar_type());
+    if (rows == 0) return out_q;
+    auto xc = x.contiguous();
+    const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    if (x32) {
+        const size_t smem = (size_t)K * sizeof(float);
+        gather_quant_i8_kernel<float><<<rows, QUANT_THREADS, smem, stream>>>(
+            reinterpret_cast<const float*>(xc.data_ptr()), index.data_ptr<int>(),
+            out_q.data_ptr<int8_t>(), out_s.data_ptr<float>(), K);
+    } else {
+        const size_t smem = (size_t)K * sizeof(uint16_t);
+        gather_quant_i8_kernel<uint16_t><<<rows, QUANT_THREADS, smem, stream>>>(
+            reinterpret_cast<const uint16_t*>(xc.data_ptr()), index.data_ptr<int>(),
+            out_q.data_ptr<int8_t>(), out_s.data_ptr<float>(), K);
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out_q;

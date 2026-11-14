@@ -570,6 +570,71 @@ torch::Tensor slice_launch(torch::Tensor q, torch::Tensor gate, torch::Tensor kc
     return out;
 }
 
+// @brief 先按「核里 silu_mul 的同一套舍入」写 bf16，再顺手量化成 int8 与逐行 scale。
+//
+// MoE 的 down 投影吃的是 SwiGLU 之后的那份激活的 int8 版本。原来那是两次启动：一次
+// ``silu_mul`` 写 ``[slots, I]`` bf16，紧跟一次 ``quant_act_i8`` 把同一片字节读回来
+// 求 amax、再写 int8。8 行 x 512 的中间量只有 8 KiB，两趟搬的是同一份。
+//
+// 舍入次序是契约：amax 必须按**落下去的那个 bf16** 算，否则和「先落盘再量化」差最后
+// 一位。所以这里先写 ``out``，再在读回同一个地址的过程中求 amax（同一条线程序写自己
+// 的那个元素，不跨线程，不需要屏障），最后按 ``1e-5`` 下限与 ``__float2int_rn`` 截断
+// 到 ``[-127, 127]``——与 ``quant_act_i8_kernel`` 逐位相同。
+//
+// @param gate [rows, W]（或一维一行）门那一半，最内层步长 1。
+// @param up 另一半，形状同 ``gate``。
+// @param out 目的地，bf16 或 fp32，可以与 ``up`` 重叠（MoE 就是原地写）。
+// @param out_q [rows, W] 连续 int8。
+// @param out_s [rows] fp32 逐行 scale。
+// @param width ``W``；``g_pitch/u_pitch/o_pitch`` 是行间距。
+// @return 无；三份目的地都归调用方所有。
+// @throws 设备侧不抛。包装层在主机侧校验布局。
+template <typename T>
+__global__ void silu_mul_quant_kernel(const T* __restrict__ gate,
+                                      const T* __restrict__ up,
+                                      T* __restrict__ out,
+                                      int8_t* __restrict__ out_q,
+                                      float* __restrict__ out_s,
+                                      int width, long g_pitch, long u_pitch,
+                                      long o_pitch) {
+    const long r = blockIdx.x;
+    const T* gr = gate + r * g_pitch;
+    const T* ur = up + r * u_pitch;
+    T* orow = out + r * o_pitch;
+    int8_t* qr = out_q + (size_t)r * width;
+
+    __shared__ float smax[256];
+    for (int c = (int)threadIdx.x; c < width; c += (int)blockDim.x) {
+        // 与 ``silu_mul_kernel`` 同一套运算与同样的两次窄化：sigmoid 在 fp32 里算、
+        // 先窄化 ``s``、乘积再窄化一次。省掉任何一次都改变 logits。
+        const float g = CxScalar<T>::to_float(gr[c]);
+        const T s = CxScalar<T>::from_float(g / (1.f + __expf(-g)));
+        orow[c] = CxScalar<T>::from_float(CxScalar<T>::to_float(s)
+                                          * CxScalar<T>::to_float(ur[c]));
+    }
+    // amax 按落盘的值算，等价于「先跑 silu_mul 再跑 quant_act_i8」看到的输入。
+    float amax = 0.f;
+    for (int c = (int)threadIdx.x; c < width; c += (int)blockDim.x) {
+        amax = fmaxf(amax, fabsf(CxScalar<T>::to_float(orow[c])));
+    }
+    smax[threadIdx.x] = amax;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            smax[threadIdx.x] = fmaxf(smax[threadIdx.x], smax[threadIdx.x + s]);
+        }
+        __syncthreads();
+    }
+    const float sc = fmaxf(smax[0], 1e-5f) / 127.0f;
+    const float inv = 1.0f / sc;
+    if (threadIdx.x == 0) out_s[r] = sc;
+    for (int c = (int)threadIdx.x; c < width; c += (int)blockDim.x) {
+        int q = __float2int_rn(CxScalar<T>::to_float(orow[c]) * inv);
+        q = max(-127, min(127, q));
+        qr[c] = (int8_t)q;
+    }
+}
+
 }  // namespace
 
 // @brief 在稠密 int8 KV 缓存上算一个解码 token。
@@ -932,6 +997,53 @@ torch::Tensor silu_mul(torch::Tensor gate, torch::Tensor up, torch::Tensor out) 
         silu_mul_kernel<float><<<grid, threads, 0, stream>>>(
             gate.data_ptr<float>(), up.data_ptr<float>(), out.data_ptr<float>(), width,
             g_pitch, u_pitch, o_pitch);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
+torch::Tensor silu_mul_quant(torch::Tensor gate, torch::Tensor up, torch::Tensor out,
+                             torch::Tensor out_q, torch::Tensor out_s) {
+    TORCH_CHECK(gate.scalar_type() == up.scalar_type() && gate.scalar_type() == out.scalar_type(),
+                "gate, up and out must share a dtype");
+    TORCH_CHECK(gate.sizes() == up.sizes() && gate.sizes() == out.sizes(),
+                "gate, up and out must have the same shape");
+    TORCH_CHECK(gate.scalar_type() == torch::kBFloat16 || gate.scalar_type() == torch::kFloat,
+                "operands must be bf16 or fp32");
+    TORCH_CHECK(gate.stride(-1) == 1 && up.stride(-1) == 1 && out.stride(-1) == 1,
+                "gate, up and out must have unit innermost stride");
+    TORCH_CHECK(out_q.scalar_type() == torch::kChar && out_q.is_contiguous(),
+                "out_q must be contiguous int8");
+    TORCH_CHECK(out_s.scalar_type() == torch::kFloat && out_s.is_contiguous(),
+                "out_s must be contiguous fp32");
+    const int width = (int)gate.size(-1);
+    const long rows = gate.dim() <= 1 ? 1 : (long)gate.numel() / width;
+    TORCH_CHECK(out_q.sizes() == torch::IntArrayRef({rows, width}),
+                "out_q shape ", out_q.sizes(), " does not match ", rows, "x", width);
+    TORCH_CHECK(out_s.numel() == rows, "out_s must hold one value per row: got ",
+                out_s.numel(), " for ", rows, " rows");
+    if (width == 0 || rows == 0) return out;
+    const long g_pitch = gate.dim() <= 1 ? (long)width : (long)gate.stride(-2);
+    const long u_pitch = up.dim() <= 1 ? (long)width : (long)up.stride(-2);
+    const long o_pitch = out.dim() <= 1 ? (long)width : (long)out.stride(-2);
+    TORCH_CHECK(g_pitch >= width && u_pitch >= width && o_pitch >= width,
+                "row pitch narrower than the row width");
+    // 一块一行：amax 只在行内归约，与 ``quant_act_i8`` 的块形状一致。呼号降到 256
+    // 是因为一行只有 ``inter`` 列（这个模型里 512），再多线程也是空转。
+    const int threads = 256;
+    const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    const dim3 grid((unsigned)rows);
+    if (gate.scalar_type() == torch::kBFloat16) {
+        silu_mul_quant_kernel<uint16_t><<<grid, threads, 0, stream>>>(
+            reinterpret_cast<const uint16_t*>(gate.data_ptr()),
+            reinterpret_cast<const uint16_t*>(up.data_ptr()),
+            reinterpret_cast<uint16_t*>(out.data_ptr()), out_q.data_ptr<int8_t>(),
+            out_s.data_ptr<float>(), width, g_pitch, u_pitch, o_pitch);
+    } else {
+        silu_mul_quant_kernel<float><<<grid, threads, 0, stream>>>(
+            gate.data_ptr<float>(), up.data_ptr<float>(), out.data_ptr<float>(),
+            out_q.data_ptr<int8_t>(), out_s.data_ptr<float>(), width, g_pitch,
+            u_pitch, o_pitch);
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;

@@ -111,6 +111,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("w"), pybind11::arg("gate"), pybind11::arg("eps") = 1e-6);
     m.def("quant_act_i8", &quant_act_i8,
           "per-token symmetric int8 quantisation of [M, K], one fp32 scale per row");
+    m.def("gather_quant_i8", &gather_quant_i8,
+          "gather one row by index table and quantise it, in one launch",
+          pybind11::arg("x"), pybind11::arg("index"), pybind11::arg("out_q"),
+          pybind11::arg("out_s"));
     m.def("w8a8_gemm", &w8a8_gemm,
           "int8 GEMM C[M, N] = A[M, K] @ W[K, N], int32 accumulate",
           pybind11::arg("a"), pybind11::arg("w"), pybind11::arg("c"));
@@ -133,6 +137,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("silu_mul", &silu_mul,
           "out = silu(gate) * up, the SwiGLU product, out may alias up",
           pybind11::arg("gate"), pybind11::arg("up"), pybind11::arg("out"));
+    m.def("silu_mul_quant", &silu_mul_quant,
+          "SwiGLU product written to bf16 and quantised to int8, in one launch",
+          pybind11::arg("gate"), pybind11::arg("up"), pybind11::arg("out"),
+          pybind11::arg("out_q"), pybind11::arg("out_s"));
     m.def("shared_gate_scale", &shared_gate_scale,
           "out = src * sigmoid(x . w), one launch for the shared-expert gate",
           pybind11::arg("x"), pybind11::arg("w"), pybind11::arg("src"),
@@ -225,6 +233,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "分组 int8 投影的归并形态：各行按路由权重加权累加成一行",
           pybind11::arg("a"), pybind11::arg("xs"), pybind11::arg("w"),
           pybind11::arg("ws"), pybind11::arg("offsets"), pybind11::arg("rw"),
+          pybind11::arg("out"), pybind11::arg("slices") = 0);
+    m.def("moe_grouped_i8_merge_tokens", &moe_grouped_i8_merge_tokens,
+          "归并形态的多流版本：每个 token 只累加自己的 top_k 行，权重按槽位号直取",
+          pybind11::arg("a"), pybind11::arg("xs"), pybind11::arg("w"),
+          pybind11::arg("ws"), pybind11::arg("offsets"), pybind11::arg("rw"),
+          pybind11::arg("slot_pos"), pybind11::arg("slot_of_pos"),
+          pybind11::arg("tokens"), pybind11::arg("top_k"),
           pybind11::arg("out"), pybind11::arg("slices") = 0);
     m.def("moe_decode_block", &moe_decode_block,
           "decode 一层的 MoE 块：路由 → 共享专家 → 分派 → 两次分组 int8 → 合并 → 残差",

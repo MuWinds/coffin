@@ -255,6 +255,107 @@ __global__ void moe_grouped_i8_merge_kernel(const int32_t* __restrict__ part,
     out[col] = CxScalar<XT>::from_float(acc);
 }
 
+// @brief 收尾的行序形态：一个 token 的全部行按**收拢后的行号升序**加权累加。
+//
+// 与 ``moe_grouped_i8_merge_kernel`` 只差权重的来源。原来调用方要先
+// ``index_select`` 把 ``[slots]`` 的路由权重摊成逐行表（一次发射加一次 4 KB 的显存往返），
+// 再为专家并行算一遍 ``arange < valid`` 的掩码并相乘（四次发射）。这里权重改由
+// ``slot_of_pos`` 直接寻址，尾部无效行按 ``offsets[E]`` 判掉。行序与加法次序都没变，
+// 所以单流的结果与那条路逐位相同。
+//
+// @tparam XT 输出 dtype：``uint16_t``（bf16）或 ``float``。
+// @tparam WT 路由权重的存储 dtype，与 ``logits`` 一致。
+// @param part     ``[slices, rows, N]`` int32 部分和。
+// @param ws       专家栈 scale，``[E, N]`` fp32。
+// @param xs       逐行激活 scale，``[rows]`` fp32。
+// @param offsets  ``[E+1]`` 前缀和，int32。
+// @param rw       路由权重，按槽位号索引。
+// @param slot_of_pos 收拢后行号 → 槽位号，int32。
+// @param out      ``[1, N]`` 目的地。
+// @param N, experts, rows, slices 几何。
+template <typename XT, typename WT>
+__global__ void moe_grouped_i8_merge_rows_kernel(const int32_t* __restrict__ part,
+                                                 const float* __restrict__ ws,
+                                                 const float* __restrict__ xs,
+                                                 const int* __restrict__ offsets,
+                                                 const WT* __restrict__ rw,
+                                                 const int* __restrict__ slot_of_pos,
+                                                 XT* __restrict__ out,
+                                                 int N, int experts, int rows,
+                                                 int slices) {
+    const int col = (int)blockIdx.x * I8_COLS + (int)threadIdx.x;
+    if (col >= N) return;
+    // 有效行数留在设备上读：``offsets[E]`` 是分派内核刚写的，取回主机就是一次 D2H
+    // 同步，而 decode 一步有 40 层——每层一次同步会把主机预取打断（qwen4exp 量到
+    // 11.7%）。这也解释了外层那套 ``arange < valid`` 为什么全在设备上算。
+    const int valid = offsets[experts];
+    float acc = 0.f;
+    for (int row = 0; row < rows; ++row) {
+        // 尾部那些行不属于本 rank：分派内核没把它们排进行序（位置表清 0），但分组内核
+        // 仍按 ``rows`` 行算过它们。跳过与「权重乘 0」逐位等价，省掉外面那四次掩码发射。
+        if (row >= valid) continue;
+        const int expert = i8_owner(offsets, experts, row);
+        int total = 0;
+        for (int s = 0; s < slices; ++s) {
+            total += part[((size_t)s * (size_t)rows + (size_t)row) * (size_t)N + col];
+        }
+        acc += (float)total * xs[row] * ws[(size_t)expert * N + col]
+               * CxScalar<WT>::to_float(rw[slot_of_pos[row]]);
+    }
+    out[col] = CxScalar<XT>::from_float(acc);
+}
+
+// @brief 收尾的槽位序形态：每个 token 只累加自己的 top_k 行，写到 ``out[t]``。
+//
+// 多流解码原来走 ``hidden * w`` → ``buf.zero_()`` → ``buf.index_add_(0, token_of_pos)``
+// 三步，外加 ``token_of_pos.long()`` 与 ``slot_of_pos.long()`` 两次 dtype 转换；一步 8 行时
+// 这一串是 40 层 × 8 次发射，而它搬的数据只有 ``[8, 2048]`` bf16。这里按槽位号找出每个
+// token 的行，一次累加写完。
+//
+// 累加用槽位序而不是行序：行序由分派的原子分配决定，按它累加等于让加法次序跟着到达
+// 顺序变；槽位序是固定的，同一输入两次运行逐位一致。这也是这条路径**不用**原子累加的
+// 原因——``index_add_`` 在 bf16 上的结果是不可复现的。
+//
+// @tparam XT 输出 dtype；@tparam WT 路由权重 dtype。
+// @param part     ``[slices, rows, N]`` int32 部分和。
+// @param ws       专家栈 scale，``[E, N]`` fp32。
+// @param xs       逐行激活 scale，``[rows]`` fp32。
+// @param offsets  ``[E+1]`` 前缀和，int32。
+// @param rw       路由权重，按槽位号索引。
+// @param slot_pos 槽位 → 收拢后行号，int32，丢弃的为 -1。
+// @param out      ``[tokens, N]`` 目的地。
+// @param N, experts, rows, slices 几何；``top_k`` 是每 token 的行数。
+template <typename XT, typename WT>
+__global__ void moe_grouped_i8_merge_slots_kernel(const int32_t* __restrict__ part,
+                                                  const float* __restrict__ ws,
+                                                  const float* __restrict__ xs,
+                                                  const int* __restrict__ offsets,
+                                                  const WT* __restrict__ rw,
+                                                  const int* __restrict__ slot_pos,
+                                                  XT* __restrict__ out,
+                                                  int N, int experts, int rows,
+                                                  int slices, int top_k) {
+    const int col = (int)blockIdx.x * I8_COLS + (int)threadIdx.x;
+    if (col >= N) return;
+    const int token = (int)blockIdx.y;
+    const int base = token * top_k;
+    const int valid = offsets[experts];
+    float acc = 0.f;
+    for (int j = 0; j < top_k; ++j) {
+        const int row = slot_pos[base + j];
+        // 路由到别的 rank 的槽位在这里被丢掉（``-1``），与「权重乘 0」等价。
+        if (row < 0 || row >= valid) continue;
+        const int expert = i8_owner(offsets, experts, row);
+        int total = 0;
+        for (int s = 0; s < slices; ++s) {
+            total += part[((size_t)s * (size_t)rows + (size_t)row) * (size_t)N + col];
+        }
+        acc += (float)total * xs[row] * ws[(size_t)expert * N + col]
+               * CxScalar<WT>::to_float(rw[base + j]);
+    }
+    out[(size_t)token * N + col] = CxScalar<XT>::from_float(acc);
+}
+
 }  // namespace
 
 // @brief 分组 int8 投影：``[tokens, K] -> [tokens, N]``，每个专家一份权重。
@@ -351,6 +452,154 @@ torch::Tensor moe_grouped_i8(torch::Tensor a, torch::Tensor xs, torch::Tensor w,
             moe_grouped_i8_reduce_kernel<XT><<<rgrid, block, 0, stream>>>( 
                 part_ptr, ws.data_ptr<float>(), xs.data_ptr<float>(),
                 offsets.data_ptr<int>(), dst, N, experts, tokens, span);
+        }
+    };
+    if (out.scalar_type() == torch::kBFloat16) launch(uint16_t{});
+    else launch(float{});
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
+// @brief 归并形态的多流版本：``[rows, K] -> [tokens, N]``，每个 token 只累加自己的行。
+//
+// 存在的理由是外层的四到十次发射全都可以搬进来：路由权重的 gather（一次
+// ``index_select``）、专家并行的有效行掩码（``arange``/``lt``/``to``/``mul`` 四次）、
+// 以及多流的收尾（``zero_``/``mul``/``index_add_`` 与两次 ``.long()``）。这些算子的输入
+// 输出都只有 ``[tokens, top_k]`` 量级，一步 8 行时 40 层合计 10 次 × 40 次发射，而它们
+// 搬的数据不到 10 KB —— 全是发射与块数不足的成本。
+//
+// 权重直接按槽位号寻址，所以调用方既不必把 ``[tokens * top_k]`` 摊成逐行表，也不必把它
+// 转成 fp32：内核按 ``rw`` 自己的 dtype 读。
+//
+// @param a           int8 激活，``[rows, K]`` 连续 CUDA，已按专家号排序。
+// @param xs          逐行激活 scale，``[rows]`` fp32 连续。
+// @param w           专家栈，``[E, K, N]`` 连续 int8。
+// @param ws          专家栈 scale，``[E, N]`` 连续 fp32。
+// @param offsets     ``[E+1]`` 前缀和，int32 连续。
+// @param rw          路由权重，``[rows]`` 连续 bf16 或 fp32。
+// @param slot_pos    槽位 → 行号，int32 ``[rows]`` 连续，丢弃的为 ``-1``。
+// @param slot_of_pos 行号 → 槽位，int32 ``[rows]`` 连续。
+// @param tokens      行数除以 ``top_k``；``1`` 时走行序以保持与单流路径逐位相同。
+// @param top_k       每 token 的专家数。
+// @param out         ``[tokens, N]`` 连续，bf16 或 fp32，dtype 由它决定。
+// @param slices      K 方向分片数；``<= 0`` 自动，本形态至少用 2 片（理由同
+//                    :func:`moe_grouped_i8_merge`）。
+// @return out。
+// @throws c10::Error 布局、设备、dtype 或形状不自洽。
+torch::Tensor moe_grouped_i8_merge_tokens(torch::Tensor a, torch::Tensor xs,
+                                          torch::Tensor w, torch::Tensor ws,
+                                          torch::Tensor offsets, torch::Tensor rw,
+                                          torch::Tensor slot_pos,
+                                          torch::Tensor slot_of_pos,
+                                          int64_t tokens, int64_t top_k,
+                                          torch::Tensor out, int64_t slices) {
+    TORCH_CHECK(a.is_cuda() && a.dim() == 2 && a.scalar_type() == torch::kChar
+                && a.is_contiguous(), "activation must be contiguous CUDA int8 [rows, K]");
+    TORCH_CHECK(xs.is_cuda() && xs.dim() == 1 && xs.scalar_type() == torch::kFloat
+                && xs.is_contiguous() && xs.size(0) == a.size(0),
+                "activation scale must be contiguous fp32 [rows]");
+    TORCH_CHECK(w.is_cuda() && w.dim() == 3 && w.scalar_type() == torch::kChar
+                && w.is_contiguous(), "weight must be contiguous CUDA int8 [E, K, N]");
+    TORCH_CHECK(ws.is_cuda() && ws.dim() == 2 && ws.scalar_type() == torch::kFloat
+                && ws.is_contiguous(), "weight scale must be contiguous fp32 [E, N]");
+    TORCH_CHECK(offsets.is_cuda() && offsets.dim() == 1
+                && offsets.scalar_type() == torch::kInt && offsets.is_contiguous(),
+                "offsets must be contiguous CUDA int32 [E+1]");
+    TORCH_CHECK(rw.is_cuda() && rw.dim() == 1 && rw.is_contiguous()
+                && (rw.scalar_type() == torch::kBFloat16
+                    || rw.scalar_type() == torch::kFloat)
+                && rw.size(0) == a.size(0),
+                "row weight must be contiguous CUDA bf16 or fp32 [rows]");
+    TORCH_CHECK(slot_pos.is_cuda() && slot_pos.dim() == 1
+                && slot_pos.scalar_type() == torch::kInt && slot_pos.is_contiguous()
+                && slot_pos.numel() == a.size(0),
+                "slot positions must be contiguous CUDA int32 [rows]");
+    TORCH_CHECK(slot_of_pos.is_cuda() && slot_of_pos.dim() == 1
+                && slot_of_pos.scalar_type() == torch::kInt && slot_of_pos.is_contiguous()
+                && slot_of_pos.numel() == a.size(0),
+                "row slots must be contiguous CUDA int32 [rows]");
+    TORCH_CHECK(out.is_cuda() && out.dim() == 2 && out.is_contiguous(),
+                "destination must be contiguous CUDA [tokens, N]");
+    TORCH_CHECK(out.scalar_type() == torch::kBFloat16
+                || out.scalar_type() == torch::kFloat,
+                "destination must be bf16 or fp32");
+    TORCH_CHECK(tokens > 0 && top_k > 0 && tokens * top_k == a.size(0),
+                "tokens * top_k must equal the activation rows");
+    TORCH_CHECK(out.size(0) == tokens, "destination needs one row per token");
+
+    const int rows = (int)a.size(0);
+    const int K = (int)a.size(1);
+    const int N = (int)out.size(1);
+    const int experts = (int)w.size(0);
+    TORCH_CHECK((int)w.size(1) == K && (int)w.size(2) == N,
+                "weight must be [E, K, N] matching activation and destination");
+    TORCH_CHECK((int)ws.size(0) == experts && (int)ws.size(1) == N,
+                "weight scale must be [E, N]");
+    TORCH_CHECK((int)offsets.size(0) == experts + 1, "offsets must have E+1 entries");
+    TORCH_CHECK(K > 0 && N > 0 && experts > 0, "sizes must be positive");
+
+    const int cols = (N + I8_COLS - 1) / I8_COLS;
+    int span = (int)slices;
+    if (span <= 0) {
+        span = 1;
+        while (span < I8_MAX_SLICES
+               && cols * rows * (span + 1) <= 1024
+               && K / (span + 1) >= I8_MIN_PER) {
+            ++span;
+        }
+    }
+    span = std::max(2, std::min(std::min(span, I8_MAX_SLICES), K));
+    const int per = ((K + span - 1) / span + 3) / 4 * 4;
+
+    const c10::cuda::CUDAGuard guard(a.device());
+    const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+
+    // 每一片都覆盖全部 (row, col)；越界列在收尾核里被 ``col >= N`` 挡住。
+    torch::Tensor part = torch::empty({(int64_t)span, (int64_t)rows, (int64_t)N},
+                                      out.options().dtype(torch::kInt));
+    int32_t* part_ptr = part.data_ptr<int32_t>();
+
+    const dim3 grid((unsigned)cols, (unsigned)rows, (unsigned)span);
+    const dim3 block(I8_COLS);
+    const size_t smem = (size_t)K * sizeof(int8_t);
+    const bool single = tokens == 1;
+    const dim3 mgrid((unsigned)cols, (unsigned)(single ? 1 : tokens));
+    auto launch = [&](auto tag) {
+        using XT = decltype(tag);
+        XT* dst = reinterpret_cast<XT*>(out.data_ptr());
+        // 主体核一律写 ``part``：本形态强制 ``span >= 2``（理由同单流归并），所以
+        // ``out`` 那一支不会被走到；传 ``dst`` 只是保持签名。
+        moe_grouped_i8_kernel<XT><<<grid, block, smem, stream>>>(
+            a.data_ptr<int8_t>(), w.data_ptr<int8_t>(), ws.data_ptr<float>(),
+            xs.data_ptr<float>(), offsets.data_ptr<int>(), part_ptr, dst,
+            K, N, experts, rows, span, per);
+        // 权重按它自己的 dtype 实例化：多流路径的路由权重是 bf16，若在这里转 fp32
+        // 就又是一次发射，而这个融合要省的正是那一次。
+        const bool wr_bf16 = rw.scalar_type() == torch::kBFloat16;
+        if (single) {
+            if (wr_bf16) {
+                moe_grouped_i8_merge_rows_kernel<XT, uint16_t><<<mgrid, block, 0, stream>>>(
+                    part_ptr, ws.data_ptr<float>(), xs.data_ptr<float>(),
+                    offsets.data_ptr<int>(),
+                    reinterpret_cast<const uint16_t*>(rw.data_ptr()),
+                    slot_of_pos.data_ptr<int>(), dst, N, experts, rows, span);
+            } else {
+                moe_grouped_i8_merge_rows_kernel<XT, float><<<mgrid, block, 0, stream>>>(
+                    part_ptr, ws.data_ptr<float>(), xs.data_ptr<float>(),
+                    offsets.data_ptr<int>(), rw.data_ptr<float>(),
+                    slot_of_pos.data_ptr<int>(), dst, N, experts, rows, span);
+            }
+        } else if (wr_bf16) {
+            moe_grouped_i8_merge_slots_kernel<XT, uint16_t><<<mgrid, block, 0, stream>>>(
+                part_ptr, ws.data_ptr<float>(), xs.data_ptr<float>(),
+                offsets.data_ptr<int>(),
+                reinterpret_cast<const uint16_t*>(rw.data_ptr()),
+                slot_pos.data_ptr<int>(), dst, N, experts, rows, span, (int)top_k);
+        } else {
+            moe_grouped_i8_merge_slots_kernel<XT, float><<<mgrid, block, 0, stream>>>(
+                part_ptr, ws.data_ptr<float>(), xs.data_ptr<float>(),
+                offsets.data_ptr<int>(), rw.data_ptr<float>(),
+                slot_pos.data_ptr<int>(), dst, N, experts, rows, span, (int)top_k);
         }
     };
     if (out.scalar_type() == torch::kBFloat16) launch(uint16_t{});
