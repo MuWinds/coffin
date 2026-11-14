@@ -91,7 +91,8 @@ torch::Tensor moe_decode_block(torch::Tensor x,
                disp_scratch, flat_index.numel(), experts, global_experts, top_k);
   torch::Tensor packed_q = gather_quant_i8(x, token_of_pos, xq_gu, xs_gu);
   torch::Tensor gu = moe_grouped_i8(packed_q, xs_gu, gu_w, gu_scale, offsets, gu_out,
-                                    slices > 0 ? slices : kAutoSlices);
+                                    slices > 0 ? slices : kAutoSlices,
+                                    /*nk=*/0);
   torch::Tensor gate = gu.narrow(1, 0, inter);
   torch::Tensor up = gu.narrow(1, inter, inter);
   // SwiGLU 乘积与它的 int8 版本在同一次启动里出：down 投影要的就是这份量化结果，
@@ -102,7 +103,7 @@ torch::Tensor moe_decode_block(torch::Tensor x,
   // 也不用算 ``arange < valid`` 的掩码——那两步原本是每层 6 次发射与一次 4 KB 往返。
   torch::Tensor merged = moe_grouped_i8_merge_tokens(
       xq_dn, xs_dn, dn_w, dn_scale, offsets, rw.reshape({-1}), slot_pos, slot_of_pos,
-      /*tokens=*/1, top_k, out, slices > 0 ? slices : kAutoSlices);
+      /*tokens=*/1, top_k, out, slices > 0 ? slices : kAutoSlices, /*nk=*/0);
   // `merged` 就是 `out`（合并核写进去的那个）。共享专家要不要现在加，由调用方定：
   // 专家并行下本函数只返回**本 rank 的专家部分**，共享专家必须在跨 rank 求和之后
   // 再加一次——这里加了的话，四个 rank 各自带一份共享贡献，求和会把它算四遍。

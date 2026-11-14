@@ -1013,7 +1013,7 @@ class Int8BatchKernelTest(unittest.TestCase):
         body = src[start:src.index(chr(10) + "}" + chr(10), start)]
         self.assertIn("threadIdx.x & 31", body,
                       "the nk kernel does not group 32 lanes per output column")
-        self.assertIn("reinterpret_cast<const int*>(row + off)", body,
+        self.assertIn("reinterpret_cast<const int*>(row[w] + off)", body,
                       "the weight is not read as one 32-bit word of four adjacent bytes")
         self.assertIn("__shfl_down_sync", body,
                       "the group does not reduce across lanes, so one lane would have "
@@ -1021,6 +1021,26 @@ class Int8BatchKernelTest(unittest.TestCase):
         self.assertNotIn("wt[", body,
                       "the nk kernel still indexes a [K, N] weight: this entry takes "
                       "[N, K], and a stray wt[] index means the layout was mixed up")
+
+    def test_the_nk_kernel_can_hold_two_columns_per_group(self):
+        """``width=2`` 的收益是「激活读摊到两列上、在飞的权重流翻倍」。
+
+        在源码里查：这是模板形状，没有卡观察不到。宽度写死成 1 会让 M >= 2 的那几档
+        退回去每 128 字节权重付 M 次激活读 —— 结果正确，只是白丢那一档。
+        """
+        src = self._sources()["gemv.cu"]
+        start = src.index("gemv_nk_i8_kernel")
+        body = src[start:src.index(chr(10) + "}" + chr(10), start)]
+        self.assertIn("int W", src[start - 200:start],
+                      "the nk kernel takes no column-per-group template parameter")
+        self.assertIn("acc[M][W]", body,
+                      "the nk kernel keeps one accumulator per (row, column) pair, not "
+                      "one per row")
+        self.assertIn("for (int w = 0; w < W; ++w)", body,
+                      "the weight is not read once per column in the group")
+        # 激活读必须在 ``m`` 环里、``w`` 环外：提到 ``w`` 环里就等于没有摊。
+        self.assertIn("NkLoad<XT>::four(x + (size_t)(m < rows ? m : 0) * K + off, x4)",
+                      body)
 
     def test_the_batched_int8_kernel_accumulates_m_rows_per_weight_load(self):
         """只有 M 条累加链在一次权重读取期间一直活着，这个内核才划算。

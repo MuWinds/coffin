@@ -95,6 +95,27 @@ _W4_DEQUANT_MAX_BYTES = int(os.environ.get("COFFIN_W4_DEQUANT_MAX_MB", "256")) <
 #: 不是随便定的。
 _ROW_CHUNK = 8
 
+#: 分组 int8 投影（``moe_grouped_i8*``）是否走 nk 权重栈 ``[E, N, K]``。
+#:
+#: kn（``[E, K, N]``）里相邻 4 个 k 隔着 N 个字节，``__dp4a`` 的 32 位字要四次单字节读
+#: 再拼，而且一个 warp 一轮只搬 32 字节；nk 里一列一行的 K 连续，一次 32 位加载就是那个
+#: 字，一轮 128 字节是一整段内存。稠密投影换 nk 时同字节量快了 1.02-1.63 倍，这条是它在
+#: 分组路径上的同一结论。代价是与 ``wq`` 并行多一份 ``[E, N, K]`` 副本（EP4 下一卡 64 个
+#: 专家约 192 MB），首次取用时一次性转置，见 :meth:`coffin.int8_weights.QWeightMoE.nk_stack`。
+#:
+#: 默认关：这条路径的归约是 warp 内树形，与 kn 的长链累加**不逐位相同**（fp32 重结合的
+#: 1e-3 量级），按纪律要先跑 greedy ids 对比再改默认值。
+_MOE_I8_NK = os.environ.get("COFFIN_MOE_I8_NK", "0").strip() == "1"
+
+#: ``gemv_nk_i8_m`` 每个通道组认领的列数：``0``/``1`` 一列一组，``2`` 两列一组。
+#:
+#: M >= 2 时每 128 字节权重只有 1 次权重读，却有 M 次激活读加 4M 次 FMA —— 压住这一档的
+#: 是 L1 与发射，不是 HBM。两列一组把每步的激活读摊到两列上（M 次 -> M/2 次），同时在
+#: 飞的权重字节翻倍；代价是块数减半，而 R8 那边 N=2560 仍有 320 个块、每 SM 20 个。
+#: M = 1 不适用（那里本来就只有 1 次激活读，块数砍半是纯损失），所以只在行数 > 1 的
+#: 分支里生效。默认 1 列，量过再改。
+_GEMV_NK_WIDTH = int(os.environ.get("COFFIN_GEMV_NK_WIDTH", "0") or "0")
+
 #: 投机校验的 W8A8 DP4A 路径；``COFFIN_COREX_W8A8_DP4A_VERIFY=1`` 打开以对照原有 GEMV。
 #:
 #: **实测更慢，所以默认关**（作业 5077，2026-11-12，gpu-node-06，B=8、K=1、M=B*c=16，
@@ -506,12 +527,13 @@ def _gemv_rows(w: torch.Tensor | QWeight | pack.KnWeight,
         # 之前这个分支的行为。
         nkw = packed.nk_weight()
         if rows <= _ROW_CHUNK:
-            return _restore(module.gemv_nk_i8_m(nkw, act, packed.scale), dtype)
+            return _restore(module.gemv_nk_i8_m(nkw, act, packed.scale,
+                                                width=_GEMV_NK_WIDTH), dtype)
         out = torch.empty((rows, packed.n), dtype=act.dtype, device=act.device)
         for start in range(0, rows, _ROW_CHUNK):
             stop = min(rows, start + _ROW_CHUNK)
             out[start:stop] = module.gemv_nk_i8_m(nkw, act[start:stop].contiguous(),
-                                                  packed.scale)
+                                                  packed.scale, width=_GEMV_NK_WIDTH)
         return _restore(out, dtype)
     if rows == 1:
         return _restore(module.gemv_kn(packed.wt, act[0]), dtype)
@@ -829,7 +851,15 @@ def moe_grouped_i8(w, x: torch.Tensor, offsets: torch.Tensor,
         bounds = offsets
     else:
         bounds = offsets.to(dtype=torch.int32, device=x.device).contiguous()
-    module.moe_grouped_i8(xq, xs, w.wq, w.scale, bounds, out, slices)
+    # ``w.nk_stack()`` 是一次性转置，第一次进来时（预热阶段，不在解码步里）付一次；
+    # 之后每步都拿同一块存储。关掉 ``COFFIN_MOE_I8_NK`` 时连副本都不建。
+    #
+    # 开之前先看内存账：副本是**整模型**翻倍的那一份，EP4 下 40 层 x 64 专家 x 3 MB
+    # = 每张 rank 多背 7.7 GB（不是一层，记一层会少算 40 倍）。所以这一档目前只适合
+    # 短烟测或单层对拍，要真上生产得让加载器直接按 ``[N, K]`` 造专家栈、不转置。
+    nk = 1 if _MOE_I8_NK else 0
+    module.moe_grouped_i8(xq, xs, w.nk_stack() if nk else w.wq, w.scale, bounds, out,
+                          slices, nk)
     return out if x.dtype == torch.int8 else _restore(out, dtype)
 
 
@@ -949,8 +979,9 @@ def moe_grouped_i8_merge(w, x: torch.Tensor, offsets: torch.Tensor,
         bounds = offsets.to(dtype=torch.int32, device=act.device).contiguous()
     out = torch.empty((1, w.n), dtype=act.dtype, device=act.device)
     module.quant_act_i8(act, xq, xs)
-    module.moe_grouped_i8_merge(xq, xs, w.wq, w.scale, bounds, row_weight, out,
-                                slices)
+    nk = 1 if _MOE_I8_NK else 0
+    module.moe_grouped_i8_merge(xq, xs, w.nk_stack() if nk else w.wq, w.scale, bounds,
+                                row_weight, out, slices, nk)
     return _restore(out, dtype)
 
 
@@ -1037,9 +1068,11 @@ def moe_grouped_i8_merge_tokens(w, x: torch.Tensor, offsets: torch.Tensor,
     if out is None or out.shape != (tokens, w.n) or out.device != x.device \
             or out.dtype not in (torch.bfloat16, torch.float32):
         out = torch.empty((tokens, w.n), dtype=act_dtype, device=x.device)
-    module.moe_grouped_i8_merge_tokens(xq, xs, w.wq, w.scale, bounds, row_weight,
+    nk = 1 if _MOE_I8_NK else 0
+    module.moe_grouped_i8_merge_tokens(xq, xs, w.nk_stack() if nk else w.wq, w.scale,
+                                       bounds, row_weight,
                                        slot_pos, slot_of_pos, int(tokens), int(top_k),
-                                       out, slices)
+                                       out, slices, nk)
     return out if x.dtype == torch.int8 else _restore(out, dtype)
 #: ``(tokens, k, device)`` → ``(xq, xs)`` 的分组 MoE 激活暂存。
 #:

@@ -115,10 +115,13 @@ torch::Tensor gemv_kn_i8_m(torch::Tensor wt, torch::Tensor x, torch::Tensor scal
 // @param scale [N] fp32 absmax scale，每个输出列一个。
 // @param threads 每块线程数；``0`` 表示 128。
 // @param unroll K 循环展开，``2``/``4``/``8``；``0`` 表示 4。
+// @param width 每个 warp 认领的列数（``1`` 或 ``2``，``0`` 表示 1）。2 让一个 warp 同时
+//              走两条独立的行流，并把每步的激活读摊到两列上：M >= 2 时每 128 字节权重
+//              的激活读从 M 次降到 M/2 次，在飞的权重字节翻倍。
 // @return [N]，dtype 同 ``x``。
 // @throws c10::Error 权重不是 int8、``K % 4 != 0``、scale 长度与 ``N`` 不符。
 torch::Tensor gemv_nk_i8(torch::Tensor wtn, torch::Tensor x, torch::Tensor scale,
-                         int64_t threads, int64_t unroll);
+                         int64_t threads, int64_t unroll, int64_t width);
 
 // @brief 批处理 W8A16 投影的 nk 版本：``M`` 行激活共用一遍权重读取。
 //
@@ -130,10 +133,11 @@ torch::Tensor gemv_nk_i8(torch::Tensor wtn, torch::Tensor x, torch::Tensor scale
 // @param scale [N] fp32 absmax scale，每个输出列一个。
 // @param threads 每块线程数；``0`` 表示 128。
 // @param unroll K 循环展开，``2``/``4``/``8``；``0`` 表示 4。
+// @param width 每个 warp 认领的列数（``1`` 或 ``2``，``0`` 表示 1）；见 :func:`gemv_nk_i8`。
 // @return [M, N]，dtype 同 ``x``。
 // @throws c10::Error 同 :func:`gemv_nk_i8`。
 torch::Tensor gemv_nk_i8_m(torch::Tensor wtn, torch::Tensor x, torch::Tensor scale,
-                           int64_t threads, int64_t unroll);
+                           int64_t threads, int64_t unroll, int64_t width);
 
 torch::Tensor gemv_kn_w4(torch::Tensor packed, torch::Tensor scale, torch::Tensor x,
                          int64_t k, int64_t group_size);
@@ -774,12 +778,15 @@ torch::Tensor moe_grouped(torch::Tensor a, torch::Tensor xs, torch::Tensor w,
 // @param ws      专家栈 scale，``[E, N]`` 连续 fp32。
 // @param offsets ``[E+1]`` 前缀和，int32 连续。
 // @param out     ``[tokens, N]`` 连续，bf16 或 fp32，dtype 由它决定。
-// @param slices  K 方向分片数；``<= 0`` 表示按块数与每片最小 k 长度自动选。
+// @param slices  K 方向分片数；``<= 0`` 表示按块数与每片最小 k 长度自动选。nk 布局下
+//                自动值就是 1 片（并行度由「列块 x 行」给出）。
+// @param nk      非 0 时权重按 ``[E, N, K]`` 的 nk 堆解释（一列一行、K 连续）。
 // @return out。
 // @throws c10::Error 布局、设备、dtype 或形状不自洽。
 torch::Tensor moe_grouped_i8(torch::Tensor a, torch::Tensor xs, torch::Tensor w,
                              torch::Tensor ws, torch::Tensor offsets,
-                             torch::Tensor out, int64_t slices);
+                             torch::Tensor out, int64_t slices, int64_t nk,
+                             int64_t rows_valid = -1);
 
 // @brief 分组 int8 投影的归并形态：[rows, K] -> [1, N]，行按路由权重加权求和。
 //
@@ -793,11 +800,13 @@ torch::Tensor moe_grouped_i8(torch::Tensor a, torch::Tensor xs, torch::Tensor w,
 // @param rw       逐行路由权重，[rows] fp32 连续。
 // @param out      [1, N] 连续，bf16 或 fp32，dtype 由它决定。
 // @param slices   K 方向分片数；<= 0 自动，归并形态至少用 2 片。
+// @param nk       非 0 时权重按 ``[E, N, K]`` 的 nk 堆解释。
 // @return out。
 // @throws c10::Error 布局、设备、dtype 或形状不自洽。
 torch::Tensor moe_grouped_i8_merge(torch::Tensor a, torch::Tensor xs, torch::Tensor w,
                                    torch::Tensor ws, torch::Tensor offsets,
-                                   torch::Tensor rw, torch::Tensor out, int64_t slices);
+                                   torch::Tensor rw, torch::Tensor out, int64_t slices,
+                                   int64_t nk);
 
 // @brief 归并形态的多流版本：每个 token 把自己的 top_k 行加权累加到自己那一行。
 //
@@ -820,6 +829,7 @@ torch::Tensor moe_grouped_i8_merge(torch::Tensor a, torch::Tensor xs, torch::Ten
 // @param top_k       每 token 的专家数。
 // @param out         [tokens, N] 连续，bf16 或 fp32，dtype 由它决定。
 // @param slices      K 方向分片数；<= 0 自动，本形态至少用 2 片。
+// @param nk          非 0 时权重按 ``[E, N, K]`` 的 nk 堆解释。
 // @return out。
 // @throws c10::Error 布局、设备、dtype 或形状不自洽。
 torch::Tensor moe_grouped_i8_merge_tokens(torch::Tensor a, torch::Tensor xs,
@@ -828,7 +838,8 @@ torch::Tensor moe_grouped_i8_merge_tokens(torch::Tensor a, torch::Tensor xs,
                                           torch::Tensor slot_pos,
                                           torch::Tensor slot_of_pos,
                                           int64_t tokens, int64_t top_k,
-                                          torch::Tensor out, int64_t slices);
+                                          torch::Tensor out, int64_t slices,
+                                          int64_t nk);
 
 // @brief 把 decode 一层的 MoE 块合成一次主机侧驱动，省掉十余次 pybind 往返。
 //

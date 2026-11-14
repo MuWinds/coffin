@@ -16,9 +16,11 @@
 // （主内核 + 分片归约），块数是 ``行数 x 列块 x 分片``，与专家数无关。
 //
 // 算术：``out[t, n] = a_scale[t] * w_scale[e, n] * sum_k a_q[t, k] * w[e, k, n]``，
-// 其中 ``e`` 由 ``t`` 落在 ``[offsets[e], offsets[e+1])`` 决定。权重按 ``[E, K, N]``
-// （K 轴在外、N 连续）存放，与 ``gemv_kn_i8`` 的 ``kn`` 布局一致，所以不需要任何转置：
-// 一个 warp 在固定 k 上读到的 128 字节正好是一个整事务。
+// 其中 ``e`` 由 ``t`` 落在 ``[offsets[e], offsets[e+1])`` 决定。权重有两种可选布局：
+// ``[E, K, N]``（K 轴在外、N 连续，与 ``gemv_kn_i8`` 的 ``kn`` 一致）和 ``[E, N, K]``
+// （nk，一列一行、K 连续）。前者一个 warp 在固定 k 上读到的 128 字节正好是一个整事务，
+// 但 ``__dp4a`` 要的 32 位字得靠四次单字节读拼；后者每个通道一次 32 位字、整轮 128
+// 字节仍是一整段，是 EP4 的 R8 上快得多的那一支（见 ``moe_grouped_i8_nk_kernel``）。
 //
 // Constraints:
 //   * 整数和可加是这条路径能用 int32 部分和的前提：scale 是逐 (专家, 输出列) 的、与
@@ -28,6 +30,8 @@
 //     凑整，那会把下一行的字节算进这一行，得到一个看着合理的错数。
 //   * 一行一个块，块数就是 ``tokens``。多行时同一专家的权重会被多读一遍，所以调用方
 //     只在 decode 那一档进来；内核本身对任意行数都成立，不需要额外的形状校验。
+//   * 行号 ``>= offsets[E]`` 的块整块退出（EP4 下不属于本 rank 的行）。调用方本来就按
+//     ``offsets[E]`` 判掉这些行，所以内核不写它们不改变结果；``nk`` 那一支与 kn 同一口径。
 //   * 激活先由 ``quant_act_i8`` 按行量化（absmax/127，下限 1e-5），与预填充路径同一套
 //     约定，所以两处的量化误差口径一致。
 //   * 不用 CUDA graph、不用 cp.async：两者在这张卡上都能过编译，然后静默挂死。
@@ -62,6 +66,47 @@ constexpr int I8_MAX_SLICES = 8;
 //: 才 256 个块，实测 146.7 GB/s；放到 128 后切 4 片、512 个块。再往下切（64）每片只剩
 //: 4 个 16-k 展开块，展开收益被尾巴吃掉。
 constexpr int I8_MIN_PER = 128;
+
+//: nk 布局下每个块里的 warp 数。一个 warp 认领一个输出列，K 在这一列内连续，所以
+//: 32 条通道每步读到的 128 字节是**一整段连续内存**，正好一个整事务。
+//:
+//: 4 与 kn 路径的 128 线程对齐：块内 4 条独立的流，块数按 ``N / 4`` 算。``gate_up``
+//: （N=1024、K=2048）在 EP4 的 R8 上是 256 个列块 x 16 个有效行 = 4096 个块，远多于这张
+//: 卡的 16 个 SM，所以 nk 路径不需要再靠切 K 换并行度。
+constexpr int I8_NK_WARPS = 8;
+
+//: 浅 K 时抬到 8 个 warp。K 小于这个阈值时一个列只有不到 8 个 128 字节步，
+//: 「块调度 + warp 归约的 5 次 shfl」的固定成本已经和流本身同量级，于是让一个块多认领
+//: 几列、少开一倍块。``down``（K=512、N=2048）就是这一档。
+constexpr int I8_NK_SHALLOW_K = 1024;
+constexpr int I8_NK_WARPS_SHALLOW = 8;
+
+//: 浅 K 档一条 warp 认领的列数。核里按 ``SUB = 32 / WCOL`` 切通道组，所以这同时决定了
+//: 每条 lane 组管一列的几条通道、以及归约几级：``4`` → SUB=8、**3 级**（4/2/1），四列并行。
+//
+//: 归约层数是浅 K 的胜负手：一列的 K 被切成 SUB 段，算完必须 SUB 路求和；K=512 时每 lane
+//: 只有 4 个 dp4a，5 级归约（SUB=32）几乎和乘加一样贵，实测 143 GB/s、加到 4 列并行后
+//: 249 GB/s。8 列（SUB=4）曾试过，掉到 222——每组通道太少，一步覆盖的连续段变短。
+//: 所以 4 是这条轴的最优点，不要再往上加。
+constexpr int I8_NK_WCOL_SHALLOW = 4;
+
+//: nk 核的行槽数（``grid.y`` 的上限）。块不再与行一一对应，每块按这个步长跨行；
+//: 取 8 是因为 64 行 × 列块之后仍有一万多条 warp 摊到 16 个 SM，再少并行度开始掉。
+//: 由此 ``moe_grouped_i8`` 的 ``rows_valid`` 参数实际已不再参与网格决策（保留只为兼容）。
+constexpr int I8_NK_ROW_SLOTS = 8;
+
+//: 每通道每步的字节数切到 16 的 K 上限。16 字节一步把一步覆盖的区间从 128 抬到 512，
+//: 浅 K 下循环次数因此除以 4；K 一深（>= 1024）就回到 4 字节——一个 warp 一轮 128 字节
+//: 是这张卡的最佳点，更宽的每通道加载会把一次事务拆成两次。
+//:
+//: 这个上限是实测定的，不是估的：`005_moelab2` 把条件反过来（``K >= 512`` 走 16 字节步、
+//: 无上限）之后，gate_up（K=2048）从 274 GB/s 掉到 **187 GB/s**，down（K=512）没动。
+//: 所以 128 字节步的默认保持不动；16 字节步只留给「K 放不下几轮 512 字节步」的浅档。
+constexpr int I8_NK_WIDE_K = 1024;
+
+//: K 是 16 的倍数时，16 字节一步读到的地址才落在同一个列内（列基址是 ``col * K``，
+//: 不是 16 的倍数就会让 ``int4`` 跨进下一列）。
+constexpr int I8_NK_WIDE_BYTES = 16;
 
 // @brief 把四个相邻 k 的 int8 权重拼成 ``__dp4a`` 要的一个字。
 //
@@ -129,19 +174,27 @@ __global__ void moe_grouped_i8_kernel(const int8_t* __restrict__ a,
     const int k0 = (int)blockIdx.z * per;
     const int k1 = min(K, k0 + per);
     const int row = (int)blockIdx.y;
-    const int col = (int)blockIdx.x * I8_COLS + (int)threadIdx.x;
-    if (col >= N) return;
+    // 不属于本 rank 的行整块退出。EP4 的 R8 上 ``rows`` 是 64 而 ``offsets[E]`` 只有 16，
+    // 也就是四分之三的块白跑（它们的行全落到最后一个专家上，读的是同一份已经进 L2 的
+    // 权重，所以以前不掉带宽、但白占块与指令）。``row`` 是块级的，这条早退在块内一致，
+    // 可以放在任何 ``__syncthreads()`` 之前。
+    if (row >= offsets[experts]) return;
 
     // 行属于哪个专家只让 thread 0 查，其余线程同时把激活行搬进共享内存：两件事互不
     // 依赖，串起来做会白付一次「八个依赖读」的延迟。激活行只有 K 字节（2048），
     // 放共享内存后每个 k 步的读都是一次广播，而不是 128 个线程各读一遍全局。
     __shared__ int s_expert;
-    extern __shared__ int32_t s_pad[];
-    int8_t* s_x = reinterpret_cast<int8_t*>(s_pad);
+    extern __shared__ __align__(16) unsigned char s_raw[];
+    int8_t* s_x = reinterpret_cast<int8_t*>(s_raw);
     if (threadIdx.x == 0) s_expert = i8_owner(offsets, experts, row);
     const int8_t* arow = a + (size_t)row * K;
     for (int i = (int)threadIdx.x; i < K; i += (int)blockDim.x) s_x[i] = arow[i];
     __syncthreads();
+
+    // 列号越界的线程在屏障**之后**才退：放在屏障之前的话，末尾那个列块里会有一半线程
+    // 跳过 ``__syncthreads()``，那是未定义行为（现在只有 N 是 128 的倍数才不出事）。
+    const int col = (int)blockIdx.x * I8_COLS + (int)threadIdx.x;
+    if (col >= N) return;
 
     const int expert = s_expert;
     const int8_t* wexp = w + (size_t)expert * (size_t)K * (size_t)N;
@@ -181,6 +234,175 @@ __global__ void moe_grouped_i8_kernel(const int8_t* __restrict__ a,
             (float)total * xs[row] * ws[(size_t)expert * N + col]);
     } else {
         part[((size_t)blockIdx.z * (size_t)tokens + (size_t)row) * (size_t)N + col] = total;
+    }
+}
+
+// @brief nk 布局的主体核：``[E, N, K]`` 的专家栈，一个 warp 认领一个输出列。
+//
+// 与上面那个 kn 主体核只差权重的寻址方式，而这一点决定了整条链的带宽：
+// ``[E, K, N]`` 里相邻 4 个 k 隔着 N 个字节，``__dp4a`` 要的那个 32 位字只能靠四次单字节
+// 读再移位拼起来（``i8_dword``，4 次加载 + 6 条位运算）；``[E, N, K]`` 里它们是连续的
+// 4 个字节，一次 32 位加载就是那个字，而且 32 条通道一轮读到的 128 字节是一整段连续
+// 内存，正好一个整事务。
+//
+// 这条规律在稠密投影上已经量过：同一份字节量、同样的 32 条通道分组，nk 是 kn 的
+// 1.02-1.63 倍（``gemv.cu`` 的 nk 段、``docs`` 里 2026-11-13 那份记录）。MoE 这边还多一层
+// ——kn 的四次单字节读每次只搬 32 字节（一个 lane 一字节），而 nk 一次搬 128 字节。
+// EP4 的 R8 实测 kn 是 89 GB/s（每层每卡 16 个有效行 x 2 MB / 360 us），远低于这张卡
+// 600 GB/s 的连续读。
+//
+// @tparam XT 输出 dtype；@tparam VB 每通道每步的字节数（4 或 16）。
+// @param wn   专家栈 ``[E, N, K]`` 连续 int8；第 ``e`` 个专家的第 ``n`` 列在第 ``n * K``。
+// @param per  每片的 k 长度，必须是 ``VB`` 的倍数（否则 16 字节的读会跨进下一列）。
+// 其余参数与 kn 主体核一致。
+template <typename XT, int VB, int WCOL, int KCOMP = 0>
+__global__ void moe_grouped_i8_nk_kernel(const int8_t* __restrict__ a,
+                                         const int8_t* __restrict__ wn,
+                                         const float* __restrict__ ws,
+                                         const float* __restrict__ xs,
+                                         const int* __restrict__ offsets,
+                                         int32_t* __restrict__ part,
+                                         XT* __restrict__ out,
+                                         int K, int N, int experts, int tokens,
+                                         int slices, int per) {
+    const int row = (int)blockIdx.y;
+    // 与 kn 主体核同一条：不属于本 rank 的行整块退出（EP4 的 R8 上这是四分之三的块）。
+    //
+    // 试过把块内改成跨行循环（``grid.y`` 只给 8 个行槽、死行用 ``continue`` 跳过）：
+    // gate_up 81.0 -> 77.3 是赚的，但 down 67.8 -> 73.9 是亏的，合并 148.8 -> 151.2 反而变差。
+    // 原因是 ``row`` 从块常量变成循环变量后，``a + row*K`` / ``out[row*N + col]`` 这些
+    // 64 位地址运算不再提到循环外；down 每 warp 只有 16 个 dp4a 却要发 582 条指令，纯指令
+    // 受限，这笔重算直接吃掉 7.8 us，而 gate_up 每行 32 倍运算量摊得平。
+    // 结论：这个卡上按行切块比跨行复用更划算，除非把地址运算也提到循环外（那要重排整个核）。
+    if (row >= offsets[experts]) return;
+
+    __shared__ int s_expert;
+    extern __shared__ __align__(16) unsigned char s_raw[];
+    int8_t* s_x = reinterpret_cast<int8_t*>(s_raw);
+    if (threadIdx.x == 0) s_expert = i8_owner(offsets, experts, row);
+    const int8_t* arow = a + (size_t)row * K;
+    for (int i = (int)threadIdx.x; i < K; i += (int)blockDim.x) s_x[i] = arow[i];
+    __syncthreads();
+
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    // 一个 warp 认领 ``WCOL`` 个相邻列（``WCOL = 1`` 就是原来的一 warp 一列）。
+    // 主机端的 ``cols`` 必须按 ``warps * WCOL`` 算，两边是同一套几何。
+    //
+    // 试过把通道切成 ``SUB = 32 / WCOL`` 组、每组认领一列（4 列并行、归约 5 级降到 3 级）：
+    // down 从 67.3 us/249 GB/s 退到 **87.6 us/191.6 GB/s**。原因是那条指令一次要读 4 个
+    // 相距 512 字节的 128 字节段，每条 load 变成 4 个 wavefront，LSU 上的指令占用翻四倍，
+    // 而有用字节不变。也就是说这个卡上「一条指令一个连续 128 字节段」比「少两级归约」值钱，
+    // 归约不是瓶颈，别再往这条路上改。
+    const int colbase = ((int)blockIdx.x * (int)(blockDim.x >> 5) + warp) * WCOL;
+    if (colbase >= N) return;
+    const int nc = (colbase + WCOL <= N) ? WCOL : (N - colbase);
+
+    const int expert = s_expert;
+    const int8_t* ebase = wn + (size_t)expert * (size_t)N * (size_t)K;
+
+    const int k0 = (int)blockIdx.z * per;
+    const int k1 = min(K, k0 + per);
+
+    // 每列各自 ``VB / 4`` 条独立链，一个 warp 一共压着 ``WCOL * ACC`` 条访存在飞。
+    // 浅 K 上一列只放得下一两轮宽步，单列根本填不满延迟（``down`` 的 K=512 就是一次
+    // 512 字节步就结束），只能靠多列并行把这些请求压满。
+    constexpr int ACC = VB / 4;
+    constexpr int STEPK = 32 * VB;
+    int s[WCOL][ACC];
+#pragma unroll
+    for (int c = 0; c < WCOL; ++c) {
+#pragma unroll
+        for (int i = 0; i < ACC; ++i) s[c][i] = 0;
+    }
+
+    // ixprof 的账：K=512 时一个 warp 一生只做 16 个 dp4a，却发射了约 582 条指令——
+    // 每 36 条换 1 次有效乘加。开销不在归约、不在带宽（加载管道跑到 352 GB/s 仍有余量），
+    // 而在「K 是运行期量」逼出来的循环、``min``、``slices`` 判定和两段尾部兜底。
+    // 所以给 K 一个编译期版本：K=512 且 span=1 时 STEPK=512 正好一步走完，整个循环、
+    // 边界与尾部全部消失，列基址在展开前算好，展开体内只剩「基址 + 立即数」。
+    if constexpr (KCOMP > 0) {
+        static_assert(KCOMP % STEPK == 0, "KCOMP 必须是 STEPK 的整数倍");
+        constexpr int STEPS = KCOMP / STEPK;
+        const int8_t* wcol[WCOL];
+#pragma unroll
+        for (int c = 0; c < WCOL; ++c) {
+            wcol[c] = ebase + (size_t)(colbase + c) * (size_t)KCOMP;
+        }
+#pragma unroll
+        for (int t = 0; t < STEPS; ++t) {
+            const int aoff = t * STEPK + lane * VB;
+            const int* aq = reinterpret_cast<const int*>(s_x + aoff);
+#pragma unroll
+            for (int c = 0; c < WCOL; ++c) {
+                if (c >= nc) break;
+                const unsigned* wq = reinterpret_cast<const unsigned*>(wcol[c] + aoff);
+#pragma unroll
+                for (int i = 0; i < ACC; ++i) s[c][i] = __dp4a((int)wq[i], aq[i], s[c][i]);
+            }
+        }
+    } else {
+        const int step = STEPK;
+        int k = k0;
+        for (; k + step <= k1; k += step) {
+            const int* aq = reinterpret_cast<const int*>(s_x + k + lane * VB);
+#pragma unroll
+            for (int c = 0; c < WCOL; ++c) {
+                if (c >= nc) break;
+                const unsigned* wq = reinterpret_cast<const unsigned*>(
+                    ebase + (size_t)(colbase + c) * (size_t)K + k + lane * VB);
+#pragma unroll
+                for (int i = 0; i < ACC; ++i) s[c][i] = __dp4a((int)wq[i], aq[i], s[c][i]);
+            }
+        }
+        // 整 128 字节的步：16 字节那条宽路径退出后，剩下的整步在这里按 4 字节走。
+        for (; k + 128 <= k1; k += 128) {
+#pragma unroll
+            for (int c = 0; c < WCOL; ++c) {
+                if (c >= nc) break;
+                const unsigned* wq = reinterpret_cast<const unsigned*>(
+                    ebase + (size_t)(colbase + c) * (size_t)K + k + lane * 4);
+                s[c][0] = __dp4a((int)wq[0],
+                                 *reinterpret_cast<const int*>(s_x + k + lane * 4), s[c][0]);
+            }
+        }
+        // 最后不足 128 字节：每条通道最多认领一个 4 字节块，尾部不足 4 个的由紧随其后那条
+        // 通道按标量兜。**不能**补齐凑整 —— 那会把下一列的字节算进这一列。
+        const int rem = k1 - k;
+        const int quads = rem / 4;
+#pragma unroll
+        for (int c = 0; c < WCOL; ++c) {
+            if (c >= nc) break;
+            const int8_t* wrow = ebase + (size_t)(colbase + c) * (size_t)K;
+            if (lane < quads) {
+                const int j = k + lane * 4;
+                s[c][0] = __dp4a((int)*reinterpret_cast<const unsigned*>(wrow + j),
+                                 *reinterpret_cast<const int*>(s_x + j), s[c][0]);
+            } else if (lane == quads) {
+                for (int j = k + lane * 4; j < k1; ++j) s[c][0] += (int)wrow[j] * (int)s_x[j];
+            }
+        }
+    }
+
+#pragma unroll
+    for (int c = 0; c < WCOL; ++c) {
+        if (c >= nc) break;
+        int total = s[c][0];
+#pragma unroll
+        for (int i = 1; i < ACC; ++i) total += s[c][i];
+        // 32 条通道各持一段 K，树形归约后由 lane 0 落盘。与 kn 的长链累加不逐位相同，
+        // 相对差在 fp32 重结合的 1e-3 量级——验收按参考实现与 greedy ids。
+        for (int o = 16; o > 0; o >>= 1) total += __shfl_down_sync(0xffffffffu, total, o);
+        if (lane == 0) {
+            const int col = colbase + c;
+            if (slices == 1) {
+                out[(size_t)row * N + col] = CxScalar<XT>::from_float(
+                    (float)total * xs[row] * ws[(size_t)expert * N + col]);
+            } else {
+                part[((size_t)blockIdx.z * (size_t)tokens + (size_t)row) * (size_t)N + col]
+                    = total;
+            }
+        }
     }
 }
 
@@ -292,8 +514,9 @@ __global__ void moe_grouped_i8_merge_rows_kernel(const int32_t* __restrict__ par
     const int valid = offsets[experts];
     float acc = 0.f;
     for (int row = 0; row < rows; ++row) {
-        // 尾部那些行不属于本 rank：分派内核没把它们排进行序（位置表清 0），但分组内核
-        // 仍按 ``rows`` 行算过它们。跳过与「权重乘 0」逐位等价，省掉外面那四次掩码发射。
+        // 尾部那些行不属于本 rank：分派内核没把它们排进行序（位置表清 0），主体核也
+        // 按 ``offsets[E]`` 整块退出了它们，所以这里跳过与「权重乘 0」逐位等价，同时
+        // 省掉外面那四次掩码发射。
         if (row >= valid) continue;
         const int expert = i8_owner(offsets, experts, row);
         int total = 0;
@@ -367,23 +590,30 @@ __global__ void moe_grouped_i8_merge_slots_kernel(const int32_t* __restrict__ pa
 // @param ws      专家栈 scale，``[E, N]`` 连续 fp32。
 // @param offsets ``[E+1]`` 前缀和，int32 连续，``offsets[0] == 0``。
 // @param out     ``[tokens, N]`` 连续，bf16 或 fp32，dtype 由它决定。
-// @param slices  K 方向分片数；``<= 0`` 表示按块数自动选。
+// @param slices  K 方向分片数；``<= 0`` 表示按块数自动选。nk 布局下自动值就是 1 片。
+// @param nk      非 0 时按 ``[E, N, K]`` 的权重栈走 nk 主体核（一列一行、K 连续）。
 // @return out。
 // @throws c10::Error 布局、设备、dtype 或形状不自洽。
 //
 // 分片的作用是换并行度：一行一个块时块数是 ``ceil(N/128) x tokens``，decode 一步
 // 只有 8 行、门/升栈 N=1024，于是 64 个块 —— 在这张卡上远不够填。切 8 片后 512 块，
 // 每片仍有 256 个 k，展开循环不会退化成标量尾巴。
+//
+// nk 那一支不需要靠分片换并行度：块数是 ``ceil(N/warp 数) x 行``，坐标本身就够多，
+// 而每步读的是连续 128 字节（见 ``moe_grouped_i8_nk_kernel``）。
 torch::Tensor moe_grouped_i8(torch::Tensor a, torch::Tensor xs, torch::Tensor w,
                              torch::Tensor ws, torch::Tensor offsets,
-                             torch::Tensor out, int64_t slices) {
+                             torch::Tensor out, int64_t slices, int64_t nk,
+                             int64_t rows_valid) {
     TORCH_CHECK(a.is_cuda() && a.dim() == 2 && a.scalar_type() == torch::kChar
                 && a.is_contiguous(), "activation must be contiguous CUDA int8 [tokens, K]");
     TORCH_CHECK(xs.is_cuda() && xs.dim() == 1 && xs.scalar_type() == torch::kFloat
                 && xs.is_contiguous() && xs.size(0) == a.size(0),
                 "activation scale must be contiguous fp32 [tokens]");
     TORCH_CHECK(w.is_cuda() && w.dim() == 3 && w.scalar_type() == torch::kChar
-                && w.is_contiguous(), "weight must be contiguous CUDA int8 [E, K, N]");
+                && w.is_contiguous(),
+                "weight must be contiguous CUDA int8, either [E, K, N] or the nk "
+                "stack [E, N, K]");
     TORCH_CHECK(ws.is_cuda() && ws.dim() == 2 && ws.scalar_type() == torch::kFloat
                 && ws.is_contiguous(), "weight scale must be contiguous fp32 [E, N]");
     TORCH_CHECK(offsets.is_cuda() && offsets.dim() == 1
@@ -399,31 +629,57 @@ torch::Tensor moe_grouped_i8(torch::Tensor a, torch::Tensor xs, torch::Tensor w,
     const int K = (int)a.size(1);
     const int N = (int)out.size(1);
     const int experts = (int)w.size(0);
-    TORCH_CHECK((int)w.size(1) == K && (int)w.size(2) == N,
-                "weight must be [E, K, N] matching activation and destination");
+    const bool wide = nk != 0;
+    if (wide) {
+        TORCH_CHECK((int)w.size(1) == N && (int)w.size(2) == K,
+                    "nk weight must be [E, N, K] matching activation and destination");
+    } else {
+        TORCH_CHECK((int)w.size(1) == K && (int)w.size(2) == N,
+                    "weight must be [E, K, N] matching activation and destination");
+    }
     TORCH_CHECK((int)ws.size(0) == experts && (int)ws.size(1) == N,
                 "weight scale must be [E, N]");
     TORCH_CHECK((int)offsets.size(0) == experts + 1, "offsets must have E+1 entries");
     TORCH_CHECK(K > 0 && N > 0 && experts > 0, "sizes must be positive");
     if (tokens == 0) return out;
 
-    const int cols = (N + I8_COLS - 1) / I8_COLS;
+    // 两种布局的块几何不一样：nk 是「warp 数 x 列」（一个 warp 一列），kn 是 128 个列线程。
+    // 收尾核（归约与三个收尾）仍然按 kn 的 128 列线程写，所以它们的网格单独算。
+    // nk 的 16 字节路径要求每片的长度是 16 的倍数（片头不对齐会让 ``int4`` 跨进下一列）；
+    // 4 字节路径只要 4 的倍数，也就是 ``__dp4a`` 本身的粒度。
+    const int vb = (wide && K % I8_NK_WIDE_BYTES == 0 && K <= I8_NK_WIDE_K)
+                       ? I8_NK_WIDE_BYTES : 4;
+    // 浅 K（``down`` 的 K=512）一列只放得下一轮 512 字节宽步，单列根本填不满延迟；
+    // 让一个 warp 认领 4 列并行，把在飞请求从 4 条抬到 16 条。只在 16 字节步这一档开。
+    const int wcol = (vb == I8_NK_WIDE_BYTES && K < I8_NK_SHALLOW_K) ? I8_NK_WCOL_SHALLOW : 1;
+    const int warps = (wide && K < I8_NK_SHALLOW_K) ? I8_NK_WARPS_SHALLOW : I8_NK_WARPS;
+    const int cols = wide ? (N + warps * wcol - 1) / (warps * wcol)
+                          : (N + I8_COLS - 1) / I8_COLS;
+    const int cols_tail = (N + I8_COLS - 1) / I8_COLS;
     int span = (int)slices;
     if (span <= 0) {
-        // 自动选片数：先把块数抬到 256 以上，但每片不低于 ``I8_MIN_PER`` 个 k。
-        // 这条规则保持原样：隔离测量里「每片 512 个 k」看起来更快（gate_up 249 vs 240
-        // GB/s、down 111 vs 107），但端到端四档冒烟反而慢 2.6%（25.5 vs 26.3 tok/s），
-        // 所以按纪律回退。隔离 benchmark 与线上口径不一致时，以后者为准。
-        span = 1;
-        while (span < I8_MAX_SLICES
-               && cols * tokens * (span + 1) <= 1024
-               && K / (span + 1) >= I8_MIN_PER) {
-            ++span;
+        if (wide) {
+            // nk 的并行度来自「列块 x 行」，已经是 1e4 量级的块数（gate_up 在 EP4 的 R8 上
+            // 就有 256 个列块 x 16 个有效行），切 K 只会多一次归约和一块分片缓冲。所以单趟，
+            // 主体核把结果窄化后直接写进 ``out``。
+            span = 1;
+        } else {
+            // 自动选片数：先把块数抬到 256 以上，但每片不低于 ``I8_MIN_PER`` 个 k。
+            // 这条规则保持原样：隔离测量里「每片 512 个 k」看起来更快（gate_up 249 vs 240
+            // GB/s、down 111 vs 107），但端到端四档冒烟反而慢 2.6%（25.5 vs 26.3 tok/s），
+            // 所以按纪律回退。隔离 benchmark 与线上口径不一致时，以后者为准。
+            span = 1;
+            while (span < I8_MAX_SLICES
+                   && cols * tokens * (span + 1) <= 1024
+                   && K / (span + 1) >= I8_MIN_PER) {
+                ++span;
+            }
         }
     }
     span = std::max(1, std::min(std::min(span, I8_MAX_SLICES), K));
-    // 每片长度按 4 对齐：``__dp4a`` 的粒度是 4 个 k，片头不对齐会让主循环整个跳过。
-    const int per = ((K + span - 1) / span + 3) / 4 * 4;
+    // nk 的 16 字节路径要求每片的长度是 16 的倍数（片头不对齐会让 ``int4`` 跨进下一列）；
+    // 4 字节路径只要 4 的倍数，也就是 ``__dp4a`` 本身的粒度。
+    const int per = ((K + span - 1) / span + vb - 1) / vb * vb;
 
     const c10::cuda::CUDAGuard guard(a.device());
     const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
@@ -438,19 +694,58 @@ torch::Tensor moe_grouped_i8(torch::Tensor a, torch::Tensor xs, torch::Tensor w,
         part_ptr = part.data_ptr<int32_t>();
     }
 
-    const dim3 grid((unsigned)cols, (unsigned)tokens, (unsigned)span);
-    const dim3 block(I8_COLS);
+    // 块与行一一对应：kn 主体核和 nk 核都按 ``tokens`` 给 y 维。
+    // 行槽实验（``grid.y = 8`` + 块内跨行）已否，见 nk 核里那段注释。
+    const unsigned rows_launch = (unsigned)tokens;
+    const dim3 grid((unsigned)cols, rows_launch, (unsigned)span);
+    const dim3 block(wide ? (unsigned)(warps * 32) : (unsigned)I8_COLS);
     const size_t smem = (size_t)K * sizeof(int8_t);
     auto launch = [&](auto tag) {
         using XT = decltype(tag);
         XT* dst = reinterpret_cast<XT*>(out.data_ptr());
-        moe_grouped_i8_kernel<XT><<<grid, block, smem, stream>>>( 
-            a.data_ptr<int8_t>(), w.data_ptr<int8_t>(), ws.data_ptr<float>(),
-            xs.data_ptr<float>(), offsets.data_ptr<int>(), part_ptr, dst,
-            K, N, experts, tokens, span, per);
+        const int8_t* wp = w.data_ptr<int8_t>();
+        if (!wide) {
+            moe_grouped_i8_kernel<XT><<<grid, block, smem, stream>>>(
+                a.data_ptr<int8_t>(), wp, ws.data_ptr<float>(),
+                xs.data_ptr<float>(), offsets.data_ptr<int>(), part_ptr, dst,
+                K, N, experts, tokens, span, per);
+        } else if (vb == I8_NK_WIDE_BYTES) {
+            if (wcol > 1) {
+                // K=512 且不分片时给 K 一个编译期版本：循环、``min``、尾部兜底全消失。
+                // 其余形状仍走运行期 K 的通用路径。
+                if (K == 512 && span == 1) {
+                    moe_grouped_i8_nk_kernel<XT, I8_NK_WIDE_BYTES, I8_NK_WCOL_SHALLOW, 512>
+                        <<<grid, block, smem, stream>>>(
+                            a.data_ptr<int8_t>(), wp, ws.data_ptr<float>(),
+                            xs.data_ptr<float>(), offsets.data_ptr<int>(), part_ptr, dst,
+                            K, N, experts, tokens, span, per);
+                } else {
+                    moe_grouped_i8_nk_kernel<XT, I8_NK_WIDE_BYTES, I8_NK_WCOL_SHALLOW>
+                        <<<grid, block, smem, stream>>>(
+                            a.data_ptr<int8_t>(), wp, ws.data_ptr<float>(),
+                            xs.data_ptr<float>(), offsets.data_ptr<int>(), part_ptr, dst,
+                            K, N, experts, tokens, span, per);
+                }
+            } else {
+                moe_grouped_i8_nk_kernel<XT, I8_NK_WIDE_BYTES, 1>
+                    <<<grid, block, smem, stream>>>(
+                        a.data_ptr<int8_t>(), wp, ws.data_ptr<float>(),
+                        xs.data_ptr<float>(), offsets.data_ptr<int>(), part_ptr, dst,
+                        K, N, experts, tokens, span, per);
+            }
+        } else {
+            // 4 字节步这一档固定 1 列：``wcol > 1`` 只在 ``K % 16 == 0`` 的浅档出现，
+            // 与这里不可能同时成立（见 ``wcol`` 的定义）。
+            moe_grouped_i8_nk_kernel<XT, 4, 1><<<grid, block, smem, stream>>>(
+                a.data_ptr<int8_t>(), wp, ws.data_ptr<float>(),
+                xs.data_ptr<float>(), offsets.data_ptr<int>(), part_ptr, dst,
+                K, N, experts, tokens, span, per);
+        }
         if (span > 1) {
-            const dim3 rgrid((unsigned)cols, (unsigned)tokens);
-            moe_grouped_i8_reduce_kernel<XT><<<rgrid, block, 0, stream>>>( 
+            // 收尾核按 kn 的 128 列线程布局，块与线程都要回到那一档。
+            const dim3 rgrid((unsigned)cols_tail, (unsigned)tokens);
+            const dim3 rblock(I8_COLS);
+            moe_grouped_i8_reduce_kernel<XT><<<rgrid, rblock, 0, stream>>>(
                 part_ptr, ws.data_ptr<float>(), xs.data_ptr<float>(),
                 offsets.data_ptr<int>(), dst, N, experts, tokens, span);
         }
@@ -485,6 +780,7 @@ torch::Tensor moe_grouped_i8(torch::Tensor a, torch::Tensor xs, torch::Tensor w,
 // @param out         ``[tokens, N]`` 连续，bf16 或 fp32，dtype 由它决定。
 // @param slices      K 方向分片数；``<= 0`` 自动，本形态至少用 2 片（理由同
 //                    :func:`moe_grouped_i8_merge`）。
+// @param nk          非 0 时按 ``[E, N, K]`` 的权重栈走 nk 主体核。
 // @return out。
 // @throws c10::Error 布局、设备、dtype 或形状不自洽。
 torch::Tensor moe_grouped_i8_merge_tokens(torch::Tensor a, torch::Tensor xs,
@@ -493,14 +789,17 @@ torch::Tensor moe_grouped_i8_merge_tokens(torch::Tensor a, torch::Tensor xs,
                                           torch::Tensor slot_pos,
                                           torch::Tensor slot_of_pos,
                                           int64_t tokens, int64_t top_k,
-                                          torch::Tensor out, int64_t slices) {
+                                          torch::Tensor out, int64_t slices,
+                                          int64_t nk) {
     TORCH_CHECK(a.is_cuda() && a.dim() == 2 && a.scalar_type() == torch::kChar
                 && a.is_contiguous(), "activation must be contiguous CUDA int8 [rows, K]");
     TORCH_CHECK(xs.is_cuda() && xs.dim() == 1 && xs.scalar_type() == torch::kFloat
                 && xs.is_contiguous() && xs.size(0) == a.size(0),
                 "activation scale must be contiguous fp32 [rows]");
     TORCH_CHECK(w.is_cuda() && w.dim() == 3 && w.scalar_type() == torch::kChar
-                && w.is_contiguous(), "weight must be contiguous CUDA int8 [E, K, N]");
+                && w.is_contiguous(),
+                "weight must be contiguous CUDA int8, either [E, K, N] or the nk "
+                "stack [E, N, K]");
     TORCH_CHECK(ws.is_cuda() && ws.dim() == 2 && ws.scalar_type() == torch::kFloat
                 && ws.is_contiguous(), "weight scale must be contiguous fp32 [E, N]");
     TORCH_CHECK(offsets.is_cuda() && offsets.dim() == 1
@@ -532,25 +831,48 @@ torch::Tensor moe_grouped_i8_merge_tokens(torch::Tensor a, torch::Tensor xs,
     const int K = (int)a.size(1);
     const int N = (int)out.size(1);
     const int experts = (int)w.size(0);
-    TORCH_CHECK((int)w.size(1) == K && (int)w.size(2) == N,
-                "weight must be [E, K, N] matching activation and destination");
+    const bool wide = nk != 0;
+    if (wide) {
+        TORCH_CHECK((int)w.size(1) == N && (int)w.size(2) == K,
+                    "nk weight must be [E, N, K] matching activation and destination");
+    } else {
+        TORCH_CHECK((int)w.size(1) == K && (int)w.size(2) == N,
+                    "weight must be [E, K, N] matching activation and destination");
+    }
     TORCH_CHECK((int)ws.size(0) == experts && (int)ws.size(1) == N,
                 "weight scale must be [E, N]");
     TORCH_CHECK((int)offsets.size(0) == experts + 1, "offsets must have E+1 entries");
     TORCH_CHECK(K > 0 && N > 0 && experts > 0, "sizes must be positive");
 
-    const int cols = (N + I8_COLS - 1) / I8_COLS;
+    // nk 的 16 字节路径要求每片的长度是 16 的倍数（片头不对齐会让 ``int4`` 跨进下一列）；
+    // 4 字节路径只要 4 的倍数，也就是 ``__dp4a`` 本身的粒度。
+    const int vb = (wide && K % I8_NK_WIDE_BYTES == 0 && K <= I8_NK_WIDE_K)
+                       ? I8_NK_WIDE_BYTES : 4;
+    // 浅 K（``down`` 的 K=512）一列只放得下一轮 512 字节宽步，单列根本填不满延迟；
+    // 让一个 warp 认领 4 列并行，把在飞请求从 4 条抬到 16 条。只在 16 字节步这一档开。
+    const int wcol = (vb == I8_NK_WIDE_BYTES && K < I8_NK_SHALLOW_K) ? I8_NK_WCOL_SHALLOW : 1;
+    const int warps = (wide && K < I8_NK_SHALLOW_K) ? I8_NK_WARPS_SHALLOW : I8_NK_WARPS;
+    const int cols = wide ? (N + warps * wcol - 1) / (warps * wcol)
+                          : (N + I8_COLS - 1) / I8_COLS;
+    // 收尾核按 kn 的 128 列线程写，网格要按那一档算。
+    const int cols_tail = (N + I8_COLS - 1) / I8_COLS;
     int span = (int)slices;
     if (span <= 0) {
-        span = 1;
-        while (span < I8_MAX_SLICES
-               && cols * rows * (span + 1) <= 1024
-               && K / (span + 1) >= I8_MIN_PER) {
-            ++span;
+        if (wide) {
+            // nk 的自动值就是 2：再少就退化成 1 片，而 1 片时主体核写的是 ``out[row]``
+            // （逐行落盘），本形态要的是按 token 累加，所以至少留 2 片走 ``part``。
+            span = 2;
+        } else {
+            span = 1;
+            while (span < I8_MAX_SLICES
+                   && cols * rows * (span + 1) <= 1024
+                   && K / (span + 1) >= I8_MIN_PER) {
+                ++span;
+            }
         }
     }
     span = std::max(2, std::min(std::min(span, I8_MAX_SLICES), K));
-    const int per = ((K + span - 1) / span + 3) / 4 * 4;
+    const int per = ((K + span - 1) / span + vb - 1) / vb * vb;
 
     const c10::cuda::CUDAGuard guard(a.device());
     const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
@@ -561,43 +883,66 @@ torch::Tensor moe_grouped_i8_merge_tokens(torch::Tensor a, torch::Tensor xs,
     int32_t* part_ptr = part.data_ptr<int32_t>();
 
     const dim3 grid((unsigned)cols, (unsigned)rows, (unsigned)span);
-    const dim3 block(I8_COLS);
+    const dim3 block(wide ? (unsigned)(warps * 32) : (unsigned)I8_COLS);
     const size_t smem = (size_t)K * sizeof(int8_t);
     const bool single = tokens == 1;
-    const dim3 mgrid((unsigned)cols, (unsigned)(single ? 1 : tokens));
+    const dim3 mgrid((unsigned)cols_tail, (unsigned)(single ? 1 : tokens));
+    const dim3 mblock(I8_COLS);
     auto launch = [&](auto tag) {
         using XT = decltype(tag);
         XT* dst = reinterpret_cast<XT*>(out.data_ptr());
+        const int8_t* wp = w.data_ptr<int8_t>();
         // 主体核一律写 ``part``：本形态强制 ``span >= 2``（理由同单流归并），所以
         // ``out`` 那一支不会被走到；传 ``dst`` 只是保持签名。
-        moe_grouped_i8_kernel<XT><<<grid, block, smem, stream>>>(
-            a.data_ptr<int8_t>(), w.data_ptr<int8_t>(), ws.data_ptr<float>(),
-            xs.data_ptr<float>(), offsets.data_ptr<int>(), part_ptr, dst,
-            K, N, experts, rows, span, per);
+        if (!wide) {
+            moe_grouped_i8_kernel<XT><<<grid, block, smem, stream>>>(
+                a.data_ptr<int8_t>(), wp, ws.data_ptr<float>(),
+                xs.data_ptr<float>(), offsets.data_ptr<int>(), part_ptr, dst,
+                K, N, experts, rows, span, per);
+        } else if (vb == I8_NK_WIDE_BYTES) {
+            if (wcol > 1) {
+                moe_grouped_i8_nk_kernel<XT, I8_NK_WIDE_BYTES, I8_NK_WCOL_SHALLOW>
+                    <<<grid, block, smem, stream>>>(
+                        a.data_ptr<int8_t>(), wp, ws.data_ptr<float>(),
+                        xs.data_ptr<float>(), offsets.data_ptr<int>(), part_ptr, dst,
+                        K, N, experts, rows, span, per);
+            } else {
+                moe_grouped_i8_nk_kernel<XT, I8_NK_WIDE_BYTES, 1>
+                    <<<grid, block, smem, stream>>>(
+                        a.data_ptr<int8_t>(), wp, ws.data_ptr<float>(),
+                        xs.data_ptr<float>(), offsets.data_ptr<int>(), part_ptr, dst,
+                        K, N, experts, rows, span, per);
+            }
+        } else {
+            moe_grouped_i8_nk_kernel<XT, 4, 1><<<grid, block, smem, stream>>>(
+                a.data_ptr<int8_t>(), wp, ws.data_ptr<float>(),
+                xs.data_ptr<float>(), offsets.data_ptr<int>(), part_ptr, dst,
+                K, N, experts, rows, span, per);
+        }
         // 权重按它自己的 dtype 实例化：多流路径的路由权重是 bf16，若在这里转 fp32
         // 就又是一次发射，而这个融合要省的正是那一次。
         const bool wr_bf16 = rw.scalar_type() == torch::kBFloat16;
         if (single) {
             if (wr_bf16) {
-                moe_grouped_i8_merge_rows_kernel<XT, uint16_t><<<mgrid, block, 0, stream>>>(
+                moe_grouped_i8_merge_rows_kernel<XT, uint16_t><<<mgrid, mblock, 0, stream>>>(
                     part_ptr, ws.data_ptr<float>(), xs.data_ptr<float>(),
                     offsets.data_ptr<int>(),
                     reinterpret_cast<const uint16_t*>(rw.data_ptr()),
                     slot_of_pos.data_ptr<int>(), dst, N, experts, rows, span);
             } else {
-                moe_grouped_i8_merge_rows_kernel<XT, float><<<mgrid, block, 0, stream>>>(
+                moe_grouped_i8_merge_rows_kernel<XT, float><<<mgrid, mblock, 0, stream>>>(
                     part_ptr, ws.data_ptr<float>(), xs.data_ptr<float>(),
                     offsets.data_ptr<int>(), rw.data_ptr<float>(),
                     slot_of_pos.data_ptr<int>(), dst, N, experts, rows, span);
             }
         } else if (wr_bf16) {
-            moe_grouped_i8_merge_slots_kernel<XT, uint16_t><<<mgrid, block, 0, stream>>>(
+            moe_grouped_i8_merge_slots_kernel<XT, uint16_t><<<mgrid, mblock, 0, stream>>>(
                 part_ptr, ws.data_ptr<float>(), xs.data_ptr<float>(),
                 offsets.data_ptr<int>(),
                 reinterpret_cast<const uint16_t*>(rw.data_ptr()),
                 slot_pos.data_ptr<int>(), dst, N, experts, rows, span, (int)top_k);
         } else {
-            moe_grouped_i8_merge_slots_kernel<XT, float><<<mgrid, block, 0, stream>>>(
+            moe_grouped_i8_merge_slots_kernel<XT, float><<<mgrid, mblock, 0, stream>>>(
                 part_ptr, ws.data_ptr<float>(), xs.data_ptr<float>(),
                 offsets.data_ptr<int>(), rw.data_ptr<float>(),
                 slot_pos.data_ptr<int>(), dst, N, experts, rows, span, (int)top_k);
@@ -623,6 +968,7 @@ torch::Tensor moe_grouped_i8_merge_tokens(torch::Tensor a, torch::Tensor xs,
 // @param rw       逐行路由权重，``[rows]`` fp32 连续。
 // @param out      ``[1, N]`` 连续，bf16 或 fp32，dtype 由它决定。
 // @param slices   K 方向分片数；``<= 0`` 自动。归并形态至少用 2 片（见下）。
+// @param nk       非 0 时按 ``[E, N, K]`` 的权重栈走 nk 主体核。
 // @return out。
 // @throws c10::Error 布局、设备、dtype 或形状不自洽。
 //
@@ -631,14 +977,17 @@ torch::Tensor moe_grouped_i8_merge_tokens(torch::Tensor a, torch::Tensor xs,
 // 求和；down（K=512）自动选片本来就会选到 3 片，这条只影响调用方硬指定 1 片的情况。
 torch::Tensor moe_grouped_i8_merge(torch::Tensor a, torch::Tensor xs, torch::Tensor w,
                                    torch::Tensor ws, torch::Tensor offsets,
-                                   torch::Tensor rw, torch::Tensor out, int64_t slices) {
+                                   torch::Tensor rw, torch::Tensor out, int64_t slices,
+                                   int64_t nk) {
     TORCH_CHECK(a.is_cuda() && a.dim() == 2 && a.scalar_type() == torch::kChar
                 && a.is_contiguous(), "activation must be contiguous CUDA int8 [rows, K]");
     TORCH_CHECK(xs.is_cuda() && xs.dim() == 1 && xs.scalar_type() == torch::kFloat
                 && xs.is_contiguous() && xs.size(0) == a.size(0),
                 "activation scale must be contiguous fp32 [rows]");
     TORCH_CHECK(w.is_cuda() && w.dim() == 3 && w.scalar_type() == torch::kChar
-                && w.is_contiguous(), "weight must be contiguous CUDA int8 [E, K, N]");
+                && w.is_contiguous(),
+                "weight must be contiguous CUDA int8, either [E, K, N] or the nk "
+                "stack [E, N, K]");
     TORCH_CHECK(ws.is_cuda() && ws.dim() == 2 && ws.scalar_type() == torch::kFloat
                 && ws.is_contiguous(), "weight scale must be contiguous fp32 [E, N]");
     TORCH_CHECK(offsets.is_cuda() && offsets.dim() == 1
@@ -656,25 +1005,48 @@ torch::Tensor moe_grouped_i8_merge(torch::Tensor a, torch::Tensor xs, torch::Ten
     const int K = (int)a.size(1);
     const int N = (int)out.size(1);
     const int experts = (int)w.size(0);
-    TORCH_CHECK((int)w.size(1) == K && (int)w.size(2) == N,
-                "weight must be [E, K, N] matching activation and destination");
+    const bool wide = nk != 0;
+    if (wide) {
+        TORCH_CHECK((int)w.size(1) == N && (int)w.size(2) == K,
+                    "nk weight must be [E, N, K] matching activation and destination");
+    } else {
+        TORCH_CHECK((int)w.size(1) == K && (int)w.size(2) == N,
+                    "weight must be [E, K, N] matching activation and destination");
+    }
     TORCH_CHECK((int)ws.size(0) == experts && (int)ws.size(1) == N,
                 "weight scale must be [E, N]");
     TORCH_CHECK((int)offsets.size(0) == experts + 1, "offsets must have E+1 entries");
     TORCH_CHECK(K > 0 && N > 0 && experts > 0 && rows > 0, "sizes must be positive");
 
-    const int cols = (N + I8_COLS - 1) / I8_COLS;
+    // nk 的 16 字节路径要求每片的长度是 16 的倍数（片头不对齐会让 ``int4`` 跨进下一列）；
+    // 4 字节路径只要 4 的倍数，也就是 ``__dp4a`` 本身的粒度。
+    const int vb = (wide && K % I8_NK_WIDE_BYTES == 0 && K <= I8_NK_WIDE_K)
+                       ? I8_NK_WIDE_BYTES : 4;
+    // 浅 K（``down`` 的 K=512）一列只放得下一轮 512 字节宽步，单列根本填不满延迟；
+    // 让一个 warp 认领 4 列并行，把在飞请求从 4 条抬到 16 条。只在 16 字节步这一档开。
+    const int wcol = (vb == I8_NK_WIDE_BYTES && K < I8_NK_SHALLOW_K) ? I8_NK_WCOL_SHALLOW : 1;
+    const int warps = (wide && K < I8_NK_SHALLOW_K) ? I8_NK_WARPS_SHALLOW : I8_NK_WARPS;
+    const int cols = wide ? (N + warps * wcol - 1) / (warps * wcol)
+                          : (N + I8_COLS - 1) / I8_COLS;
+    // 收尾核按 kn 的 128 列线程写，网格要按那一档算。
+    const int cols_tail = (N + I8_COLS - 1) / I8_COLS;
     int span = (int)slices;
     if (span <= 0) {
-        span = 1;
-        while (span < I8_MAX_SLICES
-               && cols * rows * (span + 1) <= 1024
-               && K / (span + 1) >= I8_MIN_PER) {
-            ++span;
+        if (wide) {
+            // nk 的自动值就是 2（理由与 kn 那一支相同：1 片时主体核写逐行落盘，
+            // 而这个形态只有一行目的地）。
+            span = 2;
+        } else {
+            span = 1;
+            while (span < I8_MAX_SLICES
+                   && cols * rows * (span + 1) <= 1024
+                   && K / (span + 1) >= I8_MIN_PER) {
+                ++span;
+            }
         }
     }
     span = std::max(2, std::min(std::min(span, I8_MAX_SLICES), K));
-    const int per = ((K + span - 1) / span + 3) / 4 * 4;
+    const int per = ((K + span - 1) / span + vb - 1) / vb * vb;
 
     const c10::cuda::CUDAGuard guard(a.device());
     const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
@@ -686,18 +1058,41 @@ torch::Tensor moe_grouped_i8_merge(torch::Tensor a, torch::Tensor xs, torch::Ten
     int32_t* part_ptr = part.data_ptr<int32_t>();
 
     const dim3 grid((unsigned)cols, (unsigned)rows, (unsigned)span);
-    const dim3 block(I8_COLS);
+    const dim3 block(wide ? (unsigned)(warps * 32) : (unsigned)I8_COLS);
     const size_t smem = (size_t)K * sizeof(int8_t);
     auto launch = [&](auto tag) {
         using XT = decltype(tag);
         XT* dst = reinterpret_cast<XT*>(out.data_ptr());
+        const int8_t* wp = w.data_ptr<int8_t>();
         // 主体核的 ``tokens`` 参数就是这里的 ``rows``；``part`` 的步长与之一致。
-        moe_grouped_i8_kernel<XT><<<grid, block, smem, stream>>>(
-            a.data_ptr<int8_t>(), w.data_ptr<int8_t>(), ws.data_ptr<float>(),
-            xs.data_ptr<float>(), offsets.data_ptr<int>(), part_ptr, dst,
-            K, N, experts, rows, span, per);
-        const dim3 mgrid((unsigned)cols);
-        moe_grouped_i8_merge_kernel<XT><<<mgrid, block, 0, stream>>>(
+        if (!wide) {
+            moe_grouped_i8_kernel<XT><<<grid, block, smem, stream>>>(
+                a.data_ptr<int8_t>(), wp, ws.data_ptr<float>(),
+                xs.data_ptr<float>(), offsets.data_ptr<int>(), part_ptr, dst,
+                K, N, experts, rows, span, per);
+        } else if (vb == I8_NK_WIDE_BYTES) {
+            if (wcol > 1) {
+                moe_grouped_i8_nk_kernel<XT, I8_NK_WIDE_BYTES, I8_NK_WCOL_SHALLOW>
+                    <<<grid, block, smem, stream>>>(
+                        a.data_ptr<int8_t>(), wp, ws.data_ptr<float>(),
+                        xs.data_ptr<float>(), offsets.data_ptr<int>(), part_ptr, dst,
+                        K, N, experts, rows, span, per);
+            } else {
+                moe_grouped_i8_nk_kernel<XT, I8_NK_WIDE_BYTES, 1>
+                    <<<grid, block, smem, stream>>>(
+                        a.data_ptr<int8_t>(), wp, ws.data_ptr<float>(),
+                        xs.data_ptr<float>(), offsets.data_ptr<int>(), part_ptr, dst,
+                        K, N, experts, rows, span, per);
+            }
+        } else {
+            moe_grouped_i8_nk_kernel<XT, 4, 1><<<grid, block, smem, stream>>>(
+                a.data_ptr<int8_t>(), wp, ws.data_ptr<float>(),
+                xs.data_ptr<float>(), offsets.data_ptr<int>(), part_ptr, dst,
+                K, N, experts, rows, span, per);
+        }
+        const dim3 mgrid((unsigned)cols_tail);
+        const dim3 mblock(I8_COLS);
+        moe_grouped_i8_merge_kernel<XT><<<mgrid, mblock, 0, stream>>>(
             part_ptr, ws.data_ptr<float>(), xs.data_ptr<float>(),
             offsets.data_ptr<int>(), rw.data_ptr<float>(), dst, N, experts, rows, span);
     };
@@ -709,18 +1104,19 @@ torch::Tensor moe_grouped_i8_merge(torch::Tensor a, torch::Tensor xs, torch::Ten
 
 // 绑定写在内核旁边：名字、参数名与默认值只有这一份，`bindings.cpp` 只遍历注册表。
 COFFIN_BIND(moe_grouped_i8,
-            "\u5206\u7ec4 int8 \u6295\u5f71\uff1a\u4e13\u5bb6\u6808 [E, K, N] int8 "
-          "+ \u9010 (\u4e13\u5bb6, \u5217) scale",
+            "\u5206\u7ec4 int8 \u6295\u5f71\uff1a\u4e13\u5bb6\u6808 [E, K, N] \u6216 nk "
+            "\u5806 [E, N, K] int8 + \u9010 (\u4e13\u5bb6, \u5217) scale",
             pybind11::arg("a"), pybind11::arg("xs"), pybind11::arg("w"), pybind11::arg("ws"),
-            pybind11::arg("offsets"), pybind11::arg("out"), pybind11::arg("slices") = 0);
+            pybind11::arg("offsets"), pybind11::arg("out"), pybind11::arg("slices") = 0,
+            pybind11::arg("nk") = 0, pybind11::arg("rows_valid") = -1);
 COFFIN_BIND(moe_grouped_i8_merge,
             "分组 int8 投影的归并形态：各行按路由权重加权累加成一行",
             pybind11::arg("a"), pybind11::arg("xs"), pybind11::arg("w"), pybind11::arg("ws"),
             pybind11::arg("offsets"), pybind11::arg("rw"), pybind11::arg("out"),
-            pybind11::arg("slices") = 0);
+            pybind11::arg("slices") = 0, pybind11::arg("nk") = 0);
 COFFIN_BIND(moe_grouped_i8_merge_tokens,
             "归并形态的多流版本：每个 token 只累加自己的 top_k 行，权重按槽位号直取",
             pybind11::arg("a"), pybind11::arg("xs"), pybind11::arg("w"), pybind11::arg("ws"),
             pybind11::arg("offsets"), pybind11::arg("rw"), pybind11::arg("slot_pos"),
             pybind11::arg("slot_of_pos"), pybind11::arg("tokens"), pybind11::arg("top_k"),
-            pybind11::arg("out"), pybind11::arg("slices") = 0);
+            pybind11::arg("out"), pybind11::arg("slices") = 0, pybind11::arg("nk") = 0);

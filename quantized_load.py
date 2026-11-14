@@ -352,12 +352,27 @@ def _load_w4a8(model_dir: Path, index: dict, *, device: torch.device,
                     scale_key = meta.get("scale_key")
                     if scale_key not in available:
                         raise ValueError(f"{path}: {key} has no scale tensor {scale_key}")
-                    packed = handle.get_tensor(key)
                     scale = handle.get_tensor(scale_key)
-                    if (list(packed.shape) != meta.get("shape")
-                            or list(scale.shape) != meta.get("scale_shape")):
-                        raise ValueError(f"{path}: moe int8 stack shape mismatch for {key}")
-                    value = QWeightMoE(packed, scale, k=int(meta["k"]))
+                    # 解码节点要 nk 就把 checkpoint 里那份 ``#nk`` 直接读上来，不做转置；
+                    # 其余节点（预填充）读 kn。两边读的是同一个键的两种布局，**只有一份
+                    # 会上卡**——这就是把「运行时转置」换成「打包时转置」的全部意义。
+                    # 旧 checkpoint 没有 ``nk_key`` 字段，于是退回原来的运行时转置路径。
+                    import os as _os
+                    nk_enabled = _os.environ.get("COFFIN_MOE_I8_NK", "0") not in ("0", "", "off")
+                    nk_key = meta.get("nk_key")
+                    layout = "kn"
+                    if nk_enabled and nk_key and nk_key in available:
+                        packed = handle.get_tensor(nk_key)
+                        layout = "nk"
+                        if list(packed.shape) != meta.get("nk_shape"):
+                            raise ValueError(f"{path}: moe nk stack shape mismatch for {nk_key}")
+                    else:
+                        packed = handle.get_tensor(key)
+                        if list(packed.shape) != meta.get("shape"):
+                            raise ValueError(f"{path}: moe int8 stack shape mismatch for {key}")
+                    if list(scale.shape) != meta.get("scale_shape"):
+                        raise ValueError(f"{path}: moe int8 scale shape mismatch for {key}")
+                    value = QWeightMoE(packed, scale, k=int(meta["k"]), layout=layout)
                     sd[key] = value if quant else value.to(weight_dtype)
                 elif meta.get("kind") == "q4-moe":
                     # MoE 的融合专家栈。必须走独立分支：``packed`` 是三维的

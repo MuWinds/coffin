@@ -353,19 +353,33 @@ def _emit_stack(payload: dict, tensors: dict, per_file: dict, kinds: Counter,
     key = f"{mlp}.{suffix}"
     payload[key] = wq.cpu()
     payload[key + "#scale"] = scale.cpu()
+    # 同时落一份 nk（``[E, N, K]``）供解码节点直接读：解码卡的 nk 分组核要的正是这一
+    # 份，而它在原来的口径下是**运行时转置**出来的——一张 D 卡因此同时背 kn 与 nk
+    # 两份（每 rank 15.4 GB）。在打包阶段转一次、磁盘多占一份，D 卡就只读 nk、
+    # 内存回到 7.7 GB。用完即弃的磁盘换每张卡 7.7 GB，这个交换在 PD 分离下是划算的。
+    #
+    # 只在这一步转置：``wq`` 是 ``[E, K, N]``，N 轴在外之后每一列的 K 才是连续的，
+    # 也就是 nk 核一次 32 位加载就能拿到 ``__dp4a`` 要的那个字。
+    nk = wq.transpose(1, 2).contiguous()
+    payload[key + "#nk"] = nk.cpu()
     tensors[key] = {
         "kind": "q8-moe",
+        "layout": "kn",
         "experts": int(wq.shape[0]),
         "n": int(wq.shape[2]),
         "k": int(wq.shape[1]),
         "shape": list(wq.shape),
         "scale_shape": list(scale.shape),
         "scale_key": key + "#scale",
+        #: nk 副本的键与形状。加载器按 ``COFFIN_MOE_I8_NK`` 决定读哪一份，
+        #: 两份**不会**同时上卡；缺这个字段的旧 checkpoint 会退回运行时转置。
+        "nk_key": key + "#nk",
+        "nk_shape": list(nk.shape),
         "shard": shard_name,
     }
     kinds["int8-moe"] += 1
-    per_file["tensors"] += 1
-    per_file["int8_bytes"] += wq.numel()
+    per_file["tensors"] += 2
+    per_file["int8_bytes"] += 2 * wq.numel()
     per_file["scale_bytes"] += scale.numel() * 4
 
 def convert(ckpt: Path, out: Path, *, weight_dtype: torch.dtype,
