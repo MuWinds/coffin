@@ -41,7 +41,7 @@ _SOURCES = ("bindings.cpp", "gemv.cu", "w8a8.cu", "w8a8_dp4a.cu", "norm.cu",
             "w4a8.cu", "hyper.cu", "moe_grouped.cu", "moe_grouped_i8.cu",
             "moe_dispatch.cu",
            "w4_dequant.cu", "mapped_shm.cu", "mapped_reduce.cu",
-            "moe_epilogue.cu", "moe_block.cu", "p2p_reduce.cu")
+            "moe_epilogue.cu", "moe_block.cu", "p2p_reduce.cu", "mega.cu")
 
 #: 驱动不报告 ISA 时的回退值。``ivcore10`` 是 BI-V100 的架构
 #: （``docs/qwen4/COREX-PLATFORM.md``）；报告了别的值的卡就用那个值，所以加载器把 ``arch``

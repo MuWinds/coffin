@@ -267,6 +267,49 @@ def _silu_mul(gate: torch.Tensor, up: torch.Tensor,
     return out
 
 
+def _kv_pool_store(k: torch.Tensor, v: torch.Tensor, ks: torch.Tensor, vs: torch.Tensor,
+                   slot: torch.Tensor, kc: torch.Tensor, vc: torch.Tensor,
+                   ksc: torch.Tensor, vsc: torch.Tensor, layer: int,
+                   head_major: bool) -> bool:
+    """把一层的一个 token 写进 paged 池的 ``[layer, slot]`` 单元。
+
+    池是 ``[layers, slots, nkv, hd]``；``head_major`` 时是 ``[layers, nkv, slots, hd]``，
+    scale 少最后一维、单元号相同。单槽位是这条路的前提——多槽位（预填充的行表）由调用方
+    自己走逐张量写回，这里返回 ``False`` 让它回退。
+
+    Args:
+        k: ``[nkv, hd]`` int8 key 行。
+        v: 同形状的 value 行。
+        ks: ``[nkv]`` fp32 key scale。
+        vs: 同形状的 value scale。
+        slot: ``[1]`` 槽位号。
+        kc: k 池，原地写入。
+        vc: v 池。
+        ksc: key scale 池。
+        vsc: value scale 池。
+        layer: 全注意力层在池层轴上的下标。
+        head_major: 池是否按 ``[layers, nkv, slots, hd]`` 排。
+
+    Returns:
+        是否写成功。
+    """
+    if slot.numel() != 1:
+        return False
+    s = int(slot.reshape(-1)[0])
+    lay = int(layer)
+    if head_major:
+        kc[lay, :, s] = k
+        vc[lay, :, s] = v
+        ksc[lay, :, s] = ks
+        vsc[lay, :, s] = vs
+    else:
+        kc[lay, s] = k
+        vc[lay, s] = v
+        ksc[lay, s] = ks
+        vsc[lay, s] = vs
+    return True
+
+
 def _shared_gate_scale(x: torch.Tensor, w: torch.Tensor, src: torch.Tensor,
                        out: torch.Tensor) -> torch.Tensor:
     """``out = src * sigmoid(x · w)``，共享专家的门标量。
@@ -1160,6 +1203,7 @@ def build(caps: Caps | None = None) -> Ops:
         add_rms_norm=_add_rms_norm,
         kv_quant=_kv_quant,
         silu_mul=_silu_mul,
+        kv_pool_store=_kv_pool_store,
     shared_gate_scale=_shared_gate_scale,
         rope_apply=_rope_apply,
         attn_decode=_attn_decode,

@@ -165,6 +165,11 @@ __global__ void moe_grouped_i8_kernel(const int8_t* __restrict__ a,
                                       const float* __restrict__ xs,
                                       const int* __restrict__ offsets,
                                       int32_t* __restrict__ part,
+                                      int* __restrict__ cnt,
+                                      int* __restrict__ mcnt,
+                                      const void* __restrict__ rw,
+                                      const int* __restrict__ slot_of_pos,
+                                      int rw16,
                                       XT* __restrict__ out,
                                       int K, int N, int experts, int tokens,
                                       int slices, int per) {
@@ -193,47 +198,129 @@ __global__ void moe_grouped_i8_kernel(const int8_t* __restrict__ a,
 
     // 列号越界的线程在屏障**之后**才退：放在屏障之前的话，末尾那个列块里会有一半线程
     // 跳过 ``__syncthreads()``，那是未定义行为（现在只有 N 是 128 的倍数才不出事）。
+    //
+    // 有了末块收尾（见函数末尾）之后，越界线程也不能提前 ``return``——它们必须跟着走到
+    // 那两道屏障。所以这里只记一个谓词，把计算与写回都圈进 ``if (ok)``。
     const int col = (int)blockIdx.x * I8_COLS + (int)threadIdx.x;
-    if (col >= N) return;
+    const bool ok = col < N;
 
     const int expert = s_expert;
     const int8_t* wexp = w + (size_t)expert * (size_t)K * (size_t)N;
 
-    // 四条独立累加链：每个 k 步只有一条 dp4a 时，16 次乘加串成一条依赖链，
-    // 访存延迟完全暴露。四条链让 16 个权重字节同时在飞（与 ``moe_grouped.cu``
-    // 里 1 行档的 8 路展开是同一条结论，这里按 dp4a 的 4 字节粒度展开）。
-    int s0 = 0, s1 = 0, s2 = 0, s3 = 0;
-    int k = k0;
-    for (; k + 16 <= k1; k += 16) {
-        const int a0 = *reinterpret_cast<const int*>(s_x + k);
-        const int a1 = *reinterpret_cast<const int*>(s_x + k + 4);
-        const int a2 = *reinterpret_cast<const int*>(s_x + k + 8);
-        const int a3 = *reinterpret_cast<const int*>(s_x + k + 12);
-        const unsigned q0 = i8_dword(wexp, col, N, k);
-        const unsigned q1 = i8_dword(wexp, col, N, k + 4);
-        const unsigned q2 = i8_dword(wexp, col, N, k + 8);
-        const unsigned q3 = i8_dword(wexp, col, N, k + 12);
-        s0 = __dp4a((int)q0, a0, s0);
-        s1 = __dp4a((int)q1, a1, s1);
-        s2 = __dp4a((int)q2, a2, s2);
-        s3 = __dp4a((int)q3, a3, s3);
-    }
-    for (; k + 4 <= k1; k += 4) {
-        s0 = __dp4a((int)i8_dword(wexp, col, N, k),
-                    *reinterpret_cast<const int*>(s_x + k), s0);
-    }
-    for (; k < k1; ++k) {
-        s0 += (int)wexp[(size_t)k * N + col] * (int)s_x[k];
+    if (ok) {
+        // 四条独立累加链：每个 k 步只有一条 dp4a 时，16 次乘加串成一条依赖链，
+        // 访存延迟完全暴露。四条链让 16 个权重字节同时在飞（与 ``moe_grouped.cu``
+        // 里 1 行档的 8 路展开是同一条结论，这里按 dp4a 的 4 字节粒度展开）。
+        int s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+        int k = k0;
+        for (; k + 16 <= k1; k += 16) {
+            const int a0 = *reinterpret_cast<const int*>(s_x + k);
+            const int a1 = *reinterpret_cast<const int*>(s_x + k + 4);
+            const int a2 = *reinterpret_cast<const int*>(s_x + k + 8);
+            const int a3 = *reinterpret_cast<const int*>(s_x + k + 12);
+            const unsigned q0 = i8_dword(wexp, col, N, k);
+            const unsigned q1 = i8_dword(wexp, col, N, k + 4);
+            const unsigned q2 = i8_dword(wexp, col, N, k + 8);
+            const unsigned q3 = i8_dword(wexp, col, N, k + 12);
+            s0 = __dp4a((int)q0, a0, s0);
+            s1 = __dp4a((int)q1, a1, s1);
+            s2 = __dp4a((int)q2, a2, s2);
+            s3 = __dp4a((int)q3, a3, s3);
+        }
+        for (; k + 4 <= k1; k += 4) {
+            s0 = __dp4a((int)i8_dword(wexp, col, N, k),
+                        *reinterpret_cast<const int*>(s_x + k), s0);
+        }
+        for (; k < k1; ++k) {
+            s0 += (int)wexp[(size_t)k * N + col] * (int)s_x[k];
+        }
+
+        const int total = (s0 + s1) + (s2 + s3);
+        if (slices == 1) {
+            // 两个 scale 在同一个 fp32 表达式里乘完再窄化一次：分两次窄化多一次舍入，
+            // 而这个结果要穿过 40 层。
+            out[(size_t)row * N + col] = CxScalar<XT>::from_float(
+                (float)total * xs[row] * ws[(size_t)expert * N + col]);
+        } else {
+            part[((size_t)blockIdx.z * (size_t)tokens + (size_t)row) * (size_t)N + col] = total;
+        }
     }
 
-    const int total = (s0 + s1) + (s2 + s3);
-    if (slices == 1) {
-        // 两个 scale 在同一个 fp32 表达式里乘完再窄化一次：分两次窄化多一次舍入，
-        // 而这个结果要穿过 40 层。
-        out[(size_t)row * N + col] = CxScalar<XT>::from_float(
-            (float)total * xs[row] * ws[(size_t)expert * N + col]);
-    } else {
-        part[((size_t)blockIdx.z * (size_t)tokens + (size_t)row) * (size_t)N + col] = total;
+    // 末块收尾：``cnt != nullptr`` 时本核不再需要外面那趟 ``moe_grouped_i8_reduce``。
+    //
+    // 每片写完 ``part`` 后各来一次 ``atomicAdd``，拿到 ``slices - 1`` 的那个列块就是本
+    // (row, col) 组最后到达的，它就地读回 ``slices`` 个部分和、乘两个 scale、写 ``out``，
+    // 再把计数器复位。**零自旋**：末块直接干活，不等别人，所以块数不受驻留约束。
+    // 与 GEMV 那两支同一个套路，约束也相同（见 ``gemv.cu`` 里
+    // ``gemv_kn_i8_split_kernel`` 的注释）。
+    //
+    // ``cnt == nullptr``（``moe_grouped_i8_merge_tokens`` 那一支）行为与合入前逐位一致：
+    // 它要的收尾是「跨行加权累加」，需要全部行到齐，不是一个 (row, col) 组能做完的。
+    if (cnt != nullptr && slices > 1) {
+        __threadfence();
+        __syncthreads();
+        __shared__ int slast;
+        const int slot = row * (int)gridDim.x + (int)blockIdx.x;
+        if (threadIdx.x == 0) slast = (atomicAdd(&cnt[slot], 1) == slices - 1);
+        __syncthreads();
+        if (!slast) return;
+        if (threadIdx.x == 0) cnt[slot] = 0;
+        __threadfence();
+        if (ok) {
+            int tot = 0;
+            for (int s = 0; s < slices; ++s) {
+                tot += part[((size_t)s * (size_t)tokens + (size_t)row) * (size_t)N + col];
+            }
+            out[(size_t)row * N + col] = CxScalar<XT>::from_float(
+                (float)tot * xs[row] * ws[(size_t)expert * N + col]);
+        }
+    }
+
+    // 归并形态的末块收尾：``mcnt != nullptr`` 时本核同时替代
+    // ``moe_grouped_i8_merge_rows_kernel``（单 token 的单流解码每层一次，40 层 40 次发射）。
+    //
+    // 这里的到达条件比上面宽一档：一列的加权和要**全部行、全部分片**都到齐，所以阈值是
+    // ``行数 x 分片数``，计数器按**列块**（而不是 (行, 列) 组）计数。最后一个到达的块
+    // 用一个线程算这一列块的每一列：读出 ``slices`` 个部分和、按行加权、按两个 scale 与
+    // 路由权重相乘、写 ``out[col]``。
+    //
+    // 加权顺序与 ``moe_grouped_i8_merge_rows_kernel`` 逐位一致（行号升序、fp32 累加、
+    // 每行先乘两个 scale 再乘路由权重），所以单流结果不变。
+    if (mcnt != nullptr) {
+        __threadfence();
+        __syncthreads();
+        __shared__ int mlast;
+        if (threadIdx.x == 0) {
+            // 阈值必须是**有效行数**而不是 ``gridDim.y``：不属于本 rank 的行在开头就整块
+            // 退出了（它们没有 ``part`` 可写，也就不该计数）。EP4 上一个 token 的 8 个槽位
+            // 里只有 64/256 机率落在本地，用整行数当阈值会让收尾永远攒不齐、``out`` 留着
+            // 上一层的值——这是融合版第一次跑出乱码的原因。
+            const int valid = offsets[experts];
+            const int need = valid > 0 ? valid * (int)gridDim.z : 1;
+            mlast = (atomicAdd(&mcnt[blockIdx.x], 1) == need - 1);
+        }
+        __syncthreads();
+        if (!mlast) return;
+        if (threadIdx.x == 0) mcnt[blockIdx.x] = 0;
+        __threadfence();
+        if (ok) {
+            const int valid = offsets[experts];
+            float acc = 0.f;
+            for (int r = 0; r < (int)gridDim.y; ++r) {
+                if (r >= valid) continue;
+                const int er = i8_owner(offsets, experts, r);
+                int tot = 0;
+                for (int s = 0; s < slices; ++s) {
+                    tot += part[((size_t)s * (size_t)tokens + (size_t)r) * (size_t)N + col];
+                }
+                const int sw = slot_of_pos[r];
+                const float w = rw16 ? CxScalar<uint16_t>::to_float(
+                                           reinterpret_cast<const uint16_t*>(rw)[sw])
+                                     : reinterpret_cast<const float*>(rw)[sw];
+                acc += (float)tot * xs[r] * ws[(size_t)er * N + col] * w;
+            }
+            out[(size_t)0 * N + col] = CxScalar<XT>::from_float(acc);
+        }
     }
 }
 
@@ -582,6 +669,32 @@ __global__ void moe_grouped_i8_merge_slots_kernel(const int32_t* __restrict__ pa
 
 }  // namespace
 
+// @brief 分组 GEMM 末块收尾用的到达计数，按 (设备, 块数) 常驻缓存。
+//
+// 与 ``gemv.cu`` 里 ``split_counters`` 同一件事、同一组约束：**初值必须是 0**，而**不能**
+// 每次调用清零——那一次 memset 正好又变成要省掉的发射。kn 主体核在每个 (row, col) 组的
+// 末块里把它写回 0 自复位，所以跨调用一直可用。
+//
+// 条目数等于出现过的不同 (列块 x 行) 组合，解码路径上只有个位数，所以线性扫描就够；
+// 放在命名空间外是因为两个 ``moe_grouped_*`` 入口都要用它。
+int* moe_grouped_counters(int device, int blocks) {
+    struct Entry {
+        int dev;
+        int blocks;
+        torch::Tensor buf;
+    };
+    static std::vector<Entry> cache;
+    for (int i = 0; i < (int)cache.size(); ++i) {
+        if (cache[i].dev == device && cache[i].blocks == blocks) {
+            return cache[i].buf.data_ptr<int>();
+        }
+    }
+    auto opts = torch::TensorOptions().dtype(torch::kInt).device(torch::kCUDA, device);
+    Entry e{device, blocks, torch::zeros({blocks}, opts)};
+    cache.push_back(e);
+    return cache.back().buf.data_ptr<int>();
+}
+
 // @brief 分组 int8 投影：``[tokens, K] -> [tokens, N]``，每个专家一份权重。
 //
 // @param a       int8 激活，``[tokens, K]`` 连续 CUDA。
@@ -700,6 +813,12 @@ torch::Tensor moe_grouped_i8(torch::Tensor a, torch::Tensor xs, torch::Tensor w,
     const dim3 grid((unsigned)cols, rows_launch, (unsigned)span);
     const dim3 block(wide ? (unsigned)(warps * 32) : (unsigned)I8_COLS);
     const size_t smem = (size_t)K * sizeof(int8_t);
+    // kn 主体核带末块收尾，于是外面的 ``moe_grouped_i8_reduce`` 可以整趟省掉（解码每层
+    // 一次，40 层就是 40 次发射）。nk 主体核没有收尾，``wide`` 仍走两趟。
+    int* cnt_ptr = nullptr;
+    if (span > 1 && !wide) {
+        cnt_ptr = moe_grouped_counters((int)a.get_device(), cols * (int)rows_launch);
+    }
     auto launch = [&](auto tag) {
         using XT = decltype(tag);
         XT* dst = reinterpret_cast<XT*>(out.data_ptr());
@@ -707,7 +826,8 @@ torch::Tensor moe_grouped_i8(torch::Tensor a, torch::Tensor xs, torch::Tensor w,
         if (!wide) {
             moe_grouped_i8_kernel<XT><<<grid, block, smem, stream>>>(
                 a.data_ptr<int8_t>(), wp, ws.data_ptr<float>(),
-                xs.data_ptr<float>(), offsets.data_ptr<int>(), part_ptr, dst,
+                xs.data_ptr<float>(), offsets.data_ptr<int>(), part_ptr, cnt_ptr, nullptr,
+                nullptr, nullptr, 0, dst,
                 K, N, experts, tokens, span, per);
         } else if (vb == I8_NK_WIDE_BYTES) {
             if (wcol > 1) {
@@ -741,8 +861,9 @@ torch::Tensor moe_grouped_i8(torch::Tensor a, torch::Tensor xs, torch::Tensor w,
                 xs.data_ptr<float>(), offsets.data_ptr<int>(), part_ptr, dst,
                 K, N, experts, tokens, span, per);
         }
-        if (span > 1) {
+        if (span > 1 && cnt_ptr == nullptr) {
             // 收尾核按 kn 的 128 列线程布局，块与线程都要回到那一档。
+            // kn 主体核（``cnt_ptr`` 非空）已经把这一步做完了，所以只有 nk 走到这里。
             const dim3 rgrid((unsigned)cols_tail, (unsigned)tokens);
             const dim3 rblock(I8_COLS);
             moe_grouped_i8_reduce_kernel<XT><<<rgrid, rblock, 0, stream>>>(
@@ -886,6 +1007,12 @@ torch::Tensor moe_grouped_i8_merge_tokens(torch::Tensor a, torch::Tensor xs,
     const dim3 block(wide ? (unsigned)(warps * 32) : (unsigned)I8_COLS);
     const size_t smem = (size_t)K * sizeof(int8_t);
     const bool single = tokens == 1;
+    // 单 token 时 kn 主体核自己就能做「跨行加权累加」的收尾（见内核末尾那段），于是
+    // ``moe_grouped_i8_merge_rows`` 那一趟可以整趟省掉。计数器按**列块**计数，阈值是
+    // 行 x 片；nk 主体核与多 token 形态仍走独立的收尾核。
+    int* mcnt = (!wide && single && span > 1)
+                    ? moe_grouped_counters((int)a.get_device(), cols) : nullptr;
+    const bool rw16 = rw.scalar_type() == torch::kBFloat16;
     const dim3 mgrid((unsigned)cols_tail, (unsigned)(single ? 1 : tokens));
     const dim3 mblock(I8_COLS);
     auto launch = [&](auto tag) {
@@ -897,8 +1024,9 @@ torch::Tensor moe_grouped_i8_merge_tokens(torch::Tensor a, torch::Tensor xs,
         if (!wide) {
             moe_grouped_i8_kernel<XT><<<grid, block, smem, stream>>>(
                 a.data_ptr<int8_t>(), wp, ws.data_ptr<float>(),
-                xs.data_ptr<float>(), offsets.data_ptr<int>(), part_ptr, dst,
-                K, N, experts, rows, span, per);
+                xs.data_ptr<float>(), offsets.data_ptr<int>(), part_ptr, nullptr, mcnt,
+                (const void*)rw.data_ptr(), slot_of_pos.data_ptr<int>(), rw16 ? 1 : 0,
+                dst, K, N, experts, rows, span, per);
         } else if (vb == I8_NK_WIDE_BYTES) {
             if (wcol > 1) {
                 moe_grouped_i8_nk_kernel<XT, I8_NK_WIDE_BYTES, I8_NK_WCOL_SHALLOW>
@@ -922,18 +1050,24 @@ torch::Tensor moe_grouped_i8_merge_tokens(torch::Tensor a, torch::Tensor xs,
         // 权重按它自己的 dtype 实例化：多流路径的路由权重是 bf16，若在这里转 fp32
         // 就又是一次发射，而这个融合要省的正是那一次。
         const bool wr_bf16 = rw.scalar_type() == torch::kBFloat16;
+        // ``mcnt`` 非空时 kn 主体核已经把单 token 的加权累加做完了（见内核末尾），
+        // 这一趟整个省掉。注意这个跳过必须落在 ``single`` 里面而不是并进条件里：
+        // 并进条件会让「single 且 mcnt 非空」掉进 ``merge_slots`` 那一支，
+        // 而 merge_slots 要的是逐 token 的行表，不是本形态的语义。
         if (single) {
-            if (wr_bf16) {
-                moe_grouped_i8_merge_rows_kernel<XT, uint16_t><<<mgrid, mblock, 0, stream>>>(
-                    part_ptr, ws.data_ptr<float>(), xs.data_ptr<float>(),
-                    offsets.data_ptr<int>(),
-                    reinterpret_cast<const uint16_t*>(rw.data_ptr()),
-                    slot_of_pos.data_ptr<int>(), dst, N, experts, rows, span);
-            } else {
-                moe_grouped_i8_merge_rows_kernel<XT, float><<<mgrid, mblock, 0, stream>>>(
-                    part_ptr, ws.data_ptr<float>(), xs.data_ptr<float>(),
-                    offsets.data_ptr<int>(), rw.data_ptr<float>(),
-                    slot_of_pos.data_ptr<int>(), dst, N, experts, rows, span);
+            if (mcnt == nullptr) {
+                if (wr_bf16) {
+                    moe_grouped_i8_merge_rows_kernel<XT, uint16_t><<<mgrid, mblock, 0, stream>>>(
+                        part_ptr, ws.data_ptr<float>(), xs.data_ptr<float>(),
+                        offsets.data_ptr<int>(),
+                        reinterpret_cast<const uint16_t*>(rw.data_ptr()),
+                        slot_of_pos.data_ptr<int>(), dst, N, experts, rows, span);
+                } else {
+                    moe_grouped_i8_merge_rows_kernel<XT, float><<<mgrid, mblock, 0, stream>>>(
+                        part_ptr, ws.data_ptr<float>(), xs.data_ptr<float>(),
+                        offsets.data_ptr<int>(), rw.data_ptr<float>(),
+                        slot_of_pos.data_ptr<int>(), dst, N, experts, rows, span);
+                }
             }
         } else if (wr_bf16) {
             moe_grouped_i8_merge_slots_kernel<XT, uint16_t><<<mgrid, mblock, 0, stream>>>(
@@ -1068,7 +1202,8 @@ torch::Tensor moe_grouped_i8_merge(torch::Tensor a, torch::Tensor xs, torch::Ten
         if (!wide) {
             moe_grouped_i8_kernel<XT><<<grid, block, smem, stream>>>(
                 a.data_ptr<int8_t>(), wp, ws.data_ptr<float>(),
-                xs.data_ptr<float>(), offsets.data_ptr<int>(), part_ptr, dst,
+                xs.data_ptr<float>(), offsets.data_ptr<int>(), part_ptr, nullptr, nullptr,
+                nullptr, nullptr, 0, dst,
                 K, N, experts, rows, span, per);
         } else if (vb == I8_NK_WIDE_BYTES) {
             if (wcol > 1) {

@@ -1160,6 +1160,19 @@ def moe_dispatch(expert_idx: torch.Tensor, local_table: torch.Tensor,
 _DISP_SCRATCH: dict = {}
 
 
+def mega_bar_probe(*args) -> torch.Tensor:
+    """常驻网格栅栏的冒烟入口。
+
+    Args:
+        *args: 与扩展入口同序的位置参数（``out`` / ``gate`` / ``blocks`` / ``threads`` /
+            ``iters``）。
+
+    Returns:
+        每块看到的代次快照。
+    """
+    return _kernels().mega_bar_probe(*args)
+
+
 def moe_decode_block(*args) -> torch.Tensor:
     """decode 单层 MoE 块的合成入口：一次调用顶掉十余次 pybind 往返。
 
@@ -1685,6 +1698,74 @@ def kv_quant(x: torch.Tensor, out_q: torch.Tensor,
     act = _compute_dtype(x)
     width = act.shape[-1]
     return module.kv_quant(_pitch_rows(act, width), out_q, out_s)
+
+
+def kv_store(k: torch.Tensor, v: torch.Tensor, ks: torch.Tensor, vs: torch.Tensor,
+             slot: torch.Tensor, kc: torch.Tensor, vc: torch.Tensor,
+             ksc: torch.Tensor, vsc: torch.Tensor) -> torch.Tensor:
+    """一次启动写入 k/v 缓存与它们的每头 scale。
+
+    替代 ``FullAttn.__call__`` 里那四次 ``index_copy_``（k、v、kscale、vscale 各一次）：
+    全注意力层每层四次、10 层就是每步 40 次发射，而它们共用同一个槽位号、搬的字节只有
+    ``nkv * hd``。
+
+    槽位号留在设备上读：``pos1`` 本来就是 CUDA 张量，取回主机会多一次 D2H 同步。
+
+    Args:
+        k: ``[nkv, hd]`` int8 量化后的 key。
+        v: 同形状的 value。
+        ks: ``[nkv]`` fp32 key 每头 scale。
+        vs: 同形状的 value scale。
+        slot: ``[1]`` CUDA int32/int64 槽位号。
+        kc: ``[nkv, max_seq, hd]`` int8 缓存，原地写入。
+        vc: 同上。
+        ksc: ``[nkv, max_seq]`` fp32，原地写入。
+        vsc: 同上。
+
+    Returns:
+        ``kc``，便于调用链串接。
+
+    Raises:
+        RuntimeError: 扩展不可用。
+    """
+    return _kernels().kv_store(k, v, ks, vs, slot, kc, vc, ksc, vsc)
+
+
+def kv_pool_store(k: torch.Tensor, v: torch.Tensor, ks: torch.Tensor, vs: torch.Tensor,
+                  slot: torch.Tensor, kc: torch.Tensor, vc: torch.Tensor,
+                  ksc: torch.Tensor, vsc: torch.Tensor, layer: int,
+                  head_major: bool) -> bool:
+    """一次启动把一层的一个 token 写进 paged k/v 池。
+
+    ``PagedCache.write_slot`` 原来是五次发射：一次 ``full_like`` 造层号张量、再四次
+    ``index_put_``。全注意力层每层一次、10 层就是每步 50 次发射，而它们写的是同一个
+    ``[layer, slot]`` 单元、搬的字节只有 ``nkv * hd``。层号在这里是主机侧常量，所以那次
+    ``full_like`` 也不必存在。
+
+    形状不合（多槽位、非连续、dtype 不符、层号越界）时返回 ``False``，调用方照旧走逐张量
+    写回。
+
+    Args:
+        k: ``[nkv, hd]`` int8 key 行。
+        v: 同形状的 value 行。
+        ks: ``[nkv]`` fp32 key scale。
+        vs: 同形状的 value scale。
+        slot: ``[1]`` CUDA int32/int64 槽位号，设备上读。
+        kc: ``[layers, slots, nkv, hd]`` 或 ``[layers, nkv, slots, hd]`` int8 池。
+        vc: 同上。
+        ksc: ``[layers, slots, nkv]`` 或 ``[layers, nkv, slots]`` fp32。
+        vsc: 同上。
+        layer: 全注意力层在池层轴上的下标。
+        head_major: 池是否按 ``[layers, nkv, slots, hd]`` 排。
+
+    Returns:
+        是否真的走了融合入口。``False`` 时调用方必须回退到逐张量写回。
+
+    Raises:
+        RuntimeError: 扩展不可用（此时不会返回 ``False``，而不是静默降级）。
+    """
+    return bool(_kernels().kv_pool_store(k, v, ks, vs, slot, kc, vc, ksc, vsc,
+                                         int(layer), bool(head_major)))
 
 
 def silu_mul(gate: torch.Tensor, up: torch.Tensor,

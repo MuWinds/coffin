@@ -81,20 +81,37 @@ __global__ void gemv_kn_kernel(const WT* __restrict__ wt,
     y[n] = CxScalar<XT>::from_float(dot_kn<WT, XT, U>(wt, x, n, N, 0, K));
 }
 
-// @brief 同一乘积的一个 K 区间，写进本分片在分片数组里的那一格。
+// @brief 同一乘积的一个 K 区间；**末块顺手归约**，与 int8 那支同一个套路。
 //
 // 每个分片都写自己那一格的全部 ``N`` 列，所以分片缓冲区不需要初始化，而归约顺序由 ``s``
-// 决定，而不是由哪个块碰巧先跑完决定。
+// 决定，而不是由哪个块碰巧先跑完决定。末块收尾（每列块一个原子计数、末块就地相加并写回、
+// 计数器自复位）把「分片 + 归约」两次发射压成一次；理由与约束见
+// ``gemv_kn_i8_split_kernel`` 上方那段注释，这里不重复。
 template <typename WT, typename XT, int U>
 __global__ void gemv_kn_split_kernel(const WT* __restrict__ wt,
                                      const XT* __restrict__ x, float* __restrict__ part,
+                                     XT* __restrict__ y, int* __restrict__ cnt,
                                      int N, int K, int split, int per) {
     const int n = blockIdx.x * blockDim.x + threadIdx.x;
-    if (n >= N) return;
-    const int s = blockIdx.y;
-    const int k0 = s * per;
-    const int k1 = min(K, k0 + per);
-    part[(size_t)s * N + n] = dot_kn<WT, XT, U>(wt, x, n, N, k0, k1);
+    if (n < N) {
+        const int s = blockIdx.y;
+        const int k0 = s * per;
+        const int k1 = min(K, k0 + per);
+        part[(size_t)s * N + n] = dot_kn<WT, XT, U>(wt, x, n, N, k0, k1);
+    }
+    __threadfence();
+    __syncthreads();
+    __shared__ int slast;
+    if (threadIdx.x == 0) slast = (atomicAdd(&cnt[blockIdx.x], 1) == split - 1);
+    __syncthreads();
+    if (!slast) return;
+    if (threadIdx.x == 0) cnt[blockIdx.x] = 0;
+    __threadfence();
+    if (n < N) {
+        float acc = 0.f;
+        for (int t = 0; t < split; ++t) acc += part[(size_t)t * N + n];
+        y[n] = CxScalar<XT>::from_float(acc);
+    }
 }
 
 // @brief 把分片部分和加进输出，每列一个线程。
@@ -127,18 +144,62 @@ __global__ void gemv_kn_i8_kernel(const int8_t* __restrict__ wt,
     y[n] = CxScalar<XT>::from_float(scale[n] * dot_kn<int8_t, XT, U>(wt, x, n, N, 0, K));
 }
 
-// @brief 同一乘积的一个 K 区间，写进本分片在分片数组里的那一格。
+// @brief 同一乘积的一个 K 区间，写进本分片在分片数组里的那一格；**末块顺手归约**。
+//
+// 原来这一步和 ``gemv_reduce_i8_kernel`` 是两次发射：分片核把 ``split`` 个部分和写进
+// ``part``，下一个核再读一遍、相加、施加列 scale。解码每层有两次这样的两趟（``out_proj``
+// 与 ``o_proj``），40 层就是 80 次多余发射，而中间那份 ``[split, N]`` 暂存除了给归约没有
+// 第二个读者。
+//
+// 合并不是把归约塞进某个固定块——那要么多等一个分片，要么让一个块串行扫全部列。这里用
+// 每列块一个计数器的「末块收尾」：每个分片块写完后 ``__threadfence()`` 再对
+// ``cnt[blockIdx.x]`` 做 ``atomicAdd``，拿到 ``split - 1`` 的那个块就是本列块最后一个到达
+// 的，它就地做完这个列块的归约并施加 scale，然后把计数器写回 0 自复位。
+//
+// 三个约束写在这里，免得以后被顺手改掉：
+//   * **自旋是零**。末块直接干活，不等别人，所以块数不受驻留约束，也没有死等风险。
+//   * 计数器必须跨调用常驻且初值为 0（见 ``split_counters``），每次调用重新清零等于又加了
+//     一次发射，正是要省掉的那一次。
+//   * ``__threadfence()`` 必须在 ``__syncthreads()`` **之前**、每个线程各自执行一次：它保证
+//     本线程的 ``part`` 写对全设备可见，而 ``atomicAdd`` 只在 ``tid 0`` 上做，光有它管不到
+//     别的线程写的那些列。
+//
+// @param part ``[split, N]`` 部分和暂存。
+// @param y ``[N]`` 最终输出，末块写入。
+// @param scale ``[N]`` 每列 fp32 scale，末块施加一次（与两趟写法同样只乘一次）。
+// @param cnt ``[ceil(N/threads)]`` 每列块的到达计数，常驻、初值 0、由末块复位。
 template <typename XT, int U>
 __global__ void gemv_kn_i8_split_kernel(const int8_t* __restrict__ wt,
                                         const XT* __restrict__ x,
                                         float* __restrict__ part,
+                                        XT* __restrict__ y,
+                                        const float* __restrict__ scale,
+                                        int* __restrict__ cnt,
                                         int N, int K, int split, int per) {
     const int n = blockIdx.x * blockDim.x + threadIdx.x;
-    if (n >= N) return;
-    const int s = blockIdx.y;
-    const int k0 = s * per;
-    const int k1 = min(K, k0 + per);
-    part[(size_t)s * N + n] = dot_kn<int8_t, XT, U>(wt, x, n, N, k0, k1);
+    // 尾部线程不再提前 ``return``：它们必须跟着走到 ``__syncthreads()``，否则屏障两侧
+    // 的线程数不一致，行为未定义。
+    if (n < N) {
+        const int s = blockIdx.y;
+        const int k0 = s * per;
+        const int k1 = min(K, k0 + per);
+        part[(size_t)s * N + n] = dot_kn<int8_t, XT, U>(wt, x, n, N, k0, k1);
+    }
+    __threadfence();
+    __syncthreads();
+    __shared__ int slast;
+    if (threadIdx.x == 0) slast = (atomicAdd(&cnt[blockIdx.x], 1) == split - 1);
+    __syncthreads();
+    if (!slast) return;
+    // 复位放在读 ``part`` 之前：本列块的 ``split`` 个分片块都已经加过计数了，所以此刻复位
+    // 不会有下一个调用提前读到旧值。
+    if (threadIdx.x == 0) cnt[blockIdx.x] = 0;
+    __threadfence();
+    if (n < N) {
+        float acc = 0.f;
+        for (int t = 0; t < split; ++t) acc += part[(size_t)t * N + n];
+        y[n] = CxScalar<XT>::from_float(scale[n] * acc);
+    }
 }
 
 // @brief 把分片部分和相加并施加列 scale，每列一个线程。
@@ -1186,7 +1247,10 @@ torch::Tensor launch_plain(const torch::Tensor& wt, const torch::Tensor& x,
     return y;
 }
 
-// @brief 为一种 dtype 组合启动 split-K 的两趟。
+// @brief 分片收尾用的到达计数（定义在下面，见 ``launch_i8_split`` 之前那段）。
+int* split_counters(int device, int blocks);
+
+// @brief 为一种 dtype 组合启动 split-K 的**一趟**（归约在末块里做）。
 template <typename WT, typename XT>
 torch::Tensor launch_split(const torch::Tensor& wt, const torch::Tensor& x,
                            torch::Tensor& y, int N, int K, int threads, int unroll,
@@ -1200,23 +1264,23 @@ torch::Tensor launch_split(const torch::Tensor& wt, const torch::Tensor& x,
     const int per = (K + split - 1) / split;
     const int blocks = (int)((N + threads - 1) / threads);
     const dim3 grid(blocks, split);
+    int* cnt = split_counters((int)wt.get_device(), blocks);
     if (unroll == 1) {
-        gemv_kn_split_kernel<WT, XT, 1><<<grid, threads, 0, stream>>>(wp, xp, pp, N, K,
-                                                                     split, per);
+        gemv_kn_split_kernel<WT, XT, 1><<<grid, threads, 0, stream>>>(wp, xp, pp, yp, cnt,
+                                                                     N, K, split, per);
     } else if (unroll == 2) {
-        gemv_kn_split_kernel<WT, XT, 2><<<grid, threads, 0, stream>>>(wp, xp, pp, N, K,
-                                                                     split, per);
+        gemv_kn_split_kernel<WT, XT, 2><<<grid, threads, 0, stream>>>(wp, xp, pp, yp, cnt,
+                                                                     N, K, split, per);
     } else if (unroll == 8) {
-        gemv_kn_split_kernel<WT, XT, 8><<<grid, threads, 0, stream>>>(wp, xp, pp, N, K,
-                                                                     split, per);
+        gemv_kn_split_kernel<WT, XT, 8><<<grid, threads, 0, stream>>>(wp, xp, pp, yp, cnt,
+                                                                     N, K, split, per);
     } else if (unroll == 16) {
-        gemv_kn_split_kernel<WT, XT, 16><<<grid, threads, 0, stream>>>(wp, xp, pp, N, K,
-                                                                      split, per);
+        gemv_kn_split_kernel<WT, XT, 16><<<grid, threads, 0, stream>>>(wp, xp, pp, yp, cnt,
+                                                                      N, K, split, per);
     } else {
-        gemv_kn_split_kernel<WT, XT, 4><<<grid, threads, 0, stream>>>(wp, xp, pp, N, K,
-                                                                     split, per);
+        gemv_kn_split_kernel<WT, XT, 4><<<grid, threads, 0, stream>>>(wp, xp, pp, yp, cnt,
+                                                                     N, K, split, per);
     }
-    gemv_reduce_kernel<XT><<<blocks, threads, 0, stream>>>(pp, yp, N, split);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return y;
 }
@@ -1411,6 +1475,31 @@ torch::Tensor launch_i8_plain(const torch::Tensor& wt, const torch::Tensor& x,
     return y;
 }
 
+// @brief 分片收尾用的到达计数，按 (设备, 列块数) 常驻缓存。
+//
+// 初值必须是 0（第一次 ``atomicAdd`` 才从 0 起算），而**不能**每次调用清零：那一次 memset
+// 正好又变成要省掉的发射。内核在每个列块的末块里把它写回 0 自复位，所以跨调用一直可用。
+//
+// 线性扫描而不是 ``std::map``：一张的条目数等于出现过的不同列块数（本模型解码路径只有
+// 个位数），而它只在 host 上每层调用两次。
+int* split_counters(int device, int blocks) {
+    struct Entry {
+        int dev;
+        int blocks;
+        torch::Tensor buf;
+    };
+    static std::vector<Entry> cache;
+    for (int i = 0; i < (int)cache.size(); ++i) {
+        if (cache[i].dev == device && cache[i].blocks == blocks) {
+            return cache[i].buf.data_ptr<int>();
+        }
+    }
+    auto opts = torch::TensorOptions().dtype(torch::kInt).device(torch::kCUDA, device);
+    Entry e{device, blocks, torch::zeros({blocks}, opts)};
+    cache.push_back(e);
+    return cache.back().buf.data_ptr<int>();
+}
+
 // @brief 为一种激活 dtype、宽度和展开度启动 split-K 的 int8 两趟。
 template <typename XT>
 torch::Tensor launch_i8_split(const torch::Tensor& wt, const torch::Tensor& x,
@@ -1428,6 +1517,9 @@ torch::Tensor launch_i8_split(const torch::Tensor& wt, const torch::Tensor& x,
     auto part = torch::empty({(int64_t)split, (int64_t)N}, x.options().dtype(torch::kFloat));
     float* pp = part.data_ptr<float>();
     const int w = pick_i8_width(N, width);
+    // 标量路径把归约并进了分片核（见 ``gemv_kn_i8_split_kernel`` 的注释），所以这一支
+    // 不再需要第二趟；其余宽度变体仍然两趟，靠这个旗标决定要不要补归约。
+    bool fused = false;
     if (w == 4) {
         const int blocks = (int)(((N / 4) + threads - 1) / threads);
         if (unroll == 2) {
@@ -1445,20 +1537,24 @@ torch::Tensor launch_i8_split(const torch::Tensor& wt, const torch::Tensor& x,
         launch_i8_split_w<XT, 16>(wp, xp, pp, N, K, threads, split, per, unroll);
     } else {
         const int blocks = (int)((N + threads - 1) / threads);
+        int* cnt = split_counters((int)wt.get_device(), blocks);
         if (unroll == 2) {
             gemv_kn_i8_split_kernel<XT, 2><<<dim3(blocks, split), threads, 0, stream>>>(
-                wp, xp, pp, N, K, split, per);
+                wp, xp, pp, yp, sp, cnt, N, K, split, per);
         } else {
             gemv_kn_i8_split_kernel<XT, 4><<<dim3(blocks, split), threads, 0, stream>>>(
-                wp, xp, pp, N, K, split, per);
+                wp, xp, pp, yp, sp, cnt, N, K, split, per);
         }
+        fused = true;
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    // 不管权重宽度是多少，归约都是每列一个线程：它每列读 ``split`` 个 float，所以代价由分片
-    // 数决定，而不是由权重加载宽度决定。
-    const int rblocks = (int)((N + threads - 1) / threads);
-    gemv_reduce_i8_kernel<XT><<<rblocks, threads, 0, stream>>>(pp, yp, sp, N, split);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    if (!fused) {
+        // 不管权重宽度是多少，归约都是每列一个线程：它每列读 ``split`` 个 float，所以代价
+        // 由分片数决定，而不是由权重加载宽度决定。
+        const int rblocks = (int)((N + threads - 1) / threads);
+        gemv_reduce_i8_kernel<XT><<<rblocks, threads, 0, stream>>>(pp, yp, sp, N, split);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
     return y;
 }
 

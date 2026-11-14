@@ -339,10 +339,18 @@ class FullAttn:
             self.pool.write_slot(self.pidx, self.pool.slots_for(pos1, self.prefill_row),
                                  qk, sk, qv, sv)
         else:
-            self.kcache.index_copy_(1, pos1, qk.unsqueeze(1))
-            self.vcache.index_copy_(1, pos1, qv.unsqueeze(1))
-            self.kscale.index_copy_(1, pos1, sk.unsqueeze(1))
-            self.vscale.index_copy_(1, pos1, sv.unsqueeze(1))
+            # 四次 ``index_copy_`` 合成一次启动（``bops.kv_store``）：它们共用同一个槽位
+            # 号、搬的字节只有 ``nkv * hd``，分开写只是每层多三次发射（10 层共 30 次/步）。
+            # 只有单槽位形状才走融合入口：``kv_store`` 从设备上读一个槽位号，多 token 的
+            # ``pos1`` 是行表，那种形状仍按原来的逐张量写回。
+            if pos1.numel() == 1:
+                bops.kv_store(qk, qv, sk, sv, pos1, self.kcache, self.vcache,
+                              self.kscale, self.vscale)
+            else:
+                self.kcache.index_copy_(1, pos1, qk.unsqueeze(1))
+                self.vcache.index_copy_(1, pos1, qv.unsqueeze(1))
+                self.kscale.index_copy_(1, pos1, sk.unsqueeze(1))
+                self.vscale.index_copy_(1, pos1, sv.unsqueeze(1))
 
         # 每条路径一次算子调用：反量化 k/v、折叠 scale、施加因果掩码、softmax、加门、
         # PV。由哪个内核应答是后端的事；两个入口在每个后端上都可调用，所以既没有

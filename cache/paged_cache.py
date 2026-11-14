@@ -44,6 +44,27 @@ import torch
 
 import backends
 
+#: ``bops.kv_pool_store`` 的缓存（首次解析后复用；``False`` 表示本进程拿不到它）。
+_FUSED_STORE_UNSET = object()
+_fused_store_cached = _FUSED_STORE_UNSET
+
+
+def _fused_store():
+    """返回``bops.kv_pool_store``（一次启动把一层一个 token 写进 paged 池），拿不到则 ``None``。
+
+    延迟解析：只有真到写槽位时才去碰后端，CPU 单测或不带扩展的场景不会被这条可选加速
+    路径变成硬依赖。
+    """
+    global _fused_store_cached
+    if _fused_store_cached is _FUSED_STORE_UNSET:
+        try:
+            from backends import ops as _ops
+        except Exception:                                      # pragma: no cover - 无后端
+            _fused_store_cached = None
+        else:
+            _fused_store_cached = getattr(_ops, "kv_pool_store", None)
+    return _fused_store_cached
+
 
 class OutOfBlocks(RuntimeError):
     """池里已经没有无人引用的块可以发出去了。
@@ -320,6 +341,14 @@ class PagedKVCache:
             sv: ``[nkv]`` 的 fp32 value 反量化 scale。
         """
         li = torch.full_like(slot, layer)
+        # 单槽位形状优先走一次启动的融合入口（``bops.kv_pool_store``，省掉这次
+        # ``full_like`` 与四次 ``index_put_``，每步 10 层共 50 次发射）；形状不合或扩展
+        # 缺失时 ``store`` 返回 False/None，照旧逐张量写回。
+        store = _fused_store()
+        if (store is not None
+                and store(k, v, sk, sv, slot, self.k, self.v, self.kscale, self.vscale,
+                          layer, self.head_major)):
+            return
         if self.head_major:
             self.k[li, :, slot] = k
             self.v[li, :, slot] = v

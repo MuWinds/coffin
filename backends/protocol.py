@@ -231,6 +231,13 @@ class Ops:
     #: 成别的样子，缓存就会和读它的内核脱节。两个输出都是调用方持有、原地写入的
     #: 缓冲区。
     kv_quant: OpFn | None = None
+    #: ``kv_pool_store(k, v, ks, vs, slot, kc, vc, ksc, vsc, layer, head_major) -> bool``：
+    #: 把**一个**解码 token 的 k/v 与它们的每头 scale 写进 paged 池的 ``[layer, slot]``
+    #: 单元。池是 ``[layers, slots, nkv, hd]``（``head_major`` 时 ``[layers, nkv, slots,
+    #: hd]``），scale 少一维、单元号相同。分四次写（k、v、kscale、vscale）只是每层多三次
+    #: 发射，而它们写的是同一个单元；层号是主机侧常量，所以一次启动足够。
+    #: 返回 ``False`` 表示这个形状走了比逐张量写回更差的路（多槽位、非连续），调用方回退。
+    kv_pool_store: OpFn | None = None
     #: ``silu_mul(gate, up, out) -> out``：``out = silu(gate) * up``，MLP 的 SwiGLU
     #: 乘积。它成为一个算子而不是两次 torch 调用，是因为融合的 ``gate_up`` 投影在
     #: 一次权重读取里把两半一起交回来，它们和 down 投影之间只剩一个逐元素乘积：

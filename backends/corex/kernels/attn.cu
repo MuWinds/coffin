@@ -1090,3 +1090,184 @@ COFFIN_BIND(attn_paged_batch,
             pybind11::arg("slots"), pybind11::arg("context_lens"), pybind11::arg("out"),
             pybind11::arg("max_seq"), pybind11::arg("rep"), pybind11::arg("scale"),
             pybind11::arg("part_acc"), pybind11::arg("part_ml"), pybind11::arg("head_major") = false);
+
+// @brief 一次启动把 k/v 与它们的 int8 scale 写进 paged KV 缓存。
+//
+// 原来这里是四次 ``index_copy_``（k、v、kscale、vscale 各一次）。全注意力层每层 4 次、
+// 10 层就是每步 40 次发射，而它们搬的字节只有 ``nkv * hd`` 加 ``nkv`` 两个数，四次启动
+// 共用同一个槽位号，所以合成一次没有语义差别。
+//
+// ``slot`` 在设备上读：``pos1`` 本来就是 CUDA 张量，取回主机会多一次 D2H 同步，而 decode
+// 一步有 10 层——每层一次同步正好是这条路径想消除的东西。
+//
+// @param k ``[nkv, hd]`` int8 量化后的 key。
+// @param v 同形状的 value。
+// @param ks ``[nkv]`` fp32 key 的每头 scale。
+// @param vs 同形状的 value scale。
+// @param slot ``[1]`` int32 或 int64 的槽位号。
+// @param kc ``[nkv, max_seq, hd]`` int8 缓存，原地写入。
+// @param vc 同上。
+// @param ksc ``[nkv, max_seq]`` fp32，原地写入。
+// @param vsc 同上。
+__global__ void kv_store_kernel(const int8_t* __restrict__ k,
+                                const int8_t* __restrict__ v,
+                                const float* __restrict__ ks,
+                                const float* __restrict__ vs,
+                                const void* __restrict__ slot_in,
+                                int slot64, int hd, int max_seq,
+                                int8_t* __restrict__ kc,
+                                int8_t* __restrict__ vc,
+                                float* __restrict__ ksc,
+                                float* __restrict__ vsc) {
+    const int h = (int)blockIdx.x;
+    const int slot = slot64 ? (int)reinterpret_cast<const long long*>(slot_in)[0]
+                            : reinterpret_cast<const int*>(slot_in)[0];
+    const size_t dst = ((size_t)h * (size_t)max_seq + (size_t)slot) * (size_t)hd;
+    const size_t src = (size_t)h * (size_t)hd;
+    for (int i = (int)threadIdx.x; i < hd; i += (int)blockDim.x) {
+        kc[dst + i] = k[src + i];
+        vc[dst + i] = v[src + i];
+    }
+    if (threadIdx.x == 0) {
+        ksc[(size_t)h * (size_t)max_seq + (size_t)slot] = ks[h];
+        vsc[(size_t)h * (size_t)max_seq + (size_t)slot] = vs[h];
+    }
+}
+
+// @brief ``kv_store`` 的主机侧入口，返回 ``kc`` 便于调用链串接。
+torch::Tensor kv_store(torch::Tensor k, torch::Tensor v, torch::Tensor ks, torch::Tensor vs,
+                       torch::Tensor slot, torch::Tensor kc, torch::Tensor vc,
+                       torch::Tensor ksc, torch::Tensor vsc) {
+    TORCH_CHECK(k.is_cuda() && k.dim() == 2 && k.is_contiguous(),
+                "k must be contiguous CUDA [nkv, hd]");
+    TORCH_CHECK(v.sizes() == k.sizes() && v.is_contiguous() && v.scalar_type() == k.scalar_type(),
+                "v must match k");
+    TORCH_CHECK(k.scalar_type() == torch::kChar, "k and v must be int8");
+    TORCH_CHECK(ks.is_contiguous() && vs.is_contiguous()
+                && ks.scalar_type() == torch::kFloat && vs.scalar_type() == torch::kFloat
+                && ks.numel() == k.size(0) && vs.numel() == k.size(0),
+                "key/value scales must be contiguous fp32 [nkv]");
+    TORCH_CHECK(slot.is_cuda() && slot.numel() >= 1
+                && (slot.scalar_type() == torch::kInt || slot.scalar_type() == torch::kLong),
+                "slot must be a CUDA int32/int64 tensor");
+    TORCH_CHECK(kc.is_contiguous() && vc.is_contiguous() && kc.scalar_type() == torch::kChar
+                && vc.scalar_type() == torch::kChar,
+                "k/v caches must be contiguous int8");
+    TORCH_CHECK(kc.dim() == 3 && kc.size(0) == k.size(0) && kc.size(2) == k.size(1)
+                && vc.sizes() == kc.sizes(),
+                "k/v caches must be [nkv, max_seq, hd]");
+    TORCH_CHECK(ksc.is_contiguous() && vsc.is_contiguous()
+                && ksc.scalar_type() == torch::kFloat && vsc.scalar_type() == torch::kFloat
+                && ksc.dim() == 2 && ksc.size(0) == k.size(0) && ksc.size(1) == kc.size(1)
+                && vsc.sizes() == ksc.sizes(),
+                "scale caches must be [nkv, max_seq] fp32");
+
+    const int nkv = (int)k.size(0);
+    const int hd = (int)k.size(1);
+    const int max_seq = (int)kc.size(1);
+    const int threads = hd < 64 ? 64 : (hd > 512 ? 512 : hd);
+    const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    kv_store_kernel<<<nkv, threads, 0, stream>>>(
+        k.data_ptr<int8_t>(), v.data_ptr<int8_t>(), ks.data_ptr<float>(),
+        vs.data_ptr<float>(), (const void*)slot.data_ptr(),
+        slot.scalar_type() == torch::kLong ? 1 : 0, hd, max_seq,
+        kc.data_ptr<int8_t>(), vc.data_ptr<int8_t>(), ksc.data_ptr<float>(),
+        vsc.data_ptr<float>());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return kc;
+}
+
+COFFIN_BIND(kv_store,
+            "一次启动写入 k/v 缓存与它们的 scale",
+            pybind11::arg("k"), pybind11::arg("v"), pybind11::arg("ks"), pybind11::arg("vs"),
+            pybind11::arg("slot"), pybind11::arg("kc"), pybind11::arg("vc"),
+            pybind11::arg("ksc"), pybind11::arg("vsc"));
+// @brief 把某一层的一个 decode token 的 k/v 与 per-head scale 写进 paged 池。
+//
+// ``PagedCache.write_slot`` 原来是五次独立发射：一次 ``full_like`` 造层号张量，再四次
+// ``index_put_``（k、v、kscale、vscale）。全注意力层每层走一次、10 层就是每步 50 次，
+// 而它们写的是同一个 ``[layer, slot]`` 单元、搬的字节只有 ``nkv * hd``。
+//
+// 层号改成主机侧 int 参数（核内算地址），省掉那次 ``full_like`` —— 它本来就是常量层号。
+//
+// 池有两种布局，由 ``head_major`` 选：
+//   * ``[layers, slots, nkv, hd]``（默认）：单元号 ``((layer*slots + slot)*nkv + h)``。
+//   * ``[layers, nkv, slots, hd]``：单元号 ``(((layer*nkv + h)*slots) + slot)``。
+// scale 用同一个单元号、无 ``hd`` 后缀。
+//
+// @param layer 池的层轴下标（全注意力层序号）。
+// @param slot_in ``[1]`` int32 或 int64 的池槽位，设备上读。
+__global__ void kv_pool_store_kernel(int layer, const void* __restrict__ slot_in, int slot64,
+                                     const int8_t* __restrict__ k,
+                                     const int8_t* __restrict__ v,
+                                     const float* __restrict__ ks,
+                                     const float* __restrict__ vs,
+                                     int nslots, int head_major,
+                                     int8_t* __restrict__ kc, int8_t* __restrict__ vc,
+                                     float* __restrict__ ksc, float* __restrict__ vsc) {
+    const int h = (int)blockIdx.x;
+    const int hd = (int)blockDim.x;
+    const int slot = slot64 ? (int)reinterpret_cast<const long long*>(slot_in)[0]
+                            : reinterpret_cast<const int*>(slot_in)[0];
+    const long long cell = head_major
+        ? (long long)((layer * gridDim.x + h) * nslots + slot)
+        : (long long)(((long long)layer * nslots + slot) * gridDim.x + h);
+    const long long dst = cell * hd;
+    const long long src = (long long)h * hd;
+    for (int i = (int)threadIdx.x; i < hd; i += (int)blockDim.x) {
+        kc[dst + i] = k[src + i];
+        vc[dst + i] = v[src + i];
+    }
+    if (threadIdx.x == 0) {
+        ksc[cell] = ks[h];
+        vsc[cell] = vs[h];
+    }
+}
+
+// @brief ``kv_pool_store`` 的主机侧入口。
+//
+// 形状不合（多槽位、非连续、dtype 不符）时返回 ``false``，调用方照旧走逐张量写回，
+// 所以这是一条可失败、可回退的加速路径，而不是唯一实现。
+bool kv_pool_store(torch::Tensor k, torch::Tensor v, torch::Tensor ks, torch::Tensor vs,
+                   torch::Tensor slot, torch::Tensor kc, torch::Tensor vc,
+                   torch::Tensor ksc, torch::Tensor vsc, int layer, bool head_major) {
+    if (!k.is_cuda() || k.dim() != 2 || !k.is_contiguous() || k.scalar_type() != torch::kChar)
+        return false;
+    if (v.sizes() != k.sizes() || !v.is_contiguous() || v.scalar_type() != torch::kChar
+        || !ks.is_contiguous() || !vs.is_contiguous()
+        || ks.scalar_type() != torch::kFloat || vs.scalar_type() != torch::kFloat
+        || ks.numel() != k.size(0) || vs.numel() != k.size(0))
+        return false;
+    if (!slot.is_cuda() || slot.numel() != 1
+        || (slot.scalar_type() != torch::kInt && slot.scalar_type() != torch::kLong))
+        return false;
+    if (!kc.is_contiguous() || !vc.is_contiguous() || !ksc.is_contiguous() || !vsc.is_contiguous())
+        return false;
+    if (kc.dim() != 4 || kc.scalar_type() != torch::kChar || vc.sizes() != kc.sizes())
+        return false;
+    if (ksc.scalar_type() != torch::kFloat || ksc.dim() != 3
+        || vsc.sizes() != ksc.sizes())
+        return false;
+    const int nkv = (int)k.size(0);
+    const int hd = (int)k.size(1);
+    if (kc.size(0) <= layer || (head_major ? (kc.size(1) != nkv || kc.size(3) != hd)
+                                          : (kc.size(3) != hd || kc.size(2) != nkv)))
+        return false;
+    const int nslots = head_major ? (int)kc.size(2) : (int)kc.size(1);
+    if (layer < 0) return false;
+    const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    kv_pool_store_kernel<<<nkv, hd, 0, stream>>>(
+        layer, (const void*)slot.data_ptr(), slot.scalar_type() == torch::kLong ? 1 : 0,
+        k.data_ptr<int8_t>(), v.data_ptr<int8_t>(), ks.data_ptr<float>(), vs.data_ptr<float>(),
+        nslots, head_major ? 1 : 0, kc.data_ptr<int8_t>(), vc.data_ptr<int8_t>(),
+        ksc.data_ptr<float>(), vsc.data_ptr<float>());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return true;
+}
+
+COFFIN_BIND(kv_pool_store,
+            "一次启动把一层的一个 token 写入 paged k/v 池（形状不符时返回 false 供回退）",
+            pybind11::arg("k"), pybind11::arg("v"),
+            pybind11::arg("ks"), pybind11::arg("vs"), pybind11::arg("slot"),
+            pybind11::arg("kc"), pybind11::arg("vc"), pybind11::arg("ksc"),
+            pybind11::arg("vsc"), pybind11::arg("layer"), pybind11::arg("head_major"));
