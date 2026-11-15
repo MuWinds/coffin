@@ -147,7 +147,7 @@ __global__ void delta_kernel(const float* __restrict__ q, const float* __restric
     // 映射缺的访问模式。
     float kv_mem = 0.f;
     // 这条递推原先已被编译器展开 4 倍（控制流 81 条/wavefront）；显式写八倍再省一半
-    // 控制流，整条链的设备时间 91.2 -> 86.3 us，逐位不变。列访问仍是 4 B 标量。
+    // 控制流，整条链的设备时间 ~91 提升到 ~86 us，逐位不变。列访问仍是 4 B 标量。
 #pragma unroll 8
     for (int i = 0; i < dk; ++i) {
         kv_mem = fmaf(column[(size_t)i * dv] * decay, ks[i], kv_mem);
