@@ -1,7 +1,6 @@
-#!/usr/bin/env bash
 set -u
 
-# 四卡张量并行把 Occamy-1.0（W4A8 预量化目录）起成常驻服务，并跑一遍冒烟请求。
+# 四卡张量并行把 Occamy-1.0（w8a8 预量化目录，nk 布局）起成常驻服务，并跑一遍冒烟请求。
 #
 # 四进程各只看到一张卡：这个引擎的张量并行按"一个进程一张健康 GPU"设计
 # （models/qwen35/parallel.py），进程组是 CPU 上的 Gloo，跨 rank 只有 fp32 求和与
@@ -15,7 +14,7 @@ set -u
 H=/data/home/2024240384035
 PY=/data/software/Anaconda3/2024.10-1/envs/py310/bin/python
 ENGINE_ROOT=$(cd "$(dirname "$0")/.." && pwd)
-MODEL=${OCCAMY_MODEL:-$H/models/occamy-1.0-W4A8-g128}
+MODEL=${OCCAMY_MODEL:-$H/models/occamy-1.0-W8A8-nk}
 SOCK=${OCCAMY_SOCK:-/tmp/occamy_tp4.sock}
 WORLD=${OCCAMY_WORLD:-4}
 MAX_SEQ=${OCCAMY_SEQ:-16384}
@@ -24,7 +23,7 @@ PORT=${OCCAMY_PORT:-29531}
 
 export PATH=/data/software/Anaconda3/2024.10-1/envs/py310/bin:$PATH
 export TORCH_EXTENSIONS_DIR=$H/torch_ext_coffin_corex
-export COFFIN_BACKEND=corex
+export COFFIN_BACKEND=${COFFIN_BACKEND:-corex}
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
@@ -70,13 +69,18 @@ echo "--- warm the corex extension (single process) ---"
 
 mkdir -p "$LOGDIR"
 rm -f "$SOCK"
+# 稠密（非 int8）那一档：`--fp16` 是 `runtime.py` 的 `action="store_false"`，用它才能让
+# 参考后端拿到 bf16 专家栈（它没有分组 int8 内核，见 occref1 的报错）。开关必须在本
+# 文件里翻成参数：`--env 'EXTRA=--fp16'` 里那个值以 `-` 开头，网关不肯当赋值传下来。
+DENSE=()
+[ "${FP16:-0}" = "1" ] && DENSE=(--fp16)
 PIDS=()
 for ((R = 0; R < WORLD; R++)); do
     CUDA_VISIBLE_DEVICES=${CARDS[$R]} RANK=$R WORLD_SIZE=$WORLD \
     MASTER_ADDR=127.0.0.1 MASTER_PORT=$PORT \
         "$PY" -B -u -m entrypoints.cli.runtime --serve \
         --model "$MODEL" --sock "$SOCK" --max-seq "$MAX_SEQ" \
-        --no-bench --no-vision --prefill-quantum 2048 --max-num-seqs 1 \
+        "${DENSE[@]}" --no-bench --no-vision --prefill-quantum 2048 --max-num-seqs 1 \
         > "$LOGDIR/rank$R.log" 2>&1 &
     PIDS+=($!)
     echo "STARTED rank=$R card=${CARDS[$R]} pid=$!"
@@ -116,13 +120,14 @@ grep -h "^\[serve\]" "$LOGDIR"/rank*.log || true
 echo "--- ping ---"
 "$PY" -B -u -m entrypoints.cli.runtime --sock "$SOCK" ping || echo "PING_FAILED=$?"
 
-echo "--- generate ---"
-"$PY" -B -u -m entrypoints.cli.runtime --sock "$SOCK" generate \
-    --prompt "The capital of France is" -n 24 || echo "GENERATE_FAILED=$?"
-
-echo "--- chat ---"
-"$PY" -B -u -m entrypoints.cli.runtime --sock "$SOCK" chat \
-    --user "用一句话介绍你自己" -n 64 || echo "CHAT_FAILED=$?"
+echo "--- generate / chat ---"
+# 不用 `runtime.py generate`：它直接读 `r["text"]`，服务端回错误字典时就成了
+# `KeyError: 'text'`，真正的原因被这个键访问吞掉。探针原样打字段。
+PROBE_N=${PROBE_N:-24}
+PROBE_REPEAT=${PROBE_REPEAT:-1}
+PROBE_GEN=${PROBE_GEN:-1}
+"$PY" -B -u "$ENGINE_ROOT/tools/probe_occamy_gen.py" --sock "$SOCK" -n "$PROBE_N" \
+    --repeat "$PROBE_REPEAT" --ngenerate "$PROBE_GEN" --repeat-step "${PROBE_STEP:-1}" || echo "GEN_PROBE_FAILED=$?"
 
 if [ "${OCCAMY_KEEP:-0}" = "1" ]; then
     echo "OCCAMY_KEEP=1 -> 保持服务运行，PIDS=${PIDS[*]}"

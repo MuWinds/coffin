@@ -14,13 +14,13 @@ Module: ``coffin/models/qwen35``。依赖 ``ops``（投影、激活）、``backe
 内核）和同级 ``batch``、``parallel``；由 ``blocks.Layer`` 构造。
 
 Constraints:
-    * 专家权重按融合栈存放，不是 256 个独立投影：int8 是 ``[E, K, N]``（kn 布局，
-      N 连续），W4A8 是 packed ``[E, ceil(K/2), N]``，稠密是 ``[E, 2I, H]``。分组内核
+    * 专家权重按融合栈存放，不是 256 个独立投影：int8 是 ``[E, N, K]``（nk 布局，
+      K 连续），稠密是 ``[E, 2I, H]``。分组内核
       按固定偏移寻址整块连续内存，摊成 256 份会让「第 e 个专家的起点」算错，而形状
       检查照样过。
-    * 路由矩阵（``mlp.gate``）与共享专家门（``mlp.shared_expert_gate``）保持稠密。
-      4-bit 量化噪声足够翻转 top-8 的选择，而选错专家是整层输出错，不是精度变差。
-      ``tools/quant_disk_w4a8.py`` 的 ``DENSE_SUFFIXES`` 是这条约束的执行点。
+    * 路由矩阵（``mlp.gate``）与共享专家门（``mlp.shared_expert_gate``）保持稠密：
+      量化噪声足够翻转 top-8 的选择，而选错专家是整层输出错，不是精度变差。
+      ``tools/quant_disk.py`` 的 ``DENSE_SUFFIXES`` 是这条约束的执行点。
     * 归并必须定序：``index_add_`` 在本卡上走原子加，同一输入两次前向不逐位相同，
       「同一 prompt 两次 greedy 一致」这条承诺就没了。这里改成按槽位写入
       ``[tokens * top_k, H]`` 再对 top_k 求定序和。
@@ -36,9 +36,9 @@ from backends import ops as bops
 from models.qwen35.batch import batch_proj, wide_proj
 from models.qwen35.parallel import context as parallel_context
 from models.qwen35.parallel import row_projection
+from models.qwen35 import stages
 from int8_weights import QWeight, QWeightMoE
 from ops.gemv import GEMV, _proj
-from w4a8_weights import W4A8MoEWeight, W4A8Weight
 
 #: 分组专家内核与张量核 GEMM 的分界（激活行数）。
 #:
@@ -61,6 +61,21 @@ _EXPERT_K_ALIGN = 512
 #: 张量核版的专家核按 64 行 / 64 k 分片，所以只要求 K 是 64 的整数倍（比 dp4a 版宽松）。
 _EXPERT_TCU_ALIGN = 64
 
+#: 张量核版**每专家**至少要的行数。少于此值它的 64 行 tile 末端没有零填充，垃圾行会
+#: 被 mma 算进有效行（``tools/probe_corex_moe_i8.py`` 实测每专家 1/2/3 行时 rel_rms
+#: 0.86/0.72/0.86，4 行起才回到 0.0087）。后端包装层会抛 ``ValueError``，这里提前按
+#: 行数预算判掉，免得把一条能走 dp4a 的请求打成 500。
+_EXPERT_TCU_MIN_ROWS = 4
+
+#: 张量核版还要求**每一段**（每专家分到的行数）是 4 的倍数，否则整段产出全零。
+#: 实测见 ``tools/probe_corex_moe_i8_geom.py``（E/N/K 全一致，只改段长）：
+#: 段长全为 4 的倍数时 rel_rms 0.0088；只要有一段是 3 或 5 行，整次调用 rel_rms
+#: **1.0**（输出全零）。原因是它的激活分片以「同一 k 上 4 个相邻行」为一个字搬运，
+#: 段首/段尾不落在 4 的边界上时这个字既读不到有效行、也回写不到正确行。
+#: 真实路由的段长不可能天然对齐，所以这里按段长**逐段**判（一次 D2H 取值），
+#: 不满足就退回 dp4a。``COFFIN_MOE_I8_TCU=0`` 可整条关掉。
+_EXPERT_TCU_ROW_GRAN = 4
+
 
 def _fuse_experts(sd: dict, p: str, num_experts: int):
     """把 256 个逐专家投影融合成两整栈，并删掉 state dict 里的源条目。
@@ -76,8 +91,8 @@ def _fuse_experts(sd: dict, p: str, num_experts: int):
         num_experts: 专家数；checkpoint 里必须真有这么多组。
 
     Returns:
-        ``(gate_up, down)``。权重是 :class:`~w4a8_weights.W4A8Weight` 时得到
-        :class:`~w4a8_weights.W4A8MoEWeight`，否则得到稠密 ``[E, 2I, H]`` /
+        ``(gate_up, down)``。专家是 int8 ``QWeight`` 时得到
+        :class:`~int8_weights.QWeightMoE`，否则得到稠密 ``[E, 2I, H]`` /
         ``[E, H, I]`` 张量。
 
     Raises:
@@ -101,12 +116,10 @@ def _fuse_experts(sd: dict, p: str, num_experts: int):
         raise ValueError(f"missing expert tensor: {missing[0]}")
 
     gate, up, down = groups
-    # 三种存储形式，全部融合成同一种三维栈；前向只看栈，不看它怎么来的。
+    # 两种存储形式，全部融合成同一种三维栈；前向只看栈，不看它怎么来的。
     #
-    # int8 与 W4A8 各有自己的分组内核：int8 是 ``moe_grouped_i8``（``[E, K, N]`` 加
-    # 逐 (专家, 列) scale），W4A8 是 ``moe_grouped``（packed 加逐组 scale）。两者
-    # 的分组粒度不同，所以是两个入口而不是一个开关；int8 在 decode 一档进分组内核，
-    # 多行时仍退回逐专家 ``bops.linear``（见 ``_experts``）。
+    # 量化栈只有 int8 一种：``moe_grouped_i8``（``[E, N, K]`` 加逐 (专家, 列) scale）。
+    # 它在 decode 一档进分组内核，多行时仍退回逐专家 ``bops.linear``（见 ``_experts``）。
     int8 = [isinstance(item, QWeight) for item in gate + up + down]
     if any(int8) and all(int8):
         gate_up = QWeightMoE(
@@ -121,25 +134,8 @@ def _fuse_experts(sd: dict, p: str, num_experts: int):
         return gate_up, down_stack
     if any(int8):
         raise ValueError(f"{p}: mixed int8 and floating expert weights")
-    quantized = [isinstance(item, W4A8Weight) for item in gate + up + down]
-    if any(quantized) and not all(quantized):
-        raise ValueError(f"{p}: mixed dense and W4A8 expert weights")
-
-    if all(quantized):
-        first = gate[0]
-        gate_up = W4A8MoEWeight(
-            torch.stack([torch.cat([g.packed, u.packed], dim=1)
-                         for g, u in zip(gate, up)]).contiguous(),
-            torch.stack([torch.cat([g.scale, u.scale], dim=1)
-                         for g, u in zip(gate, up)]).contiguous(),
-            k=first.k, group_size=first.group_size)
-        down_stack = W4A8MoEWeight(
-            torch.stack([item.packed for item in down]).contiguous(),
-            torch.stack([item.scale for item in down]).contiguous(),
-            k=down[0].k, group_size=down[0].group_size)
-    else:
-        gate_up = torch.stack([torch.cat([g, u], dim=0) for g, u in zip(gate, up)])
-        down_stack = torch.stack(down)
+    gate_up = torch.stack([torch.cat([g, u], dim=0) for g, u in zip(gate, up)])
+    down_stack = torch.stack(down)
 
     _drop_expert_entries(sd, p, num_experts)
     return gate_up, down_stack
@@ -176,8 +172,7 @@ def _expert_project(stack, index: int, x: torch.Tensor) -> torch.Tensor:
     ``F.linear``、packed W4 只能走分组内核（调用方保证不会到这里）。
 
     Args:
-        stack: :class:`~int8_weights.QWeightMoE`、稠密 ``[E, N, K]`` 或
-            :class:`~w4a8_weights.W4A8MoEWeight`。
+        stack: :class:`~int8_weights.QWeightMoE` 或稠密 ``[E, 2I, H]`` / ``[E, H, I]``。
         index: 专家下标。
         x: 激活，``[rows, K]``。
 
@@ -257,23 +252,21 @@ class SparseMoE:
         #: 多行解码收尾的 ``[tokens, H]`` 累加缓冲；按第一次用到的行数定尺，之后复用。
         self._tail_buf: torch.Tensor | None = None
         self._router = getattr(bops, "moe_router", None) if "moe_router" in native else None
-        #: 分组投影只有 W4A8 栈能用：内核消费的是 packed 缓冲区和分组 scale，
-        #: 稠密栈在 ``backends.reference`` 里另有实现，但本卡上它不是原生路径，
-        #: 走它等于在解码循环里跑一遍候选调用。
-        self._grouped = (getattr(bops, "moe_grouped", None)
-                         if isinstance(self.gate_up, W4A8MoEWeight) else None)
+        #: 分组投影的入口只对 int8 栈成立：本仓库的专家权重只有 int8 与稠密两种存储，
+        #: 4-bit 那条路连同它的分组内核一起删掉了。稠密栈在
+        #: ``backends.reference`` 里另有实现，但本卡上它不是原生路径，走它等于在解码
+        #: 循环里跑一遍候选调用。
+        self._grouped = None
         #: int8 栈的分组入口。只在 decode 那一档接上（见 :meth:`_experts`）：分组内核
         #: 的行就是激活行，多行时同一专家的权重会被按行重读，而 decode 是每专家一行。
         self._grouped_i8 = (getattr(bops, "moe_grouped_i8", None)
                             if ("moe_grouped_i8" in native
                                 and isinstance(self.gate_up, QWeightMoE)) else None)
         #: 预填充那一档的入口：按专家切块、把他的行一趟扫完，权重每层每专家只读一遍。
-        #: 只在 **nk 原生**栈上接（``layout == "nk"``）：那个核是一条线程认领一整列，
-        #: 要求 K 在这一列里连续；kn 栈要走它得先付一份整模型的转置副本。
+        #: 专家栈只有 nk 一种布局，所以这里不再按 ``layout`` 分叉。
         self._grouped_i8_expert = (getattr(bops, "moe_grouped_i8_expert", None)
                                    if ("moe_grouped_i8_expert" in native
                                        and isinstance(self.gate_up, QWeightMoE)
-                                       and self.gate_up.layout == "nk"
                                        and self.hidden % _EXPERT_K_ALIGN == 0
                                        and self.inter % _EXPERT_K_ALIGN == 0) else None)
         #: 同一个「按专家跨行」形态、但把专家 GEMM 交给张量核。同一张卡同一形状上实测
@@ -282,7 +275,6 @@ class SparseMoE:
         self._grouped_i8_tcu = (getattr(bops, "moe_grouped_i8_tcu", None)
                                 if ("moe_grouped_i8_tcu" in native
                                     and isinstance(self.gate_up, QWeightMoE)
-                                    and self.gate_up.layout == "nk"
                                     and self.hidden % _EXPERT_TCU_ALIGN == 0
                                     and self.inter % _EXPERT_TCU_ALIGN == 0) else None)
         #: int8 栈的**归并**入口：down 的输出对单条解码来说要的是 top_k 行加权之和，
@@ -311,8 +303,6 @@ class SparseMoE:
         #: gate/up 的输出、激活乘积、以及归并核的 ``[tokens, H]`` 目的地。按层复用，
         #: 因为它们只在层内活，而每层新建等于每步白付 120 次分配。
         self._act_bufs: dict = {}
-        self._grouped_gemm = (getattr(bops, "moe_grouped_gemm", None)
-                              if "moe_grouped_gemm" in native else None)
         #: 全局专家号 → 本地号；``ep`` 下不归本 rank 的专家是 -1。见 :meth:`_expert_table`。
         self._table: torch.Tensor | None = None
         #: decode 单行的整块驱动。它只省 pybind 编组与 Python 包装（约 4 us/次 x 17 次），
@@ -324,6 +314,167 @@ class SparseMoE:
         # 清零。这两条不加就是「首 token 正确、其后逐 token 变胡话」。
         self._block_w = None
         self._block_b = None
+        #: 句柄入口（``moe_decode_prepare`` / ``moe_decode_run``）。装载时把 26 个常量
+        #: 编组一次，解码步里每次只传 ``(handle, x)``——省的是 pybind 的逐参转换，
+        #: 与算术无关，所以数值与 30 参那条路逐位相同。缺任一个就退回老形态。
+        self._block_prepare = getattr(bops, "moe_decode_prepare", None)
+        self._block_run = getattr(bops, "moe_decode_run", None)
+        if self._block_prepare is None or self._block_run is None:
+            self._block_run = None
+        self._block_handle = 0
+        #: 「后置归一化 + 整块 + 跨 rank 求和 + 加共享专家」的融合入口。一步 25 ms 里
+        #: `add_residual`（79 次）、`moe_decode_run`（40 次）、`all_reduce_sum`（40 次）
+        #: 合计约 13.5 ms，而它们的内核时间只有 8 / 73 / 20 us——大头是每层的
+        #: **四次 Python→C 往返与适配器准备**。并成一次就是一层省三次往返。
+        self._layer_prepare = getattr(bops, "moe_layer_prepare", None)
+        self._layer_run = getattr(bops, "moe_layer_run", None)
+        if self._layer_prepare is None or self._layer_run is None:
+            self._layer_run = None
+        self._layer_handle = 0
+        self._ln_buf: torch.Tensor | None = None
+
+    def layer_step(self, x_res: torch.Tensor, h: torch.Tensor,
+                   gain: torch.Tensor) -> torch.Tensor | None:
+        """MoE 层的整段：``x += h``、归一化、专家、跨 rank 求和、加共享专家。
+
+        替代原来四段 Python 编排（``post_ln.add_residual`` → ``mlp`` → ``_reduce`` →
+        加共享专家）。逐位口径不变：残差先累加再归一化，跨 rank 和**先窄化再**加共享
+        专家（两次舍入，不能合并成一次 fp32 加法）。
+
+        Args:
+            x_res: 残差流，``[H]`` 或 ``[1, H]``，原地累加。
+            h: 混合器输出，形状同 ``x_res``。
+            gain: ``post_ln`` 的增益，``[H]``，已带 ``1 + w`` 偏移。
+
+        Returns:
+            与 ``x_res`` 同形的下一步残差增量；前提不满足时返回 ``None``。
+        """
+        if self._layer_run is None:
+            return None
+        p2p = getattr(self.parallel, "_p2p", None) if self.parallel is not None else None
+        if p2p is None:
+            self._layer_run = None
+            return None
+        if self._layer_handle == 0:
+            if self._block_w is None:
+                self._build_block(h)
+                if self._block_w is None:
+                    self._layer_run = None
+                    return None
+            if self._ln_buf is None:
+                self._ln_buf = torch.empty((1, self.hidden), dtype=torch.bfloat16,
+                                           device=x_res.device)
+            rows = 1
+            blocks, threads = p2p._grid(rows * self.hidden)
+            self._layer_handle = self._layer_prepare(
+                list(self._block_w) + list(self._block_b), self.top_k, gain,
+                self._ln_buf, p2p._out[:rows], self._block_b[-1],
+                list(p2p._slot_ptr), list(p2p._flag_ptr), int(p2p.rank),
+                int(blocks), int(threads), 1e-6, 0,
+                1)
+            if not getattr(self, "_lyr_logged", False):
+                print(f"[moe] layer fuse on, handle={self._layer_handle} "
+                      f"grid={blocks}x{threads}", flush=True)
+                self._lyr_logged = True
+        # 代际号必须是**整个进程唯一**的一条单调序列：每个层各持一份会撞号，对端看到
+        # 「这一代已到」立刻放行、读走别人写了一半的槽位。用 Python 那个全局计数，
+        # 先加后用（与 ``ep.py`` 同一口径）。
+        round_ = p2p._round + 1
+        p2p._round = round_
+        # 默认走**只融合前段**：`moe_layer_run(..., with_p2p=0)` 拿回本 rank 部分和，跨 rank
+        # 求和与加共享专家留在 Python。前段融合是挣到的（0.6–1.0 ms/步），而**全融合**目前
+        # 还不可信：同一份代码（`027_fp` 与 `028_fq`）两次跑出不同质量的文本，其中一次是
+        # 标点乱码——贪心解码本该确定，两次不同就说明还有竞态没关掉（见台账 §11.8）。
+        # `COFFIN_FUSE_FULL=1` 可切回全融合做结构实验。
+        #
+        # 已查清的三件事都记在台账 §11：① p2p 的会合与求和**是对的**（已知答案探针在
+        # 四张卡上都读到 10）；② 之前那套「逐段自检」的参考链是坏的（`_decode_block` 没
+        # 重算，返回的就是融合输出本身），拿它当基准得到的结论全部作废；③ 驱动把自己那块
+        # 常驻缓冲当结果交出去会被下一层的 `carry` 就地覆写，必须交副本。
+        if os.environ.get("COFFIN_FUSE_FULL") != "1":
+            part = self._layer_run(self._layer_handle, x_res, h, round_, 0)
+            merged = self._reduce(part.reshape(1, -1), torch.bfloat16) + self._block_b[-2]
+            return merged.reshape(-1) if x_res.dim() == 1 else merged
+        if os.environ.get("COFFIN_FUSE_CHECK") == "1" and not getattr(
+                type(self), "_fuse_checked", False):
+            type(self)._fuse_checked = True
+            return self._checked_step(p2p, x_res, h, gain, round_)
+        return self._layer_run(self._layer_handle, x_res, h, round_, 1)
+
+    def _checked_step(self, p2p, x_res: torch.Tensor, h: torch.Tensor,
+                      gain: torch.Tensor, round_: int) -> torch.Tensor:
+        """同一次运行里把融合结果和参考链逐段比一次，定位差在哪一段。
+
+        只在 ``COFFIN_FUSE_CHECK=1`` 下、每进程跑一次（第一层第一步）。为了不把残差
+        流写坏，先备份 ``x_res``、跑完融合再把备份写回去，然后用**参考链**算一遍。
+        最后返回参考结果——这一跑的生成质量因此不受融合路径影响，自检读数才可信。
+
+        Args:
+            p2p: EP 的 p2p 归约器（提供轮次与缓冲）。
+            x_res: 残差流，``[H]``。
+            h: 混合器输出，``[H]``。
+            gain: ``post_ln`` 的增益。
+            round_: 本次调用已经占用的代际号。
+
+        Returns:
+            参考链的结果，形状同 ``x_res``。
+        """
+        backup = x_res.clone()
+        # 三段各自 clone：融合输出落在 ``_block_b[-1]``、累加位落在 ``p2p._out``，参考链
+        # 会把这两块缓冲都覆写一遍，不先拷出来，后面读到的就是参考自己的结果。
+        fused = self._layer_run(self._layer_handle, x_res, h, round_).clone()
+        fused_normed = self._ln_buf.clone()
+        fused_sum = p2p._out[:1].clone()
+        x_res.copy_(backup)
+        # 参考链的归一化：与 ``ops/norm.py`` 的 ``add_residual`` 同一组入参（行视图 +
+        # 该行间距），只是这里直接调算子表，不经过 RMSNorm 包装。
+        rows_ref = x_res.reshape(1, -1)
+        ref_normed_2d = torch.empty_like(rows_ref)
+        bops.add_rms_norm(rows_ref, h.reshape(1, -1), gain, ref_normed_2d,
+                          self.hidden, 1e-6)
+        driven = self._decode_block(ref_normed_2d)
+        out = self._reduce(driven, driven.dtype)
+        ref_sum = p2p._out[:1].clone()
+        if self._is_ep:
+            out = out + self._block_b[-2]
+        ref = out.reshape(-1) if out.dim() == 2 else out
+        def _stat(a, b):
+            d = (a.float() - b.float()).abs()
+            return f"{float(d.max()):.3e}/{float(d.mean()):.3e}"
+        # 全部先算成标量再拼一行：f-string 表达式里换行在 3.10 上是语法错误，而本地
+        # 解释器是 3.12（PEP 701 允许），本地语法检查拦不住这类错，节点上一跑就炸。
+        d_normed = _stat(fused_normed, ref_normed_2d)
+        d_sum = _stat(fused_sum, ref_sum)
+        d_out = _stat(fused.reshape(-1), ref)
+        d_sum_part = _stat(fused_sum, driven)
+        d_out_part = _stat(fused.reshape(-1),
+                           (driven.to(torch.bfloat16) + self._block_b[-2]).reshape(-1))
+        m_sum = float(ref_sum.float().abs().mean())
+        m_out = float(ref.float().abs().mean())
+        m_fused = float(fused.float().abs().mean())
+        m_part = float(driven.float().abs().mean())
+        m_shared = float(self._block_b[-2].float().abs().mean())
+        print(f"[fusechk] normed={d_normed} sum32={d_sum} out={d_out} "
+              f"sum32_vs_part={d_sum_part} out_vs_part={d_out_part} "
+              f"|ref_sum|={m_sum:.3e} |ref_out|={m_out:.3e} |fused_out|={m_fused:.3e} "
+              f"|ref_part|={m_part:.3e} |ref_shared|={m_shared:.3e}", flush=True)
+        # 头 8 个元素直接摆出来。标量差的判读已经错过一次（四个 rank 的 ``red32`` 逐位
+        # 相同本来是「all-reduce 正确」的证据，却被读成「没有求和」），所以这里给第一手
+        # 数字：``fs``/``rs`` 是融合与参考的 fp32 累加位，``drv`` 是参考链的本 rank 部分，
+        # ``fu`` 是融合输出。若 ``drv`` 与 ``fu`` 头几位相同而 ``|drv|`` 又等于 ``|out|``，
+        # 就说明参考链的 ``_decode_block`` 根本没重算。
+        def _e8(t):
+            vals = t.reshape(-1)[:8].float().tolist()
+            return " ".join(format(v, "+.3e") for v in vals)
+        e_fs = _e8(fused_sum)
+        e_rs = _e8(ref_sum)
+        e_drv = _e8(driven)
+        e_fu = _e8(fused)
+        print(f"[fusechk8] fs={e_fs}", flush=True)
+        print(f"[fusechk8] rs={e_rs}", flush=True)
+        print(f"[fusechk8] drv={e_drv}", flush=True)
+        print(f"[fusechk8] fu={e_fu}", flush=True)
+        return ref
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         """解码一步：``[H]`` 或 ``[B, H]`` 进，同形出。
@@ -390,20 +541,19 @@ class SparseMoE:
         if not isinstance(self.gate_up, QWeightMoE) or sg is None or sd is None:
             self._block_driver = None
             return
-        if self.gate_up.layout != "kn":
-            # nk 原生栈上 ``wq`` 是一次**整栈转置**（40 层 32 GB、每段 16 GB）。这条
-            # 整块驱动只服务单流解码，而 PP2 的预填充根本不进它；为一个用不到的路由
-            # 常驻一份和权重等大的副本，等于把一张 32 GB 的卡撑爆。
-            self._block_driver = None
-            return
+        #: 专家栈给整块驱动用的就是 checkpoint 原生那一份：``nk_stack()`` 零拷贝、不转置，
+        #: 所以整块驱动不会为任何布局留第二份显存。路由与共享专家的权重也按 nk（``[N, K]``）
+        #: 直接传下去，不做 ``.t().contiguous()`` ——那份 kn 副本已经整条删掉。
+        gu_stack = self.gate_up.nk_stack()
+        dn_stack = self.down.nk_stack()
         router_w = self.router.w
         self._block_w = (
-            router_w.t().contiguous(),
+            router_w,
             torch.empty(0, dtype=torch.float32, device=device),
-            self.gate_up.wq, self.gate_up.scale,
-            self.down.wq, self.down.scale,
-            sg.wq.t().contiguous(), sg.scale,
-            sd.wq.t().contiguous(), sd.scale,
+            gu_stack, self.gate_up.scale,
+            dn_stack, self.down.scale,
+            sg.wq, sg.scale,
+            sd.wq, sd.scale,
             self._gate_w32.to(device), self._expert_table(device),
         )
         self._block_b = (
@@ -422,9 +572,28 @@ class SparseMoE:
             torch.empty((1, hidden), dtype=bf16, device=device),
             torch.empty((1, hidden), dtype=bf16, device=device),
         )
+        if self._block_run is not None:
+            # 26 个常量按 ``moe_decode_block`` 的张量顺序：``_block_w`` 的 12 个权重在前、
+            # ``_block_b`` 的 14 个复用缓冲（含输出 ``out``）在后。句柄持有这些张量本身，
+            # 所以它们在本层活着期间不会被回收。
+            self._block_handle = self._block_prepare(
+                list(self._block_w) + list(self._block_b), top_k, 0,
+                0 if self._is_ep else 1, 1)
+            if not getattr(self, "_blk_logged", False):
+                # 一行、每进程一次：句柄入口是**静默降级**的（拿不到就退回 30 参），
+                # 所以量下来没变化时必须能一眼看出走的是哪条路。
+                print(f"[moe] handle path on, handle={self._block_handle} "
+                      f"to_k={top_k} ep={0 if self._is_ep else 1} nk=1",
+                      flush=True)
+                self._blk_logged = True
 
     def _decode_block(self, flat: torch.Tensor):
         """用 C++ 驱动算 decode 一层的 MoE 块。
+
+        走句柄那一支：常量在装载时编组一次（``moe_decode_prepare``），每次只传激活与
+        句柄号。实测每个张量入参的 pybind 转换约 2–3 us，29 个入参就是 90 us 上下，而
+        一层每步调一次、40 层——那是每步 3 ms 级的主机成本，且**与算术无关**。
+        扩展没有句柄入口时退回 30 参的历史形态，两条路的数值完全相同。
 
         Args:
             flat: ``[1, H]`` 的归一化激活。
@@ -441,6 +610,8 @@ class SparseMoE:
             self._build_block(flat)
             if self._block_w is None:
                 return None
+        if self._block_run is not None:
+            return self._block_run(self._block_handle, flat)
         return driver(flat, *self._block_w, *self._block_b, self.top_k, 0,
                       0 if self._is_ep else 1)
 
@@ -469,17 +640,24 @@ class SparseMoE:
                     # 在 decode 上是实打实的浪费，而驱动无论如何都要算它（输出布局
                     # 决定了它必须写进那个缓冲区）。
                     shared = self._block_b[-2]
+                    # 不复用 ``out`` 做就地相加：``out`` 可能是驱动自己那块输出缓冲的
+                    # 视图，``add_`` 会把它改写掉，而那块缓冲下一层还要当输入读——省
+                    # 下的一次分配只值 0.16 ms/步，不值得拿「几百 token 之后才开始走
+                    # 样」的风险去换。
                     out = out + (shared if shared.shape == out.shape
                                  else shared.reshape(out.shape))
                 return out if out.shape == shape else out.reshape(shape)
-        weights, index = self._route(x, kind)
+        with stages.span("moe.route"):
+            weights, index = self._route(x, kind)
         # 路由与分组按二维算（专家内核与 top-k 都只认二维），共享专家则保留原始
         # 维数交给投影：单条解码时 ``x`` 是一维，``GEMV`` 只在一维输入上给出
         # ``[N]``，扁平化会把它变成 ``GEMVGroup`` 不接受的 ``[1, N]``。
-        shared = self._shared(x, kind)
+        with stages.span("moe.shared"):
+            shared = self._shared(x, kind)
         if shared.shape != flat.shape:
             shared = shared.reshape(flat.shape)
-        out = self._experts(flat, index, weights) + shared
+        with stages.span("moe.experts"):
+            out = self._experts(flat, index, weights) + shared
         return out if out.shape == shape else out.reshape(shape)
 
     def _project(self, proj, x: torch.Tensor, kind: str):
@@ -558,6 +736,28 @@ class SparseMoE:
             self._gate_buf = buf = torch.empty_like(hidden)
         return self._gate_scale(x, self._gate_w32, hidden, buf)
 
+    @staticmethod
+    def _tcu_rows_aligned(offsets: torch.Tensor) -> bool:
+        """每专家的段长是否都是 ``_EXPERT_TCU_ROW_GRAN`` 的整数倍。
+
+        ``moe_grouped_i8_tcu`` 的激活分片以「同一 k 上 4 个相邻行」为一个字，段首/段尾
+        不落在 4 边界上时整次调用产出全零（实测 rel_rms 1.0）。真实路由的段长由
+        top-k 决定，无法天然对齐，所以这里必须逐段查。
+
+        代价是一次 D2H 取值（每层一次）。相对一次 2000 行预填充的几十毫秒可以忽略，
+        换来的是不会把「看着像话但数值全错」的 token 送出去。
+
+        Args:
+            offsets: ``[E + 1]`` int32 的每专家行区间。
+
+        Returns:
+            ``True`` 表示可以进张量核。
+        """
+        if offsets.numel() <= 1:
+            return True
+        seg = (offsets[1:] - offsets[:-1]) % _EXPERT_TCU_ROW_GRAN
+        return int(seg.abs().max().item()) == 0
+
     def _experts(self, x: torch.Tensor, index: torch.Tensor,
                  weights: torch.Tensor) -> torch.Tensor:
         """按专家分组算路由部分，再对每个 token 的 top_k 项定序求和。
@@ -589,8 +789,7 @@ class SparseMoE:
                 "expert parallel needs the native moe_dispatch and moe_grouped_i8 "
                 "kernels; the per-expert fallback would index a full-width stack "
                 "while this rank holds only its own slice")
-        if self._dispatch is not None and (self._grouped is not None
-                                          or grouped_i8 is not None):
+        if self._dispatch is not None and grouped_i8 is not None:
             # 第四、五个实参依次是**本 rank**的专家数与全局专家数：分派内核要按局部
             # 桶数做前缀和，按全局数建表。ep 下两者差 world_size 倍，写反了不会报错，
             # 只会把一半槽位塞进不存在的桶。
@@ -600,9 +799,15 @@ class SparseMoE:
             rows = int(token_of_pos.numel())
             # 预填充那一档（每专家十几行）换「按专家跨行」核：它把该专家的行一趟扫完，
             # 权重每层每专家只读一遍。行数少（decode 的 1-2 行）时逐行核才是最优的。
+            # 张量核版还多一条**行数预算**：每专家不足 4 行时它的 tile 末尾没有零填充，
+            # 结果会被垃圾行污染（后端包装层会抛 ValueError）。这里按 ``rows`` 直接
+            # 预算掉，亏的只是这一批换 dp4a，不是整条请求失败。
+            tcu_ok = (self._grouped_i8_tcu is not None
+                      and os.environ.get("COFFIN_MOE_I8_TCU") != "0"
+                      and rows >= _EXPERT_TCU_MIN_ROWS * self.local_experts
+                      and self._tcu_rows_aligned(offsets))
             expert_rows = (rows >= _EXPERT_ROW_MIN
-                           and (self._grouped_i8_tcu is not None
-                                or self._grouped_i8_expert is not None))
+                           and (tcu_ok or self._grouped_i8_expert is not None))
             if ((grouped_i8 is not None or expert_rows) and self._gather_quant is not None
                     and self._silu_quant is not None
                     and (expert_rows or self._merge_tokens is not None)):
@@ -614,7 +819,7 @@ class SparseMoE:
                 # 一写一读。
                 xq, xs = self._gather_quant(x, token_of_pos)
                 gu = self._act_buf(rows, 2 * self.inter, x.dtype, x.device)
-                grouped = ((self._grouped_i8_tcu or self._grouped_i8_expert)
+                grouped = ((self._grouped_i8_tcu if tcu_ok else self._grouped_i8_expert)
                            if expert_rows else self._grouped_i8)
                 gate_up = grouped(self.gate_up, xq, offsets, 0, xs, gu)
                 gate, up = gate_up.chunk(2, dim=-1)
@@ -776,30 +981,27 @@ class SparseMoE:
         return self.parallel.combine(value).to(dtype)
 
     def _group(self, stack, x: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
-        """用分组内核按专家投影一整栈权重。
+        """用分组内核按专家投影一整栈 int8 权重。
 
         Args:
-            stack: int8 专家栈（:class:`~int8_weights.QWeightMoE`，``[E, K, N]``）或
-                :class:`~w4a8_weights.W4A8MoEWeight`（``[E, N, K]``）。
+            stack: int8 专家栈（:class:`~int8_weights.QWeightMoE`，``[E, N, K]``）。
             x: ``[rows, K]``，已按专家号排好序。
             offsets: ``[E+1]`` 前缀和。
 
         Returns:
             ``[rows, N]``。
+
+        Raises:
+            ValueError: 栈不是 int8 的。稠密栈走 :meth:`_experts_dense`，那条路根本
+                不会走到这里——在这里悄悄换成逐专家循环等于让调用点以为自己在跑内核。
         """
-        if isinstance(stack, QWeightMoE):
-            # int8 栈只有分组内核这一条路：``moe_grouped`` 与 ``moe_grouped_gemm``
-            # 消费的都是 packed W4，把 int8 张量喂进去只会在形状校验里报错。
-            return self._grouped_i8(stack, x, offsets)
-        if x.shape[0] >= _GEMM_ROWS and self._grouped_gemm is not None:
-            # 张量核那条路对 K 与分组的对齐有要求（本族 K=2048/512，分组 128，够用）。
-            # 它不满足时会明确抛 ValueError 而不是算错，所以这里退回 GEMV 结构——
-            # 慢，但答案对。
-            try:
-                return self._grouped_gemm(stack, x, offsets)
-            except ValueError:
-                pass
-        return self._grouped(stack, x, offsets)
+        if not isinstance(stack, QWeightMoE):
+            raise ValueError(
+                f"grouped projection needs an int8 stack, got {type(stack).__name__}; "
+                f"dense stacks take the per-expert loop")
+        # int8 栈只有分组内核这一条路：``moe_grouped_i8*`` 吃的是 ``[E, N, K]`` 的
+        # int8 栈 + 逐 (专家, 列) scale，别的东西喂进去只会在形状校验里报错。
+        return self._grouped_i8(stack, x, offsets)
 
     def _experts_dense(self, x: torch.Tensor, index: torch.Tensor, weights: torch.Tensor,
                        tokens: int, top_k: int) -> torch.Tensor:
@@ -823,10 +1025,10 @@ class SparseMoE:
             RuntimeError: 专家栈是量化形式却没有分组内核。这条路径不会自己编一个
                 反量化循环——那会把 256 个专家每步实体化一遍。
         """
-        if isinstance(self.gate_up, W4A8MoEWeight) and self._grouped is None:
+        if isinstance(self.gate_up, QWeightMoE) and self._grouped_i8 is None:
             raise RuntimeError(
-                "packed-W4 expert stacks need the grouped-MoE kernel, which this "
-                "backend does not provide natively")
+                "int8 expert stacks need the grouped int8 kernel, which this backend "
+                "does not provide natively")
         flat = index.reshape(-1)
         if tokens == 1:
             # 单条解码：top_k 个槽位都落在同一行上，所以 "哪些行去哪个专家" 这件事不存在，
@@ -888,3 +1090,5 @@ class SparseMoE:
 
 
 __all__ = ["SparseMoE"]
+
+

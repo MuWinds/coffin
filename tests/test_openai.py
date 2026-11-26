@@ -38,6 +38,7 @@ import urllib.request
 import support  # noqa: F401
 
 from entrypoints.openai import server as srv
+from utils import chat_protocol
 from utils.tool_call import parse_tool_calls, split_thinking
 
 
@@ -67,6 +68,31 @@ CALL_FRAG_CITY = ["<tool_call>", "\n<function=", "get_weather", ">\n<parameter="
                   ">\n", "北", "京", "\n</par", "ameter>\n</fun", "ction>\n</tool", "_call>"]
 CALL_FRAG_INT = ["<tool_call>", "\n<function=multiply>\n<parameter=a>\n1", "2\n</parameter>\n",
                  "<parameter=b>\n", "8", "\n</parameter>\n</function>\n</tool_call>"]
+#: 参数闭合标记。这里拼出来而不是写字面量：仓库里的 XML 风格工具链会把完整的
+#: 闭合标签当成自己的标签结束，把参数内容截断。
+PC = "</" + "parameter>"
+
+# 旧式形状：开标记不在 prompt 里，由模型自己写，而且出现在一小段答案之后。
+OLD_THINK = ["The", " capital ", "<think>", "hmm", "</think>", " is Paris."]
+# 推理段里写了一次「看起来该调用」的调用，答案段才给真正的调用。
+THINK_CALL = ["I", " should", " call", " multiply.", CALL2, "</think>",
+              "Let me check.", CALL]
+
+# 带完整 properties 的工具：参数类型全部由 schema 声明。
+TYPED_SCHEMA = [{"type": "function", "function": {
+    "name": "lookup",
+    "parameters": {"type": "object", "properties": {
+        "zip": {"type": "string"}, "n": {"type": "integer"},
+        "flag": {"type": "boolean"}, "ratio": {"type": "number"},
+        "tags": {"type": "array", "items": {"type": "string"}}},
+        "required": ["zip", "n"]}}}]
+TYPED_CALL = ("<tool_call>\n<function=lookup>\n"
+              "<parameter=zip>\n0755\n" + PC + "\n"
+              "<parameter=n>\n12\n" + PC + "\n"
+              "<parameter=flag>\ntrue\n" + PC + "\n"
+              "<parameter=ratio>\n3.0\n" + PC + "\n"
+              "<parameter=tags>\n[\"a\", \"b\"]\n" + PC + "\n"
+              "\n\n</tool_call>")
 CALL_FRAG_ESC = ["<tool_call>", "\n<function=multiply>\n<parameter=x>\n", 'he said "hi"',
                  "\nline2\\path", "\n</parameter>\n</function>\n</tool_call>"]
 
@@ -83,7 +109,14 @@ def _pieces(req: dict) -> tuple[list[str], bool]:
     text = " ".join(str(m.get("content") or "") for m in req.get("messages") or [])
     if req.get("tool_prefix"):
         return [CALL_BODY], False
+    if "oldthink" in text:
+        # 旧式模板/裸 prompt：prompt 里没有开标记，模型自己写，还在答案中途。
+        return OLD_THINK, False
     if req.get("tools"):
+        if "thinkcall" in text:
+            return THINK_CALL, True
+        if "typed" in text:
+            return [TYPED_CALL], False
         if "fragcity" in text:
             pieces = CALL_FRAG_CITY
         elif "fragint" in text:
@@ -118,8 +151,14 @@ def _reply(req: dict) -> dict:
             and not thinking and "</think>" not in raw):
         thinking, answer = answer, ""           # 与运行时 chat 拆分同一条规则
     return {"ok": True, "text": answer, "thinking": thinking, "raw": raw,
-            "tool_calls": [c.to_openai_dict() for c in parse_tool_calls(answer)],
+            # 真实引擎把请求里的 tools 交给解析器，参数因此按 schema 声明的类型
+            # 定型；桩引擎必须复刻这一条，否则它和非流式路径的类型规则会分叉。
+            "tool_calls": [c.to_openai_dict()
+                           for c in parse_tool_calls(answer, req.get("tools"))],
             "forced_tool": bool(prefix),
+            # 引擎在闭合标记处切出推理段，并报出落在里面的 token 数；桩引擎用
+            # 推理段的分词数代替，足够验证用量字段有没有接上。
+            "n_reasoning": len(thinking.split()) if thinking else 0,
             "n_prompt": 11, "n_new": len(pieces),
             "max_new": int(req.get("max_new", -1)), "window_full": False,
             "cached_tokens": 0,
@@ -160,6 +199,9 @@ def _fake_engine(port: int, stop: threading.Event) -> None:
                     pieces, opens = _pieces(req)
                     conn.sendall((json.dumps({"type": "start", "n_prompt": 11,
                                               "prompt_opens_think": opens,
+                                              # 真实引擎把 checkpoint 模板里的标记
+                                              # 带下来；外壳据此解析，不写死。
+                                              "markers": chat_protocol.DEFAULT_MARKERS,
                                               "forced_tool": bool(req.get("tool_prefix"))}
                                              ) + "\n").encode())
                     for piece in pieces:
@@ -369,6 +411,60 @@ class OpenAIServerTest(unittest.TestCase):
         self.assertEqual(r["choices"][0]["finish_reason"], "tool_calls")
         self.assertEqual(call.get("name"), "get_weather")
         self.assertEqual(json.loads(call["arguments"])["city"], "北京")
+
+    def test_model_written_think_midstream_goes_to_reasoning(self):
+        """开标记由模型自己写出（旧式模板或裸 prompt）时，推理段也必须走
+        ``reasoning_content``——带着标签留在 ``content`` 里就是把草稿当答案。"""
+        ch = sse(self.port, {"messages": [{"role": "user", "content": "oldthink"}]})
+        self.assertEqual(reasoning_of(ch), "hmm")
+        self.assertEqual(content_of(ch), "The capital  is Paris.")
+        self.assertNotIn("<think>", content_of(ch))
+
+        message = post(self.port, {"messages": [{"role": "user", "content": "oldthink"}]
+                                   })["choices"][0]["message"]
+        self.assertEqual(message.get("reasoning_content"), "hmm")
+        self.assertEqual(message["content"], "The capital  is Paris.")
+
+    def test_reasoning_tool_call_is_not_executed(self):
+        """思考里写出来的调用只是文字：只有答案段里的调用能变成 ``tool_calls``，
+        否则客户端会去执行模型最终并没有选择的工具。"""
+        body = {"messages": [{"role": "user", "content": "thinkcall"}],
+                "tools": TOOLS_SCHEMA}
+        ch = sse(self.port, body)
+        got = tool_calls_of(ch)
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["function"]["name"], "get_weather")
+        self.assertNotIn("multiply", content_of(ch))
+        self.assertTrue(reasoning_of(ch).startswith("I should call multiply"))
+
+        once = post(self.port, body)["choices"][0]["message"]
+        self.assertEqual([c["function"]["name"] for c in once["tool_calls"]],
+                         ["get_weather"])
+
+    def test_argument_types_come_from_the_tool_schema(self):
+        """``0755`` 这类字符串型参数必须保持字符串，数字/布尔按 schema 声明成型；
+        流式与非流式给出的是同一份 JSON。"""
+        body = {"messages": [{"role": "user", "content": "typed"}],
+                "tools": TYPED_SCHEMA}
+        once = json.loads(post(self.port, body)["choices"][0]["message"]["tool_calls"][0]
+                          ["function"]["arguments"])
+        self.assertEqual(once, {"zip": "0755", "n": 12, "flag": True, "ratio": 3,
+                                "tags": ["a", "b"]})
+        got = tool_calls_of(sse(self.port, body))
+        self.assertEqual(len(got), 1)
+        self.assertEqual(json.loads(got[0]["function"]["arguments"]), once)
+
+    def test_usage_reports_reasoning_tokens(self):
+        """思考型客户端靠 ``reasoning_tokens`` 把起草时间单独算；流式用量块和非
+        流式必须一致。"""
+        body = {"messages": [{"role": "user", "content": "hi"}],
+                "enable_thinking": True}
+        usage = post(self.port, body)["usage"]
+        self.assertGreater(usage["reasoning_tokens"], 0)
+        self.assertLess(usage["reasoning_tokens"], usage["completion_tokens"])
+        chunks = sse(self.port, {**body, "stream_options": {"include_usage": True}})
+        last = [c for c in chunks if c["choices"] == []][-1]
+        self.assertEqual(last["usage"]["reasoning_tokens"], usage["reasoning_tokens"])
 
     def test_sse_tool_fragments_accumulate_to_the_non_stream_call(self):
         """客户端从片段拼回调用，因此累积结果必须与非流式调用逐字相同；切法不同

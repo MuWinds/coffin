@@ -1,6 +1,6 @@
 """稠密投影与词表嵌入：按激活行数挑后端入口，不再直接调 ``F.linear``。
 
-这个文件存在的理由是一次真机账本（作业 4481，48 层 W4A8 单卡 decode 1149.61 ms）：
+这个文件存在的理由是一次真机账本（作业 4481，48 层 w8a8 单卡 decode 1149.61 ms）：
 设备时间 1093 ms 里 ``GemmEx_kernel::gemmh`` 737 次占 900.14 ms（82.4%），MoE 分组
 内核只有 24.46 ms（2.2%）。慢的不是专家而是稠密投影，而根因是布局——checkpoint 的
 ``[N, K]`` 行主序在本卡 M=1 下实测只有 3.2-31.9 GB/s，``[K, N]`` 加自写 GEMV 是
@@ -15,9 +15,9 @@ Module: ``coffin/models/qwen4exp``。族里唯一 import ``backends`` 的地方�
 
 Constraints:
     * 布局转换只许发生一次，而且只许由后端做。``bops.linear*`` 对裸 bf16 权重内部走
-      ``pack.as_kn`` 并按对象身份记忆化；这里再转一次等于把权重多读一遍，而那正是
+      按对象身份记忆化的那份视图；这里再转一次等于把权重多读一遍，而那正是
       窄投影账本里 245.2 -> 21.2 ms 的来源。
-    * 权重有三种状态：bf16 ``nn.Parameter``、``W4A8Weight``、以及「由量化产物提供但
+    * 权重有三种状态：bf16 ``nn.Parameter``、``QWeight``、以及「由量化产物提供但
       还没挂上」。第三种必须让前向立刻报错，绝不静默退回 bf16 查表/GEMM——那会同时
       丢掉 6-20 倍的速度和 5.39 GiB 常驻，而形状与数值都正常，只有账本能发现。
     * ``reshape(-1, K)`` 只在最后一维 stride 为 1 时是视图；其余情况先 ``contiguous()``，
@@ -29,7 +29,7 @@ Constraints:
     * 量化路径的模型必须在 ``torch.device("meta")`` 下构造：占位参数虽然在构造末尾就被
       摘掉，但摘之前已经建过一份，48 层的稠密投影是 9 GiB 量级（``moe.Experts`` 记着
       同一次 OOM）。
-    * 同激活投影的融合组只在 decode 的**单行**前向上生效，且只在权重全部由 W4A8 供
+    * 同激活投影的融合组只在 decode 的**单行**前向上生效，且只在权重全部由 int8 供
       货的成员之间生效；BF16 回填的窄投影走 ``_gemv_rows``，那条路的权重布局与内核
       都不同，拼进去只会把两条路搅在一起。组命不中时一次都不许多算，命中率长期不到
       一半就自愈停用并释放拼接权重（见 :meth:`_FusedGroup.try_forward`）。
@@ -41,12 +41,11 @@ import os
 import weakref
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from backends import caps as _caps
 from backends import ops as bops
-from w4a8_weights import W4A8Weight
+from int8_weights import QWeight
 
 #: 量化路径查表输出用的 dtype。与 ``ops/embed.TiedEmbedding.lookup`` 同一条约定：
 #: 不管权重怎么存，激活一律是后端声明的 ``act_dtype``——KV 缓存和每个内核都是照
@@ -75,7 +74,7 @@ def dispatch_linear(w, x: torch.Tensor, n: int | None = None) -> torch.Tensor:
     慢回去了」，账本上只表现为一行数字变大。
 
     Args:
-        w: 权重，契约布局 ``[N, K]``；也可以是后端已打包的形式（``W4A8Weight``、
+        w: 权重，契约布局 ``[N, K]``；也可以是后端已打包的形式（``QWeight``、
             ``pack.KnWeight``），它们自己带 ``n``。
         x: 激活，``[..., K]``，最后一维的 stride 必须是 1，否则这里先拷一份。
         n: 输出宽度，只在激活为空批时用来造结果。``None`` 表示从 ``w`` 推断。
@@ -132,11 +131,38 @@ _UNCOVERED_GROUPS = 0
 _SERIAL = 0
 
 
+def cat_output(boxes: list) -> QWeight:
+    """把若干 ``[N_i, K]`` 的 int8 权重沿 N 轴拼成一份 ``[sum N_i, K]``。
+
+    每行有自己的 absmax scale，所以拼接只是「把行摆到一起」：``wq`` 沿第 0 轴拼、
+    ``scale`` 沿第 0 轴拼，算术上没有任何跨越行的东西被混在一起。拼完必须
+    ``contiguous()``——内核按扁平指针按行寻址，非连续拼接会让行起点整体错位。
+
+    Args:
+        boxes: 至少一个 :class:`QWeight`，``K`` 必须相同。
+
+    Returns:
+        一份新的连续 ``QWeight``（这是组内常驻的那份拼接权重）。
+
+    Raises:
+        ValueError: ``K`` 不一致，或设备不同。前者让每行的列数对不上，后者会在
+            第一次内核调用时报一个远在别处的位置错误。
+    """
+    first = boxes[0]
+    for box in boxes[1:]:
+        if box.k != first.k or box.wq.device != first.wq.device:
+            raise ValueError(
+                f"cannot concatenate {box.n}x{box.k} onto {first.n}x{first.k}: "
+                f"K and device must match")
+    return QWeight(torch.cat([box.wq for box in boxes], dim=0).contiguous(),
+                   torch.cat([box.scale for box in boxes], dim=0).contiguous())
+
+
 class _FusedGroup:
     """一组吃同一份激活的投影：合成一次量化 + 一次 N 拼接 GEMV。
 
-    存在理由是账本，不是整洁：一步 decode 有 314 次 W4A8 投影（每步
-    ``w4a8_dot`` 计数，作业 q4attrib3 的 3 步合计 942），而其中三簇天然吃同一份
+    存在理由是账本，不是整洁：一步 decode 有 314 次量化投影（每步内核计数，
+    作业 q4attrib3 的 3 步合计 942），而其中三簇天然吃同一份
     ``hidden_states``：
 
     * ``qsa.Attention.forward`` 里的 ``q_proj`` / ``k_proj`` / ``v_proj``（``K=2560``）；
@@ -148,26 +174,24 @@ class _FusedGroup:
     * ``moe.MLP.forward`` 的 ``gate_proj`` 与 ``up_proj``（``K=2560``、``N=512``，两者相邻
       调用；宿主类名是通用的 ``MLP``，所以档位判定按属性名而不是类名）。
 
-    分开跑等于把同一份激活量化 3 次 / 2 次，并且各发一次 ``w4a8_dot`` 与
-    ``w4a8_finish``。合成一次之后，量化次数、发射次数、主机侧的 ``_w4_rows``
-    调用次数同时下降——这是这段代码唯一要买的东西。实测（作业 187，纯内核）：
-    QSA 那三路 220.60 -> 89.26 us/层，且**逐位相同**（``absmax`` 差 0）。
+    分开跑等于把同一份激活量化 3 次 / 2 次，并且各发一次投影内核。合成一次之后，
+    量化次数、发射次数、主机侧的包装调用次数同时下降——这是这段代码唯一要买的东西。
+    实测（作业 187，纯内核）：QSA 那三路 220.60 -> 89.26 us/层，且**逐位相同**
+    （``absmax`` 差 0）。
 
     ``indexer.index_qk_proj`` 也吃同一份激活，但它挂在 ``QSAIndexer`` 下面而不是
     ``Attention`` 下面，按「只认同一个父模块的直接子模块」就收不进来。收它要往
     上找最小公共祖先，那会把跨层的同名投影放进同一个桶——它们吃不同的激活，
     代价是每次求值白算整组。省下的约 0.1 ms/步不值得这条风险。
 
-    拼接由 :meth:`W4A8Weight.cat_output` 完成，沿 N 轴逐列独立，所以数值上只是
-    「同一份算术算到更宽的 N」：int32 累加逐组精确，唯一的变化是 ``split-K`` 的
-    分片数与 fp32 部分和的累加顺序（``pick_split_w4`` 依赖 ``N``），落在 fp32
-    归约噪声里。
+    拼接由 :func:`cat_output` 完成，沿 N 轴逐行独立（每行有自己的 absmax scale），
+    所以数值上只是「同一份算术算到更宽的 N」：唯一的变化是同一份激活被一次性量化。
 
     Attributes:
         members: 组的成员，顺序即 N 轴上的排列顺序。
-        boxes: 与 ``members`` 一一对应的 :class:`W4A8Weight`；``merged`` 由它们拼成。
+        boxes: 与 ``members`` 一一对应的 :class:`QWeight`；``merged`` 由它们拼成。
         offsets: ``(起点, 宽度)``，按成员下标索引。
-        merged: 拼好的 ``[K, N_total]`` 权重，惰性建一次。
+        merged: 拼好的 ``[N_total, K]`` 权重，惰性建一次。
         window: 信箱的有效窗口，单位是 ``Proj.forward`` 调用序号之差。
         hits / misses: 命中与「不得不自己算一遍」的次数，用于自愈。
         disabled: 长期命中率低于一半时置真，此后该组退回逐投影路径。
@@ -198,15 +222,15 @@ class _FusedGroup:
 
         组在 ``release_quantized_placeholders`` 时建，那时每个投影的权重都还是
         ``None``：量化产物只覆盖它认识的那批键，剩下的由 ``Proj.set_bf16`` 补回，
-        所以「这个组里到底有几个人真的是 W4A8」只有装载完成后才知道。第一次前向
+        所以「这个组里到底有几个人真的是 int8」只有装载完成后才知道。第一次前向
         时核一次，之后权重不再变（换了对象的话 :attr:`keys` 会让它重建）。
 
         Returns:
-            合并后的 :class:`W4A8Weight`；成员不足两个、``K``/``group_size``/设备
+            合并后的 :class:`QWeight`；成员不足两个、``K``/设备
             不一致时返回 ``None``，此时整组停用而不是退化成更慢的路径。
 
         Raises:
-            ValueError: 成员共享 ``K`` 但 ``group_size`` 或设备不同。拼接会在
+            ValueError: 成员共享 ``K`` 但设备不同。拼接会在
                 scale 轴上整体错位，形状却完全合法。
         """
         if self.disabled:
@@ -215,7 +239,7 @@ class _FusedGroup:
         boxes = []
         for proj in self.members:
             weight = proj._quantized
-            if isinstance(weight, W4A8Weight):
+            if isinstance(weight, QWeight):
                 kept.append(proj)
                 boxes.append(weight)
         if len(boxes) < 2:
@@ -232,10 +256,10 @@ class _FusedGroup:
             return self.merged
         first = boxes[0]
         for box in boxes[1:]:
-            if (box.k, box.group_size) != (first.k, first.group_size):
+            if box.k != first.k:
                 raise ValueError(
-                    "fused projection group shares in_features but not K/group_size; "
-                    "concatenating the scales would silently shift every group")
+                    "fused projection group shares in_features but not K; "
+                    "concatenating the weights would silently shift every row")
         offs = []
         offset = 0
         for box in boxes:
@@ -252,7 +276,7 @@ class _FusedGroup:
         self.boxes = boxes
         self.offsets = offs
         self.keys = keys
-        self.merged = W4A8Weight.cat_output(boxes)
+        self.merged = cat_output(boxes)
         self.window = len(kept) + 1
         for slot, proj in enumerate(kept):
             proj._group_slot = slot
@@ -550,7 +574,7 @@ class Proj(nn.Linear):
 
         Raises:
             ValueError: 宽度非正，或 ``quantized`` 与 ``bias`` 同时成立。后者不提供：
-                ``W4A8Weight`` 里没有 bias，挂上去之后这个 bias 会停在 ``meta`` 上，
+                ``QWeight`` 里没有 bias，挂上去之后这个 bias 会停在 ``meta`` 上，
                 而报错位置会离这里很远。
         """
         if in_features <= 0 or out_features <= 0:
@@ -558,17 +582,17 @@ class Proj(nn.Linear):
                 f"projection widths must be positive, got {in_features} -> {out_features}.")
         if quantized and bias:
             raise ValueError(
-                "quantized projections carry no bias: W4A8Weight holds only the packed "
+                "quantized projections carry no bias: QWeight holds only the int8 "
                 "matrix, so a bias parameter would stay on the meta device")
         if quantized:
             # 占位参数只活这一次构造：建在 meta 上，省下一次「马上要丢的 [N, K] 分配」。
             with torch.device("meta"):
                 super().__init__(in_features, out_features, bias=bias)
-            self._quantized: W4A8Weight | None = None
+            self._quantized: QWeight | None = None
             self.release_placeholder()
         else:
             super().__init__(in_features, out_features, bias=bias)
-            self._quantized: W4A8Weight | None = None
+            self._quantized: QWeight | None = None
         #: 所属的同激活融合组与自己在组内的槽位；``None`` / ``-1`` 表示不参与。
         #: 由 :func:`_plan_fused_groups` 在模型构造末尾填，此时权重还没挂上，
         #: 所以组内成员要到第一次前向才收敛（见 :meth:`_FusedGroup._reconcile`）。
@@ -581,7 +605,7 @@ class Proj(nn.Linear):
         """交给后端算子的权重对象。
 
         Returns:
-            :class:`W4A8Weight` 或 bf16 ``nn.Parameter``；两者都不在时抛错，而不是
+            :class:`QWeight` 或 bf16 ``nn.Parameter``；两者都不在时抛错，而不是
             返回 ``None`` 让某个 ``F.linear`` 用一个莫名其妙的 ``NoneType`` 报错。
 
         Raises:
@@ -611,22 +635,22 @@ class Proj(nn.Linear):
         self.weight = None
         self.owns_quantized_weight = True
 
-    def set_quantized(self, weight: W4A8Weight) -> None:
-        """把量化权重就地挂上，前向从此走后端的 W4A8 分派。
+    def set_quantized(self, weight: QWeight) -> None:
+        """把量化权重就地挂上，前向从此走后端的 w8a8 分派。
 
         Args:
-            weight: :class:`W4A8Weight`，逻辑形状 ``[N, K]``。它必须已经在目标设备上：
-                ``W4A8Weight`` 不是 ``nn.Module`` 也不是 buffer，``model.to(device)``
+            weight: :class:`QWeight`，逻辑形状 ``[N, K]``。它必须已经在目标设备上：
+                ``QWeight`` 不是 ``nn.Module`` 也不是 buffer，``model.to(device)``
                 搬不动它。
 
         Raises:
-            TypeError: 传进来的不是 :class:`W4A8Weight`。误传一个普通张量会让下面
+            TypeError: 传进来的不是 :class:`QWeight`。误传一个普通张量会让下面
                 ``owns_quantized_weight`` 的记账与实际权重不符。
             ValueError: 形状与构造时声明的不一致。混用两个 checkpoint 的投影权重会让
                 每一层用上别人的矩阵，而形状往往仍然合法。
         """
-        if not isinstance(weight, W4A8Weight):
-            raise TypeError(f"set_quantized expects W4A8Weight, got {type(weight).__name__}")
+        if not isinstance(weight, QWeight):
+            raise TypeError(f"set_quantized expects QWeight, got {type(weight).__name__}")
         if (weight.n, weight.k) != (self.out_features, self.in_features):
             raise ValueError(
                 f"quantized weight is {weight.n}x{weight.k}, this projection is "
@@ -642,7 +666,7 @@ class Proj(nn.Linear):
         305 个稠密投影，``in_proj_a/b``（N=48）与 ``block_inject``（N=4）等 169 个窄
         投影不在里面，因为量化工具跳过了它们。它们不能因此退回 ``F.linear``——那正是
         一步 245.2 ms 的来源——而应当留着 bf16 权重继续走 :class:`Proj` 的同一条路：
-        ``bops.linear`` 对裸 bf16 张量内部做 ``pack.as_kn`` 并按对象身份记忆化，实测
+        ``bops.linear`` 对裸 bf16 张量内部做视图转换并按对象身份记忆化，实测
         245.2 -> 21.2 ms，无损。量化只再省 8.7 ms，所以「产物没覆盖就用 bf16」几乎不
         损失什么，却省掉一轮重新量化。
 
@@ -722,15 +746,15 @@ class Proj(nn.Linear):
 
 
 class QuantizedEmbedding(nn.Embedding):
-    """主词表嵌入；权重可以是 bf16 表，也可以是由量化产物提供的 W4 行。
+    """主词表嵌入；权重可以是 bf16 表，也可以是由量化产物提供的 int8 行。
 
     继承 ``nn.Embedding`` 的理由与 :class:`Proj` 相同：``model.embed_tokens.weight``
     是 checkpoint 的键名，查表语义（含 ``padding_idx`` 只是普通 gather）也照旧。
 
-    这里每查一个 token 就解包一次：``W4A8Weight.rows`` 是 torch 实现，会为每行重建
-    分组下标并做一次 fp32 乘法。它慢，但它正确，而且是**唯一**不退回 bf16 查表的
-    写法。真正的修法是把解包融进下一层投影的 prologue（嵌入永远紧接着一次投影），
-    那是单独一步，不该混进这次布局切换里。
+    这里每查一个 token 就解包一次：``QWeight.rows`` 是 torch 实现，按行取 int8 值
+    和它的 fp32 scale，再做一次乘法。它慢，但它正确，而且是**唯一**不退回 bf16 查表
+    的写法。真正的修法是把解包融进下一层投影的 prologue（嵌入永远紧接着一次投影），
+    那是单独一步，不该混进布局统一里。
 
     Attributes:
         owns_quantized_weight: 同 :attr:`Proj.owns_quantized_weight`。
@@ -759,11 +783,11 @@ class QuantizedEmbedding(nn.Embedding):
         if quantized:
             with torch.device("meta"):
                 super().__init__(num_embeddings, embedding_dim, padding_idx)
-            self._quantized: W4A8Weight | None = None
+            self._quantized: QWeight | None = None
             self.release_placeholder()
         else:
             super().__init__(num_embeddings, embedding_dim, padding_idx)
-            self._quantized: W4A8Weight | None = None
+            self._quantized: QWeight | None = None
 
     def release_placeholder(self) -> None:
         """把 bf16 表从 ``state_dict`` 里摘掉，标记为由量化产物提供。"""
@@ -772,19 +796,19 @@ class QuantizedEmbedding(nn.Embedding):
         self.weight = None
         self.owns_quantized_weight = True
 
-    def set_quantized(self, weight: W4A8Weight) -> None:
+    def set_quantized(self, weight: QWeight) -> None:
         """把量化嵌入表就地挂上。
 
         Args:
-            weight: :class:`W4A8Weight`，逻辑形状 ``[vocab, hidden]``，已在目标设备上。
+            weight: :class:`QWeight`，逻辑形状 ``[vocab, hidden]``，已在目标设备上。
 
         Raises:
-            TypeError: 传进来的不是 :class:`W4A8Weight`。
+            TypeError: 传进来的不是 :class:`QWeight`。
             ValueError: 行数或宽度与构造时声明的不一致。行数错位会让查到的每一行都是
                 别的 token，而形状完全合法。
         """
-        if not isinstance(weight, W4A8Weight):
-            raise TypeError(f"set_quantized expects W4A8Weight, got {type(weight).__name__}")
+        if not isinstance(weight, QWeight):
+            raise TypeError(f"set_quantized expects QWeight, got {type(weight).__name__}")
         if (weight.n, weight.k) != (self.num_embeddings, self.embedding_dim):
             raise ValueError(
                 f"quantized embedding is {weight.n}x{weight.k}, this table is "
@@ -836,7 +860,10 @@ class QuantizedEmbedding(nn.Embedding):
                     "quantized path, but set_quantized() was never called")
             return super().forward(input)
         ids = input.reshape(-1)
-        rows = self._quantized.rows(ids).to(_ACT_DTYPE)
+        # int8 表只反量化被点到的那几行：整表反量化在 248320 行的词表上是 2.5 GB 的
+        # 一次实体化，而一次查表只碰几千行。
+        rows, scale = self._quantized.rows(ids)
+        rows = (rows.float() * scale[:, None]).to(_ACT_DTYPE)
         return rows.reshape(*input.shape, self.embedding_dim)
 
 
@@ -884,7 +911,7 @@ def release_quantized_placeholders(root: nn.Module) -> int:
         摘掉占位参数的模块个数，供装载日志核对「量化到底接上了几个投影」。
 
     Raises:
-        ValueError: 某个模块已经挂着 :class:`W4A8Weight` 却被要求摘占位参数。那说明
+        ValueError: 某个模块已经挂着 :class:`QWeight` 却被要求摘占位参数。那说明
             调用顺序反了；静默继续会把刚挂上的权重和占位参数一起丢掉。
     """
     released = 0
@@ -914,4 +941,5 @@ __all__ = [
     "dispatch_linear",
     "proj_from_config",
     "release_quantized_placeholders",
+    "cat_output",
 ]

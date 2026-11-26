@@ -33,7 +33,8 @@ from .request import (
     ImagePartError,
 )
 from . import request as _request
-from .stream import AnswerFilter, ToolStream, TOOL_OPEN
+from .stream import AnswerFilter, ToolStream
+from utils import chat_protocol
 
 SOCK = os.environ.get("ENGINE_SOCK", "/tmp/qwen35.sock")
 STATE: dict = {}
@@ -247,6 +248,9 @@ class Handler(BaseHTTPRequestHandler):
         tools, forced = _tool_plan(body)
         single_call = body.get("parallel_tool_calls") is False
         include_usage = _include_usage(body)
+        # 参数的定型规则由请求自带的 schema 决定，流式和非流式因此用同一份类型表，
+        # 客户端在两种模式间切换不会看到 ``{"n": 3}`` 和 ``{"n": "3"}`` 两种参数。
+        specs = chat_protocol.param_types(tools)
         think_keys = sorted(k for k in ("enable_thinking", "thinking", "reasoning_effort",
                                         "chat_template_kwargs") if k in body)
         print(f"[http] chat: {len(messages)} msgs {roles} max_new={max_new} "
@@ -274,7 +278,8 @@ class Handler(BaseHTTPRequestHandler):
         cid = "chatcmpl-" + uuid.uuid4().hex[:24]
         created = int(time.time())
         if stream:
-            self._chat_stream(req, cid, created, model, single_call, include_usage)
+            self._chat_stream(req, cid, created, model, single_call, include_usage,
+                              specs)
         else:
             self._chat_once(req, cid, created, model, single_call)
 
@@ -313,9 +318,14 @@ class Handler(BaseHTTPRequestHandler):
         """
         pt = int(out.get("n_prompt") or 0)
         ct = int(out.get("n_new") or 0)
-        return {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct,
-                "prompt_tokens_details": {"cached_tokens":
-                                          int(out.get("cached_tokens") or 0)}}
+        usage = {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct,
+                 "prompt_tokens_details": {"cached_tokens":
+                                           int(out.get("cached_tokens") or 0)}}
+        # 思考型客户端按这个数把起草时间从计费里拆出来。引擎只在数得准的时候
+        # 报它（词表里没有闭合标记、又不是截断的推理段时给 ``None``）。
+        if out.get("n_reasoning") is not None:
+            usage["reasoning_tokens"] = int(out["n_reasoning"])
+        return usage
 
     def _chat_once(self, req: dict, cid: str, created: int, model: str,
                    single_call: bool = False) -> None:
@@ -345,7 +355,7 @@ class Handler(BaseHTTPRequestHandler):
         if calls:
             # 只保留自然语言的开场白：调用是结构化字段走的，和流式内容一样
             # （两者都由模板渲染）。
-            text = text.split(TOOL_OPEN, 1)[0].strip()
+            text = text.split(chat_protocol.DEFAULT_MARKERS["tool_open"], 1)[0].strip()
         message: dict = {"role": "assistant", "content": text or None}
         if calls:
             message["tool_calls"] = calls
@@ -359,7 +369,8 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def _chat_stream(self, req: dict, cid: str, created: int, model: str,
-                     single_call: bool = False, include_usage: bool = False) -> None:
+                     single_call: bool = False, include_usage: bool = False,
+                     specs: dict | None = None) -> None:
         """把 ``stream: true`` 的请求按 ``chat.completion.chunk`` 的 SSE 帧回出去。
 
         帧的顺序按定义来：先一个只带 role 的开头 delta，然后推理/内容/工具调用
@@ -377,6 +388,8 @@ class Handler(BaseHTTPRequestHandler):
             single_call: 为 ``parallel_tool_calls: false`` 把解析器的调用数上限
                 压到一个。
             include_usage: 是否发定义里那个额外的 ``choices: []`` 用量块。
+            specs: 工具 schema 的 ``函数名 -> (参数名 -> 类型)`` 表，用来把参数
+                定成 schema 声明的类型。
         """
         base = {"id": cid, "object": "chat.completion.chunk", "created": created,
                 "model": model}
@@ -400,12 +413,10 @@ class Handler(BaseHTTPRequestHandler):
             self._sse({**base, "choices": choices, **marker, **extra})
 
         flt: AnswerFilter | None = None
+        # 本次回复的流式工具调用解析器：``start`` 行到达时才建，因为标记表和
+        # 强制开头都随那一行下来（标记表由引擎从 checkpoint 模板里读）。
+        tstream: ToolStream | None = None
         done: dict | None = None
-        # 本次回复只用一个流式工具调用解析器，用强制开头播种，这样
-        # ``tool_choice: required`` 产生的调用流出来和自然产生的完全一样
-        # （开头在 prompt 里，不在生成文本里）。
-        tstream = ToolStream(seed=req.get("tool_prefix") or "",
-                             max_calls=1 if single_call else None)
         # 引擎在自己的 ``start`` 行*之前*就完成了校验（图像解码、处理器展开、
         # 占位符自检），所以它的第一行仍可能是拒绝。这一行到达之前什么都不写：
         # 被拒的带图请求因此能拿到真正的 400/503 和 OpenAI 客户端期待的 JSON
@@ -428,20 +439,34 @@ class Handler(BaseHTTPRequestHandler):
                 if line is None:
                     continue
                 if line.get("type") == "start":
-                    flt = AnswerFilter(bool(line.get("prompt_opens_think")))
+                    # 标记表来自 checkpoint 的对话模板：两个模型族（4B 与 occamy
+                    # 1.0）都用 Qwen3.5 的线格式，但外壳不该把这一点写死。
+                    markers = chat_protocol.markers_from(line.get("markers"))
+                    flt = AnswerFilter(bool(line.get("prompt_opens_think")), markers)
                     if line.get("forced_tool"):
                         # ``tool_choice: required``：开头已经在 prompt 里了，
                         # 所以生成的文本是调用的*正文*——它绝不能当成 content
                         # 发出去，调用会在下面以结构化字段交付。
                         flt.done_tools = True
+                    tstream = ToolStream(seed=req.get("tool_prefix") or "",
+                                         max_calls=1 if single_call else None,
+                                         markers=markers, specs=specs)
                     continue
                 if line.get("type") != "token":
                     done = line
                     break
                 piece = line.get("text") or ""
-                delta_r, delta_c = flt.push(piece) if flt else ("", "")
-                for td in tstream.push(piece):
-                    emit([{"index": 0, "delta": td, "finish_reason": None}])
+                if flt is None:
+                    # 引擎没发 ``start`` 就吐 token 是不该出现的形状；按纯文本
+                    # 转发，至少不丢内容，也不假装自己解析过调用。
+                    emit([{"index": 0, "delta": {"content": piece},
+                           "finish_reason": None}])
+                    continue
+                delta_r, delta_c, delta_t = flt.push(piece)
+                # 工具解析器只吃答案段：推理里写出来的调用不能被执行。
+                if tstream is not None and delta_t:
+                    for td in tstream.push(delta_t):
+                        emit([{"index": 0, "delta": td, "finish_reason": None}])
                 if delta_r:
                     # 推理段边产生边发出，带思考面板的客户端因此能实时显示
                     # （而且永远不会混进 content）
@@ -473,19 +498,24 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
             return
-        if flt is not None and not flt.done_tools:
-            tail_r, tail_c = flt.finish(bool(done.get("tool_calls")))
+        has_calls = bool(done.get("tool_calls"))
+        if flt is not None:
+            tail_r, tail_c, tail_t = flt.finish(has_calls)
             if tail_r:      # 流在推理段内部就结束了
                 emit([{"index": 0, "delta": {"reasoning_content": tail_r},
                        "finish_reason": None}])
             if tail_c:
                 emit([{"index": 0, "delta": {"content": tail_c}, "finish_reason": None}])
-        for td in tstream.finish():          # 调用被截断：把已有的部分收尾
-            emit([{"index": 0, "delta": td, "finish_reason": None}])
+            if tstream is not None and tail_t:
+                for td in tstream.push(tail_t):
+                    emit([{"index": 0, "delta": td, "finish_reason": None}])
+        if tstream is not None:
+            for td in tstream.finish():          # 调用被截断：把已有的部分收尾
+                emit([{"index": 0, "delta": td, "finish_reason": None}])
         calls = done.get("tool_calls") or []
         if single_call and len(calls) > 1:       # parallel_tool_calls: false
             calls = calls[:1]
-        if calls and not tstream.emitted_any:
+        if calls and (tstream is None or not tstream.emitted_any):
             # 流式解析器没看见的调用走这里兜底（那说明解析器有 bug）：整个调用
             # 一次性发出去。如果片段已经发出去了，这里再重复完整调用会让客户端
             # 把 arguments 拼接两遍。

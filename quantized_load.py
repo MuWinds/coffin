@@ -1,30 +1,34 @@
 """从离线预量化目录直接读 int8 权重，全程不实例化 bf16。
 
-Module: ``coffin/quantized_load.py``。导入图的叶子之一：只 import ``torch``、
+Module: ``coffin/quantized_load.py``。
+
+两种「torch 在不在场」各有一条读法：真 torch 在场时 ``safetensors.safe_open`` 把字节
+直读进设备；真 torch 不在场（``COFFIN_NO_TORCH=1``，``torch`` 是 ``cxrt.torchshim``）
+时走 :mod:`cxrt.safetensors`，纯 numpy + ``np.memmap``，一个 torch 符号都不碰。导入图的叶子之一：只 import ``torch``、
 ``int8_weights`` 和 ``backends``（要问一句磁盘布局与后端是否对得上）。由
 ``models/qwen35/weights.py`` 在认出预量化目录之后整趟调用，所以
 ``engine_api.load_weights`` 一行都不用改，指到预量化目录就换了权重来源。
 
-盘上的格式由 ``coffin/tools/quant_disk.py`` 写：
+盘上的格式由 ``coffin/tools/quant_disk.py`` 写，**只有 nk 一种**：
 
 * 每个源分片对应一个 ``quant-000NN-of-000MM.safetensors``；可量化投影存成
-  ``int8 [K, N]`` 连续，另一个 ``<key>#scale`` 键存 ``fp32 [N]``；
-* ``quant_index.json`` 记录每个张量的 ``kind``/``shape``/``K``/``N``、它所在的分片
-  和 scale 的键名，外加源 checkpoint 的 ``config.json`` 摘要。
+  ``int8 [N, K]`` 连续（一行输出通道一段连续字节、K 轴在内），另一个
+  ``<key>#scale`` 键存 ``fp32 [N]``；
+* ``quant_index.json`` 记录每个张量的 ``kind``/``layout``/``shape``/``K``/``N``、
+  它所在的分片和 scale 的键名，外加源 checkpoint 的 ``config.json`` 摘要。
 
 那份索引不是装饰。没有它，读回来的形状违反一个常数倍的张量不会报错，而是在某一层
 的 ``matmul`` 上错位；有了它，加载器能在装配之前把 K/N、dtype 和 scale 长度全部对
 一遍，报出的是「哪个张量与索引不符」而不是「第 17 层形状不匹配」。
 
+Layout:
+    nk 是**唯一**的落盘布局，也是 ``Caps.weight_layout`` 的默认值：``int8 [N, K]`` 读上来
+    直接就是 :class:`QWeight` 要的形状，本文件不转置、不复制。仍然按 ``[K, N]`` 吃权重
+    的个别算子（corex 的库 GEMM 预填充、int8 的 ``gemv_nk_i8``）由后端在
+    算子内部转一次，代价归用它的算子；把转置写在加载器里，等于让每一份权重在加载期多背
+    一次拷贝。
+
 Constraints:
-    * ``[K, N]`` 落到 :class:`int8_weights.QWeight` 时不复制、不转置。``QWeight.wq``
-      是本文件的 ``[K, N]`` 缓冲区的一个转置视图，``backends/corex`` 的
-      ``pack.to_kn`` 再取一次转置就回到原缓冲区本身，``.contiguous()`` 于是是空操作。
-      这条路径的全部收益就在这里：读文件、装箱、完事。
-    * 因此本格式只对 ``caps.weight_layout == "kn"`` 的后端有意义。声明 ``"nk"`` 的
-      后端要把权重按行主序交给自己的内核，而它的内核按扁平指针索引连续内存，一份
-      非连续的视图会读到错位的字节且不报错——所以那种后端在这里被拒绝，而不是被
-      喂一个看起来能用、算出来是垃圾的张量。
     * 不读源 checkpoint 的任何权重分片。预量化目录自带 ``config.json``，少读 4.6 GB。
     * 非投影张量（归一化权重、``A_log``、``dt_bias``、``conv1d.weight``）在本文件里
       原样透传：它们是被 bf16 激活内核消费的，改 dtype 会让那些内核在错误的精度下
@@ -33,13 +37,14 @@ Constraints:
 
 from __future__ import annotations
 
+import sys
+
 from pathlib import Path
 from typing import Any
 
 import torch
 
 from int8_weights import QWeight, QWeightMoE
-from w4a8_weights import W4A8MoEWeight, W4A8Weight
 
 #: 索引文件名。加载器靠它认出一个目录是预量化的，所以这个名字不能在任何
 #: checkpoint 里出现。
@@ -47,8 +52,10 @@ INDEX_NAME = "quant_index.json"
 
 #: 索引格式标识。布局一改就递增：读旧格式的加载器会明确报错，而不是按新布局错读
 #: 字节——错读出来的 int8 是一堆看似合理的数字。
-FORMAT = "coffin-int8-kn-v1"
-W4A8_FORMAT = "coffin-w4a8-kn-v1"
+#:
+#: 只有一种：4-bit 那条路连同它的索引格式一起删掉了（见
+#: ``docs/COREX-PORT-MATRIX.md``）。盘上出现的其他格式一律报错，不再猜。
+FORMAT = "coffin-int8-nk-v1"
 
 #: 文本默认前缀，与 ``models/qwen35/weights.py`` 的那一组一致。
 DEFAULT_PREFIX = "model.language_model."
@@ -56,8 +63,8 @@ DEFAULT_PREFIX = "model.language_model."
 #: 视觉张量的前缀。它们在预量化目录里只可能是稠密的。
 VISUAL_PREFIX = "model.visual."
 
-#: 索引里唯一一个允许 ``QWeight.wq`` 非连续的布局要求。见模块 docstring。
-_KN_LAYOUT = "kn"
+#: 本加载器唯一认识的 int8 布局。见模块 docstring。
+_NK_LAYOUT = "nk"
 
 
 def is_quantized_dir(model_dir: str | Path) -> bool:
@@ -91,9 +98,10 @@ def read_index(model_dir: str | Path) -> dict:
 
     path = Path(model_dir) / INDEX_NAME
     index = json.loads(path.read_text(encoding="utf-8"))
-    if index.get("format") not in {FORMAT, W4A8_FORMAT}:
+    if index.get("format") != FORMAT:
         raise ValueError(
-            f"{path}: unsupported quantized format {index.get('format')!r}")
+            f"{path}: unsupported quantized format {index.get('format')!r}; this loader "
+            f"reads {FORMAT!r} only")
     return index
 
 
@@ -120,24 +128,41 @@ def summary(index: dict) -> dict:
     }
 
 
-def _require_kn_backend() -> str:
-    """确认当前后端要的就是 ``[K, N]``，否则拒绝加载这种格式。
+def _require_index_layout(index: dict) -> str:
+    """确认索引声明的布局是 nk，否则拒绝加载这份目录。
+
+    布局只认索引自己写的那个字段，不看后端：后端要不要转置是它自己的事
+    （``corex`` 直接用 ``[N, K]``，不做任何转置），而磁盘是 ``[N, K]`` 就永远是 ``[N, K]``。
+    一份 ``[K, N]`` 的目录交上来，读出的每个投影都是转置的、形状仍然对得上——
+    必须在这里停住。
+
+    Args:
+        index: :func:`read_index` 的返回值。
 
     Returns:
-        后端的 ``weight_layout``，供报错信息使用。
+        索引里的布局串，供报错信息使用。
 
     Raises:
-        RuntimeError: 后端声明 ``weight_layout`` 不是 ``"kn"``。它自己的内核会按连续
-            内存索引一份非连续的视图，读到的是错位的字节：结果是错的，而且不报错。
+        ValueError: 索引的 ``layout`` 不是 nk，或某个张量条目声明了别的布局。
     """
-    from backends import caps as _caps
-
-    layout = _caps().weight_layout
-    if layout != _KN_LAYOUT:
-        raise RuntimeError(
-            f"pre-quantised weights are stored as int8 [K, N] with one fp32 scale "
-            f"per output column, which backend {_caps().name!r} cannot consume: it "
-            f"declares weight_layout={layout!r}. Load the original checkpoint instead.")
+    layout = str(index.get("weight_layout") or "")
+    if not layout:
+        # 早期索引只写了给人看的那句 ``layout`` 与逐张量的 ``layout``。缺顶层字段时
+        # 从逐张量条目推出来：它们必须一致，推不出不一致的结论就当没有。
+        seen = {meta.get("layout") for meta in (index.get("tensors") or {}).values()
+                if meta.get("kind") in ("q8", "q8-moe")}
+        if len(seen) == 1:
+            layout = str(next(iter(seen)) or "")
+    if layout != _NK_LAYOUT:
+        raise ValueError(
+            f"pre-quantised index declares weight_layout={layout!r}; this loader only "
+            f"reads nk ({_NK_LAYOUT}: int8 [N, K] with one fp32 scale per output row). "
+            f"Re-run coffin/tools/quant_disk.py --layout nk.")
+    for key, meta in index.get("tensors", {}).items():
+        if meta.get("kind") in ("q8", "q8-moe") and meta.get("layout") != _NK_LAYOUT:
+            raise ValueError(
+                f"{key}: index records layout {meta.get('layout')!r}, expected "
+                f"{_NK_LAYOUT!r}; the directory mixes layouts")
     return layout
 
 
@@ -158,17 +183,17 @@ def _device_arg(device: torch.device | str) -> str:
 def _check_q8(key: str, wt: torch.Tensor, scale: torch.Tensor, meta: dict) -> QWeight:
     """校验一组 int8 张量和它的索引，再包成 :class:`QWeight`。
 
-    索引里的 ``K``/``N`` 与张量形状必须对得上，而且必须是同一次写入的产物：只对上一
+    索引里的 ``N``/``K`` 与张量形状必须对得上，而且必须是同一次写入的产物：只对上一
     半，反量化出来的是一份尺寸正确、内容错位的权重。
 
     Args:
         key: checkpoint 参数名，只用于报错。
-        wt: 盘上的 ``[K, N]`` int8 张量。
+        wt: 盘上的 ``[N, K]`` int8 张量。
         scale: 同一个文件里的 ``[N]`` fp32 scale。
         meta: 索引里该张量的条目。
 
     Returns:
-        ``wq`` 是 ``wt`` 的转置视图的 ``QWeight``；没有任何数据被复制或转置。
+        ``wq`` **就是** ``wt`` 本身的 ``QWeight``；没有任何数据被复制或转置。
 
     Raises:
         ValueError: 形状、dtype 或 scale 长度与索引不符，或者 scale 不是 fp32。
@@ -177,14 +202,20 @@ def _check_q8(key: str, wt: torch.Tensor, scale: torch.Tensor, meta: dict) -> QW
     if wt.dim() != 2 or wt.dtype != torch.int8:
         raise ValueError(f"{key}: expected a 2-D int8 weight, got "
                          f"{tuple(wt.shape)} {wt.dtype}")
-    k, n = int(wt.shape[0]), int(wt.shape[1])
-    if [k, n] != list(meta.get("shape") or []):
-        raise ValueError(f"{key}: index says shape {meta.get('shape')}, "
-                         f"shard holds {[k, n]}")
+    n, k = int(wt.shape[0]), int(wt.shape[1])
+    if [n, k] != list(meta.get("shape") or []):
+        raise ValueError(f"{key}: index says shape {meta.get('shape')} ([N, K]), "
+                         f"shard holds {[n, k]}")
+    if int(meta.get("n", n)) != n or int(meta.get("k", k)) != k:
+        raise ValueError(f"{key}: index says N={meta.get('n')} K={meta.get('k')}, "
+                         f"shard holds N={n} K={k}")
     if scale.dim() != 1 or scale.dtype != torch.float32 or int(scale.numel()) != n:
-        raise ValueError(f"{key}: scale must be fp32 [{n}], got "
+        raise ValueError(f"{key}: scale must be fp32 [{n}] (one per output row), got "
                          f"{tuple(scale.shape)} {scale.dtype}")
-    return QWeight.from_kn(wt, scale)
+    if not wt.is_contiguous():
+        raise ValueError(f"{key}: stored [N, K] weight is not contiguous; the kernels "
+                         f"index it by flat pointer and would read shifted bytes")
+    return QWeight(wt, scale)
 
 
 def load(model_dir: str | Path, *, device: torch.device, quant: bool = True,
@@ -215,23 +246,16 @@ def load(model_dir: str | Path, *, device: torch.device, quant: bool = True,
 
     Returns:
         按 checkpoint 参数名索引的 state dict。``quant`` 为真时投影是
-        :class:`~int8_weights.QWeight`，``.wq`` 是盘上 ``[K, N]`` 缓冲区的转置视图。
+        :class:`~int8_weights.QWeight`，``wq`` 就是盘上 ``[N, K]`` 缓冲区本身。
 
     Raises:
-        RuntimeError: 当前后端不是 ``[K, N]`` 布局；见 :func:`_require_kn_backend`。
-            checkpoint 声明了视觉塔、而调用方显式要求读它时也在这里失败。
-        ValueError: 索引格式不认识、源配置摘要对不上，或者某个张量与索引不符。
+        ValueError: 索引格式不认识、布局不是 nk、源配置摘要对不上，或者某个张量与
+            索引不符。checkpoint 声明了视觉塔、而调用方显式要求读它时也在这里失败。
         FileNotFoundError: 索引里点名的分片不在目录里。
     """
-    from safetensors import safe_open
-
     model_dir = Path(model_dir)
     index = read_index(model_dir)
-    if index["format"] == W4A8_FORMAT:
-        return _load_w4a8(model_dir, index, device=device, quant=quant,
-                          prefix=prefix, weight_dtype=weight_dtype,
-                          vision=vision, vision_quant=vision_quant, keep=keep)
-    _require_kn_backend()
+    _require_index_layout(index)
 
     stored_dtype = index.get("weight_dtype")
     if weight_dtype is None:
@@ -257,8 +281,9 @@ def load(model_dir: str | Path, *, device: torch.device, quant: bool = True,
     prefixes = (prefix, "mtp.", "lm_head.")
     entries: dict[str, dict] = index["tensors"]
     wanted = {key: meta for key, meta in entries.items()
-              if key.startswith(prefixes)
-              or (take_vision and key.startswith(VISUAL_PREFIX))}
+              if (key.startswith(prefixes)
+                  or (take_vision and key.startswith(VISUAL_PREFIX)))
+              and (keep is None or keep(key))}
     if not wanted:
         raise ValueError(
             f"{model_dir}: index holds no tensor under prefixes {prefixes}")
@@ -269,7 +294,7 @@ def load(model_dir: str | Path, *, device: torch.device, quant: bool = True,
         path = model_dir / shard
         if not path.is_file():
             raise FileNotFoundError(f"{model_dir}: index names {shard}, which is missing")
-        with safe_open(str(path), framework="pt", device=device_arg) as handle:
+        with _Shard(path, device_arg, _torch_free()) as handle:
             available = set(handle.keys())
             for key, meta in wanted.items():
                 if meta["shard"] != shard:
@@ -287,113 +312,98 @@ def load(model_dir: str | Path, *, device: torch.device, quant: bool = True,
                     scale = handle.get_tensor(scale_key)
                     sd[key] = _check_q8(key, wt, scale, meta) if quant else (
                         _check_q8(key, wt, scale, meta).dequant(weight_dtype))
-                else:
-                    sd[key] = handle.get_tensor(key)
-    return sd
-
-
-def _load_w4a8(model_dir: Path, index: dict, *, device: torch.device,
-               quant: bool, prefix: str, weight_dtype: torch.dtype | None,
-               vision: bool | None, vision_quant: bool,
-               keep: "callable | None" = None) -> dict:
-    """读取 W4A8 分组权重；非量化调用显式反量化到目标 dtype。"""
-    from safetensors import safe_open
-
-    if quant:
-        _require_kn_backend()
-    if vision_quant:
-        raise ValueError(f"{model_dir}: W4A8 disk format keeps the vision tower dense")
-    _check_source_config(model_dir, index)
-    take_vision = bool(index.get("vision")) if vision is None else bool(vision)
-    if take_vision and not index.get("vision"):
-        raise RuntimeError(f"{model_dir}: W4A8 index does not contain vision tensors")
-    if weight_dtype is None:
-        weight_dtype = _dtype_from_name(index.get("weight_dtype"))
-    elif _name_of(weight_dtype) != index.get("weight_dtype"):
-        raise ValueError(f"{model_dir}: W4 weights were quantized from "
-                         f"{index.get('weight_dtype')}, not {_name_of(weight_dtype)}")
-
-    prefixes = (prefix, "mtp.", "lm_head.")
-    wanted = {key: meta for key, meta in index["tensors"].items()
-              if (key.startswith(prefixes)
-                  or (take_vision and key.startswith(VISUAL_PREFIX)))
-              and (keep is None or keep(key))}
-    if not wanted:
-        raise ValueError(f"{model_dir}: index holds no tensor under {prefixes}")
-
-    sd: dict[str, Any] = {}
-    for shard in sorted({meta["shard"] for meta in wanted.values()}):
-        path = model_dir / shard
-        if not path.is_file():
-            raise FileNotFoundError(f"{model_dir}: index names missing shard {shard}")
-        with safe_open(str(path), framework="pt", device=_device_arg(device)) as handle:
-            available = set(handle.keys())
-            for key, meta in wanted.items():
-                if meta["shard"] != shard:
-                    continue
-                if key not in available:
-                    raise ValueError(f"{path}: index names missing tensor {key}")
-                if meta.get("kind") == "q4":
-                    scale_key = meta.get("scale_key")
-                    if scale_key not in available:
-                        raise ValueError(f"{path}: {key} has no scale tensor {scale_key}")
-                    packed = handle.get_tensor(key)
-                    scale = handle.get_tensor(scale_key)
-                    if (list(packed.shape) != meta.get("packed_shape")
-                            or list(scale.shape) != meta.get("scale_shape")):
-                        raise ValueError(f"{path}: packed shape mismatch for {key}")
-                    value = W4A8Weight(packed, scale, k=int(meta["k"]),
-                                       group_size=int(meta["group_size"]))
-                    sd[key] = value if quant else value.to(weight_dtype)
-                elif meta.get("kind") == "q8-moe":
+                elif meta["kind"] == "q8-moe":
                     # int8 的融合专家栈：``[E, N, K]`` int8 加 ``[E, N]`` fp32。三维形状
                     # 不能按 ``[N, K]`` 套 ``QWeight``——那对 ``[256, 1024, 2048]`` 也能
                     # 过形状检查，然后每次取专家都取错位置。
-                    scale_key = meta.get("scale_key")
-                    if scale_key not in available:
-                        raise ValueError(f"{path}: {key} has no scale tensor {scale_key}")
-                    scale = handle.get_tensor(scale_key)
-                    # 解码节点要 nk 就把 checkpoint 里那份 ``#nk`` 直接读上来，不做转置；
-                    # 其余节点（预填充）读 kn。两边读的是同一个键的两种布局，**只有一份
-                    # 会上卡**——这就是把「运行时转置」换成「打包时转置」的全部意义。
-                    # 旧 checkpoint 没有 ``nk_key`` 字段，于是退回原来的运行时转置路径。
-                    import os as _os
-                    nk_enabled = _os.environ.get("COFFIN_MOE_I8_NK", "0") not in ("0", "", "off")
-                    nk_key = meta.get("nk_key")
-                    layout = "kn"
-                    if nk_enabled and nk_key and nk_key in available:
-                        packed = handle.get_tensor(nk_key)
-                        layout = "nk"
-                        if list(packed.shape) != meta.get("nk_shape"):
-                            raise ValueError(f"{path}: moe nk stack shape mismatch for {nk_key}")
-                    else:
-                        packed = handle.get_tensor(key)
-                        if list(packed.shape) != meta.get("shape"):
-                            raise ValueError(f"{path}: moe int8 stack shape mismatch for {key}")
-                    if list(scale.shape) != meta.get("scale_shape"):
-                        raise ValueError(f"{path}: moe int8 scale shape mismatch for {key}")
-                    value = QWeightMoE(packed, scale, k=int(meta["k"]), layout=layout)
-                    sd[key] = value if quant else value.to(weight_dtype)
-                elif meta.get("kind") == "q4-moe":
-                    # MoE 的融合专家栈。必须走独立分支：``packed`` 是三维的
-                    # ``[E, ceil(K/2), N]``，喂给 ``W4A8Weight`` 会被它按
-                    # ``[N, K]`` 解释，而 ``[512, 1280, 2560]`` 恰好也能过分组形状
-                    # 校验——不报错，只是之后每次取专家都取错位置。落进 ``else``
-                    # 更糟：三维 uint8 会被原样塞进 state dict。
-                    scale_key = meta.get("scale_key")
+                    scale_key = meta["scale_key"]
                     if scale_key not in available:
                         raise ValueError(f"{path}: {key} has no scale tensor {scale_key}")
                     packed = handle.get_tensor(key)
                     scale = handle.get_tensor(scale_key)
-                    if (list(packed.shape) != meta.get("packed_shape")
-                            or list(scale.shape) != meta.get("scale_shape")):
-                        raise ValueError(f"{path}: packed shape mismatch for {key}")
-                    value = W4A8MoEWeight(packed, scale, k=int(meta["k"]),
-                                          group_size=int(meta["group_size"]))
+                    if list(packed.shape) != meta.get("shape"):
+                        raise ValueError(f"{path}: moe nk stack shape mismatch for {key}, "
+                                         f"index says {meta.get('shape')}")
+                    if list(scale.shape) != meta.get("scale_shape"):
+                        raise ValueError(f"{path}: moe int8 scale shape mismatch for {key}")
+                    value = QWeightMoE(packed, scale, k=int(meta["k"]))
                     sd[key] = value if quant else value.to(weight_dtype)
                 else:
                     sd[key] = handle.get_tensor(key)
     return sd
+
+
+
+def _torch_free() -> bool:
+    """当前进程里 ``torch`` 是不是本项目的壳（也就是真 torch 没入册）。
+
+    Returns:
+        ``True`` 表示整条链路跑在 :mod:`cxrt.torchshim` 上。
+    """
+    mod = sys.modules.get("torch")
+    if mod is None:
+        return False
+    from cxrt import torchshim
+
+    return mod is torchshim
+
+
+class _Shard:
+    """一个 safetensors 分片的读取面：``keys()`` / ``get_tensor()`` / 上下文管理。
+
+    两条实现分开是有原因的。真 torch 在场时用 ``safetensors.safe_open(framework="pt")``
+    ——它把字节**直读进目标设备**，省掉一次主机中转，4.4 GB 上是几百毫秒的差别。
+    真 torch 不在场时那个 API 根本不可用（它的 ``framework="pt"`` 与 ``device=`` 都
+    要求一个真的 torch），于是走 :mod:`cxrt.safetensors`：解析 JSON 头、``np.memmap``
+    映射数据区，全程 numpy，一个 torch 符号都不碰。
+
+    bf16 在 numpy 侧会被还原成 fp32（差值在 `cxrt.safetensors` 里按 bf16 舍入过），
+    所以稠密路径的内存占用是 2 倍 16 位权重——那是这条 CPU 参考路径本来的口径。
+    """
+
+    def __init__(self, path: Path, device_arg: str, torch_free: bool) -> None:
+        self._path = path
+        self._device_arg = device_arg
+        self._torch_free = torch_free
+        self._handle: Any = None
+        self._tensors: dict[str, Any] = {}
+
+    def __enter__(self) -> "_Shard":
+        if self._torch_free:
+            from cxrt import safetensors as _st
+
+            self._tensors = _st.load(self._path, keep_alive=False)
+        else:
+            from safetensors import safe_open
+
+            self._handle = safe_open(str(self._path), framework="pt",
+                                     device=self._device_arg)
+            self._handle.__enter__()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        if self._handle is not None:
+            self._handle.__exit__(*exc)
+            self._handle = None
+
+    def keys(self) -> list[str]:
+        """分片里有的张量名。"""
+        if self._torch_free:
+            return list(self._tensors)
+        return list(self._handle.keys())
+
+    def get_tensor(self, name: str) -> Any:
+        """按名取一个张量。
+
+        Args:
+            name: 张量名。
+
+        Returns:
+            真 torch 下是设备上的张量，壳下是 :class:`cxrt.tt.Tensor`。
+        """
+        if self._torch_free:
+            return self._tensors[name]
+        return self._handle.get_tensor(name)
 
 
 def _name_of(dtype: torch.dtype) -> str:

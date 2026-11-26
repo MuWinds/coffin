@@ -28,7 +28,6 @@ import torch
 import torch.distributed as dist
 
 from int8_weights import QWeight, QWeightMoE
-from w4a8_weights import W4A8Weight
 
 
 class ParallelContext:
@@ -110,10 +109,6 @@ class ParallelContext:
                     rank, world_size,
                     os.environ.get("COFFIN_EP_SHM", "/dev/shm/coffin_ep.bin"),
                     int(os.environ.get("COFFIN_EP_SLOT_BYTES", str(64 << 20))))
-        self.scale_mode = os.environ.get("COFFIN_TP_SCALE_MODE", "shared")
-        if self.scale_mode not in {"shared", "local", "decode_local"}:
-            raise ValueError(
-                "COFFIN_TP_SCALE_MODE must be 'shared', 'local', or 'decode_local'")
 
     def reduce(self, tensor: torch.Tensor, *, maximum: bool = False) -> torch.Tensor:
         """在 CPU 上以 fp32 做全归约，回传本 rank 当前流。
@@ -751,8 +746,15 @@ def shard_weight(key: str, value, cfg: dict, rank: int, world_size: int):
         raise ValueError("invalid rank/world_size")
     axis, ranges = None, None
     # ``QWeight`` 把形状放在 ``.n`` / ``.k`` 上，没有 ``.shape``；两处都读成 ``[N, K]``，
-    # 下面的分片判据因此对稠密、int8、packed W4 三种存储一视同仁。
-    shape = (value.n, value.k) if isinstance(value, QWeight) else value.shape
+    # 下面的分片判据因此对稠密、int8、packed W4 三种存储一视同仁。融合专家栈
+    # （``QWeightMoE``）没有 ``n``/``k``，它的形状在 ``wq`` 上、且是三维——这里只要
+    # 末两维，专家轴由下面专门的分支按 ``layout`` 单独处理。
+    if isinstance(value, QWeight):
+        shape = (value.n, value.k)
+    elif isinstance(value, QWeightMoE):
+        shape = value.wq.shape[-2:]
+    else:
+        shape = value.shape
     if ".linear_attn." in key and key.endswith("in_proj_qkv.weight"):
         kd = cfg["linear_num_key_heads"] * cfg["linear_key_head_dim"]
         vd = cfg["linear_num_value_heads"] * cfg["linear_value_head_dim"]
@@ -795,20 +797,32 @@ def shard_weight(key: str, value, cfg: dict, rank: int, world_size: int):
             raise ValueError(
                 f"{key}: fused expert stack sharding supports int8 stacks only, got "
                 f"{type(value).__name__}")
-        # 栈是 ``[E, K, N]``：gate_up 切 N（dim 2），down 切 K（dim 1）。
+        # 栈按 nk 落盘（``[E, N, K]``）：gate_up 切 N（dim 1），down 切 K（dim 2）。
+        # 只有这一种布局——kn 的 ``[E, K, N]`` 栈与它的内核已删除——所以轴是固定的，
+        # 不需要再按 ``layout`` 分支。切错轴的表现是「切出来的形状合法、每个专家在算
+        # 别人那段输出列」。
         gate_up = key.endswith(".experts.gate_up_stack")
-        axis = 2 if gate_up else 1
-        width = int(value.wq.shape[axis])
+        # 要切的是 nk 那一份缓冲（:meth:`nk_stack` 零拷贝交出），不是再造一份转置。
+        src = value.nk_stack()
+        axis = 1 if gate_up else 2
+        width = int(src.shape[axis])
+        if gate_up:
+            # 融合栈的 N 轴是 ``[gate(I), up(I)]`` **两段**，不是一段。按一段切会让
+            # rank 0 拿到全 gate 的前 1/4、rank 2 拿到全 up 的对应段——每张卡上的
+            # 「gate 与 up」都不是同一批通道，``chunk(2)`` 之后 SwiGLU 相乘的是两个
+            # 不同通道门，输出看着像话、数值全错。所以逐段切再按原顺序拼。
+            segs = _ranges([width // 2, width // 2], rank, world_size)
+            wq = torch.cat([src.narrow(axis, a, b - a) for a, b in segs],
+                           dim=axis).contiguous()
+            scale = torch.cat([value.scale.narrow(1, a, b - a)
+                               for a, b in segs], dim=1).contiguous()
+            return QWeightMoE(wq, scale, k=value.k)
         if width % world_size:
             raise ValueError(f"{key}: width {width} not divisible by {world_size}")
         size = width // world_size
         begin = rank * size
-        if gate_up:
-            return QWeightMoE(value.wq.narrow(2, begin, size).contiguous(),
-                              value.scale.narrow(1, begin, size).contiguous(),
-                              k=value.k)
-        return QWeightMoE(value.wq.narrow(1, begin, size).contiguous(),
-                          value.scale, k=size)
+        wq = src.narrow(axis, begin, size).contiguous()
+        return QWeightMoE(wq, value.scale, k=size)
     elif ".mlp.experts." in key or ".mlp.shared_expert." in key:
         # 专家的 gate/up 按输出轴（专家内宽度）分片，down 按 K 轴分片；路由器
         # （``.mlp.gate.weight``）与共享专家门（``.mlp.shared_expert_gate.weight``）
@@ -823,27 +837,22 @@ def shard_weight(key: str, value, cfg: dict, rank: int, world_size: int):
     if isinstance(value, QWeight):
         # int8 的 scale 是逐输出行一个、与 K 长度无关，所以 K 轴（axis 1）切分时它原样
         # 跟着每个 rank 走；只有 N 轴切分才需要把它一起切开。
-        # 区间来自 ``ranges``（逐 rank 的 ``(lo, hi)``），不是某个循环里残留的 a/b：
-        # 早先这里直接用了 a、b，任何走到该分支的调用都会 NameError，而 PP 下永远
-        # 走不到这条分支，所以一直没暴露。
-        lo, hi = ranges[0]
+        #
+        # 融合段（q/k/v）的 ``ranges`` 有**三段**，必须逐段切完再拼起来。原来这里只取
+        # ``ranges[0]``，于是 ``in_proj_qkv`` 的 int8 分片只剩 q 那一段（四卡下
+        # 8192 -> 512 而不是 2048），单卡``world_size=1`` 时 ``ranges[0]`` 恰好是全长
+        # 所以 4B 一直没暴露；Occamy 四卡第一次解码就撞在卷积状态的形状上。
         if axis == 0:
-            return QWeight(value.wq.narrow(0, lo, hi - lo).contiguous(),
-                           value.scale.narrow(0, lo, hi - lo).contiguous())
+            wq = torch.cat([value.wq.narrow(0, a, b - a)
+                            for a, b in ranges], dim=0).contiguous()
+            scale = torch.cat([value.scale.narrow(0, a, b - a)
+                               for a, b in ranges], dim=0).contiguous()
+            return QWeight(wq, scale)
+        lo, hi = ranges[0]
         return QWeight(value.wq.narrow(1, lo, hi - lo).contiguous(), value.scale)
-    if not isinstance(value, W4A8Weight):
-        return torch.cat([value.narrow(axis, a, b - a) for a, b in ranges], dim=axis).contiguous()
-    if axis == 0:
-        packed = torch.cat([value.packed[:, a:b] for a, b in ranges], dim=1).contiguous()
-        scale = torch.cat([value.scale[:, a:b] for a, b in ranges], dim=1).contiguous()
-        return W4A8Weight(packed, scale, k=value.k, group_size=value.group_size)
-    start, stop = ranges[0]
-    gs = value.group_size
-    if start % gs or start % 2 or (stop != value.k and stop % gs):
-        raise ValueError(f"{key}: W4 input partition must align to groups and packed pairs")
-    return W4A8Weight(value.packed[start // 2:(stop + 1) // 2].contiguous(),
-                       value.scale[start // gs:(stop + gs - 1) // gs].contiguous(),
-                       k=stop - start, group_size=gs)
+    if not isinstance(value, torch.Tensor):
+        return value
+    return torch.cat([value.narrow(axis, a, b - a) for a, b in ranges], dim=axis).contiguous()
 
 
 def pipe_keeps(key: str, cfg: dict, parallel: "ParallelContext",
@@ -906,11 +915,11 @@ def load_weights(model_dir: str | Path, device: torch.device,
     """
     from safetensors import safe_open
     from quantized_load import FORMAT as I8_FORMAT
-    from quantized_load import W4A8_FORMAT, _check_source_config, read_index
+    from quantized_load import _check_source_config, read_index
 
     model_dir = Path(model_dir)
     index = read_index(model_dir)
-    if index["format"] not in (W4A8_FORMAT, I8_FORMAT):
+    if index["format"] != I8_FORMAT:
         raise ValueError(
             f"tensor parallel loader needs a pre-quantised directory, got "
             f"format={index['format']!r}")
@@ -941,35 +950,24 @@ def load_weights(model_dir: str | Path, device: torch.device,
                 # 805 MB、40 层 32 GB，先读进来再切会把一张 31.7 GiB 的卡撑爆，而
                 # 这也正是「连续切专家」而不是「交错切」的理由（见 expert_range）。
                 ep_slice = (parallel.mode == "ep" and meta["kind"] == "q8-moe")
-                # 专家栈在盘上有两种落盘形态：kn 原生 ``[E, K, N]``，以及 nk 原生
-                # ``[E, N, K]``（``nkfull`` 产物把后者单独存在 ``#nk`` 键上，前者也留着）。
-                # ``COFFIN_MOE_STACK=nk`` 时读 nk 那一份：预填充走的就是 nk 几何，栈本身
-                # 即所需，省掉在内存里为整模型转置一份副本（40 层 = 32 GB，一张卡装不下
-                # 两份）。键必须在**读盘前**挑好——先读 kn 再读 nk 等于把 63 GB 读两遍。
-                read_key = key
-                if meta["kind"] == "q8-moe" and "nk_key" in meta \
-                        and os.environ.get("COFFIN_MOE_STACK", "kn") == "nk":
-                    read_key = meta["nk_key"]
+                # 专家栈在盘上就是 nk：``[E, N, K]``（K 连续），这就是内核要的几何，
+                # 不需要再转置一份副本。旧产物把另一种布局放在主键、nk 放在 ``#nk``
+                # 附加键上，那种目录仍用 ``nk_key`` 直取 nk——键必须在**读盘前**挑好，
+                # 先读主键再读 nk 等于把两份都读一遍（40 层 = 63 GB）。
+                read_key = meta["nk_key"] if (
+                    meta["kind"] == "q8-moe" and "nk_key" in meta) else key
                 if ep_slice:
                     lo, hi = parallel.expert_range(int(cfg["num_experts"]))
                     value = handle.get_slice(read_key)[lo:hi]
                 else:
                     value = handle.get_tensor(read_key)
                 kind = meta["kind"]
-                if kind == "q4":
-                    scale = handle.get_tensor(meta["scale_key"])
-                    if list(value.shape) != meta["packed_shape"] or list(scale.shape) != meta["scale_shape"]:
-                        raise ValueError(f"{key}: packed checkpoint shape mismatch")
-                    value = W4A8Weight(value, scale, k=meta["k"], group_size=meta["group_size"])
-                elif kind == "q8-moe":
-                    # 融合专家栈 `[E, K, N]` int8 + `[E, N]` fp32。漏掉这一条会让它落进
-                    # 下面的 "else"，被当成稠密张量原样搬到设备——形状合法、MoE 一跑
+                if kind == "q8-moe":
+                    # 融合专家栈 ``[E, N, K]`` int8 + ``[E, N]`` fp32。漏掉这一条会让它
+                    # 落进下面的 "else"，被当成稠密张量原样搬到设备——形状合法、MoE 一跑
                     # 就 mat1/mat2 形状不匹配，而引擎把那次异常当成「这一步没产出」，
                     # 原地空转到看门狗报 KV pool 太小。
-                    # 布局由读盘时挑的键决定：``#nk`` 那份是 ``[E, N, K]``，另一份是
-                    # ``[E, K, N]``；两种都要按各自的 shape 校验，混着比会把 1024 当 K。
-                    nk_native = read_key != key
-                    wshape = list(meta["nk_shape"]) if nk_native else meta["shape"]
+                    wshape = list(meta.get("nk_shape") or meta["shape"])
                     if ep_slice:
                         scale = handle.get_slice(meta["scale_key"])[lo:hi]
                         expect = (hi - lo, *wshape[1:])
@@ -982,30 +980,25 @@ def load_weights(model_dir: str | Path, device: torch.device,
                         if (list(value.shape) != wshape
                                 or list(scale.shape) != meta.get("scale_shape")):
                             raise ValueError(f"{key}: moe int8 stack shape mismatch")
-                    value = QWeightMoE(value, scale, k=int(meta["k"]),
-                                       layout="nk" if nk_native else "kn")
+                    value = QWeightMoE(value, scale, k=int(meta["k"]))
                 elif kind == "q8":
-                    # 盘上 int8 是 ``[K, N]`` 加逐输出列的 fp32 scale；``from_kn`` 只
-                    # 取一个转置视图，不复制也不转置，所以这一趟仍然是「读文件、装箱」。
+                    # 盘上 int8 是 ``[N, K]`` 加逐输出行的 fp32 scale；``from_nk`` 只做
+                    # 校验、把 ``w`` 本身交出去，所以这一趟仍然是「读文件、装箱」。
                     scale = handle.get_tensor(meta["scale_key"])
                     if list(value.shape) != meta["shape"] or int(scale.numel()) != meta["n"]:
                         raise ValueError(f"{key}: int8 checkpoint shape mismatch")
-                    value = QWeight.from_kn(value, scale)
+                    value = QWeight.from_nk(value, scale)
                 if parallel.mode == "tp":
                     value = shard_weight(key, value, cfg, parallel.rank, parallel.world_size)
-                if isinstance(value, W4A8Weight):
-                    value = W4A8Weight(value.packed.to(device), value.scale.to(device),
-                                       k=value.k, group_size=value.group_size)
-                elif isinstance(value, QWeight):
+                if isinstance(value, QWeight):
                     value = QWeight(value.wq.to(device), value.scale.to(device))
                 elif isinstance(value, QWeightMoE):
-                    # 搬去设备时必须**保住布局**：nk 原生栈上 ``wq`` 是一次整栈转置
-                    # （每层 805 MB），用它重建等于把省掉的那份副本又造回来，还会把栈
-                    # 换成 kn，预填充的 nk 核随之消失、运行时再按层转一次（一张 31.7 GiB
-                    # 的卡上就是 20 层 16 GB 的 OOM）。
-                    raw = value.nk_stack() if value.layout == "nk" else value.wq
-                    value = QWeightMoE(raw.to(device), value.scale.to(device),
-                                       k=value.k, layout=value.layout)
+                    # 搬去设备时必须**搬 nk 那一份**（``nk_stack`` 零拷贝）：按 ``wq``
+                    # 重建等于把一份整栈转置又造回来，还会把栈换成 kn，预填充的 nk 核
+                    # 随之消失、运行时再按层转一次（一张 31.7 GiB 的卡上就是 20 层 16 GB
+                    # 的 OOM）。
+                    value = QWeightMoE(value.nk_stack().to(device),
+                                       value.scale.to(device), k=value.k)
                 else:
                     value = value.to(device)
                 sd[key] = value
@@ -1019,21 +1012,24 @@ class RowParallelProjection:
         """持有局部投影及对应通信上下文。
 
         Args:
-            projection: 从本 rank 权重构造的 GEMV。
+            projection: 从本 rank 权重（K 已按世界大小切过）构造的投影。
             parallel: 模型共享的进程上下文。
 
         Raises:
-            ValueError: 投影没有 packed W4 权重。
+            ValueError: 投影的权重不是 int8 ``QWeight``。行并行的每一次调用都要把
+                「本 rank 的部分和」加进别人的部分和里，而只有量化投影的局部点积
+                能与通信重叠；碰上一个不是量化权的投影，说明分片规则和这里不一致，
+                宁可现在失败也不要安静地少加一份。
         """
-        if not isinstance(projection.w, W4A8Weight):
-            raise ValueError("row parallel projection requires packed W4 weights")
-        self.w, self.N, self.K = projection.w, projection.N, projection.K
+        if not isinstance(getattr(projection, "w", None), QWeight):
+            raise ValueError(
+                "row parallel projection requires int8 weights; "
+                f"got {type(getattr(projection, 'w', None)).__name__}")
+        self.proj, self.w, self.N, self.K = projection, projection.w, projection.N, projection.K
         self.parallel = parallel
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        """按上下文选择激活 scale，以 fp32 归约局部整数点积后窄化。"""
-        from backends.corex import _w4_rows
-
+        """切出本 rank 的 K 段、算局部点积，跨 rank 以 fp32 求和后窄化。"""
         if x.dim() not in (1, 2):
             raise ValueError("row parallel activation shape mismatch")
         if x.shape[-1] != self.K:
@@ -1041,24 +1037,20 @@ class RowParallelProjection:
                 raise ValueError("row parallel input width does not match shard count")
             start = self.parallel.rank * self.K
             x = x[..., start:start + self.K].contiguous()
-        local_max = x.reshape(-1, self.K).float().abs().amax(-1)
-        mode = self.parallel.scale_mode
-        if mode not in {"shared", "local", "decode_local"}:
-            raise ValueError(f"unknown activation scale mode: {self.parallel.scale_mode}")
-        use_local_scale = mode == "local" or (mode == "decode_local" and x.numel() == self.K)
-        scale_max = local_max if use_local_scale else self.parallel.reduce(
-            local_max, maximum=True)
-        scale = scale_max.clamp_min_(1e-5).div_(127)
-        partial = _w4_rows(self.w, x.float(), activation_scale=scale)
-        return self.parallel.reduce(partial).to(x.dtype)
+        # 局部投影自己会量化激活（w8a8 内核按行 absmax），所以这里不需要、也不应该
+        # 再喂一个跨 rank 统一的 scale：每个 rank 的 K 段不同，统一 scale 只会把
+        # 量程压到最坏的那一段。部分和在 fp32 里相加后再窄化——bf16 加三个部分和
+        # 会在末位上丢有效位，而这是每层每个 token 都要走一次的地方。
+        partial = self.proj(x)
+        return self.parallel.reduce(partial.float()).to(x.dtype)
 
     def linear_m(self, x: torch.Tensor) -> torch.Tensor:
-        """批处理沿用同一全局量化和归约契约。"""
-        return self(x)
+        """批处理（多行）沿用同一切分与归约契约。"""
+        return self.__call__(x)
 
     def prefill(self, x: torch.Tensor) -> torch.Tensor:
-        """预填充由 CoreX 按形状选择直接消费 packed W4 的张量核。"""
-        return self(x)
+        """预填充沿用同一切分与归约契约；分块由调用方决定。"""
+        return self.__call__(x)
 
 
 def row_projection(projection):

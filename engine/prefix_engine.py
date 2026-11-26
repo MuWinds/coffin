@@ -474,7 +474,31 @@ class PrefixCacheEngine:
         Returns:
             按顺序排列的生成 token id；第一个 token 就是 EOS 时可能为空。
         """
-        return list(self.decode_iter(logits, max_new, eos))
+        # 贪心 + 单流走「设备内回填」的批循环：每步的 argmax 与写回都在设备上完成，
+        # 一步一次 D2H 都不发生，token 只在收尾时一次性取回。原来的写法每步要同步
+        # 两次（argmax 的取回、``commit_upto(model.pos1)`` 里的 int），两万多次发射
+        # 的深队列因此每步被排空一次——那笔墙钟比这里多出来的两次小发射贵得多。
+        # 序列本身逐 token 完全相同：贪心的 argmax 与顺序无关，只是取回的时机变了。
+        eos = eos or set()
+        model, seq = self.model, self.seq
+        n = max(0, int(max_new))
+        if n == 0:
+            return []
+        ring = torch.empty(n, dtype=torch.long, device=model.logits_single.device)
+        # 两个入口都铺 token 并推进 ``pos1``，选择只在于有没有图可回放。
+        step = model.decode_step if self.graph else model.greedy_logits
+        for i in range(n):
+            seq.reserve(1)
+            step()
+            ring[i:i + 1].copy_(model._tok_scalar)
+        ids = ring.tolist()
+        seq.commit_upto(int(model.pos1))
+        out: list[int] = []
+        for t in ids:
+            if t in eos:
+                break
+            out.append(t)
+        return out
 
     @torch.inference_mode()
     def generate(self, tokens: list[int], max_new: int, eos: set[int] | None = None,

@@ -63,8 +63,10 @@ INDEX_NAME = "quant_index.json"
 
 #: 索引格式版本。布局一改就递增：读旧格式的加载器会明确报错，而不是按新布局错读
 #: 字节——错读出来的 int8 是一堆看似合理的数字，不会自己报错。
-FORMAT = "coffin-int8-kn-v1"
-
+#: 唯一的落盘格式：``int8 [N, K]``（每行一个输出通道、K 轴连续）+ ``fp32 [N]``
+#: 每行一个标尺。``[K, N]``（kn）那一档连同它的格式标签与 ``--layout`` 开关已整条
+#: 删除——仓库只装 nk，内核与库出口都直接吃 ``[N, K]``。
+FORMAT = "coffin-int8-nk-v1"
 #: 必须保持稠密的二维矩阵后缀（Qwen3.5-MoE 的两处门）。
 #:
 #: 路由矩阵决定每个 token 选哪 8 个专家，int8 的噪声比 4-bit 小得多，但它仍然是
@@ -144,35 +146,40 @@ def _pick_device(request: str) -> torch.device:
     return device
 
 
-def quantize_projection(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """把 ``[N, K]`` 投影量化成 ``[K, N]`` int8 加 ``[N]`` fp32 列 scale。
+def quantize_projection(w: torch.Tensor
+                        ) -> tuple[torch.Tensor, torch.Tensor]:
+    """把 ``[N, K]`` 投影量化成 int8 加 ``[N]`` fp32 每输出通道的 scale。
 
     公式不在本文件里：每个行块原样交给 :meth:`int8_weights.QWeight.quantize`，所以
     「预量化」与「运行时量化」用的是同一段代码、同一串舍入。外层再按输出行分块，是
     为了把临时量限制在一块上；每行的 absmax 只读自己那一行，分块因此不改变结果。
 
+    nk 是唯一布局：``[N, K]``、K 轴连续——一行输出通道是一段连续字节，``__dp4a``
+    一次 32 位加载就够，不需要先转置。``[K, N]`` 那一档已删除。
+
     Args:
         w: 设备上的 ``[N, K]`` 权重，dtype 已经与运行时那条路的 ``weight_dtype`` 一致。
 
     Returns:
-        ``(int8 [K, N] 连续, fp32 [N])``。两者都归调用方所有，``QWeight`` /
-        ``KnQWeight`` 要求它们成对出现，拆开任何一个都会让反量化整体偏移。
+        ``(int8 [N, K], fp32 [N])``。两者都归调用方所有，
+        ``QWeight`` 要求它们成对出现，拆开任何一个都会让反量化整体偏移。
 
     Raises:
-        ValueError: ``w`` 不是二维。一维归一化权重走到这里说明 ``is_quantizable``
-            的判定被别人绕过了，转置它只会在很远的地方报形状错误。
+        ValueError: ``w`` 不是二维。
+            一维归一化权重走到这里说明 ``is_quantizable`` 的判定被别人绕过了，
+            转置它只会在很远的地方报形状错误。
     """
     if w.dim() != 2:
         raise ValueError(f"projection must be 2-D, got {tuple(w.shape)}")
     n, k = int(w.shape[0]), int(w.shape[1])
-    out = torch.empty((k, n), dtype=torch.int8, device=w.device)
+    out = torch.empty((n, k), dtype=torch.int8, device=w.device)
     scale = torch.empty(n, dtype=torch.float32, device=w.device)
     for start in range(0, n, _QUANT_CHUNK_ROWS):
         stop = min(n, start + _QUANT_CHUNK_ROWS)
         q = QWeight.quantize(w[start:stop])
-        # 跨列写而不是先攒一份 ``[N, K]`` 再整体转置：后者要同时活着两份 int8
-        # （27B 的 lm_head 是 2 x 1.27 GB），而这里每个块的写是 K 段连续字节。
-        out[:, start:stop] = q.wq.t()
+        # ``QWeight.quantize`` 的 ``wq`` 本来就是 ``[N, K]`` 行主序，一块输出行
+        # 在盘上就是连续的一整段，直接整块落进去——没有任何转置。
+        out[start:stop] = q.wq
         scale[start:stop] = q.scale
     return out, scale
 
@@ -324,9 +331,9 @@ def _fused_stacks(group: dict, read, weight_dtype: torch.dtype,
             read(group["up_proj"][e]).to(device).to(weight_dtype).contiguous())
         dq, ds = quantize_projection(
             read(group["down_proj"][e]).to(device).to(weight_dtype).contiguous())
-        # 按 ``kn`` 布局拼：``quantize_projection`` 交出来的已经是 ``[K, N]``，gate 与 up
-        # 沿 N 轴接起来就是 ``[K, 2I]``，转置一次都不用做。
-        gu_parts.append(torch.cat([gq, uq], dim=1))
+        # nk 布局：``quantize_projection`` 交出来的是 ``[N, K]``，gate 与 up 沿**行**
+        # 接起来就是 ``[2I, K]``——一行一个输出通道，K 仍在这行里连续，转置一次都不用做。
+        gu_parts.append(torch.cat([gq, uq], dim=0))
         gu_scales.append(torch.cat([gs, us], dim=0))
         dn_parts.append(dq)
         dn_scales.append(ds)
@@ -346,40 +353,29 @@ def _emit_stack(payload: dict, tensors: dict, per_file: dict, kinds: Counter,
         kinds: 全局的类型计数。
         mlp: 这一层的 ``mlp`` 前缀。
         suffix: :data:`GATE_UP_STACK` 或 :data:`DOWN_STACK`。
-        wq: ``[E, N, K]`` int8 栈。
+        wq: ``[E, N, K]`` int8 栈（nk，就是盘上的形状）。
         scale: ``[E, N]`` fp32。
         shard_name: 当前输出分片名。
+        （布局固定是 ``[E, N, K]``。）
     """
     key = f"{mlp}.{suffix}"
+    # nk 原生：主键本身就是 ``[E, N, K]``，没有 kn 副本，也没有布局开关。
     payload[key] = wq.cpu()
     payload[key + "#scale"] = scale.cpu()
-    # 同时落一份 nk（``[E, N, K]``）供解码节点直接读：解码卡的 nk 分组核要的正是这一
-    # 份，而它在原来的口径下是**运行时转置**出来的——一张 D 卡因此同时背 kn 与 nk
-    # 两份（每 rank 15.4 GB）。在打包阶段转一次、磁盘多占一份，D 卡就只读 nk、
-    # 内存回到 7.7 GB。用完即弃的磁盘换每张卡 7.7 GB，这个交换在 PD 分离下是划算的。
-    #
-    # 只在这一步转置：``wq`` 是 ``[E, K, N]``，N 轴在外之后每一列的 K 才是连续的，
-    # 也就是 nk 核一次 32 位加载就能拿到 ``__dp4a`` 要的那个字。
-    nk = wq.transpose(1, 2).contiguous()
-    payload[key + "#nk"] = nk.cpu()
     tensors[key] = {
         "kind": "q8-moe",
-        "layout": "kn",
+        "layout": "nk",
         "experts": int(wq.shape[0]),
-        "n": int(wq.shape[2]),
-        "k": int(wq.shape[1]),
+        "n": int(wq.shape[1]),
+        "k": int(wq.shape[2]),
         "shape": list(wq.shape),
         "scale_shape": list(scale.shape),
         "scale_key": key + "#scale",
-        #: nk 副本的键与形状。加载器按 ``COFFIN_MOE_I8_NK`` 决定读哪一份，
-        #: 两份**不会**同时上卡；缺这个字段的旧 checkpoint 会退回运行时转置。
-        "nk_key": key + "#nk",
-        "nk_shape": list(nk.shape),
         "shard": shard_name,
     }
+    per_file["tensors"] += 1
+    per_file["int8_bytes"] += wq.numel()
     kinds["int8-moe"] += 1
-    per_file["tensors"] += 2
-    per_file["int8_bytes"] += 2 * wq.numel()
     per_file["scale_bytes"] += scale.numel() * 4
 
 def convert(ckpt: Path, out: Path, *, weight_dtype: torch.dtype,
@@ -491,8 +487,9 @@ def convert(ckpt: Path, out: Path, *, weight_dtype: torch.dtype,
                 kinds["int8"] += 1
                 tensors[key] = {
                     "kind": "q8",
-                    "k": int(wt.shape[0]),
-                    "n": int(wt.shape[1]),
+                    "layout": "nk",
+                    "k": int(wt.shape[1]),
+                    "n": int(wt.shape[0]),
                     "shape": [int(wt.shape[0]), int(wt.shape[1])],
                     "scale_key": key + "#scale",
                     "shard": name,
@@ -540,7 +537,10 @@ def convert(ckpt: Path, out: Path, *, weight_dtype: torch.dtype,
         "scheme": ("per-output-column symmetric absmax: s = max|w|/127 then "
                    "round(w/s) clamped to [-127, 127]; s floored at 1e-8"),
         "chunk_rows": _QUANT_CHUNK_ROWS,
-        "layout": "int8 [K, N] contiguous + fp32 [N]",
+        #: 机器可读的布局标识。后面那句人话只是给人看的，读取器不该去解析它。
+        "weight_layout": "nk",
+        "layout": "int8 [N, K] contiguous + fp32 [N]",
+        "weight_axis": "row-major output channels (N) outer, K inner",
         "prefixes": list(prefixes),
         "vision": bool(include_vision),
         "skipped_vision_tensors": skipped_vision,
@@ -584,6 +584,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", required=True, help="预量化目录，会被创建")
     parser.add_argument("--weight-dtype", default="bf16", choices=sorted(_WEIGHT_DTYPES),
                         help="量化前窄到的 dtype，必须与运行时加载器的 weight_dtype 一致")
+    # 没有 --layout：nk 是唯一的落盘布局（int8 [N, K]，每行一个输出通道、K 轴连续）。
     parser.add_argument("--device", default="auto", help="量化设备：auto / cpu / cuda:N")
     parser.add_argument("--prefix", action="append", default=None,
                         help="要收进来的参数名前缀，可重复；默认文本+mtp+lm_head")
@@ -605,7 +606,8 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"  source : {ckpt}", flush=True)
     print(f"  out    : {out}", flush=True)
-    print(f"  device : {device}  weight_dtype={_dtype_name(weight_dtype)}", flush=True)
+    print(f"  device : {device}  weight_dtype={_dtype_name(weight_dtype)}  "
+          "layout=nk", flush=True)
     source_bytes = _dir_bytes(ckpt)
     started = time.time()
     report = convert(ckpt, out, weight_dtype=weight_dtype, device=device,
@@ -636,3 +638,5 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+

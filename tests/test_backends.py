@@ -57,11 +57,11 @@ BF16_TOL = 2e-2
 FP32_TOL = 1e-5
 
 #: 暂缺参考实现的算子：只有编译内核提供，模型代码按 ``caps.native`` 判定是否调用，
-#: 缺了就走自己的 torch 回退（``models/qwen4exp/moe.py`` 的 ``moe_dispatch`` /
-#: ``moe_grouped_gemm``、``qsa.py`` 的 ``attn_sparse`` / ``qsa_block_keys``），
+#: 缺了就走自己的 torch 回退（``models/qwen4exp/moe.py`` 的 ``moe_dispatch``、
+#: ``qsa.py`` 的 ``attn_sparse`` / ``qsa_block_keys``），
 #: 所以参考后端答 ``None`` 在当前设计下是正确的。这是**临时桩**：参考实现补齐之后
 #: 删掉这个集合，下面两条 totality 断言就该重新覆盖整张算子表。
-_NATIVE_ONLY = frozenset({"moe_grouped_gemm", "moe_dispatch",
+_NATIVE_ONLY = frozenset({"moe_dispatch",
                           "attn_sparse", "qsa_block_keys"})
 
 #: 参考后端今天必须答满的名字，按契约顺序。
@@ -321,7 +321,7 @@ class NativeRegistrationTest(unittest.TestCase):
     干净的零提升，与「这个融合没赚到」无法区分。约定把名字变成注册动作
     （``protocol.native_ops``），所以这里不再逐条比对两份清单，只查约定本身。
 
-    检查针对适配器而不是内核符号：内核以自己的扩展层名字绑定（``gemv_kn``、
+    检查针对适配器而不是内核符号：内核以自己的扩展层名字绑定（``gemv_nk_i8``、
     ``silu_mul``），不必与算子名一致，所以这里只问一件事：``NATIVE`` 里的每个名字是不是
     本模块自己定义的适配器，而不是顺手 import 进来的参考实现。
     """
@@ -349,20 +349,19 @@ class NativeRegistrationTest(unittest.TestCase):
     def test_every_native_op_is_bound_in_the_extension(self):
         """写在 ``.cu`` 文件里的内核，在注册之前都取不到。
 
-        这是上面 ``_NATIVE`` 那条守卫同一个陷阱的另一半，而且已经咬过一次：
-        ``delta_normed`` 有声明、有定义、有协议字段、有参考实现、有适配器、也有
-        ``_NATIVE`` 条目，可在卡上 decode 仍然死在 ``AttributeError``，因为 pybind 的
-        ``m.def`` 那行没写。参考补齐和本地测试套件都看不见这一点：参考实现在 CPU
-        主机上就能作答，而绑定只有导入扩展时才被读取。
-
-        之所以做源码扫描，是因为没有工具链就导不进这个扩展。它天然是近似的——只证明
-        某个名字出现在一次 ``m.def`` 调用里，不证明签名对得上——但它让这个遗漏无法
-        留在树里，而真正发生过的正是这个遗漏。
+        这条测试守的是 torch JIT 扩展的 pybind 绑定。**扩展已经不在了**（链路整条搬到
+        C ABI，见 ``docs/COREX-NO-TORCH.md``），绑定表本身没有可扫的东西，所以这里跳过；
+        留一个守卫的只有「导出名与 Python 侧 ``shim.export`` 的名字必须一致」那一半，
+        那个由 ``tests/test_cxrt_*.py`` 覆盖。
         """
         import re
 
         from backends import corex
-        from backends.corex import kernels
+
+        try:
+            from backends.corex import kernels
+        except ImportError:
+            self.skipTest("the torch JIT extension has been removed")
 
         # 注册有两种写法：``bindings.cpp`` 里的 ``m.def("name", ...)``，以及内核自己的
         # ``.cu`` 里同名约定下的 ``COFFIN_BIND(name, ...)``（lambda 包装的那两条用
@@ -377,7 +376,7 @@ class NativeRegistrationTest(unittest.TestCase):
             bound |= set(re.findall(r'COFFIN_BIND(?:_LAMBDA)?\(\s*([a-z0-9_]+)', text))
 
         # 融合工作新增的算子，后端层算子名都由同名的扩展条目提供；内核以别的名字绑定
-        # 的算子（``linear`` -> ``gemv_kn``）按设计不在本检查范围内，所以这里只对扩展
+        # 的算子（``linear`` -> ``gemv_nk_i8``）按设计不在本检查范围内，所以这里只对扩展
         # 头文件里也有声明的名字下断言。
         header_path = corex.kernels.KERNEL_DIR / "corex_ops.h"
         declared = set(re.findall(r"^(?:torch::Tensor|void)\s+([a-z0-9_]+)\s*\(",
@@ -869,55 +868,6 @@ class DependencyDirectionTest(unittest.TestCase):
         self.assertIn("COFFIN_BACKEND", bad.stderr)
 
 
-class CorexPackTest(unittest.TestCase):
-    """int8 -> bf16 的权重量化转换，每次 int8 预填充调用都要付这个代价。"""
-
-    def _packed(self):
-        """造一个小尺寸、scale 接近真实的打包 int8 权重。
-
-        Returns:
-            一个 ``KnQWeight``，其 ``[K, N]`` 矩阵是连续的 int8，scale 是一维 fp32，
-            正是构造函数校验的那一对。
-        """
-        from backends.corex.pack import KnQWeight
-
-        k, n = 96, 40
-        wt = torch.randint(-127, 127, (k, n), dtype=torch.int8)
-        scale = (torch.rand(n) * 0.01 + 1e-4).to(torch.float32)
-        return KnQWeight(wt, scale)
-
-    def test_dequant_kn_is_bit_identical_to_the_wide_fp32_spelling(self):
-        """快的写法不许挪动任何一个权重。
-
-        原先的转换会先造一个 ``[K, N]`` 的 fp32 临时张量再窄化，在卡上每次预填充请求
-        花 174.8 ms。先转成输出 dtype 再原地缩放快 1.70x，因为 ``mul_`` 的 dtype 取自
-        目标张量，它仍在 fp32 下相乘、只舍入一次——同样的算术，没有临时张量。换成 bf16
-        的 *scale* 反而会让每个权重差 1 ULP，这就是这里 scale 保持 fp32、这条测试要求
-        逐位精确而不是近似的原因。
-        """
-        q = self._packed()
-        got = q.dequant_kn(torch.bfloat16).wt
-        want = (q.wt.float() * q.scale.view(1, -1)).to(torch.bfloat16)
-        self.assertTrue(torch.equal(got, want),
-                        "dequant_kn changed the weights; a faster conversion is only "
-                        "acceptable if it is bit-identical")
-
-    def test_dequant_kn_keeps_the_kn_layout(self):
-        """结果直接喂给 ``matmul(lhs, wt)``；转置了或者不连续，乘法就会悄悄算错。"""
-        q = self._packed()
-        out = q.dequant_kn(torch.bfloat16)
-        self.assertEqual((out.k, out.n), (q.k, q.n))
-        self.assertEqual(tuple(out.wt.shape), (q.k, q.n))
-        self.assertTrue(out.wt.is_contiguous())
-        self.assertEqual(out.wt.dtype, torch.bfloat16)
-
-    def test_dequant_kn_rejects_an_integer_destination(self):
-        """往整型目标里缩放会回绕而不是抛错，事后读起来像一个损坏的 checkpoint。"""
-        q = self._packed()
-        with self.assertRaises(TypeError):
-            q.dequant_kn(torch.int8)
-
-
 class Int8BatchKernelTest(unittest.TestCase):
     """int8 批量投影必须是内核，不是看起来像内核的循环。
 
@@ -973,25 +923,11 @@ class Int8BatchKernelTest(unittest.TestCase):
                 return True
         return False
 
-    def test_the_batched_int8_entry_exists_in_header_binding_and_kernel(self):
-        """声明、注册、定义是三处改动，必须全部落地。"""
-        src = self._sources()
-        self.assertIn("gemv_kn_i8_m", src["corex_ops.h"],
-                      "the batched int8 entry is not declared in corex_ops.h")
-        self.assertTrue(self._registered("gemv_kn_i8_m"),
-                        "the batched int8 entry is not registered with pybind, so "
-                        "calling it raises AttributeError on the card instead of failing "
-                        "the build")
-        self.assertIn("gemv_kn_i8_m_kernel", src["gemv.cu"],
-                      "gemv_kn_i8_m has no kernel body, so the entry has nothing to "
-                      "launch")
-
     def test_the_nk_int8_pair_exists_in_header_binding_and_kernel(self):
         """解码走 nk 之后，这一对同样是「声明、注册、定义」三处缺一不可。
 
-        它与 kn 那一对并存：kn 仍在预填充与 MoE 的路径上，nk 是解码投影。少了任一处的
-        表现和 kn 那次一样——在卡上表现为 AttributeError 或内核无处可启动，而且离真正
-        发起分派的 Python 入口很远。
+        kn 那一对已经整条删除，仓库只剩这两个 nk 入口。少了任一处的表现是——在卡上
+        表现为 AttributeError 或内核无处可启动，而且离真正发起分派的 Python 入口很远。
         """
         src = self._sources()
         for name in ("gemv_nk_i8", "gemv_nk_i8_m"):
@@ -1042,25 +978,6 @@ class Int8BatchKernelTest(unittest.TestCase):
         self.assertIn("NkLoad<XT>::four(x + (size_t)(m < rows ? m : 0) * K + off, x4)",
                       body)
 
-    def test_the_batched_int8_kernel_accumulates_m_rows_per_weight_load(self):
-        """只有 M 条累加链在一次权重读取期间一直活着，这个内核才划算。
-
-        在源码里查，是因为这是编译器的产物，没有卡时任何单元测试都观察不到：行循环必须
-        按 M 做模板实例化并完全展开，权重读取要提到循环外。用运行时的 ``for`` 遍历行，
-        内核形状不变、权重却要读 M 次，那正是这个内核要消除的 bug。
-        """
-        src = self._sources()["gemv.cu"]
-        start = src.index("gemv_kn_i8_m_kernel")
-        body = src[start:src.index(chr(10) + "}" + chr(10), start)]
-        self.assertIn("float acc[M * W];", body,
-                      "the int8 batched kernel has no per-(row, column) accumulator array")
-        self.assertIn("load_i8_row<W>(&wt[", body,
-                      "the weight bytes are not loaded once into a local word, so they "
-                      "are re-read once per row")
-        self.assertIn("#pragma unroll", body,
-                      "the row loop is not unrolled, so the M chains may spill or "
-                      "re-read the weight")
-
     def test_linear_m_routes_int8_to_the_batched_kernel_not_a_row_loop(self):
         """分派正是「正确但更慢」的回退会悄悄改掉的那一块。"""
         import inspect
@@ -1084,9 +1001,9 @@ class Int8BatchKernelTest(unittest.TestCase):
                       "linear does not call the nk int8 entry: decode falls back to the "
                       "[K, N] kernel, which measures 202-305 GB/s on the shapes that "
                       "dominate the step")
-        self.assertIn("nk_weight", source,
-                      "linear does not ask for the [N, K] copy, so the nk kernel would "
-                      "be fed a [K, N] tensor and read the wrong elements")
+        self.assertIn("w.wq", source,
+                      "linear does not hand the nk buffer straight to the kernel; any "
+                      "conversion here would allocate a [K, N] copy that no longer exists")
 
 
 if __name__ == "__main__":

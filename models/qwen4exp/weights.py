@@ -1,7 +1,7 @@
 """把 checkpoint 的张量装进 qwen4exp 的模型，并按 EP 切分专家。
 
 这一层不碰硬件、也不碰 ``safetensors``：它只认一个张量源
-源可以是内存字典（测试用）、safetensors 分片目录（集群用），或者 W4A8 量化产物。
+源可以是内存字典（测试用）、safetensors 分片目录（集群用），或者 int8 量化产物。
 把"从哪读"和"怎么装"分开，是唯一能在纯 CPU 开发机上验证加载路径的办法——真实
 权重是 360 GB，本机连一个分片都放不下。
 
@@ -236,7 +236,7 @@ def plan(source: TensorSource, config: TextConfig,
             末端 mixer 时必须给，否则会拿全模型的账目去核对单层的 ``state_dict``。
         max_layers: 只规划前 N 层。裁层跑通时（比如先装 4 层验装载与形状）源里
             仍有 48 层，不限制会让规划范围大过模型，校验报"计划张量不是模型参数"。
-        skip_experts: 跳过专家栈。量化路径下模型里的专家是 ``W4A8MoEWeight`` 而不
+        skip_experts: 跳过专家栈。量化路径下模型里的专家是 ``QWeightMoE`` 而不
             是 ``nn.Parameter``，bf16 的那两个张量根本不存在，装它只会白读 60 GB。
         with_mtp: 是否规划 ``mtp.*``。默认 ``False``：主模型不建 MTP 头时那 31 个
             张量无处安放，规划进来会让校验报「计划张量不是模型参数」。只有
@@ -368,7 +368,7 @@ def quantized_param_keys(model: torch.nn.Module) -> frozenset[str]:
     量化路径下 ``proj.Proj`` / ``proj.QuantizedEmbedding`` 的 bf16 占位权重在模型
     构造时就被释放（``release_quantized_placeholders``），于是它们既不在
     ``state_dict`` 里，也不该出现在按源张量规划出来的计划里：源那边读到的是
-    ``W4A8Weight``，``copy_`` 装不进去，而真正的挂载由 ``set_quantized`` 完成。
+    ``QWeight``，``copy_`` 装不进去，而真正的挂载由 ``set_quantized`` 完成。
 
     为什么选这条路，而不是「保留同形状的 meta 参数、量化后再置 None」：``to_empty``
     是 ``empty_like`` 每个 meta 参数，它不看这个参数之后会不会被删，于是 48 层稠密
@@ -466,7 +466,7 @@ def load_into(model: torch.nn.Module, source: TensorSource, config: TextConfig,
     plan_result = plan(source, config, local_experts, with_lm_head, subtree=subtree,
                        max_layers=max_layers, skip_experts=skip_experts,
                        with_mtp=with_mtp)
-    # 量化路径下稠密投影没有 bf16 参数可以 ``copy_``，它们的源张量是 ``W4A8Weight``，
+    # 量化路径下稠密投影没有 bf16 参数可以 ``copy_``，它们的源张量是 ``QWeight``，
     # 由调用方在装载完成之后交给 ``proj.set_quantized``。这一条必须在 ``verify``
     # 之前算出来：计划里留着这些键，两边都会报错（模型侧说没有源，计划侧说不是参数）。
     provided = quantized_param_keys(model)

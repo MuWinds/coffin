@@ -26,6 +26,7 @@ from models.qwen35.full_attn import FullAttn
 from models.qwen35.linear_attn import LinearAttn
 from models.qwen35.moe import SparseMoE
 from models.qwen35.parallel import row_projection
+from models.qwen35 import stages
 from ops.gemv import _proj
 from ops.norm import RMSNorm
 
@@ -210,6 +211,13 @@ class Layer:
         normed = (self.in_ln(x) if carry is None
                   else self._add_then_norm(self.in_ln, x, carry, carry))
         h = self.mix(normed, *ctx)
+        # MoE 层把「后置归一化 → 整块 → 跨 rank 求和 → 加共享专家」压成一次调用；
+        # 拿不到融合入口（非 EP、或扩展没这个符号）时返回 ``None``，走原编排。
+        layer_step = getattr(self.mlp, "layer_step", None)
+        if layer_step is not None:
+            fused = layer_step(x, h, self.post_ln.g)
+            if fused is not None:
+                return x, fused
         return x, self.mlp(self.post_ln.add_residual(x, h, h))
 
     def __call__(self, x: torch.Tensor, ctx) -> torch.Tensor:
@@ -242,9 +250,14 @@ class Layer:
         Returns:
             ``[C, hidden]`` 的输出激活。
         """
-        proj = self.mix.prefill_project(self.in_ln(x))
-        h = self.prefill_state(proj, positions, ctx, tiles, self.mix.prefill_row)
-        return x + self.mlp.prefill(self.norm_after_add(x, h))
+        with stages.span("block.in_ln+proj"):
+            proj = self.mix.prefill_project(self.in_ln(x))
+        with stages.span(f"block.{self.type}.state"):
+            h = self.prefill_state(proj, positions, ctx, tiles, self.mix.prefill_row)
+        with stages.span("block.mlp"):
+            out = x + self.mlp.prefill(self.norm_after_add(x, h))
+        stages.done_layer()
+        return out
 
     def prefill_state(self, proj, positions: torch.Tensor, ctx,
                       tiles: list | None, row: int) -> torch.Tensor:

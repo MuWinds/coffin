@@ -43,7 +43,6 @@ import torch.nn.functional as F
 
 from backends.protocol import Caps, Ops, make_device
 from int8_weights import QWeight
-from w4a8_weights import W4A8MoEWeight
 
 #: Mask fill value; ``-inf`` makes the softmax weight exactly zero.
 NEG_INF = float("-inf")
@@ -117,7 +116,7 @@ def _moe_grouped(w, x: torch.Tensor, offsets: torch.Tensor,
     多数后端能算但会白付一次启动，而 decode 期 128 个专家里往往只有几个非空。
 
     Args:
-        w: 专家栈，``[E, N, K]``，可以是 :class:`W4A8MoEWeight`。
+        w: 专家栈，``[E, N, K]``，:class:`int8_weights.QWeightMoE` 或稠密张量。
         x: 激活，``[tokens, K]``，已按专家号排序。
         offsets: ``[E+1]`` 前缀和，第 ``e`` 个专家吃 ``x[offsets[e]:offsets[e+1]]``。
         weight_dtype: int8 权重要反量化到的 dtype（权重比激活宽时不反量化）。
@@ -265,6 +264,37 @@ def _silu_mul(gate: torch.Tensor, up: torch.Tensor,
     """
     out.copy_(F.silu(gate) * up)
     return out
+
+
+def _kv_store(k: torch.Tensor, v: torch.Tensor, ks: torch.Tensor, vs: torch.Tensor,
+              slot: torch.Tensor, kc: torch.Tensor, vc: torch.Tensor,
+              ksc: torch.Tensor, vsc: torch.Tensor) -> torch.Tensor:
+    """单 token 的 k/v 与标尺写进线性 KV 缓存的 ``slot`` 列，作为融合入口的基线。
+
+    corex 这个入口是一次 ``kv_store`` 内核（四次写合成一次发射）。参考路径不需要
+    省发射，但**需要入口存在**：``models/qwen35/full_attn.py`` 在单槽位形状上
+    无条件调它，没有这条就退不到 ``index_copy_`` 的四行写法。语义与那四行逐字相同。
+
+    Args:
+        k: ``[nkv, hd]`` int8 key 行。
+        v: 同形状的 value 行。
+        ks: ``[nkv]`` fp32 key 标尺。
+        vs: 同形状的 value 标尺。
+        slot: ``[1]`` 槽位号。
+        kc: k 缓存，``[nkv, slots, hd]``，原地写入。
+        vc: v 缓存。
+        ksc: key 标尺缓存，``[nkv, slots]``。
+        vsc: value 标尺缓存。
+
+    Returns:
+        ``kc``，便于调用链串接。
+    """
+    s = int(slot.reshape(-1)[0])
+    kc[:, s] = k
+    vc[:, s] = v
+    ksc[:, s] = ks
+    vsc[:, s] = vs
+    return kc
 
 
 def _kv_pool_store(k: torch.Tensor, v: torch.Tensor, ks: torch.Tensor, vs: torch.Tensor,
@@ -1102,8 +1132,9 @@ def _hyper_down(normed: torch.Tensor, wt: torch.Tensor, out: torch.Tensor,
     """Read-gate down projection followed by ``silu(v / hc)``.
 
     ``wt`` arrives in the checkpoint layout ``[lowrank, K]``, the same ``[N, K]``
-    the rest of the contract uses; a ``weight_layout == "kn"`` backend transposes
-    it once on its own side. The division by ``hc`` must precede ``silu`` -- silu
+    the rest of the contract uses and the default of ``caps.weight_layout``; a
+    backend whose kernel wants ``[K, N]`` transposes it inside that one op on its
+    own side. The division by ``hc`` must precede ``silu`` -- silu
     is not linear, so applying it first is a different curve with unchanged shapes.
 
     Args:
@@ -1202,9 +1233,10 @@ def build(caps: Caps | None = None) -> Ops:
         rms_norm_gated=_rms_norm_gated,
         add_rms_norm=_add_rms_norm,
         kv_quant=_kv_quant,
+        kv_store=_kv_store,
         silu_mul=_silu_mul,
         kv_pool_store=_kv_pool_store,
-    shared_gate_scale=_shared_gate_scale,
+        shared_gate_scale=_shared_gate_scale,
         rope_apply=_rope_apply,
         attn_decode=_attn_decode,
         attn_paged=_attn_paged,
@@ -1225,11 +1257,12 @@ def build(caps: Caps | None = None) -> Ops:
         delta_normed_seq=_delta_normed_seq,
         triangular_solve=_triangular_solve,
         moe_grouped=functools.partial(_moe_grouped, weight_dtype=c.weight_dtype),
-    # int8 专家栈（``QWeightMoE``）走同一份参考实现：它按 ``offsets`` 逐段取专家、
-    # 反量化到计算 dtype 再做一次 ``F.linear``。差别只在激活不量化——参考语义里
-    # 没有那一步，所以它的输出是「无激活量化」的上界，与内核的差就是量化误差本身。
-    moe_grouped_i8=functools.partial(_moe_grouped, weight_dtype=c.weight_dtype),    moe_grouped_i8_merge=functools.partial(_moe_grouped_merge,
-                                            weight_dtype=c.weight_dtype),
+        # int8 专家栈（``QWeightMoE``）走同一份参考实现：它按 ``offsets`` 逐段取专家、
+        # 反量化到计算 dtype 再做一次 ``F.linear``。差别只在激活不量化——参考语义里
+        # 没有那一步，所以它的输出是「无激活量化」的上界，与内核的差就是量化误差本身。
+        moe_grouped_i8=functools.partial(_moe_grouped, weight_dtype=c.weight_dtype),
+        moe_grouped_i8_merge=functools.partial(_moe_grouped_merge,
+                                               weight_dtype=c.weight_dtype),
         moe_router=_moe_router,
         # 参考后端不实现这个合成入口：它是「同一串参考算子少跨几次语言边界」的加速形态，
         # 语义与逐个调用完全一致。在这里给一个能跑的替代只会掩盖「有人以为参考路径也走它」。

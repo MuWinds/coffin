@@ -17,7 +17,12 @@ import json
 import os
 import re
 
-TOOL_OPEN = "<tool_call>"
+from utils import chat_protocol
+
+# 强制工具调用靠把模板的开标记种进 prompt，所以这两个字面量必须与 checkpoint 模板
+# （以及解析器）用的是同一个写法，统一从 ``chat_protocol`` 取。
+TOOL_OPEN = chat_protocol.DEFAULT_MARKERS["tool_open"]
+FUNCTION_OPEN = chat_protocol.DEFAULT_MARKERS["function_open"]
 MAX_IMAGE_BYTES = int(os.environ.get("ENGINE_MAX_IMAGE_BYTES", 8 * 1024 * 1024))
 MAX_IMAGES = int(os.environ.get("ENGINE_MAX_IMAGES", 4))
 MAX_IMAGE_TOTAL_BYTES = int(
@@ -337,6 +342,10 @@ def _norm_messages(messages: list) -> list[dict]:
             role = "user"
         m["role"] = role
         m["content"] = _template_content(m.get("content"))
+        # 从别家转过来的客户端把思考段叫 ``reasoning``，而 Qwen 模板只认
+        # ``reasoning_content``；不改名，多轮里模型自己的推理历史就整段丢了。
+        if m.get("reasoning_content") is None and isinstance(m.get("reasoning"), str):
+            m["reasoning_content"] = m["reasoning"]
         calls = m.get("tool_calls")
         if isinstance(calls, list):
             fixed = []
@@ -489,7 +498,7 @@ def _tool_plan(body: dict) -> tuple[list | None, str]:
                 named = [t for t in tools
                          if isinstance(t, dict)
                          and (t.get("function") or {}).get("name") == name]
-                return (named or tools), f"{TOOL_OPEN}\n<function={name}>\n"
+                return (named or tools), f"{TOOL_OPEN}\n{FUNCTION_OPEN}{name}>\n"
             return tools, TOOL_OPEN + "\n"
     return tools, ""
 

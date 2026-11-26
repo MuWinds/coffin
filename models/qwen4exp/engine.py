@@ -48,7 +48,7 @@ def load_weights(model_dir, quant: bool = False, weight_dtype=None,
 
     Args:
         model_dir: checkpoint 目录。
-        quant: 是否期望 W4A8 量化产物。本 lane 不接量化装载，所以 ``True`` 直接抛
+        quant: 是否期望 int8 量化产物。本 lane 不接量化装载，所以 ``True`` 直接抛
             ``NotImplementedError``——静默按 bf16 读会先花几十分钟，然后在
             ``Tried to allocate`` 上失败，而那个错看不出根因是「量化没接上」。
         weight_dtype: 稠密张量的计算 dtype。本族的装载器按目标参数自己的 dtype
@@ -70,7 +70,7 @@ def load_weights(model_dir, quant: bool = False, weight_dtype=None,
     """
     if quant:
         raise NotImplementedError(
-            "qwen4exp 的 W4A8 装载还没接：量化产物由 proj.set_quantized 供货，"
+            "qwen4exp 的 int8 装载还没接：量化产物由 proj.set_quantized 供货，"
             "走的是量化那条路（M0/M2），本 lane 只有 bf16 流式装载。"
             "真机部署请先用 --no-quant 跑通，再等量化产物接上。")
     if vision:

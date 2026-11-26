@@ -26,8 +26,19 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 import time
 from pathlib import Path
+
+# 「torch 不在场」必须发生在**任何一条 import 之前**：``engine_api`` 与模型层都会
+# ``import torch``，而 :func:`cxrt.install.install` 只在真 torch 尚未入册时才肯装壳
+# （否则它会拒绝，见那边的文档）。所以这一步放在最前面，由 ``COFFIN_NO_TORCH=1``
+# 显式打开——它是进程级的别名，不是本脚本的开关，装完同一个进程里所有 ``import torch``
+# 都拿到我们自己的实现。
+if os.environ.get("COFFIN_NO_TORCH", "0") == "1":                # pragma: no cover
+    import cxrt.install as _no_torch
+
+    _no_torch.install()
 
 import torch
 from tokenizers import Tokenizer
@@ -137,10 +148,22 @@ def main() -> None:
     # 会把它当成普通 checkpoint 走反量化路径，70 GB 的稠密权重在 32 GB 的卡上是 OOM，
     # 而不是一句"用错了目录"。
     ap.add_argument("--int8", action="store_true",
-                    help="load a pre-quantised directory as int8/W4A8 instead of dequantising")
+                    help="load a pre-quantised directory as int8 instead of dequantising")
     ap.add_argument("--no-graph", action="store_true",
                     help="disable the device-graph decode path and run eager")
     args = ap.parse_args()
+
+    # ``COFFIN_NO_TORCH=1`` 时这一句是硬门槛，不是日志：真 torch 要是从某条新加的
+    # import 里溜进来，这里立刻炸，而不是安静地跑在真 torch 上、让「链路里没有 torch」
+    # 这句话变成一句口头承诺。
+    if os.environ.get("COFFIN_NO_TORCH", "0") == "1":             # pragma: no cover
+        from cxrt import install as _nt
+
+        if not _nt.verify():
+            raise SystemExit("COFFIN_NO_TORCH=1: sys.modules['torch'] is not the cxrt shim "
+                             f"({sys.modules.get('torch')!r}); a real torch got imported "
+                             "before the shim was installed")
+        print(f"torch-free: torch -> {torch.__file__} (Tensor = {torch.Tensor})", flush=True)
 
     tok = Tokenizer.from_file(str(Path(args.model) / "tokenizer.json"))
 

@@ -26,10 +26,9 @@ bf16——连激活一起量化（W8A8）要在关键路径上再加一个量化
 所有一维归一化权重同样保留。
 
 Constraints:
-    * 权重保持行主序 ``[N, K]``，那是 checkpoint 发出的、HIP 内核索引的布局；这里
-      只换 dtype，绝不换布局。唯一一处例外是 :meth:`QWeight.from_kn`：它接受内核
-      布局 ``[K, N]``（也就是离线预量化写到盘上的那个形状）并交出 ``[N, K]`` 转置
-      视图，目的是让 ``pack.to_kn`` 的那次 ``.contiguous()`` 成为空操作。
+    * 权重保持行主序 ``[N, K]``，那是 checkpoint 发出的、内核索引的布局；这里
+      只换 dtype，绝不换布局。kn（``[K, N]``）那一套已经整条删除，包括
+      :meth:`QWeight.from_kn` 与 ``QWeightMoE`` 的 kn 装载分支。
     * 存储的是 int8 加每输出行一个 fp32 scale，数学依赖这一配对：不带行 scale 反量化，
       或者按张量缩放，都会重新引入本方案避开的漂移。
     * ``dequant`` 会实体化一份稠密拷贝。它只为预填充 GEMM 路径存在；在解码循环里
@@ -39,8 +38,6 @@ Constraints:
 """
 
 from __future__ import annotations
-
-import os
 
 import torch
 
@@ -73,15 +70,15 @@ def is_quantizable(key: str, w: torch.Tensor) -> bool:
 
 
 class QWeightMoE:
-    """一组共享 K 的 int8 专家，``[E, K, N]`` int8 加 ``[E, N]`` fp32 scale。
+    """一组共享 K 的 int8 专家，``[E, N, K]`` int8 加 ``[E, N]`` fp32 scale。
 
-    布局是 ``kn``（K 轴在外、N 轴连续），与 ``W4A8MoEWeight`` 的 packed 一致，也正好是
-    本卡 ``gemv_kn_i8`` 要的形状：``expert(e)`` 交出的 ``QWeight`` 由 ``from_kn`` 构造，
-    它内部只取一个转置视图，``pack.to_kn`` 的 ``.contiguous()`` 因此是空操作。
+    布局只有 ``nk``（N 轴在外、K 连续），这既是盘上 checkpoint 的形状，也是本卡
+    ``moe_grouped_i8*`` 一族内核要的形状：``nk_stack()`` 零拷贝交出那一份，
+    ``expert(e)`` 交出的 ``QWeight`` 由 ``from_nk`` 构造，内部不复制也不转置。
 
-    反过来（存 ``[E, N, K]``）不会报错，但每次 ``bops.linear`` 都要真转置一遍 2-4 MB
-    的 int8 权重：``pack.as_kn`` 的缓存键是 ``id(w.wq)``，而每次新建的视图对象 id 都不同，
-    缓存必然 miss。实测这一步让每专家一次调用贵到 289 us（4.62 ms/层，decode 224 ms/token）。
+    kn（``[E, K, N]``）那一档已经删除：它每步都要真转置一遍 2-4 MB 的 int8 权重
+    （实测每专家一次调用 289 us、4.62 ms/层、decode 224 ms/token），而 NK 是后续要
+    专门优化的唯一布局。
 
     MoE 的专家在 checkpoint 里是逐个二维张量（``experts.{e}.gate_proj.weight``），
     逐专家建 :class:`QWeight` 会让解码一步变成 40 层 x 8 槽 x 2 次小调用，光是主机侧
@@ -90,92 +87,46 @@ class QWeightMoE:
     ``index_select`` 就能把命中的专家凑齐。
 
     Constraints:
-        * ``wq`` 必须是 ``[E, K, N]`` 连续 int8，``scale`` 必须是 ``[E, N]`` 连续 fp32。
-          三维张量按 ``[N, K]`` 解释时形状校验照样能过，于是错位要到第一次取专家才
-          算出来——所以这里逐维校验。
+        * ``wq`` 必须是 ``[E, N, K]`` 连续 int8，``scale`` 必须是 ``[E, N]`` 连续
+          fp32。三维张量按转置解释时形状校验照样能过，于是错位要到第一次取专家才算
+          出来——所以这里逐维校验。
         * 第 ``e`` 个专家的视图是**视图**不是拷贝：``w8a8`` 内核本来就按偏移读这块
           连续内存，拷贝会把省下的带宽还回去。
     """
 
-    __slots__ = ("expert_count", "k", "n", "_wq", "scale", "_cache", "_nk", "_kn",
-                 "layout")
+    __slots__ = ("expert_count", "k", "n", "_wq", "scale", "_cache")
 
-    def __init__(self, wq: torch.Tensor, scale: torch.Tensor, *, k: int,
-                 layout: str = "kn") -> None:
+    def __init__(self, wq: torch.Tensor, scale: torch.Tensor, *, k: int) -> None:
         """校验形状关系并原地持有两块缓冲。
 
         Args:
-            wq: ``layout="kn"`` 时是 ``[E, K, N]`` 连续 int8（K 轴在外、N 连续）；
-                ``layout="nk"`` 时是 ``[E, N, K]`` 连续 int8，直接从 checkpoint 读来，
-                不再在内存里转置。
-            scale: ``[E, N]`` 连续 fp32，每专家每输出行一个 absmax scale。两种布局
-                共用同一份 scale（它按 N 索引，与 K 的摆放无关）。
+            wq: ``[E, N, K]`` 连续 int8，直接从 checkpoint 读来，不在内存里转置。
+            scale: ``[E, N]`` 连续 fp32，每专家每输出行一个 absmax scale。
             k: 每个专家沿 K 的长度。
-            layout: ``"kn"`` 或 ``"nk"``。``"nk"`` 时 :meth:`nk_stack` 零拷贝返回，
-                :attr:`wq` 变成惰性转置——只有真正吃 kn 的消费者（预填充的大 M
-                GEMM、单流解码）才会付那次拷贝。
 
         Raises:
             ValueError: 维度、dtype、连续性或形状关系不符。
         """
-        if layout not in ("kn", "nk"):
-            raise ValueError(f"moe int8 layout must be 'kn' or 'nk', got {layout!r}")
         if wq.dim() != 3 or wq.dtype != torch.int8 or not wq.is_contiguous():
             raise ValueError(
-                f"moe int8 weight must be contiguous 3-D int8 "
-                f"[E, K, N] for kn or [E, N, K] for nk, got {tuple(wq.shape)}")
+                f"moe int8 weight must be contiguous 3-D int8 [E, N, K], got "
+                f"{tuple(wq.shape)}")
         if scale.dim() != 2 or scale.dtype != torch.float32 or not scale.is_contiguous():
             raise ValueError("moe int8 scale must be contiguous 2-D fp32 [E, N]")
         experts = int(wq.shape[0])
-        # ``k`` 永远在最内或次内那一维的另一端：kn 是 dim1、nk 是 dim2。
-        k_dim = int(wq.shape[1]) if layout == "kn" else int(wq.shape[2])
-        n = int(wq.shape[2]) if layout == "kn" else int(wq.shape[1])
+        k_dim = int(wq.shape[2])
+        n = int(wq.shape[1])
         if k <= 0 or k_dim != k:
             raise ValueError(f"moe int8 weight holds K={k_dim} but k={k}")
         if tuple(scale.shape) != (experts, n):
             raise ValueError(f"moe int8 scale must be {(experts, n)}, got {tuple(scale.shape)}")
         self._wq = wq
-        #: 权重在内存里的真实布局。``"nk"`` 表示这是一份 nk 原生栈，没有 kn 副本。
-        self.layout = layout
         self.scale = scale
         self.expert_count = experts
         self.n = n
         self.k = int(k)
-        #: 逐专家的 ``QWeight`` 缓存。每次新建视图会让 ``pack.as_kn`` 的 ``id()`` 键
-        #: 全部失效，转置成本就落在解码路径上；这里让同一个专家永远交同一个对象。
+        #: 逐专家的 ``QWeight`` 缓存，让同一个专家永远交同一个对象。
         self._cache = None
-        #: ``nk`` 原生时按需生成的 ``[E, K, N]`` kn 副本，见 :attr:`wq`。
-        self._kn = None
-
-    @property
-    def wq(self) -> torch.Tensor:
-        """``[E, K, N]`` 连续 int8（kn）。
-
-        ``layout="kn"`` 时就是 checkpoint 里那一份本身；``layout="nk"`` 时惰性转置
-        一次并缓存——**只有**吃 kn 的消费者会触发它（预填充的 ``moe_grouped_gemm``、
-        单流解码的 ``moe_decode_block``）。纯解码批量路径走 :meth:`nk_stack`，
-        永远不会碰这里，所以 nk 原生 checkpoint 在解码节点上不占第二份显存。
-
-        Returns:
-            ``[E, K, N]`` 连续 int8。
-
-        Notes:
-            ``transpose(1, 2).contiguous()`` 而不是 ``permute``：内核按行主序索引，
-            交出非连续视图会让每次列读跨 stride，等于白改布局。
-        """
-        if self.layout == "kn":
-            return self._wq
-        kn = self._kn
-        if kn is None:
-            # 诊断钩子：nk 原生栈上这一次转置是**整栈**的（每层 805 MB，40 层 32 GB），
-            # 在 31.7 GiB 的卡上等于直接 OOM。要查是谁在预填充里摸到它，开
-            # ``COFFIN_WQ_TRACE=1`` 就会把调用栈打出来。
-            if os.environ.get("COFFIN_WQ_TRACE") == "1":
-                import traceback
-                print("[wq-transpose]", tuple(self._wq.shape), flush=True)
-                print("".join(traceback.format_stack()[-5:]), flush=True)
-            kn = self._kn = self._wq.transpose(1, 2).contiguous()
-        return kn
 
     def __len__(self) -> int:
         """专家个数。"""
@@ -200,12 +151,8 @@ class QWeightMoE:
             cache = self._cache = [None] * self.expert_count
         view = cache[index]
         if view is None:
-            # nk 原生时只转置这一个专家（几 MB），不碰整份栈——:attr:`wq` 那条路
-            # 会把 40 层的全部专家一次转完，诊断路径不值得付这个。
-            src = self._wq[index]
-            if self.layout == "nk":
-                src = src.transpose(0, 1).contiguous()
-            view = QWeight.from_kn(src, self.scale[index])
+            # nk 原生：直接切一行专家，零转置。
+            view = QWeight.from_nk(self._wq[index], self.scale[index])
             cache[index] = view
         return view
 
@@ -214,36 +161,23 @@ class QWeightMoE:
         return torch.stack([self.expert(i).dequant(dtype) for i in range(self.expert_count)])
 
     def nk_stack(self) -> torch.Tensor:
-        """``[E, N, K]`` 连续 int8 副本，供解码期的 nk 分组核读取。
+        """``[E, N, K]`` 连续 int8，供解码期的 nk 分组核读取。
 
-        置顶的 ``wq`` 是 ``kn``（K 轴在外）：一个 warp 在固定 k 上读到的 128 字节是
-        一个整事务，但 ``__dp4a`` 要的 32 位字得靠四次单字节读拼。``[E, N, K]`` 让每一列
-        的 K 连续，一次 32 位加载就是那个字，且整轮 128 字节仍是一段连续内存——这是
-        稠密投影上已经量过的 1.02-1.63 倍（``gemv_kn_i8`` -> ``gemv_nk_i8``）。
-
-        与 ``pack.as_kn`` 同一个理由，这里**必须**是一次性拷贝并缓存：转置 2 MB/专家的
-        权重如果落在解码路径上，省下的带宽会被它自己吃掉。首次调用（预热阶段）做一次
-        ``[E, K, N] -> [E, N, K]`` 的 device 拷贝，之后返回同一块存储。
+        就是 checkpoint 原生那一份，零拷贝：``[E, N, K]`` 让每一列的 K 连续，一次
+        32 位加载就是 ``__dp4a`` 要的那个字，且整轮 128 字节仍是一段连续内存——这是
+        稠密投影上已经量过的 1.02-1.63 倍。
 
         Returns
         -------
         torch.Tensor
-            ``[E, N, K]`` 连续 int8。EP4 下一张卡 64 个专家约 192 MB，与 ``wq`` 各占一份。
+            ``[E, N, K]`` 连续 int8。EP4 下一张卡 64 个专家约 192 MB，只有这一份。
 
         Notes
         -----
-        预填充仍按 ``kn`` 走库 GEMM，所以两份都留着；这里只加解码期的那一份。
+        预填充也按 nk 走（``moe_grouped_i8_tcu`` / 库 GEMM 的 ``[N, K]`` 当列主序），
+        所以整条链上只有这一份，没有 kn 副本。
         """
-        nk = getattr(self, "_nk", None)
-        if self.layout == "nk":
-            # 原生 nk：直接就是 checkpoint 里那一份，零拷贝。
-            return self._wq
-        if nk is None:
-            # ``transpose(1, 2).contiguous()`` 而不是 ``permute``：内核按行主序索引，
-            # 交出非连续视图会让每次列读跨 stride，等于白改布局。
-            nk = self.wq.transpose(1, 2).contiguous()
-            self._nk = nk
-        return nk
+        return self._wq
 
 
 class QWeight:
@@ -268,40 +202,34 @@ class QWeight:
         self.n, self.k = wq.shape
 
     @classmethod
-    def from_kn(cls, wt: torch.Tensor, scale: torch.Tensor) -> "QWeight":
-        """包住一份已经是 ``[K, N]`` 的 int8 权重，不复制也不转置。
+    def from_nk(cls, w: torch.Tensor, scale: torch.Tensor) -> "QWeight":
+        """包住一份已经是 ``[N, K]`` 的 int8 权重，零拷贝。
 
-        ``backends/corex/pack.to_kn`` 消费 ``QWeight`` 的方式是 ``w.wq.t()`` 再
-        ``.contiguous()``。这里交出的 ``wq`` 是 ``wt`` 的转置视图（strides
-        ``(1, N)``），所以那一步取回来正是 ``wt`` 自己，``.contiguous()`` 空转不复制。
-        离线预量化到盘上时就写成 ``[K, N]``，省掉的正是这一次转置。
+        这是契约布局：盘上、``QWeight.wq``、内核读的 ``nk`` 缓冲三处是同一份内存，
+        所以这里只做校验——形状写反了要到第一次点积才变成「数看着合理但不对」，
+        那时已经晚了。
 
         Args:
-            wt: ``[K, N]`` 连续存放的 int8 权重，内核读取的布局。
-            scale: ``[N]`` 个 fp32 scale，每个输出列一个。
+            w: ``[N, K]`` 连续存放的 int8 权重。
+            scale: ``[N]`` 个 fp32 scale，每输出行一个。
 
         Returns:
-            ``wq`` 为转置视图的 ``QWeight``。
+            ``wq`` 就是 ``w`` 本身的 ``QWeight``。
 
         Raises:
-            ValueError: ``wt`` 不是二维 int8、``scale`` 不是一维 fp32，或两者长度对
-                不上。拿错元素算出来的数看着合理，所以在这里拒绝。
+            ValueError: ``w`` 不是二维连续 int8、``scale`` 不是一维 fp32，或长度对不上。
         """
-        if wt.dim() != 2 or wt.dtype != torch.int8:
-            raise ValueError(f"packed int8 weight must be 2-D int8, got "
-                             f"{tuple(wt.shape)} {wt.dtype}")
+        if w.dim() != 2 or w.dtype != torch.int8:
+            raise ValueError(f"nk int8 weight must be 2-D int8, got "
+                             f"{tuple(w.shape)} {w.dtype}")
+        if not w.is_contiguous():
+            raise ValueError("nk [N, K] weight must be contiguous")
         if scale.dim() != 1 or scale.dtype != torch.float32:
             raise ValueError("scale must be 1-D fp32")
-        k, n = int(wt.shape[0]), int(wt.shape[1])
+        n = int(w.shape[0])
         if int(scale.numel()) != n:
             raise ValueError(f"scale holds {scale.numel()} values for N = {n}")
-        if not wt.is_contiguous():
-            raise ValueError("packed [K, N] weight must be contiguous")
-        obj = cls.__new__(cls)
-        obj.wq = wt.t()                   # [N, K] 视图，strides (1, N)
-        obj.scale = scale
-        obj.n, obj.k = n, k
-        return obj
+        return cls(w, scale)
 
     @classmethod
     def quantize(cls, w: torch.Tensor, chunk_rows: int = _QUANT_CHUNK_ROWS) -> "QWeight":

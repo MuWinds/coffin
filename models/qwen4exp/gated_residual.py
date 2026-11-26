@@ -49,7 +49,7 @@ _HYPER_OPS = frozenset({"hyper_norm", "hyper_down", "hyper_up"})
 
 #: 融合超连接是否已**接线正确并验证过语义**。
 #:
-#: 2026-11-02 真机（作业 4548/4551，gpu-node-06，48 层 W4A8 EP=4 单卡，真 n-gram 表）
+#: 2026-11-02 真机（作业 4548/4551，gpu-node-06，48 层 w8a8 EP=4 单卡，真 n-gram 表）
 #: ``COFFIN_HYPER_FUSED=off`` 对 ``on`` 两臂对照：
 #:
 #:   判据            结果
@@ -64,7 +64,7 @@ _HYPER_WIRED = True
 
 #: 融合超连接当前是否**真的更快**。接线正确与值得开启是两件事，所以是两个常量。
 #:
-#: **当前为 ``True``**。2026-11-03 真机（gpu-node-06，48 层 W4A8 EP=4 单卡，真
+#: **当前为 ``True``**。2026-11-03 真机（gpu-node-06，48 层 w8a8 EP=4 单卡，真
 #: n-gram 表）三轮迭代，每轮都是同树两臂独立进程：
 #:
 #:   作业       off 臂      on 臂       收益      hyper_up    hyper_down
@@ -136,7 +136,7 @@ _HYPER_MODE = os.environ.get("COFFIN_HYPER_FUSED", "").strip().lower()
 #: 都是标准 GEMM，而内核还在按「一块一列、K 轴切片累加」的 GEMV 结构跑。
 #:
 #: 所以按行数分档：**超过这个数就退回纯 torch 链**——那条链里的 ``Proj`` 会走到
-#: ``linear_prefill`` → ``w4a8_gemm_tcu``/``matmul``，正是 prefill 该走的路。分界取
+#: ``linear_prefill`` → 张量核 GEMM/``matmul``，正是 prefill 该走的路。分界取
 #: :data:`proj._SMALL_ROWS`（8）之上的一档，因为 decode 的批量也是 1-8 行，而 16 行
 #: 以上已经确定是 prefill 的领地。
 _HYPER_FUSED_MAX_ROWS = 16
@@ -245,7 +245,7 @@ class GatedResidual(nn.Module):
 
         三个 ``hyper_*`` 核是照 ``M == 1`` 调的，在 prefill 的行数上会输给 GEMM：
         作业 ``q4prebase2`` 的 ``seq=2048`` 账本里 ``hyper_down``/``hyper_up`` 各
-        16.1 ms/次（96 次共 3086 ms，占 31.9%），而同一份工作走 ``w4_gemm_tcu``
+        16.1 ms/次（96 次共 3086 ms，占 31.9%），而同一份工作走张量核 GEMM
         只要 2.9 ms/次。见 :data:`_HYPER_FUSED_MAX_ROWS`。
 
         Args:

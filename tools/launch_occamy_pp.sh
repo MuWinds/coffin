@@ -15,7 +15,7 @@ set -u
 H=/data/home/2024240384035
 PY=/data/software/Anaconda3/2024.10-1/envs/py310/bin/python
 ENGINE_ROOT=$(cd "$(dirname "$0")/.." && pwd)
-MODEL=${OCCAMY_MODEL:-$H/models/occamy-1.0-W8A8-kn}
+MODEL=${OCCAMY_MODEL:-$H/models/occamy-1.0-W8A8-nk}
 WORLD=${OCCAMY_WORLD:-4}
 SOCK=${OCCAMY_SOCK:-/tmp/occamy_pp.sock}
 LOGDIR=${OCCAMY_LOGS:-$H/coffin-work/base/occamy_pp_logs}

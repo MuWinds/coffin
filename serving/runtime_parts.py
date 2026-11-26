@@ -22,9 +22,13 @@ import os
 import queue
 import threading
 import time
+import traceback
 from pathlib import Path
 
 import torch
+
+if os.environ.get("COFFIN_CPY_TRACE"):
+    from . import cpy_trace  # noqa: F401  一次性拷贝溯源（不带环境变量时根本不 import）
 
 import backends
 import engine_api
@@ -33,6 +37,7 @@ from engine.config import EngineConfig
 from engine.prefix_engine import merge_parts
 from engine.sequence import SamplingParams, Sequence, SequenceStatus
 from utils.tool_call import parse_tool_calls, split_thinking
+from utils import chat_protocol
 
 from .runtime_support import (MMError, _decode_image, allocated_gib, empty_cache,
                               profiler_activities, reserved_gib, sync)
@@ -215,6 +220,10 @@ class RuntimeLifecycleMixin:
             # 服务要继续活着，所以把错误报给每个在途请求，而不是把线程弄挂。
             except Exception as exc:  # noqa: BLE001
                 print(f"[serve] engine step failed: {exc}", flush=True)
+                # 栈一定要打：一行消息只能说明「哪类错」，定位靠的是调用链。前几次排
+                # 战线上的问题（见 `docs/DECODE-LAUNCH-LEDGER.md` §12.13）就因为没有栈
+                # 只能靠猜。异常路径不在热路径上，打印成本无所谓。
+                traceback.print_exc()
                 self._fail(str(exc))
                 self.engine.reset()
                 continue
@@ -683,10 +692,23 @@ class RuntimeChatMixin:
         Returns:
             ``(token_ids, text)``。保留文本，是因为图像路径要把*渲染好的* prompt
             交给处理器，也因为调用方会看它的结尾判断思考段有没有被打开。
+
+        Raises:
+            MMError: checkpoint 没有可用的对话模板（400）——回一个能读懂的理由，
+                而不是让 jinja 在请求中间抛 traceback。两个模型族的模板来源不同：
+                qwen3.5 写在 ``tokenizer_config.json`` 里，occamy 1.0 放在同目录的
+                ``chat_template.jinja``，加载时已经由 ``ensure_template`` 统一。
         """
-        text = self.tok.apply_chat_template(
-            messages, tools=tools, enable_thinking=enable_thinking,
-            tokenize=False, add_generation_prompt=True)
+        if not getattr(self.tok, "chat_template", None):
+            raise MMError("checkpoint has no chat template: put one in "
+                          "tokenizer_config.json or chat_template.jinja", 400)
+        try:
+            text = self.tok.apply_chat_template(
+                messages, tools=tools, enable_thinking=enable_thinking,
+                tokenize=False, add_generation_prompt=True)
+        except Exception as exc:      # noqa: BLE001 - jinja 的错误五花八门
+            raise MMError(f"chat template failed: {type(exc).__name__}: {exc}",
+                          400) from exc
         if forced_prefix:
             # ``tool_choice: required``（OpenAI 的 ``ChatCompletionToolChoiceOption``）
             # 是靠续写 assistant 轮次实现的：渲染好的 prompt 已经停在 assistant 头
@@ -709,13 +731,12 @@ class RuntimeChatMixin:
         """
         return self._render_with_text(messages, tools, enable_thinking, forced_prefix)[0]
 
-    @staticmethod
-    def _split(raw: str, enable_thinking: bool) -> tuple[str, str]:
+    def _split(self, raw: str, enable_thinking: bool) -> tuple[str, str]:
         """在知道有没有要求思考的前提下，把推理段和答案分开。
 
         ``split_thinking`` 分不清「没有推理」和「推理在闭合标记之前就被截断了」：
-        开着思考而文本里没有 ``</think>`` 时，到目前为止生成的全部*都是*推理。
-        把它当答案返回，思考模型的内心独白就会变成一条看起来像回复的东西。
+        开着思考而文本里没有闭合标记时，到目前为止生成的全部*都是*推理。把它当
+        答案返回，思考模型的内心独白就会变成一条看起来像回复的东西。
 
         Args:
             raw: 完整的生成文本，含强制开头。
@@ -725,10 +746,66 @@ class RuntimeChatMixin:
             ``(thinking, answer)``。模型什么都没产出时两者都是空串；推理段被截断
             时答案是空串。
         """
-        thinking, answer = split_thinking(raw)
-        if enable_thinking and not thinking and "</think>" not in raw:
+        thinking, answer = split_thinking(raw, self.markers)
+        if enable_thinking and not thinking and self.markers["think_close"] not in raw:
             thinking, answer = answer, ""
         return thinking, answer
+
+    def _drop_control(self, text: str) -> str:
+        """剔掉解码结果里混进来的轮次控制 token。
+
+        流式解码必须保留 ``<think>``、``<tool_call>`` 这类结构标记——它们就是模板
+        方言，而推理段的闭合标记正是外壳切分推理和答案的唯一依据。但
+        ``<|im_end|>``、``<|endoftext|>`` 这类控制 token 发给客户端只会变成可见
+        乱码，所以按字符串整段剔掉：它们是单个 token，解码结果里必然完整出现。
+
+        Args:
+            text: 一段增量解码结果。
+
+        Returns:
+            去掉 ``<|...|>`` 形状控制 token 之后的文本。
+        """
+        for token in self.control_texts:
+            if token in text:
+                text = text.replace(token, "")
+        return text
+
+    def _thinking_for(self, req: dict, prefix: str) -> bool:
+        """这一轮模板是否真的会打开推理段。
+
+        请求要思考、又没在强制调用，还不够：模板本身得认 ``enable_thinking``。
+        两个模型族的模板同源，但把判断绑在模板实际能力上，换模板时行为不会悄悄
+        变成「要了思考、却按思考模式切分一段没有思考的输出」。
+
+        Args:
+            req: 请求字典。
+            prefix: 强制工具调用的开头；非空时这一轮必须关掉推理。
+
+        Returns:
+            模板这一轮会打开 ``<think>`` 时为 ``True``。
+        """
+        return bool(req.get("enable_thinking", False)) and not prefix \
+            and self.template_thinks
+
+    def _reasoning_tokens(self, out: list[int], thinking_on: bool) -> int | None:
+        """落在推理段里的 token 数，供 OpenAI 的 ``usage.reasoning_tokens``。
+
+        闭合标记在词表里是单 token 时，它在生成序列里的下标就是推理段的长度。
+        截断的推理段（没有闭合标记）整段都算推理。词表里没有这个 token 时返回
+        ``None``——由调用方省略该字段，而不是报一个不准的数。
+
+        Args:
+            out: 生成的 token id。
+            thinking_on: 这一轮是否要求了推理。
+
+        Returns:
+            推理段的 token 数；数不准时为 ``None``。
+        """
+        if self.think_close_id is None:
+            return None
+        if self.think_close_id in out:
+            return out.index(self.think_close_id)
+        return len(out) if thinking_on else 0
 
     def _render_request(self, req: dict, thinking_on: bool, prefix: str):
         """渲染一个请求的 prompt -> ``(token_ids, text, MMInput|None)``。
@@ -797,8 +874,8 @@ class RuntimeChatMixin:
         prefix = str(req.get("tool_prefix") or "")
 
         # 强制调用必须开在答案最前面，所以这一轮关掉推理：否则模板会在调用该出现
-        # 的位置先打开 ``<think>``。
-        thinking_on = bool(req.get("enable_thinking", False)) and not prefix
+        # 的位置先打开推理段。
+        thinking_on = self._thinking_for(req, prefix)
         try:
             ids, prompt, mm = self._render_request(req, thinking_on, prefix)
         except MMError as exc:
@@ -809,7 +886,12 @@ class RuntimeChatMixin:
         temp = float(req.get("temperature", 0.0))
         deadline = self._deadline(req)
         yield {"type": "start", "n_prompt": len(ids), "max_new": n,
-               "prompt_opens_think": prompt.rstrip().endswith("<think>"),
+               # 由 prompt 本身判断，而不是靠字符串结尾猜：模板可能把开标记和换行
+               # 拆在两处，两个模型族的模板细节也不必一致。
+               "prompt_opens_think": chat_protocol.opens_reasoning(prompt, self.markers),
+               # 外壳的流式过滤器靠这一份解析推理段和调用标记，两个模型族各用
+               # 自己模板里的写法，外壳不写死任何一个。
+               "markers": self.markers,
                "forced_tool": bool(prefix),
                "n_images": mm.num_images if mm is not None else 0,
                "image_tokens": len(mm) if mm is not None else 0}
@@ -834,7 +916,12 @@ class RuntimeChatMixin:
                 # 停在 UTF-8 序列中间，所以它的 id 先扣住，和接下来的几个一起解码，
                 # 直到那个字符补齐。
                 held = hold + [nxt] if hold else [nxt]
-                text = self.tok.decode(held, skip_special_tokens=True)
+                # 不能按 ``skip_special_tokens`` 解码：``<think>``、``<tool_call>``
+                # 这些是模板方言的一部分，被当成控制 token 吃掉之后，外壳就看不到
+                # 推理段的闭合标记，整段答案会被错误地归进 ``reasoning_content``。
+                # 轮次结束的控制 token 单独剔掉（见 ``_drop_control``）。
+                text = self._drop_control(
+                    self.tok.decode(held, skip_special_tokens=False))
                 if text.endswith("\ufffd"):
                     hold = held
                 else:
@@ -844,7 +931,8 @@ class RuntimeChatMixin:
             if ev["done"]:
                 break
         if hold:                         # 这个字符始终没补全（被截断）
-            text = self.tok.decode(hold, skip_special_tokens=True)
+            text = self._drop_control(
+                self.tok.decode(hold, skip_special_tokens=False))
             if text:
                 yield {"type": "token", "id": hold[-1], "text": text}
         t_dec = time.time() - t1
@@ -855,10 +943,11 @@ class RuntimeChatMixin:
         # 否则那个块看起来就是一段没有 `<tool_call>` 包着的 `<function=...>`。
         full = prefix + raw
         thinking, answer = self._split(full, thinking_on)
-        calls = parse_tool_calls(answer)
+        calls = parse_tool_calls(answer, req.get("tools"), self.markers)
         yield {"type": "done", "ok": True, "text": answer, "thinking": thinking,
                "raw": full, "tokens": out,
                "tool_calls": [c.to_openai_dict() for c in calls],
+               "n_reasoning": self._reasoning_tokens(out, thinking_on),
                "n_prompt": len(ids), "n_new": len(out), "max_new": n,
                "window_full": window_full, "cached_tokens": self._cached_tokens(),
                "prefill_ms": round(t_pre * 1000, 1),
@@ -907,20 +996,19 @@ class RuntimeChatMixin:
                 self._cv.notify_all()
 
     def _decode_one(self, logits: torch.Tensor) -> torch.Tensor:
-        """把 ``logits`` 的 argmax 喂回去，走一次解码步。
+        """走一次贪心解码步，返回下一步的 logits。
 
-        它把诊断同样需要的图/eager 选择包了一层：关掉 capture 时模型没有图可回放，
-        ``decode_step`` 会抛异常。两个入口产出的数字一样，基准因此测的是它实际
-        拥有的启动方式，而不是因为缺一张图就失败。
+        它的 token 回填不走主机：``argmax`` 与写回都是设备上的小内核，一次 D2H 都不
+        发生。这条循环量的是解码器本身，不该把「每 token 取回一次分词结果」的代价
+        摊进来——那是流式服务的事，由引擎在产出 token 的地方付。
 
         Args:
-            logits: 来自预填充或上一步的 ``[vocab]`` logits。
+            logits: 上一步的 ``[vocab]`` logits；内容由模型自己回填时不需要它。
 
         Returns:
             下一个位置的 logits；两种路径下都是同一个缓冲区。
         """
-        token = int(logits.argmax())
-        return self.model.decode_step(token) if self.graph else self.model.logits(token)
+        return self.model.decode_step() if self.graph else self.model.greedy_logits()
 
     def _handle_impl(self, req: dict, on_submitted=None) -> dict:
         """分派一个操作并构造它的回复。
@@ -963,6 +1051,11 @@ class RuntimeChatMixin:
                    "image_min_pixels": self.image_min_pixels,
                    "max_images": self.max_images,
                    "n_image_req": self.n_image_req,
+                   # 对话线格式：外壳的流式解析按这一份走，两个模型族各用自己模板
+                   # 里出现的标记；``thinks`` 为 False 说明模板不认思考开关。
+                   "chat": {"markers": self.markers,
+                            "thinks": self.template_thinks,
+                            "reasoning_tokens": self.think_close_id is not None},
                    "processor": ("loaded" if self.processor is not None
                                  else ("failed" if self._processor_failed else "lazy"))}
 
@@ -1010,7 +1103,7 @@ class RuntimeChatMixin:
                     "spec_k": k if spec else 0, "spec": spec}
         if op == "chat":
             prefix = str(req.get("tool_prefix") or "")
-            thinking_on = bool(req.get("enable_thinking", False)) and not prefix
+            thinking_on = self._thinking_for(req, prefix)
             try:
                 ids, _prompt, mm = self._render_request(req, thinking_on, prefix)
             except MMError as exc:
@@ -1029,9 +1122,10 @@ class RuntimeChatMixin:
             raw = self.tok.decode(out, skip_special_tokens=False)
             full = prefix + raw
             thinking, answer = self._split(full, thinking_on)
-            calls = parse_tool_calls(answer)
+            calls = parse_tool_calls(answer, req.get("tools"), self.markers)
             return {"ok": True, "text": answer, "thinking": thinking, "raw": full,
                     "tool_calls": [c.to_openai_dict() for c in calls], "forced_tool": bool(prefix),
+                    "n_reasoning": self._reasoning_tokens(out, thinking_on),
                     "n_prompt": len(ids), "n_new": len(out), "max_new": n,
                     "window_full": window_full, "cached_tokens": self._cached_tokens(),
                     "prefill_ms": round(t_pre * 1000, 1),
@@ -1065,6 +1159,29 @@ class RuntimeChatMixin:
             return self._pd_decode(req)
         if op == "pd_decode_batch":
             return self._pd_decode_batch(req)
+        if op == "cprof":
+            # 主机下发的归因：整步 25.5 ms 全在 Python 侧，得先知道它花在哪些函数上。
+            # cProfile 每次调用要多付约 1 µs，绝对值会偏高，但排序和占比是可信的。
+            n = int(req.get("n", 6))
+            ids = self.tok.encode(req.get("prompt") or "The quick brown fox")
+            self.model.reset()
+            logits = self.model.prefill(ids)
+            for _ in range(3):
+                logits = self._decode_one(logits)
+            sync()
+            import cProfile
+            import io
+            import pstats
+            pr = cProfile.Profile()
+            pr.enable()
+            for _ in range(n):
+                logits = self._decode_one(logits)
+            pr.disable()
+            sync()
+            buf = io.StringIO()
+            pstats.Stats(pr, stream=buf).sort_stats(req.get("sort", "tottime")).print_stats(
+                int(req.get("top", 30)))
+            return {"ok": True, "n": n, "ms_per_step": None, "text": buf.getvalue()}
         if op == "bench":
             n = int(req.get("n", 30))
             ids = self.tok.encode(req.get("prompt") or "The quick brown fox")
@@ -1076,9 +1193,14 @@ class RuntimeChatMixin:
             t0 = time.time()
             for _ in range(n):
                 logits = self._decode_one(logits)
+            # 只到这一步为止量到的墙钟是**主机下发耗时**：没有同步，设备侧还在排队，
+            # 所以它回答的是「主机能不能把这一千多次发射及时喂进去」。它与总步时的差
+            # 就是设备侧的净执行时间；两者相等说明主机是瓶颈，差很大说明设备是瓶颈。
+            t_host = time.time() - t0
             sync()
             dt = time.time() - t0
             return {"ok": True, "n": n, "ms_per_step": round(dt / n * 1000, 2),
+                    "host_ms_per_step": round(t_host / n * 1000, 2),
                     "decode_tok_s": round(n / dt, 2)}
         if op == "profile":
             n = int(req.get("n", 30))
@@ -1095,7 +1217,9 @@ class RuntimeChatMixin:
                 sync()
             ka = prof.key_averages()
             total = sum(_self_device_us(r) for r in ka)
-            rows = sorted(ka, key=_self_device_us, reverse=True)[:18]
+            # 归因要看全表：只列前 18 名时，剩下 50 个各 10 余微秒的小核加起来能占
+            # 一整成，而那正是「簿记」那一列的真身。
+            rows = sorted(ka, key=_self_device_us, reverse=True)[:int(req.get("top", 18))]
             # 整步的**发射次数**：直接读 ``cudaLaunchKernel`` 这一条的调用数（主机侧真正
             # 发下去的次数，与逐核表里各内核 ``calls`` 之和同源）。不能拿「自有设备时间 > 0
             # 的条目计数」去凑：这张卡上的 ``key_averages`` 把内核事件重复计了一份，凑出
@@ -1614,7 +1738,7 @@ class RuntimeChatMixin:
             for item in rows:
                 name = item["kernel"].lower()
                 if any(token in name for token in
-                       ("gemv_kn_m", "gemv_kn_i8_m", "gemv_nk_i8_m", "gemv_i8_m")):
+                       ("gemv_nk_i8_m", "gemv_nk_dense", "moe_grouped_i8_expert")):
                     group = target_totals["gemv_m"]
                     group["calls"] += item["calls"]
                     group["us"] += item["us"]
@@ -1627,8 +1751,7 @@ class RuntimeChatMixin:
                              for name, value in target_totals.items()}
             target_rows = [item for item in rows if any(
                 name in item["kernel"].lower() for name in
-                ("gemv_kn_m", "gemv_kn_i8_m", "gemv_nk_i8_m", "gemv_i8_m",
-                 "moe_grouped_i8"))]
+                ("gemv_nk_i8_m", "gemv_nk_dense", "moe_grouped_i8"))]
             return {"n_kernel_per_step": round(calls / steps, 1),
                     "rows": rows[:8], "targets": target_rows,
                     "target_totals": target_totals}

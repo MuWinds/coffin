@@ -416,15 +416,6 @@ ALLOWLISTS: dict[str, dict[str, dict[str, int]]] = {
         "probe": {
             "tests/test_backends.py": 4,
             "tests/test_openai_mm.py": 2,
-            # 归因探针必须按设备计时：夹住设备的唯一手段就是设备侧同步，而 CoreX
-            # 把整张卡塞进 torch.cuda 命名空间，写法上没有第二条路。
-            "tools/probe_q4_attrib.py": 13,
-            # 批缩放与 EP4 生成探针同理：它们要在真机上按设备计时/选卡。
-            "tools/probe_q4_batch_b.py": 5,
-            "tools/probe_q4_batch_divergence.py": 1,
-            "tools/probe_q4_ep4_gen.py": 4,
-            # 胶水算子归属探针：要把 aten 层与内核层的耗时对上，只能设备侧夹事件。
-            "tools/probe_q4_glue.py": 3,
         },
         "prod": {
         },

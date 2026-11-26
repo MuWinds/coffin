@@ -43,8 +43,13 @@ from models.qwen35.full_attn import FullAttn
 from models.qwen35.linear_attn import LinearAttn
 from models.qwen35.mtp import MTP
 from models.qwen35.tuning import CKPT, PREFILL_ATTN_TILE
+from models.qwen35 import stages
 from models.qwen35.weights import load_weights
 from ops import runtime
+
+# 单流解码步里把 RoPE 表的查表提到层循环外（见 ``_forward``）。置 1 回到逐层查表，
+# 只为对照这处改动省下的节点与步耗，不是运行选项。
+_ROPE_HOIST = os.environ.get("COFFIN_NO_ROPE_HOIST", "") != "1"
 from ops.dtypes import D, WF
 from ops.embed import TiedEmbedding
 from ops.mrope import mrope_cos_sin, scatter_image_embeds
@@ -527,8 +532,18 @@ class Qwen35:
         else:
             x = self.pipe.await_relay((1, self.hidden), self.pipe.rank - 1,
                                       _device, D).view(-1)
-        ctx = (self.pos1, self.cos_tbl, self.sin_tbl, self.mask_idx,
-               self.rope_delta1)
+        # 步内只查一次 RoPE 表。8 个全注意力层原先各自算 ``pos1 + rope_delta`` 再各查
+        # 两张表（每步 8×(1+2) = 24 次发射），用的却是**同一个**下标 —— ``pos1`` 和
+        # ``rope_delta1`` 在层循环里都不动。提到循环外，每步 3 次。
+        # 逐位不变：同一个下标张量、同一张表、同一个 ``index_select``。
+        # ``COFFIN_NO_ROPE_HOIST=1`` 回到逐层查表，用来量这处图改动值多少。
+        if _ROPE_HOIST:
+            idx1 = self.pos1 + self.rope_delta1
+            rope = (self.rope_delta1, self.cos_tbl.index_select(0, idx1),
+                    self.sin_tbl.index_select(0, idx1))
+        else:
+            rope = (self.rope_delta1, None, None)
+        ctx = (self.pos1, self.cos_tbl, self.sin_tbl, self.mask_idx, *rope)
         # 层与层之间的残差相加留给下一层的 ``in_ln`` 折进同一次发射；只有最后一层的
         # MLP 输出没人接了，在这里补一次相加。
         carry = None
@@ -812,8 +827,11 @@ class Qwen35:
                 a, b = pos0 + c0, pos0 + c1
                 rope = mrope_cos_sin(mm.slice_positions(a, b), self.inv_freq)
                 layer_ctx = ctx + (rope,)
+            stages.reset()
             for layer in self.layers:
                 x = layer.prefill(x, positions, layer_ctx, tiles)
+            stages.report(f"rank={'pipe' if self.pipe is not None else 'tp'} "
+                          f"c=[{c0},{c1})")
 
             if self.mtp is not None and self.mtp_prefill:
                 # 把 MTP 头按分块喂，而不是把所有分块的隐含状态都攒着最后拼接：256k 的
@@ -1971,11 +1989,42 @@ class Qwen35:
             "tokens_per_step": round(tokens / steps, 3),
         }
 
-    def decode_step(self, token: int) -> torch.Tensor:
+    def greedy_logits(self) -> torch.Tensor:
+        """把上一步 logits 的 argmax 在设备上写回输入，再走一遍 eager 前向。
+
+        与 ``logits(token)`` 的唯一区别是 token 不过主机：argmax 与写回都是设备上的
+        两个小内核，整步因此没有任何 D2H 同步。单流解码的主机下发本来就比设备执行
+        快，一次取回会把四卡的发射队列按 40 层一次排空，省掉它比多两次小发射便宜
+        得多。贪心的 token 序列与主机取回完全相同。
+
+        Returns:
+            该位置的 ``[vocab]`` logits；仍是活缓冲区，下一次调用会覆盖它。
+        """
+        self.token_in[self.prefill_row:self.prefill_row + 1].copy_(self._argmax_token())
+        self._forward()
+        return self.logits_single
+
+    def _argmax_token(self) -> torch.Tensor:
+        """把当前 logits 的 argmax 落到一个常驻的设备标量上。
+
+        Returns:
+            ``[1]`` int64 的设备张量，内容是本步选出的 token；它被复用，不要留存。
+        """
+        buf = getattr(self, "_tok_scalar", None)
+        if buf is None:
+            buf = torch.zeros(1, dtype=torch.long, device=_device)
+            self._tok_scalar = buf
+        buf.copy_(self.logits_single.argmax().reshape(1))
+        return buf
+
+    def decode_step(self, token: int | None = None) -> torch.Tensor:
         """把一个 token 喂给捕获的单流图，返回它的 logits。
 
         Args:
             token: 要追加的 token；它被放到预填充行上，该行的位置随后推进。
+                ``None`` 表示「用上一步 logits 的 argmax，且全程不碰主机」——
+                贪心单流解码走这一支，省掉每步一次 D2H。
+            ...
 
         Returns:
             该行的 ``[vocab]`` logits 缓冲区。是活的而不是拷贝：下一次重放会覆盖它，
@@ -1986,7 +2035,10 @@ class Qwen35:
                 启动路径。
         """
         pr = self.prefill_row
-        self.token_in[pr:pr + 1].fill_(token)
+        if token is None:
+            self.token_in[pr:pr + 1].copy_(self._argmax_token())
+        else:
+            self.token_in[pr:pr + 1].fill_(token)
         self._graph.replay()
         return self.logits_single
 

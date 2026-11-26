@@ -19,6 +19,7 @@ import os
 import socket
 import threading
 import time
+import traceback
 
 import torch
 
@@ -336,6 +337,8 @@ def _serve_connection(srv_model: "Server", conn: socket.socket) -> None:
         except Exception:
             pass
         print(f"[serve] error: {exc}", flush=True)
+        if os.environ.get("COFFIN_SERVE_TB") == "1":
+            traceback.print_exc()
     finally:
         conn.close()
 

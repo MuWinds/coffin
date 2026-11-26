@@ -1,10 +1,17 @@
-"""Iluvatar CoreX（BI-V100）后端：手写 ``[K, N]`` 内核，垫在算子契约之下。
+"""Iluvatar CoreX（BI-V100）后端：手写 nk（``[N, K]``）内核，垫在算子契约之下。
 
 这是 ``coffin`` 里第二个原生后端。同一份生产代码在 Hygon DCU 和这张卡上跑；变的
 是算子表、权重布局和 dtype 策略，三者都属于本包。两个实测事实决定了这里的一切
-（docs/qwen4/COREX-PLATFORM.md）：这张卡按 ``[K, N]`` 流式读权重是 168-361 GB/s，而
-checkpoint 的 ``[N, K]`` 形式只有 19-30 GB/s；另外它的 ``cuBLAS`` 在
-``lm_head`` 的宽度上返回 NaN。
+（docs/qwen4/COREX-PLATFORM.md）：这张卡在 ``lm_head`` 的宽度上 ``cuBLAS`` 返回 NaN，
+所以超过 ``pack.LIB_MAX_N`` 的输出列不许进库；另外权重的读取效率完全由「一条 32
+条通道的分组每步能搬多少连续字节」决定——nk 的 ``[N, K]`` 让这一组每步覆盖 128 个
+连续字节，``[K, N]``（kn）只能每步 32 个，实测差 1.02-1.63 倍。
+
+**``[K, N]``（kn）内核在本包里已经一个都不剩**：稠密 kn GEMM、``gemv_kn*``、
+``hyper_down/up``、``w8a8_gemm`` 的 kn 包装、``moe_grouped_i8`` 的 kn 主体核、
+``w8a8_dp4a`` 的 kn 家族，连同一份 ``pack.KnWeight`` / ``KnQWeight`` 与
+``as_kn`` / ``to_kn`` 的转换机制一起删除。推理里只有 nk 一种布局，也没有为 int8
+转出来的 ``[K, N]`` 副本。
 
 Module: ``coffin/backends/corex``。import ``backends.protocol``、
 ``backends.reference``（用来补齐还没有内核的算子）、``int8_weights`` 以及自己的
@@ -14,19 +21,32 @@ Module: ``coffin/backends/corex``。import ``backends.protocol``、
 而不被索要工具链。
 
 Constraints:
-    * ``caps.weight_layout == "kn"`` 是一句承诺：加载器交出的每份权重是 ``[K, N]``。契约里
-      的 ``w`` 仍然是 ``[N, K]``（那是 checkpoint），所以 :func:`pack.as_kn` 每个权重转置
-      一次并记忆化；调用 :func:`pack.repack_state_dict` 的加载器只付这一次代价，之后常驻
-      一份拷贝。预填充的库 GEMM 与张量核 GEMM 按 ``[K, N]`` 吃，解码的 int8 GEMV 按
-      ``[N, K]`` 吃（``pack.KnQWeight.nk_weight``，同一份权重转置而来的第二份拷贝）：一列
-      一行、K 连续让一组 32 条通道每步读 128 个连续字节，实测比 ``[K, N]`` 快 1.02-1.63 倍，
-      而 ``[K, N]`` 的四个旋钮全拧只值 2-6%。
+    * ``caps.weight_layout == "nk"``：契约布局就是加载器手里的那份 ``int8/bf16 [N, K]``，
+      一行输出通道、K 轴在内。加载器不再替任何后端转置，所以这里也不假装自己收到的是
+      ``[K, N]``。**预填充**直接吃这份 nk 原缓冲：``cublas`` 的 ``transa = T`` 让行主序的
+      ``[N, K]`` 就是列主序的 ``[K, N]``（``lda = ldb = K``），于是 ``pack.as_kn`` 那份
+      整份转置副本（4B 上 4.3 GB）在默认路径上不再产生。**解码**同样吃原缓冲：int8 走
+      ``GemvOps.nk_i8(_m)``（一列一行、K 在行内连续，一组 32 条通道每步读 128 个连续
+      字节，实测比 ``[K, N]`` 快 1.02-1.63 倍），稠密走库的 ``GemmEx``。
+
+      **本包不再自己造任何副本。** 曾经为 int8 加过「转一份 ``[K,N]`` 走
+      ``OP_N/OP_N``（49.3 TOPS，TN 是 39.5）」和 ``COFFIN_I8_GEMM=tcu`` 那条分支，
+      两者都已删除：NK 是模型权重唯一的布局，也是后面要专门优化的方向，一份 int8
+      权重副本换来的两成速度不值得。
+    * 本包**不再调用任何 torch 算子**（``torch.matmul`` / ``mm`` / ``bmm`` / ``F.linear``
+      一个都没有）：投影走 ``cublas``，其余算子走 ``abi/*.cu``。``torch.empty`` /
+      ``zeros`` 只是分配，``.to()`` 只是窄化，两者不算算子。唯一的例外是
+      :func:`_solve_blocked`——那是「扩展不可用」时才走的纯 torch 回退，不在推理链路上。
+      验收脚本：``python tools/audit_torch_path.py``。
     * 输出列超过 ``pack.LIB_MAX_N`` 时不许用库 GEMM。本卡在 ``N = 248320`` 实测
       NaN，在 ``N = 131072`` 结果正确，所以预填充路径沿 ``N`` 分块，解码路径则完全
       不调库。这是 ``lm_head`` 算错还是算慢的分界。
     * 每次内核启动都在 ``c10::cuda::getCurrentCUDAStream()`` 上（``.cu`` 文件自己
       完成）。在 legacy stream 上启动不属于 ``torch.cuda.graph`` 的捕获范围，被捕获
-      的解码步会重放陈旧输出——这是会被误读成数值问题的正确性 bug。
+      的解码步会重放陈旧输出——这是会被误读成数值问题的正确性 bug。走 ``cxrt`` 的那些
+      出口（``abi/*.cu`` 与 ``cublas``）由 Python 侧显式传流
+      （``torch.cuda.current_stream().cuda_stream``，见 :func:`_stream`）：``cxrt`` 不查
+      任何全局「当前流」，所以两条流不会在同一批字节上竞态。
     * ``caps.graph`` 和 ``caps.batch_attn`` 是从算子表推导出来的，不是声明的。只有
       当没有任何算子回退到参考实现时捕获才安全，因为那条回退会走到 ``cuBLAS``，而
       它在这里无法捕获；同理 ``batch_attn`` 的含义是 ``attn_paged_batch`` 有内核。
@@ -42,15 +62,15 @@ from __future__ import annotations
 
 import functools
 import os
+import sys
 from typing import Any
 
 import torch
 
 from backends import reference
-from backends.corex import kernels, pack
+from backends.corex import pack
 from backends.protocol import Backend, Caps, Ops, OpFn, make_device, native_ops
-from int8_weights import QWeight
-from w4a8_weights import W4A8Weight
+from int8_weights import QWeight, QWeightMoE
 
 #: 后端标识符，即 ``COFFIN_BACKEND=corex`` 选中的名字。
 NAME = "corex"
@@ -72,40 +92,14 @@ _NAME_MARKERS: tuple[str, ...] = ("iluvatar", "bi-v100", "bi-v150", "corex")
 #: 权重读一遍，而 GEMM 要 *每个 tile* 读一遍，这就是两种情形被拆成两个算子的原因。
 _PREFILL_MIN_M = 64
 
-#: W4 权重走「反量化成 bf16 + 厂商 GEMM」的最小行数。低于它时反量化那 79 MB 的读写
-#: 摊不开（``w4_dequant`` 实测 198.4 us / 401.3 GB/s，是纯带宽的固定成本），而小 M 下
-#: ``_w4_rows`` 的 GEMV 只把权重读一遍就够。
-#:
-#: 起手取 256，实测再调：M=512 时「反量化 + matmul」935.9 us，对 ``w4_gemm_tcu`` 的
-#: 1934.8 us 是 2.07 倍（作业 371，q_proj 形状 512x12288x2560）。
-_W4_DEQUANT_MIN_M = int(os.environ.get("COFFIN_W4_DEQUANT_MIN_M", "256"))
-
-#: 反量化的显存闸门：``K * N * 2`` 字节超过它就放弃这条路、回退 ``_w4_rows``。
-#: 63 MB（q_proj）是正常量级；``lm_head`` 那类 248320 列的形状反量化要 1.27 GB，
-#: 虽然不会立刻 OOM，但没有理由为它付这个峰值 —— 判据 4 要求「per-call 只活一张权重」。
-_W4_DEQUANT_MAX_BYTES = int(os.environ.get("COFFIN_W4_DEQUANT_MAX_MB", "256")) << 20
-
 #: 为了避开库而必须分块时，每次内核启动处理的行数。:func:`_gemv_rows` 最多把这么
 #: 多行并进一次权重读取，正好对上小 M 内核的特化范围。
 #:
 #: **不要把它调大。** 试过改成 64（理由是内核现在支持任意 M，按 8 切会让 10 行付
-#: 两遍权重），实测 B=10 从 466.71 变成 475.58 ms —— **更慢**。原因是 ``gemv_kn_m``
-#: 的 grid 只按 ``N`` 分块、与 ``M`` 无关，所以行数超过 8 之后并行度不涨、每线程的
-#: 串行 FMA 变多，反而比「切两块、各自占满 SM」差。这个 8 是被内核结构钉住的，
-#: 不是随便定的。
+#: 两遍权重），实测 B=10 从 466.71 变成 475.58 ms —— **更慢**。原因是 nk 批处理入口
+#: （``gemv_nk_i8_m``）按宽度特化，宽度之外的行由上一档承接。
 _ROW_CHUNK = 8
 
-#: 分组 int8 投影（``moe_grouped_i8*``）是否走 nk 权重栈 ``[E, N, K]``。
-#:
-#: kn（``[E, K, N]``）里相邻 4 个 k 隔着 N 个字节，``__dp4a`` 的 32 位字要四次单字节读
-#: 再拼，而且一个 warp 一轮只搬 32 字节；nk 里一列一行的 K 连续，一次 32 位加载就是那个
-#: 字，一轮 128 字节是一整段内存。稠密投影换 nk 时同字节量快了 1.02-1.63 倍，这条是它在
-#: 分组路径上的同一结论。代价是与 ``wq`` 并行多一份 ``[E, N, K]`` 副本（EP4 下一卡 64 个
-#: 专家约 192 MB），首次取用时一次性转置，见 :meth:`coffin.int8_weights.QWeightMoE.nk_stack`。
-#:
-#: 默认关：这条路径的归约是 warp 内树形，与 kn 的长链累加**不逐位相同**（fp32 重结合的
-#: 1e-3 量级），按纪律要先跑 greedy ids 对比再改默认值。
-_MOE_I8_NK = os.environ.get("COFFIN_MOE_I8_NK", "0").strip() == "1"
 
 #: ``gemv_nk_i8_m`` 每个通道组认领的列数：``0``/``1`` 一列一组，``2`` 两列一组。
 #:
@@ -115,6 +109,15 @@ _MOE_I8_NK = os.environ.get("COFFIN_MOE_I8_NK", "0").strip() == "1"
 #: M = 1 不适用（那里本来就只有 1 次激活读，块数砍半是纯损失），所以只在行数 > 1 的
 #: 分支里生效。默认 1 列，量过再改。
 _GEMV_NK_WIDTH = int(os.environ.get("COFFIN_GEMV_NK_WIDTH", "0") or "0")
+
+#: ``gemv_nk_i8_m`` 的 K 循环展开度：``0`` 表示内核默认值 4，可选 ``2``/``8``。
+#:
+#: 为什么值得动：解码里 ``N = 12352`` 那个投影（grid 3088 x 128 线程）在自己的时间轴上
+#: 是 **127.63 us** 一发，按 ``N * K = 25.3 MB`` 算只有 **198 GB/s** —— 离这张卡的带宽
+#: 还差一个量级，而在飞字节数由展开度决定：U=4 时每个 warp 只有 ``4 x 128 = 512 B``
+#: 在天上。把 U 抬到 8 就是 1 KB，正好补上这条「带宽-延迟积」的缺口。
+#: 默认 0（不动内核默认 4），量过再改默认值。
+_GEMV_NK_UNROLL = int(os.environ.get("COFFIN_GEMV_NK_UNROLL", "0") or "0")
 
 #: 投机校验的 W8A8 DP4A 路径；``COFFIN_COREX_W8A8_DP4A_VERIFY=1`` 打开以对照原有 GEMV。
 #:
@@ -130,69 +133,13 @@ _GEMV_NK_WIDTH = int(os.environ.get("COFFIN_GEMV_NK_WIDTH", "0") or "0")
 #: mlp 段在 M=16 上按元素胜出。
 _W8A8_DP4A_VERIFY = os.environ.get("COFFIN_COREX_W8A8_DP4A_VERIFY", "0").strip() == "1"
 
+#: 预填充是否走 nk 原生张量核、不做那份 ``[K, N]`` 转置（``COFFIN_PREFILL_NK=1``）。
+#: 默认关，理由与实测数字见 :func:`_prefill_nk_tcu` 的 Note：4B 上省 4.3 GB 显存
+#: 但预填充 2468 -> 662 tok/s。只有「权重加副本放不下」时才值得开（Occamy）。
+_PREFILL_NK = os.environ.get("COFFIN_PREFILL_NK", "0").strip() == "1"
+
 #: 宽指令张量核 GEMM 的形状门限，按**权重字节数**而不是 K 或 N 单独判。
 #:
-#: 实测（4B 的真实预填充形状，M=2048，同一张卡同进程，``docs/TCU_INT8.md``）：
-#:
-#:   形状            K      N      TCU ms   库 ms    相对
-#:   gate_up       2560  18432     3.44     5.75   1.67x
-#:   full_attn     2560  10240     1.80     3.26   1.81x
-#:   linear_attn   2560  12352     2.35     3.92   1.66x
-#:   o_proj        4096   2560     0.84     1.18   1.41x
-#:   k5120         5120   2560     1.12     1.33   1.20x
-#:   mlp_down      9216   2560     2.14     2.01   0.94x   <- 唯一输
-#:
-#: 判据**不是** ``K * N``：``o_proj``（10.5 MB）与 ``k5120``（13.1 MB）都远小于任意
-#: 一个 24 MB 门限，却都赢；而 ``mlp_down``（23.6 MB）最大却输。真正的区别在
-#: **K 有多深**——``mlp_down`` 是 K=9216 的深归约、N 只有 2560，一次预填充要沿 K 走
-#: 144 个 k-tile，TCU 的块间固定开销摊不薄；其余形状 N 宽 K 浅。所以门限落在 K 上。
-#:
-#: 这个数只决定走哪条路，两条路的**数值逐位相同**（int32 累加是精确的，epilogue 的
-#: 舍入次数也一样），所以分派错了只会慢、不会错。``COFFIN_I8_GEMM`` 可覆盖**全部**
-#: 形状（``tcu`` 强制走 TCU，``lib`` 强制走库）；只动深 K 这一档的开关是
-#: ``COFFIN_I8_GEMM_DEEP``。两者必须分开：全形状覆盖做「深 K 该走哪条」的实验时，
-#: 会把另外六个形状也一起换掉，量到的是「全部手写 vs 全部库」。
-_TCU_MAX_K = 8192
-
-
-def _use_tcu_gemm(rows: int, k: int, n: int, available: bool) -> bool:
-    """决定这次预填充投影走宽指令 TCU 内核还是库。
-
-    Args:
-        rows: 激活行数 ``M``。
-        k: 内维。
-        n: 输出列数。
-        available: 扩展里有没有 ``w8a8_gemm_tcu``。旧构建没有它，而「扩展能加载」
-            不等于「这个入口在」，所以两者分开判。
-
-    Returns:
-        走 TCU 时为 ``True``。
-
-    Raises:
-        ValueError: ``COFFIN_I8_GEMM`` / ``COFFIN_I8_GEMM_DEEP`` 是不认识的值。静默
-            回退会让一次 A/B 看起来像「两边一样快」，而实际两边跑的是同一条路。
-    """
-    if not available:
-        return False
-    forced = os.environ.get("COFFIN_I8_GEMM", "").strip().lower()
-    if forced in {"tcu", "tensor", "i8x8"}:
-        return True
-    if forced in {"lib", "cublas"}:
-        return False
-    if forced:
-        raise ValueError(
-            f"COFFIN_I8_GEMM={forced!r} is not one of 'tcu' / 'lib'")
-    if k > _TCU_MAX_K:
-        deep = os.environ.get("COFFIN_I8_GEMM_DEEP", "").strip().lower()
-        if deep in {"tcu", "tensor", "i8x8"}:
-            return True
-        if deep in {"lib", "cublas"}:
-            return False
-        if deep:
-            raise ValueError(
-                f"COFFIN_I8_GEMM_DEEP={deep!r} is not one of 'tcu' / 'lib'")
-        return False
-    return True
 
 
 @functools.lru_cache(maxsize=1)
@@ -286,16 +233,32 @@ def _arch() -> str:
     return DEFAULT_ARCH
 
 
+#: 一次构建尝试的结果，``None`` 表示工具链可用。记忆化：坏工具链每进程只花一次尝试。
+_SHIM_ERROR: str | None = None
+#: 是否已经尝试过。
+_SHIM_TRIED = False
+
+
 def _build_error() -> str | None:
-    """返回记忆下来的扩展构建失败，必要时尝试构建一次。
+    """构建最小的那个 ``cxrt`` 库，判断工具链能不能用（记忆化）。
 
     Returns:
-        构建失败时为 ``"<ExceptionType>: <message>"``，扩展已加载时为 ``None``。
-        这次尝试在 :mod:`backends.corex.kernels` 里被记忆化，所以再问不花代价。
+        构建失败时为 ``"<ExceptionType>: <message>"``，否则 ``None``。
+
+    Note:
+        判据从「torch 扩展能不能编出来」换成了「``cxrt`` 的 ABI 库能不能编出来」：
+        链路已经一个 torch 符号都不碰，能不能服务模型只取决于 C ABI 那条构建。
     """
-    if kernels.available():
-        return None
-    return kernels.last_error() or "backends.corex.kernels.available() is False"
+    global _SHIM_ERROR, _SHIM_TRIED
+    if _SHIM_TRIED:
+        return _SHIM_ERROR
+    _SHIM_TRIED = True
+    try:                                   # noqa: SIM105 - 失败文本要留下
+        from cxrt import open_runtime
+        open_runtime().build_norm(_arch() or DEFAULT_ARCH)
+    except Exception as exc:               # noqa: BLE001 - 任何失败都算工具链不可用
+        _SHIM_ERROR = f"{type(exc).__name__}: {exc}"
+    return _SHIM_ERROR
 
 
 def usable() -> bool:
@@ -324,38 +287,21 @@ def reason() -> str:
     return "" if err is None else f"kernel build failed: {err}"
 
 
-#: 已加载的扩展模块，由 :func:`_kernels` 填一次。
-#:
-#: 缓存的是**模块对象**而不是 ``load_kernels()`` 的返回值：那个函数自己也是记忆化的，
-#: 但它前面还压着 ``_arch()`` → ``probe()`` → 驱动查询那条链。一步 decode 有几千次
-#: 算子调用、每次都要问一遍，一次属性读取比那条链便宜得多。构建失败时不缓存（保持
-#: ``None``），让异常路径每次照常抛。
-_KERNEL_MODULE: Any = None
-
-
 def _kernels() -> Any:
-    """返回已加载的扩展，首次使用时构建。
-
-    这是每次算子调用的必经之路（``linear`` / ``moe_grouped`` / ``rms_norm`` … 全走
-    它），所以第一次之后只允许剩一次属性读取。实测（作业 ``q4host1``）扩展直调
-    ``rms_norm`` 的主机侧成本是 6.7 us/次，而原生 ``torch`` 逐元素是 4.9 us ——
-    差额就是这里的 Python 开销，必须压到接近零。
+    """已被删除的 torch JIT 扩展。
 
     Returns:
-        带 ``gemv_kn`` / ``gemv_kn_m`` / ``rms_norm`` / ``rms_norm_gated`` 入口的
-        扩展模块。
+        从不返回：这个函数现在是**桩**。扩展连同 18 个 torch 宿主 ``.cu`` 一起删掉了
+        （``docs/COREX-NO-TORCH.md`` §7），解码链路整条走 ``cxrt`` 的 C ABI。
 
     Raises:
-        RuntimeError: 构建失败或 ``TORCH_EXTENSIONS_DIR`` 未设置。经 :func:`ops`
-            走的话这种主机上永远到不了受影响的入口，因为整张表就是参考实现；直接
-            调用意味着调用方绕过了表。
+        RuntimeError: 永远。仍在调用它的是两处还没迁移的旁路——``models/qwen35/ep.py``
+            的跨 rank 归约与 ``models/qwen4exp/parallel.py`` 的映射内存注册。它们不在
+            单卡解码路径上，但一旦被调到必须立刻报错，而不是静默地退到参考实现。
     """
-    global _KERNEL_MODULE
-    module = _KERNEL_MODULE
-    if module is None:
-        module = kernels.load_kernels(_arch() or DEFAULT_ARCH)
-        _KERNEL_MODULE = module
-    return module
+    raise RuntimeError(
+        "the CoreX torch JIT extension was deleted (docs/COREX-NO-TORCH.md §7); the EP "
+        "collectives and mapped-memory paths still need their own ABI migration")
 
 
 def _compute_dtype(x: torch.Tensor) -> torch.Tensor:
@@ -390,10 +336,330 @@ def _restore(y: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     return y if y.dtype == dtype else y.to(dtype)
 
 
+# 预填充的 torch-free 算子面
+#
+# 这三条出口（``quant_act_i8`` / ``coffin_w8a8_epilogue`` 在 ABI 里，``GemmEx`` 在
+# libcublas 里）合起来就是一次 int8 预填充投影，中间没有一步回到 torch。缓存的是
+# **算子对象**：``build_w8a8`` 会编一次 ``.so``，``build_gemm`` 会开一个 cublas 句柄，
+# 都得在一遍请求里只做一次。
+
+#: :class:`cxrt.GemmOps`，首次使用时建。
+_GEMM_OPS: Any = None
+
+#: :class:`cxrt.W8A8Ops`，首次使用时建（会编 ``abi/w8a8_epilog_abi.cu``）。
+_W8A8_OPS: Any = None
+
+#: :class:`cxrt.GemvOps`，首次使用时建（会编 ``abi/gemv_abi.cu``）。
+_GEMV_OPS: Any = None
+
+#: :class:`cxrt.RMSNormOps`，首次使用时建（会编 ``abi/norm_abi.cu``）。
+_NORM_OPS: Any = None
+
+#: :class:`cxrt.ConvOps`，首次使用时建（会编 ``abi/conv_abi.cu``）。
+_CONV_OPS: Any = None
+
+#: :class:`cxrt.AttnOps`，首次使用时建（会编 ``abi/attn_abi.cu``）。
+_ATTN_OPS: Any = None
+
+#: :class:`cxrt.SolveOps`，首次使用时建（会编 ``abi/solve_abi.cu``）。
+_SOLVE_OPS: Any = None
+
+
+
+def _stream() -> int | None:
+    """当前流的句柄：**没有 torch 时就是默认流 0**。
+
+    这条出口不是「顺手取一下」：``cxrt`` 的 ABI 出口、``cublas`` 句柄上的队列与内核
+    启动必须落在同一条流上，否则两个算子会在同一批字节上竞态（表现为偶发的错值，不是
+    崩溃）。以前这条流只能去问 torch 要，因为链路上跑的张量归 torch 的分配器管。
+
+    现在它**先看 torch 在不在场**：``sys.modules`` 里没有 torch，或者那一个是
+    :mod:`cxrt.torchshim`（本项目的壳，``cuda`` 上没有 ``current_stream``），就返回
+    ``0``——``cudart`` 的默认流本来就是这条链唯一在用的流，我们自己建的流与它之间不需要
+    任何同步，因为链上没有第二个所有者了。真 torch 在场时仍然跟随它（服务端可能把
+    decoder 挂在别的流上），这条兼容不是为了保住 torch，而是为了留住那条路径的数值。
+
+    Returns:
+        流句柄号，或 ``None``（没有 CUDA 上下文时）。
+    """
+    tl = sys.modules.get("torch")
+    if tl is None:
+        return 0
+    cuda = getattr(tl, "cuda", None)
+    current = getattr(cuda, "current_stream", None)
+    if current is None:
+        # 壳没有流的概念：它跑的是 numpy，不存在跨流竞态。
+        return 0
+    return int(current().cuda_stream)
+
+
+def _gemm_ops() -> Any:
+    """返回预填充 GEMM 的库面，首次调用时绑定。
+
+    Returns:
+        :class:`cxrt.GemmOps`。
+
+    Raises:
+        RtError: 找不到 ``libcublas``（装了 ixblas 就是它的同名替换）。
+    """
+    global _GEMM_OPS
+    if _GEMM_OPS is None:
+        from cxrt import build_gemm
+
+        _GEMM_OPS = build_gemm()
+    return _GEMM_OPS
+
+
+def _w8a8_ops() -> Any:
+    """返回 W8A8 的 ABI 面（量化 + epilogue），首次调用时编译并装载。
+
+    Returns:
+        :class:`cxrt.W8A8Ops`。
+
+    Raises:
+        BuildError: 工具链缺失或编译失败。
+    """
+    global _W8A8_OPS
+    if _W8A8_OPS is None:
+        from cxrt import open_runtime
+
+        _W8A8_OPS = open_runtime().build_w8a8(_arch() or DEFAULT_ARCH)
+    return _W8A8_OPS
+
+
+def _gemv_ops() -> Any:
+    """返回投影 GEMV 的 ABI 面，首次调用时编译并装载。
+
+    ``coffin_gemv_nk_i8(_m)`` 与 torch 扩展里那两条是**同一个内核**（设备代码是同一份
+    ``gemv_device.inc``），所以换过来是纯搬家：数值逐位相同，唯一的变化是参数不再是
+    ``torch::Tensor``。
+
+    Returns:
+        :class:`cxrt.GemvOps`。
+
+    Raises:
+        BuildError: 工具链缺失或编译失败。
+    """
+    global _GEMV_OPS
+    if _GEMV_OPS is None:
+        from cxrt import open_runtime
+
+        _GEMV_OPS = open_runtime().build_gemv(_arch() or DEFAULT_ARCH)
+    return _GEMV_OPS
+
+#: MoE 族 ABI 句柄。``None`` 表示还没编过。
+_MOE_OPS: Any = None
+
+
+def _norm_ops() -> Any:
+    """返回归一化族的 ABI 面，首次调用时编译并装载。
+
+    设备代码是同一份 ``norm_device.inc``（``norm.cu`` 与 ``abi/norm_abi.cu`` 各包含
+    一次），所以从 torch 扩展换到这里是纯搬家：同样的五个 ``__global__``、同样的
+    整数预算，数值逐位相同。区别只有两处：目的地由调用方给（``norm_abi`` 不分配），
+    以及参数不再是 ``torch::Tensor`` 而是 ``cxrt.Array`` 视图。
+
+    Returns:
+        :class:`cxrt.RMSNormOps`。
+
+    Raises:
+        BuildError: 工具链缺失或编译失败。
+    """
+    global _NORM_OPS
+    if _NORM_OPS is None:
+        from cxrt import open_runtime
+
+        _NORM_OPS = open_runtime().build_norm(_arch() or DEFAULT_ARCH)
+    return _NORM_OPS
+
+
+def _conv_ops() -> Any:
+    """返回线性注意力入口那个深度卷积的 ABI 面，首次调用时编译并装载。
+
+    设备代码是同一份 ``conv_device.inc``（``linear_attn.cu`` 与 ``abi/conv_abi.cu``
+    各包含一次），三个入口的算术因此逐位相同；批处理那条启动的就是单 token 那条
+    内核（行轴收成 ``rows``），不是另一份实现。
+
+    Returns:
+        :class:`cxrt.ConvOps`。
+
+    Raises:
+        BuildError: 工具链缺失或编译失败。
+    """
+    global _CONV_OPS
+    if _CONV_OPS is None:
+        from cxrt import open_runtime
+
+        _CONV_OPS = open_runtime().build_conv(_arch() or DEFAULT_ARCH)
+    return _CONV_OPS
+
+
+def _attn_ops() -> Any:
+    """返回注意力族里已经搬进 ABI 的四个算子，首次调用时编译并装载。
+
+    设备代码与 ``attn.cu`` 里那四条是同一份 ``attn_device.inc``（两条前端各包含一次），
+    所以 ``silu_mul`` / ``silu_mul_quant`` / ``rope_apply`` / ``kv_quant`` 换过来是纯
+    搬家。分页注意力那几条要连块表一起定契，还在扩展里，见
+    ``docs/COREX-NO-TORCH.md`` §6.2。
+
+    Returns:
+        :class:`cxrt.AttnOps`。
+
+    Raises:
+        BuildError: 工具链缺失或编译失败。
+    """
+    global _ATTN_OPS
+    if _ATTN_OPS is None:
+        from cxrt import open_runtime
+
+        _ATTN_OPS = open_runtime().build_attn(_arch() or DEFAULT_ARCH)
+    return _ATTN_OPS
+
+
+def _solve_ops() -> Any:
+    """返回前向替换求解的 ABI 面，首次调用时编译并装载。
+
+    Returns:
+        :class:`cxrt.SolveOps`。
+
+    Raises:
+        BuildError: 工具链缺失或编译失败。
+    """
+    global _SOLVE_OPS
+    if _SOLVE_OPS is None:
+        from cxrt import open_runtime
+
+        _SOLVE_OPS = open_runtime().build_solve(_arch() or DEFAULT_ARCH)
+    return _SOLVE_OPS
+
+
+def _moe_ops() -> Any:
+    """返回 MoE 族已经搬进 ABI 的算子，首次调用时编译并装载。
+
+    设备代码与 ``moe_epilogue.cu`` 里那条是同一份 ``shared_gate_device.inc``（两条前端
+    各包含一次），所以 ``shared_gate_scale`` 换过来是纯搬家。``moe_router`` /
+    ``moe_dispatch`` / ``moe_grouped_i8*`` 要连分组偏移与槽位表一起定契，还在扩展里。
+
+    Returns:
+        :class:`cxrt.MoeOps`。
+
+    Raises:
+        BuildError: 工具链缺失或编译失败。
+    """
+    global _MOE_OPS
+    if _MOE_OPS is None:
+        from cxrt import open_runtime
+
+        _MOE_OPS = open_runtime().build_moe(_arch() or DEFAULT_ARCH)
+    return _MOE_OPS
+
+
+def _ptr(t: torch.Tensor) -> int:
+    """取设备地址。
+
+    热路径上用这个而不是 ``Array.borrow``：一次借用要问形状、步长、dtype 码、存储
+    偏移，再种两个 Python 对象；实测把一次归一化的主机侧成本从 6.7 us 抬到 30 us
+    以上，而一个解码步里有七十多次归一化——折下来正好是每步 5 ms，占 16.7 ms 步时
+    的三成。``cxrt`` 的 ``Array`` 面留着给离机单测和 ``selftest`` 用，这里直接进
+    同一个 ``extern "C"`` 入口，参数只给地址。
+
+    Args:
+        t: 设备张量。
+
+    Returns:
+        设备地址（整数）。
+    """
+    return int(t.data_ptr())
+
+
+def _dcode(t: torch.Tensor) -> int:
+    """取 dtype 的内核整数码。
+
+    Args:
+        t: 设备张量。
+
+    Returns:
+        ``cx::Tensor`` 认的 dtype 码。
+    """
+    from cxrt.tensors import code_of
+
+    return code_of(t.dtype)
+
+
+def _norm_out(shape: tuple[int, ...], like: torch.Tensor) -> torch.Tensor:
+    """按``like`` 的 dtype/设备分配一块稠密目的地。
+
+    ``norm_abi`` 的契约是「目的地归调用方」：捕获/重放的路径要求地址稳定，所以这一
+    层显式分配，而不是让 ABI 层偷偷分配一块 cxrt 自己的缓冲。
+
+    Args:
+        shape: 目的地形状，``[rows, width]``。
+        like: 对 dtype 与设备的参照张量。
+
+    Returns:
+        新张量，内容是未初始化的。
+    """
+    return torch.empty(shape, dtype=like.dtype, device=like.device)
+
+
+def _gemv_nk(nkw: torch.Tensor, ws: torch.Tensor, act: torch.Tensor) -> torch.Tensor:
+    """nk 原生的 int8 解码投影，走 ABI，不经过 torch 扩展。
+
+    收的是**裸缓冲**而不是 ``QWeight``：``QWeight.wq`` 就是 ``[N, K]`` 的那一份，
+    零拷贝传进来即可，于是「哪条权重来源」与「怎么算」在这里分开。
+
+    Args:
+        nkw: ``[N, K]`` int8 权重，连续。
+        ws: ``[N]`` fp32 每列 scale。
+        act: 激活，``[K]`` 或 ``[C, K]``，bf16 或 fp32，连续。
+
+    Returns:
+        ``[N]`` 或 ``[C, N]``，dtype 同 ``act``。
+
+    Raises:
+        ShapeError: 形状、dtype 或对齐不符（``K % 4``、bf16 需 8 字节对齐）。
+    """
+    ops = _gemv_ops()
+    stream = _stream()
+    if act.dim() == 1:
+        return ops.nk_i8(nkw, act, ws, unroll=_GEMV_NK_UNROLL, width=_GEMV_NK_WIDTH,
+                         stream=stream)
+    rows = act.shape[0]
+    if rows <= _ROW_CHUNK:
+        return ops.nk_i8_m(nkw, act, ws, unroll=_GEMV_NK_UNROLL, width=_GEMV_NK_WIDTH,
+                           stream=stream)
+    out = torch.empty((rows, int(nkw.shape[0])), dtype=act.dtype, device=act.device)
+    for start in range(0, rows, _ROW_CHUNK):
+        stop = min(rows, start + _ROW_CHUNK)
+        out[start:stop] = ops.nk_i8_m(nkw, act[start:stop].contiguous(), ws,
+                                     unroll=_GEMV_NK_UNROLL, width=_GEMV_NK_WIDTH,
+                                     stream=stream)
+    return out
+
+
+def _gemm_nk_dense(w: torch.Tensor, act: torch.Tensor) -> torch.Tensor:
+    """稠密（bf16/fp32）权重的一次投影，走库，形状按 ``act`` 的维数收放。
+
+    解码也用它：``GemvOps`` 只有 int8 入口，而 bf16 权重没有对应的 nk GEMV，所以稠密
+    这一档统一落到 ``GemmEx``（``N = 1`` 时库内部按 GEMV 处理）。代价是每次调用多付
+    库的固定开销（7.5-11 us），换来这条路径上不再出现 torch 张量参数。
+
+    Args:
+        w: ``[N, K]`` 稠密权重，bf16 或 fp32。
+        act: ``[K]`` 或 ``[C, K]`` 激活。
+
+    Returns:
+        与 ``act`` 前导维数一致的输出。
+    """
+    if act.dim() == 2:
+        return _gemm_nk_rows(w, act)
+    return _gemm_nk_rows(w, act.unsqueeze(0))[0]
+
+
 # 投影
 
 
-def linear(w: torch.Tensor | QWeight | pack.KnWeight, x: torch.Tensor) -> torch.Tensor:
+def linear(w: torch.Tensor | QWeight, x: torch.Tensor) -> torch.Tensor:
     """解码期投影：一行激活对 ``[N, K]`` 的 ``w`` 做乘加。
 
     Args:
@@ -406,26 +672,25 @@ def linear(w: torch.Tensor | QWeight | pack.KnWeight, x: torch.Tensor) -> torch.
         ``[N]`` 或 ``[C, N]``，dtype 同 ``x``。
 
     Raises:
-        RuntimeError: 扩展不可用且直接走到了这个入口；经 :func:`ops` 走的话由参考
-            实现应答。
+        RtError: 找不到 ``libcublas``（装了 ixblas 就是它的同名替换）。这条入口
+            现在完全不需要 torch 扩展：int8 走 ``coffin_gemv_nk_i8``，稠密走 ``GemmEx``。
     """
-    if isinstance(w, W4A8Weight):
-        return _w4_rows(w, x)
     if x.dim() != 1:
         return _gemv_rows(w, x)
-    packed = pack.as_kn(w)
-    module = _kernels()
     dtype = x.dtype
     act = _compute_dtype(x).contiguous()
-    if packed.int8:
-        # 解码走 nk：一列一行、K 连续，于是一组 32 条通道每步读 128 字节连续权重。同一份
-        # 字节量下 nk 比 kn 快 1.02-1.63 倍（窄的 2560 列形状受益最大），而 kn 那条路
-        # 四个旋钮一起拧也只值 2-6%，所以这里不再按形状挑，全部走 nk。
-        return _restore(module.gemv_nk_i8(packed.nk_weight(), act, packed.scale), dtype)
-    return _restore(module.gemv_kn(packed.wt, act), dtype)
+    if isinstance(w, QWeight):
+        # nk 原生：盘上那一份就是内核要的几何，直接交出去（``w.wq`` 即 ``[N, K]``）。
+        # 早先这里会先转一份 ``[K, N]``（4B 是 4.3 GB）再把原缓冲要回来——那份副本除
+        # 了吃显存什么都不做，已经连同转换机制一起删除。
+        # 传输走 :func:`_gemv_nk`：同一个内核的 ABI 出口，参数不再是 ``torch::Tensor``，
+        # 所以这条路径连 torch 扩展都不必装载。
+        return _restore(_gemv_nk(w.wq, w.scale, act), dtype)
+    # 稠密（bf16/fp32）：nk 权重直接交给库的 TN 出口，不转置。
+    return _restore(_gemm_nk_dense(w, act), dtype)
 
 
-def linear_m(w: torch.Tensor | QWeight | pack.KnWeight, x: torch.Tensor) -> torch.Tensor:
+def linear_m(w: torch.Tensor | QWeight, x: torch.Tensor) -> torch.Tensor:
     """小 M 投影：``M`` 行激活只把权重读一遍。
 
     Args:
@@ -440,14 +705,12 @@ def linear_m(w: torch.Tensor | QWeight | pack.KnWeight, x: torch.Tensor) -> torc
     Raises:
         RuntimeError: 扩展不可用。
     """
-    if isinstance(w, W4A8Weight):
-        return _w4_rows(w, x)
     if x.shape[0] > _ROW_CHUNK:
         return linear_prefill(w, x)
     return _gemv_rows(w, x)
 
 
-def linear_m_verify(w: torch.Tensor | QWeight | pack.KnWeight,
+def linear_m_verify(w: torch.Tensor | QWeight,
                     x: torch.Tensor) -> torch.Tensor:
     """为投机校验的 W8A8 投影选择带 LDS 重排的 DP4A 内核。
 
@@ -467,12 +730,8 @@ def linear_m_verify(w: torch.Tensor | QWeight | pack.KnWeight,
         if w.wq.is_contiguous():
             wt, ws = w.wq, w.scale
         else:
-            packed = pack.as_kn(w)
-            wt, ws = packed.dp4a_weight(), packed.scale
-    elif isinstance(w, pack.KnQWeight):
-        if w.k % 4:
-            return linear_m(w, x)
-        wt, ws = w.dp4a_weight(), w.scale
+            # 不连续的 nk 权重在这里补一次连续。dp4a 核本来吃 nk（``utrans = 0``）。
+            wt, ws = w.wq.contiguous(), w.scale
     else:
         return linear_m(w, x)
 
@@ -482,17 +741,21 @@ def linear_m_verify(w: torch.Tensor | QWeight | pack.KnWeight,
     if rows < 2 or k % 4:
         return linear_m(w, x)
 
-    module = _kernels()
+    ops = _w8a8_ops()
+    stream = _stream()
     xq = torch.empty((rows, k), dtype=torch.int8, device=act.device)
     xs = torch.empty(rows, dtype=torch.float32, device=act.device)
     acc = torch.empty((rows, n), dtype=torch.int32, device=act.device)
     out = torch.empty((rows, n), dtype=act.dtype, device=act.device)
-    module.quant_act_i8(act, xq, xs)
-    module.w8a8_dp4a_nk(xq, wt, acc, out, xs, ws, 0)
+    ops.quant_act_i8(act, xq, xs, stream=stream)
+    # 融合模式由这里的 dtype 决定：ABI 出口拿的是裸指针，读不到 ``out`` 的类型。
+    ops.shim.dp4a_nk(_ptr(xq), _ptr(wt), _ptr(acc), _ptr(out), _ptr(xs), _ptr(ws),
+                     1 if out.dtype == torch.bfloat16 else 2, int(n), int(rows), int(k),
+                     int(n), stream)
     return _restore(out, x.dtype)
 
 
-def _gemv_rows(w: torch.Tensor | QWeight | pack.KnWeight,
+def _gemv_rows(w: torch.Tensor | QWeight,
                x: torch.Tensor) -> torch.Tensor:
     """用自写 GEMV 分块投影至多 :data:`_ROW_CHUNK` 行。
 
@@ -507,256 +770,16 @@ def _gemv_rows(w: torch.Tensor | QWeight | pack.KnWeight,
     Returns:
         ``[C, N]``，dtype 同 ``x``。
     """
-    packed = pack.as_kn(w)
-    module = _kernels()
     dtype = x.dtype
     act = _compute_dtype(x).contiguous()
-    rows = act.shape[0]
-    if packed.int8:
-        # 每个分块只读一遍权重。在批处理 int8 入口出现之前，这个循环走的是单行内核，
-        # 于是一批行每行都把整个权重读一遍：实测 M=8 是 M=1 的 8.19 倍
-        # （probe_row_cost.py，五个解码形状），这就是为什么一次 c-token 投机校验要付
-        # c 遍完整权重读取，在任何草稿深度都无法打平（docs/qwen4/QWEN4-PERF.md）。
-        #
-        # nk 版本与单行入口同构，所以批处理也换到 nk：权重按 [N, K] 读，一组 32 条通道每步
-        # 读 128 个连续字节，M 行共用这一遍读取。
-        #
-        # 内核只接受它有实例化的宽度，而本辅助函数会被以不超过 _ROW_CHUNK 的任意行数
-        # 调用（比如某个退回这里的分块预填充），所以下面 bf16 分支做的分块这里也必须
-        # 做：把 24 行交给 TORCH_CHECK 写着 [1, 8] 的内核会抛异常，这正是加分块循环
-        # 之前这个分支的行为。
-        nkw = packed.nk_weight()
-        if rows <= _ROW_CHUNK:
-            return _restore(module.gemv_nk_i8_m(nkw, act, packed.scale,
-                                                width=_GEMV_NK_WIDTH), dtype)
-        out = torch.empty((rows, packed.n), dtype=act.dtype, device=act.device)
-        for start in range(0, rows, _ROW_CHUNK):
-            stop = min(rows, start + _ROW_CHUNK)
-            out[start:stop] = module.gemv_nk_i8_m(nkw, act[start:stop].contiguous(),
-                                                  packed.scale, width=_GEMV_NK_WIDTH)
-        return _restore(out, dtype)
-    if rows == 1:
-        return _restore(module.gemv_kn(packed.wt, act[0]), dtype)
-    if rows <= _ROW_CHUNK:
-        return _restore(module.gemv_kn_m_split(packed.wt, act), dtype)
-    out = torch.empty((rows, packed.n), dtype=act.dtype, device=act.device)
-    for start in range(0, rows, _ROW_CHUNK):
-        stop = min(rows, start + _ROW_CHUNK)
-        chunk = act[start:stop]
-        if chunk.shape[0] == 1:
-            out[start] = module.gemv_kn(packed.wt, chunk[0])
-        else:
-            out[start:stop] = module.gemv_kn_m_split(packed.wt, chunk.contiguous())
-    return _restore(out, dtype)
-
-
-def _dequant_w4(w: W4A8Weight) -> torch.Tensor:
-    """把 packed W4 权重反量化成 ``[K, N]`` bf16。
-
-    每次调用**新建**输出，绝不缓存到 module 上：``q_proj`` 一份是 63 MB，128 个投影
-    常驻就是 4.5 GB，会在这个已经贴着显存上限的模型上直接 OOM。反量化的成本是
-    79.6 MB 的读写（实测 198.4 us / 401.3 GB/s），只有 ``M`` 足够大时才摊得薄，
-    所以这条路只在 :func:`linear_prefill` 的 ``rows >= _W4_DEQUANT_MIN_M`` 分支上用。
-
-    Args:
-        w: W4 权重，``packed`` 是 ``[ceil(K/2), N]`` uint8、``scale`` 是
-            ``[ceil(K/group), N]`` fp32（**K 在行、N 在列**）。
-
-    Returns:
-        ``[K, N]`` bf16 连续张量，可直接喂 ``torch.matmul(lhs, wt)``。
-
-    Raises:
-        RuntimeError: 扩展不可用，或形状不满足 ``w4_dequant`` 的向量化约束
-            （``N % 4 != 0``、``packed`` 不是 ``[ceil(K/2), N]``）。
-    """
-    module = _kernels()
-    return module.w4_dequant(w.packed, w.scale, w.k, w.n, w.group_size)
-
-
-def _w4_rows(w: W4A8Weight, x: torch.Tensor,
-             activation_scale: torch.Tensor | None = None) -> torch.Tensor:
-    """量化激活到 int8，再以逐组 int32 累加消费 packed W4 权重。
-
-    主机侧成本是这个入口的主要问题：一步 decode 有 316 次单行 W4A8 投影
-    （``w4a8_dot`` 计数，作业 ``q4budget2``），而实测 ``bops.linear`` 的 W4A8
-    一档主机耗时 **36.4 us/次**（作业 ``q4host1``），其中原生 torch 分发只占
-    4.9 us。差额几乎全是这里每次调用新建的三个张量（``xq`` / ``xs`` / ``out``）
-    加 ``quant_act_i8`` 的适配：
-
-    * ``xq`` / ``xs`` 是**纯暂存**，形状只由 ``(rows, K)`` 决定，调用方之间不共享
-      也不该看见它们。按 ``(形状, 设备)`` 缓存起来复用，省掉每步 316 次分配。
-    * ``out`` 必须每次新建：它是返回给调用方的结果，复用会让上一步的结果被就地
-      覆盖（而调用方常常还攥着它做后续加法）。
-
-    缓存只按形状键取，不按内容；暂存之间没有别名关系，所以复用是安全的。键里带
-    设备与 dtype：``.to()`` 之后旧缓冲在另一张卡上。
-
-    Args:
-        w: W4A8 权重，逻辑形状 ``[N, K]``。
-        x: 激活，``[K]``、``[M, K]`` 或它们的任意前导形状。
-        activation_scale: 已有的逐行 scale；给了就复用它、不重新分配。
-
-    Returns:
-        与 ``x`` 同前导形状、最后一维为 ``N`` 的张量，dtype 同 ``x``。
-
-    Raises:
-        ValueError: 激活的最后一维不是 ``K``，或与权重不在同一设备。
-    """
-    module = _kernels()
-    dtype = x.dtype
-    if x.dim() not in (1, 2) or x.shape[-1] != w.k:
-        raise ValueError("W4 projection expects [K] or [M, K] activations")
-    if x.device != w.packed.device:
-        raise ValueError("W4 weight and activation must share a device")
-    act = _compute_dtype(x)
-    # 只在真的需要时 reshape/contiguous。``x`` 在 decode 路径上几乎总是已经
-    # ``[1, K]``（或 ``[K]``）且连续，而 ``.reshape(-1, K)`` 与 ``.contiguous()``
-    # 即使什么都不做也各付一次 Python 分发 —— 一步 316 次 W4A8 投影就是 632 次。
-    if act.dim() != 2 or act.shape[1] != w.k:
-        act = act.reshape(-1, w.k)
-    if not act.is_contiguous():
-        act = act.contiguous()
-    rows = act.shape[0]
-    xq, xs = _w4_scratch(rows, w.k, act.device, activation_scale)
-    out = torch.empty((rows, w.n), dtype=act.dtype, device=act.device)
-    if rows:
-        # 分支提到循环外：这几个条件只由形状决定，而它每次调用都要判一遍。
-        #
-        # 分界 64 是实测的（作业 009，形状 ``[12288, 2560]``、单卡、bf16 输出）：
-        #
-        #     M=1    张量核 484.4 us / GEMV   59.3 us   -> GEMV 快 8.2 倍
-        #     M=32   张量核 510.6 us / GEMV  419.1 us   -> GEMV 快 18%
-        #     M=512  张量核 1998.2 us / GEMV 6734.7 us  -> 张量核快 3.4 倍
-        #
-        # 32 这一档必须走 GEMV：张量核的 warp tile 在 M 方向恒为 64 行，M=32 时一半是
-        # padding，而它还得付整套分块装载。从 64 起张量核领先。
-        use_gemm = rows >= 64 and w.k % 4 == 0 and w.group_size % 64 == 0
-        # M tile：从 256 行起用 256（实测 M=512 上比 128 快 11%，作业 259），
-        # 64-255 行仍用 128 —— 这一档用 256 会把行数补到 256，白算一倍。
-        m_tile = 256 if rows >= 256 else 0
-        # **不套 ``torch.cuda.device(...)``**。那个上下文管理器每次都走一遍
-        # ``c10::cuda::OptionalCUDAGuard``：读当前设备、比较、必要时切换、出块再
-        # 恢复。而扩展自己的每个入口都已经有 ``CUDAGuard guard(t.device())``
-        # （见 ``corex_ops.h`` 的 Constraints），张量也在正确的设备上，所以在
-        # 单卡路径上它什么也没做——一步 316 次投影就是 316 次纯开销。
-        # 多卡时由调用方保证当前设备，或由扩展的 guard 兜住。
-        if activation_scale is None:
-            module.quant_act_i8(act, xq, xs)
-        else:
-            module.quant_act_i8_scaled(act, xq, xs)
-        if use_gemm:
-            module.w4a8_gemm_tcu(xq, w.packed, xs, w.scale, out, w.group_size, m_tile)
-        else:
-            module.w4a8_gemv(xq, w.packed, xs, w.scale, out, w.group_size)
-    return _restore(out[0] if x.dim() == 1 else out, dtype)
-
-
-#: ``(rows, k, device)`` → ``(xq, xs)`` 的 W4A8 激活暂存池。
-#:
-#: 只在单线程的引擎主循环里被读写（``llm_engine`` 单线程驱动，见 ``moe.py`` 的
-#: Constraints），所以不需要锁。条数上限是防御性的：形状随 prompt 长度变化，
-#: 不设限会把每个见过的行数都留一份 int8 缓冲。
-_W4_SCRATCH: dict = {}
-_W4_SCRATCH_MAX = 32
-
-
-def _w4_scratch(rows: int, k: int, device: torch.device,
-                activation_scale: torch.Tensor | None):
-    """取（必要时分配）一对 W4A8 激活暂存。
-
-    Args:
-        rows: 本次的行数。
-        k: 激活宽度。
-        device: 目标设备。
-        activation_scale: 调用方已经持有的 scale；给了就直接用它，不碰缓存。
-
-    Returns:
-        ``(xq, xs)``：``[rows, k]`` 的 int8 与 ``[rows]`` 的 fp32。
-    """
-    if activation_scale is not None:
-        xq = _W4_SCRATCH.get((rows, k, device, True))
-        if xq is None:
-            xq = torch.empty((rows, k), dtype=torch.int8, device=device)
-            _W4_SCRATCH[(rows, k, device, True)] = xq
-        return xq, activation_scale
-    key = (rows, k, device, False)
-    pair = _W4_SCRATCH.get(key)
-    if pair is None:
-        if len(_W4_SCRATCH) >= _W4_SCRATCH_MAX:
-            _W4_SCRATCH.clear()
-        pair = (torch.empty((rows, k), dtype=torch.int8, device=device),
-                torch.empty(rows, dtype=torch.float32, device=device))
-        _W4_SCRATCH[key] = pair
-    return pair
-
-
-def moe_grouped(w, x: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
-    """按专家分组做 W4A8 投影，每个专家的权重一步只读一遍。
-
-    与 :func:`_w4_rows` 的区别只在并行维：那个是"一行激活对一个投影"，这个是
-    "一个专家对其全部路由行"。decode 期每个专家平均只分到 1-2 行，按 token 分组
-    会把 2.4 MB 的专家权重读到 token 数的倍数；按专家分组只读一遍。
-
-    激活先整体量成 int8，再交给内核：量化是逐 token 的，与哪些 token 属于哪个专家
-    无关，所以可以在分组之前一次做完，不必按段各量化一次。
-
-    内核侧按**每专家行数**分两档，调用方不需要知道：每专家 1 行时走「8 路展开 +
-    （K 够长才切）weight-group 分片」的那一档，实测 gate_up 203.3 -> 62.9 us、
-    down 58.5 -> 35.9 us（作业 213，逐位相同）；每专家多行时走单趟形态 —— 分片在
-    每专家 4 行以上反而慢 26%，因为部分和与归约是固定成本。判据与反例见
-    ``kernels/moe_grouped.cu`` 里那段启动注释。
-
-    Args:
-        w: 专家栈，:class:`W4A8MoEWeight`，``[E, N, K]``。
-        x: 激活，``[tokens, K]``，已按专家号排序。
-        offsets: ``[E+1]`` 前缀和，int32 或 int64；空段表示该专家没有行。
-
-    Returns:
-        ``[tokens, N]``，dtype 同 ``x``。
-
-    Raises:
-        ValueError: 激活或前缀和的形状与权重不自洽。
-    """
-    module = _kernels()
-    if x.dim() != 2 or x.shape[-1] != w.k:
-        raise ValueError("grouped MoE expects [tokens, K] activations")
-    if int(offsets.numel()) != len(w) + 1:
-        raise ValueError(f"offsets must have {len(w) + 1} entries")
-    tokens = x.shape[0]
-    dtype = x.dtype
-    if tokens == 0:
-        return torch.empty((0, w.n), dtype=dtype, device=x.device)
-
-    # 这一段是**主机侧**的主要成本（一条路径 48 层 x 2 次）。原来每次调用做四件事：
-    # ``_compute_dtype`` / ``reshape`` / ``contiguous`` / 两个 ``torch.empty`` /
-    # 一个 ``torch.zeros`` / 一个 ``offsets.to(int32)`` —— 六次分配加两次转换，
-    # 而它们描述的东西在一步之内完全不变（形状只由 tokens 决定，``offsets`` 本来就是
-    # int32 且在各 rank 间同构）。
-    #
-    # 所以这里按「形状键」把 xq/xs/out 复用起来，并短路掉那些已经是目标状态的转换。
-    act = x if x.dtype in (torch.bfloat16, torch.float32) else x.float()
-    if act.shape != (tokens, w.k) or not act.is_contiguous():
-        act = act.reshape(tokens, w.k).contiguous()
-    # 只复用 ``xq`` / ``xs`` 这对**纯暂存**：它们从不被返回、只在这次调用里被内核
-    # 读写，所以复用无别名风险。``out`` 不复用 —— 它是返回值，调用方可能把它挂进
-    # 残差流或是留着做后续加法，复用会让上一步的结果被就地覆盖。这一条与
-    # ``_w4_rows`` 里"out 必须每次新建"是同一条理由。
-    xq, xs = _moe_scratch(tokens, w.k, act.device)
-    # out 必须清零：分组内核只写 ``offsets`` 覆盖到的行，尾部一个字节都不写，而
-    # 调用方会把整块结果乘一个含 0 的权重掩码再加回去 —— ``0 * nan`` 还是 ``nan``。
-    out = torch.zeros((tokens, w.n), dtype=act.dtype, device=act.device)
-    # ``offsets`` 已经是 int32 连续时不要 ``.to()``：``.to`` 同 dtype 仍是一次
-    # Python 层分发，而这里每层要付两次。
-    if offsets.dtype == torch.int32 and offsets.is_contiguous():
-        bounds = offsets
-    else:
-        bounds = offsets.to(dtype=torch.int32, device=act.device).contiguous()
-    # 同样不套 ``torch.cuda.device(...)``：扩展入口自带 ``CUDAGuard``，而单卡路径
-    # 上当前设备本来就是对的。一步 96 次就是 96 次纯开销。
-    module.quant_act_i8(act, xq, xs)
-    module.moe_grouped(xq, xs, w.packed, w.scale, bounds, out, w.group_size)
-    return _restore(out, dtype)
-
+    if isinstance(w, QWeight):
+        # 同 :func:`linear`：``w.wq`` 就是内核要的 ``[N, K]``，一次转置都不做；分块
+        # （``_ROW_CHUNK``）在 :func:`_gemv_nk` 里做，一次启动落在一个内核真的有的特化上。
+        return _restore(_gemv_nk(w.wq, w.scale, act), dtype)
+    # 稠密（bf16/fp32）：nk 权重交给库。原先这里是 ``gemv_kn`` / ``gemv_kn_m_split``
+    # （torch 扩展），整套 kn 内核已删除；稠密 bf16 没有 nk GEMV，库的 ``N = 1`` 出口
+    # 吃得了这个形状。
+    return _restore(_gemm_nk_dense(w, act), dtype)
 
 def shared_gate_scale(x: torch.Tensor, w: torch.Tensor, src: torch.Tensor,
                       out: torch.Tensor) -> torch.Tensor:
@@ -778,8 +801,19 @@ def shared_gate_scale(x: torch.Tensor, w: torch.Tensor, src: torch.Tensor,
     Raises:
         RuntimeError: 扩展不可用。
     """
-    module = _kernels()
-    module.shared_gate_scale(x, w, src, out)
+    act = _compute_dtype(x)
+    width = int(act.shape[-1])
+    if x.dim() == 1:
+        rows, x_pitch = 1, width
+        s_pitch = o_pitch = width
+    else:
+        rows = int(act.reshape(-1, width).shape[0])
+        x_pitch = int(act.reshape(-1, width).stride(0))
+        s_pitch = int(src.reshape(-1, width).stride(0))
+        o_pitch = int(out.reshape(-1, width).stride(0))
+    _moe_ops().shim.shared_gate_scale(_ptr(act), _ptr(w), _ptr(src), _ptr(out), rows,
+                                      width, x_pitch, s_pitch, o_pitch, _dcode(act),
+                                      _stream() or 0)
     return out
 
 
@@ -788,8 +822,8 @@ def moe_grouped_i8(w, x: torch.Tensor, offsets: torch.Tensor,
                    out: torch.Tensor | None = None) -> torch.Tensor:
     """按专家分组做 int8 投影，一整栈权重在一次启动里读完。
 
-    与 :func:`moe_grouped` 的区别是权重的量化格式：那个吃 packed W4 加逐 (weight-group,
-    列) 的 scale，这个吃 ``[E, K, N]`` 的 int8 加逐 (专家, 列) 的 scale。后者让 K 方向
+    权重是 ``[E, N, K]``（nk 契约布局，也是**唯一**的布局）的 int8 加逐 (专家, 列) 的
+    scale；``[E, K, N]`` 的栈与它的内核已经删除。int8 让 K 方向
     分片可以先把整数和相加、最后一次乘两个 scale，所以部分和是 int32（见
     ``kernels/moe_grouped_i8.cu``）。
 
@@ -798,7 +832,7 @@ def moe_grouped_i8(w, x: torch.Tensor, offsets: torch.Tensor,
     量化误差口径才对得上。
 
     Args:
-        w: int8 专家栈，:class:`~int8_weights.QWeightMoE`（``[E, K, N]`` int8 加
+        w: int8 专家栈，:class:`~int8_weights.QWeightMoE`（``[E, N, K]`` int8 加
             ``[E, N]`` fp32）。
         x: 激活，``[tokens, K]``，已按专家号排序。bf16 时本函数就地量化；int8 时必须
             同时给出 ``scales``（上游已经量化过，例如 :func:`gather_quant_i8`、
@@ -814,7 +848,6 @@ def moe_grouped_i8(w, x: torch.Tensor, offsets: torch.Tensor,
     Raises:
         ValueError: 激活或前缀和的形状与权重不自洽。
     """
-    module = _kernels()
     if x.dim() != 2 or x.shape[-1] != w.k:
         raise ValueError("grouped MoE expects [tokens, K] activations")
     if int(offsets.numel()) != len(w) + 1:
@@ -838,7 +871,7 @@ def moe_grouped_i8(w, x: torch.Tensor, offsets: torch.Tensor,
         if act.shape != (tokens, w.k) or not act.is_contiguous():
             act = act.reshape(tokens, w.k).contiguous()
         xq, xs = _moe_scratch(tokens, w.k, act.device)
-        module.quant_act_i8(act, xq, xs)
+        _w8a8_ops().quant_act_i8(act, xq, xs)
     # 内核覆盖每一行的每一列（网格的 y 维就是行数），所以这里用 ``empty`` 而不是
     # ``zeros``：一行清零的发射在 decode 一步里要付 80 次。
     #
@@ -851,15 +884,16 @@ def moe_grouped_i8(w, x: torch.Tensor, offsets: torch.Tensor,
         bounds = offsets
     else:
         bounds = offsets.to(dtype=torch.int32, device=x.device).contiguous()
-    # ``w.nk_stack()`` 是一次性转置，第一次进来时（预热阶段，不在解码步里）付一次；
-    # 之后每步都拿同一块存储。关掉 ``COFFIN_MOE_I8_NK`` 时连副本都不建。
-    #
-    # 开之前先看内存账：副本是**整模型**翻倍的那一份，EP4 下 40 层 x 64 专家 x 3 MB
-    # = 每张 rank 多背 7.7 GB（不是一层，记一层会少算 40 倍）。所以这一档目前只适合
-    # 短烟测或单层对拍，要真上生产得让加载器直接按 ``[N, K]`` 造专家栈、不转置。
-    nk = 1 if _MOE_I8_NK else 0
-    module.moe_grouped_i8(xq, xs, w.nk_stack() if nk else w.wq, w.scale, bounds, out,
-                          slices, nk)
+    # `w.nk_stack()` 是**零拷贝**（就是盘上那一份），专家栈只剩 nk 一种布局，所以
+    # 这里不再有布局开关，也不会有任何整栈转置。
+    rc = _moe_ops().shim.grouped_i8(_ptr(xq), _ptr(xs), _ptr(w.nk_stack()), _ptr(w.scale),
+                                    _ptr(bounds), _ptr(out), 0, _dcode(out),
+                                    int(tokens), int(w.k), int(w.n), len(w), int(slices),
+                                    _stream() or 0)
+    if rc:
+        raise RuntimeError(f"coffin_moe_grouped_i8 rejected the geometry "
+                           f"(tokens={tokens} K={w.k} N={w.n} E={len(w)} slices={slices}, "
+                           f"code={rc})")
     return out if x.dtype == torch.int8 else _restore(out, dtype)
 
 
@@ -875,10 +909,11 @@ def moe_grouped_i8_expert(w, x: torch.Tensor, offsets: torch.Tensor, slices: int
     带宽已经打满，只是全花在重复字节上）。这里按专家切块，行在块内成趟复用权重。
 
     只接受 **nk 原生**专家栈（``[E, N, n]``，一列的 K 连续）：这条几何是一条线程认领
-    一整列、一个 32 字节步铺满一个扇区，kn 栈要先转置一份整模型的副本才谈得上。
+    一整列、一个 32 字节步铺满一个扇区；``[E, K, N]`` 的栈要先转置一份整模型的副本才
+    谈得上，那条分支（连同内核）已经删除。
 
     Args:
-        w: int8 专家栈，:class:`~int8_weights.QWeightMoE`，``layout == "nk"``。
+        w: int8 专家栈，:class:`~int8_weights.QWeightMoE`（nk，``[E, N, K]``）。
         x: 激活，``[tokens, K]``，已按专家号排序；int8 时必须同时给出 ``scales``。
         offsets: ``[E+1]`` 前缀和，int32 或 int64。
         slices: 与 :func:`moe_grouped_i8` 同形保留，本形态忽略（并行度来自列块 x 专家）。
@@ -891,9 +926,8 @@ def moe_grouped_i8_expert(w, x: torch.Tensor, offsets: torch.Tensor, slices: int
     Raises:
         ValueError: 权重不是 nk 布局，或激活、前缀和与权重不自洽。
     """
-    module = _kernels()
-    if getattr(w, "layout", "kn") != "nk":
-        raise ValueError("moe_grouped_i8_expert needs an nk-native expert stack [E, N, K]")
+    # 专家栈只有 nk 一种布局（kn 的 `[E, K, N]` 与它的内核已删除），`nk_stack()`
+    # 零拷贝交出的就是 `[E, N, K]` 那一份，所以不再有布局分支要检查。
     if x.dim() != 2 or x.shape[-1] != w.k:
         raise ValueError("grouped MoE expects [tokens, K] activations")
     if int(offsets.numel()) != len(w) + 1:
@@ -914,7 +948,7 @@ def moe_grouped_i8_expert(w, x: torch.Tensor, offsets: torch.Tensor, slices: int
         if act.shape != (tokens, w.k) or not act.is_contiguous():
             act = act.reshape(tokens, w.k).contiguous()
         xq, xs = _moe_scratch(tokens, w.k, act.device)
-        module.quant_act_i8(act, xq, xs)
+        _w8a8_ops().quant_act_i8(act, xq, xs)
 
     if out is None or out.shape != (tokens, w.n) or out.device != x.device \
             or out.dtype not in (torch.bfloat16, torch.float32):
@@ -924,7 +958,10 @@ def moe_grouped_i8_expert(w, x: torch.Tensor, offsets: torch.Tensor, slices: int
     else:
         bounds = offsets.to(dtype=torch.int32, device=x.device).contiguous()
     # ``nk_stack()`` 在 nk 原生栈上是零拷贝：直接就是 checkpoint 里那一份。
-    module.moe_grouped_i8_expert(xq, xs, w.nk_stack(), w.scale, bounds, out)
+    _moe_ops().shim.grouped_i8_expert(_ptr(xq), _ptr(xs), _ptr(w.nk_stack()), _ptr(w.scale),
+                                       _ptr(bounds), _ptr(out),
+                                       1 if out.dtype == torch.bfloat16 else 0, int(tokens),
+                                       int(w.k), int(w.n), len(w), _stream())
     return out if x.dtype == torch.int8 else _restore(out, dtype)
 
 
@@ -935,7 +972,7 @@ def moe_grouped_i8_tcu(w, x: torch.Tensor, offsets: torch.Tensor, slices: int = 
 
     与 :func:`moe_grouped_i8_expert` 的算术逐位相同，差别在算力：同一张卡上同一形状
     （4096 x 2048 -> 1024）实测 ``moe_grouped_i8_expert`` 8.99 ms（0.96 TMAC/s，dp4a
-    的天花板），而稠密 ``w8a8_gemm_tcu`` 只要 0.446 ms（19.2 TMAC/s）。PP2 预填充要
+    的天花板），而张量核这条 0.446 ms（19.2 TMAC/s）。PP2 预填充要
     4000 tps，每卡需要约 2 TMAC/s，所以预填充必须走这条。
 
     nk 原生栈在这里**不需要转置**：内核把两个操作数互换（mat-a 吃激活、mat-b 吃权重），
@@ -943,7 +980,7 @@ def moe_grouped_i8_tcu(w, x: torch.Tensor, offsets: torch.Tensor, slices: int = 
     要按 k 主序再摆一份，即下面那次 ``t().contiguous()``。
 
     Args:
-        w: int8 专家栈，:class:`~int8_weights.QWeightMoE`，``layout == "nk"``。
+        w: int8 专家栈，:class:`~int8_weights.QWeightMoE`（nk，``[E, N, K]``）。
         x: 激活，``[tokens, K]``，已按专家号排序；int8 时必须同时给出 ``scales``。
         offsets: ``[E+1]`` 前缀和，int32 或 int64。
         slices: 保留同形，本形态忽略。
@@ -954,11 +991,11 @@ def moe_grouped_i8_tcu(w, x: torch.Tensor, offsets: torch.Tensor, slices: int = 
         ``[tokens, N]``，dtype 同 ``x``。
 
     Raises:
-        ValueError: 权重不是 nk 布局，或 K 不是 64 的整数倍。
+        ValueError: 权重不是 nk 布局、K 不是 64 的整数倍，或**每专家不足 4 行**——
+            后者是内核的已知缺陷（见下），在这里挡住，调用方按 ``ValueError`` 退回
+            :func:`moe_grouped_i8` 的 GEMV 结构。
     """
-    module = _kernels()
-    if getattr(w, "layout", "kn") != "nk":
-        raise ValueError("moe_grouped_i8_tcu needs an nk-native expert stack [E, N, K]")
+    # 同上：只有 nk 一种专家栈，没有布局分支要检查。
     if w.k % 64 != 0:
         raise ValueError("moe_grouped_i8_tcu needs K to be a multiple of 64")
     if x.dim() != 2 or x.shape[-1] != w.k:
@@ -969,6 +1006,16 @@ def moe_grouped_i8_tcu(w, x: torch.Tensor, offsets: torch.Tensor, slices: int = 
     dtype = x.dtype
     if tokens == 0:
         return torch.empty((0, w.n), dtype=dtype, device=x.device)
+    # 每专家不足 4 行时**不要**进这个内核：``tools/probe_corex_moe_i8.py`` 在
+    # 8 专家 / K=2048 / N=512 上量到每专家 1、2、3 行的相对 RMS 分别是 0.86、0.72、
+    # 0.86（同一个栈走 GEMV 结构是 0.008，也就是量化噪声本身），每专家 4 行起才
+    # 回到 0.0087。共享内存里的 64 行 tile 在末端没有零填充，短段的垃圾行会被 mma
+    # 算进有效行——症状是「输出看着像话但数值不对」，所以宁可在这里失败。
+    experts = len(w)
+    if tokens < 4 * experts:
+        raise ValueError(
+            f"moe_grouped_i8_tcu needs >= 4 rows per expert; got {tokens} rows for "
+            f"{experts} experts")
 
     if x.dtype == torch.int8:
         if scales is None:
@@ -981,7 +1028,7 @@ def moe_grouped_i8_tcu(w, x: torch.Tensor, offsets: torch.Tensor, slices: int = 
         if act.shape != (tokens, w.k) or not act.is_contiguous():
             act = act.reshape(tokens, w.k).contiguous()
         xq, xs = _moe_scratch(tokens, w.k, act.device)
-        module.quant_act_i8(act, xq, xs)
+        _w8a8_ops().quant_act_i8(act, xq, xs)
 
     if out is None or out.shape != (tokens, w.n) or out.device != x.device \
             or out.dtype not in (torch.bfloat16, torch.float32):
@@ -995,8 +1042,18 @@ def moe_grouped_i8_tcu(w, x: torch.Tensor, offsets: torch.Tensor, slices: int = 
     # 用分块转置核而不是 ``xq.t().contiguous()``：后者实测只有 15.7 GB/s，占掉张量核
     # 那条路两成的时间。
     at = torch.empty((w.k, tokens), dtype=torch.int8, device=x.device)
-    module.transpose_i8(xq, at)
-    module.moe_grouped_i8_tcu(at, xs, w.nk_stack(), w.scale, bounds, out)
+    ops = _moe_ops().shim
+    stream = _stream() or 0
+    rc = ops.transpose_i8(_ptr(xq), _ptr(at), int(tokens), int(w.k), stream)
+    if rc:
+        raise RuntimeError(f"coffin_transpose_i8 rejected the geometry "
+                           f"(rows={tokens} K={w.k}, code={rc})")
+    rc = ops.grouped_i8_tcu(_ptr(at), _ptr(xs), _ptr(w.nk_stack()), _ptr(w.scale),
+                            _ptr(bounds), _ptr(out), _dcode(out),
+                            int(tokens), int(w.k), int(w.n), len(w), stream)
+    if rc:
+        raise RuntimeError(f"coffin_moe_grouped_i8_tcu rejected the geometry "
+                           f"(rows={tokens} K={w.k} N={w.n} E={len(w)}, code={rc})")
     return out if x.dtype == torch.int8 else _restore(out, dtype)
 
 
@@ -1023,7 +1080,6 @@ def gather_quant_i8(x: torch.Tensor, index: torch.Tensor,
     Raises:
         ValueError: 源激活不是二维连续张量，或索引表的 dtype 不是 int32。
     """
-    module = _kernels()
     if x.dim() != 2 or not x.is_contiguous():
         raise ValueError("gather_quant_i8 expects a contiguous [tokens, K] source")
     if index.dtype != torch.int32:
@@ -1031,8 +1087,8 @@ def gather_quant_i8(x: torch.Tensor, index: torch.Tensor,
     rows = int(index.numel())
     if out_q is None or out_s is None:
         out_q, out_s = _moe_scratch(rows, x.shape[1], x.device)
-    module.gather_quant_i8(x, index, out_q, out_s)
-    return out_q, out_s
+    return _w8a8_ops().gather_quant_i8(x, index, rows=rows, out_q=out_q, out_s=out_s,
+                                       stream=_stream())
 
 
 def silu_mul_quant(gate: torch.Tensor, up: torch.Tensor,
@@ -1060,7 +1116,6 @@ def silu_mul_quant(gate: torch.Tensor, up: torch.Tensor,
     Raises:
         ValueError: 两个输入形状不一致。
     """
-    module = _kernels()
     if gate.shape != up.shape or gate.dim() != 2:
         raise ValueError("silu_mul_quant needs two same-shaped [rows, K] inputs")
     rows, width = int(gate.shape[0]), int(gate.shape[1])
@@ -1068,7 +1123,10 @@ def silu_mul_quant(gate: torch.Tensor, up: torch.Tensor,
         out = torch.empty_like(gate)
     if out_q is None or out_s is None:
         out_q, out_s = _moe_scratch(rows, width, gate.device)
-    module.silu_mul_quant(gate, up, out, out_q, out_s)
+    _attn_ops().shim.silu_mul_quant(_ptr(gate), _ptr(up), _ptr(out), _ptr(out_q),
+                                    _ptr(out_s), rows, width, int(gate.stride(0)),
+                                    int(up.stride(0)), int(out.stride(0)),
+                                    _dcode(gate), _stream() or 0)
     return out, out_q, out_s
 
 
@@ -1094,7 +1152,6 @@ def moe_grouped_i8_merge(w, x: torch.Tensor, offsets: torch.Tensor,
     Raises:
         ValueError: 激活行数、前缀和长度或逐行权重与权重栈不自洽。
     """
-    module = _kernels()
     if x.dim() != 2 or x.shape[-1] != w.k:
         raise ValueError("grouped MoE expects [rows, K] activations")
     rows = int(x.shape[0])
@@ -1115,10 +1172,16 @@ def moe_grouped_i8_merge(w, x: torch.Tensor, offsets: torch.Tensor,
     else:
         bounds = offsets.to(dtype=torch.int32, device=act.device).contiguous()
     out = torch.empty((1, w.n), dtype=act.dtype, device=act.device)
-    module.quant_act_i8(act, xq, xs)
-    nk = 1 if _MOE_I8_NK else 0
-    module.moe_grouped_i8_merge(xq, xs, w.nk_stack() if nk else w.wq, w.scale, bounds,
-                                row_weight, out, slices, nk)
+    _w8a8_ops().quant_act_i8(act, xq, xs)
+    stack = w.nk_stack()
+    rc = _moe_ops().shim.merge(_ptr(xq), _ptr(xs), _ptr(stack), _ptr(w.scale),
+                               _ptr(bounds), _ptr(row_weight), _ptr(out), _dcode(out),
+                               int(rows), int(w.k), int(w.n), len(w), int(slices),
+                               _stream() or 0)
+    if rc:
+        raise RuntimeError(f"coffin_moe_grouped_i8_merge rejected the geometry "
+                           f"(rows={rows} K={w.k} N={w.n} E={len(w)} slices={slices}, "
+                           f"code={rc})")
     return _restore(out, dtype)
 
 
@@ -1158,7 +1221,6 @@ def moe_grouped_i8_merge_tokens(w, x: torch.Tensor, offsets: torch.Tensor,
     Raises:
         ValueError: 激活行数、权重形状或两张位置表的长度与 ``tokens * top_k`` 不自洽。
     """
-    module = _kernels()
     if x.dim() != 2 or x.shape[-1] != w.k:
         raise ValueError("grouped MoE expects [rows, K] activations")
     rows = int(x.shape[0])
@@ -1186,7 +1248,7 @@ def moe_grouped_i8_merge_tokens(w, x: torch.Tensor, offsets: torch.Tensor,
         if not act.is_contiguous():
             act = act.reshape(rows, w.k).contiguous()
         xq, xs = _moe_scratch(rows, w.k, act.device)
-        module.quant_act_i8(act, xq, xs)
+        _w8a8_ops().quant_act_i8(act, xq, xs)
     if not row_weight.is_contiguous():
         row_weight = row_weight.contiguous()
     if row_weight.dtype not in (torch.bfloat16, torch.float32):
@@ -1205,11 +1267,15 @@ def moe_grouped_i8_merge_tokens(w, x: torch.Tensor, offsets: torch.Tensor,
     if out is None or out.shape != (tokens, w.n) or out.device != x.device \
             or out.dtype not in (torch.bfloat16, torch.float32):
         out = torch.empty((tokens, w.n), dtype=act_dtype, device=x.device)
-    nk = 1 if _MOE_I8_NK else 0
-    module.moe_grouped_i8_merge_tokens(xq, xs, w.nk_stack() if nk else w.wq, w.scale,
-                                       bounds, row_weight,
-                                       slot_pos, slot_of_pos, int(tokens), int(top_k),
-                                       out, slices, nk)
+    rc = _moe_ops().shim.merge_tokens(_ptr(xq), _ptr(xs), _ptr(w.nk_stack()), _ptr(w.scale),
+                                      _ptr(bounds), _ptr(row_weight), _ptr(slot_pos),
+                                      _ptr(slot_of_pos), _ptr(out), _dcode(out), _dcode(row_weight),
+                                      int(rows), int(w.k), int(w.n), len(w), int(tokens),
+                                      int(top_k), int(slices), _stream() or 0)
+    if rc:
+        raise RuntimeError(f"coffin_moe_grouped_i8_merge_tokens rejected the geometry "
+                           f"(rows={rows} K={w.k} N={w.n} E={len(w)} tokens={tokens} "
+                           f"top_k={top_k} slices={slices}, code={rc})")
     return out if x.dtype == torch.int8 else _restore(out, dtype)
 #: ``(tokens, k, device)`` → ``(xq, xs)`` 的分组 MoE 激活暂存。
 #:
@@ -1275,9 +1341,6 @@ def moe_dispatch(expert_idx: torch.Tensor, local_table: torch.Tensor,
         ValueError: 专家数或槽位数与 ``local_table`` 不自洽。
         RuntimeError: 扩展不可用。
     """
-    module = _kernels()
-    if expert_idx.dtype != torch.int32:
-        expert_idx = expert_idx.to(torch.int32)
     if local_table.dtype != torch.int32:
         local_table = local_table.to(torch.int32)
     device = expert_idx.device
@@ -1286,43 +1349,20 @@ def moe_dispatch(expert_idx: torch.Tensor, local_table: torch.Tensor,
     token_of_pos = torch.empty(slots, dtype=torch.int32, device=device)
     slot_of_pos = torch.empty(slots, dtype=torch.int32, device=device)
     scratch = _disp_scratch(local_experts, device)
-    with torch.cuda.device(device):
-        module.moe_dispatch(expert_idx, local_table, offsets, slot_pos,
-                            token_of_pos, slot_of_pos, scratch, slots,
-                            local_experts, num_experts, top_k)
+    # ``expert_idx`` 不窄化：出口按 dtype 选模板（int32 / int64 各一条），读 int64 与
+    # 读 int32 在只有 ``slots`` 个元素的分派核上没有可测差别，而窄化是一次独立发射
+    # （实测 11 us/层）。
+    if expert_idx.dtype not in (torch.int32, torch.int64):
+        expert_idx = expert_idx.to(torch.int32)
+    _moe_ops().shim.moe_dispatch(_ptr(expert_idx), _ptr(local_table), _ptr(offsets),
+                                 _ptr(slot_pos), _ptr(token_of_pos), _ptr(slot_of_pos),
+                                 _ptr(scratch), slots, local_experts, num_experts,
+                                 int(top_k), _dcode(expert_idx), _stream() or 0)
     return offsets, slot_pos, token_of_pos, slot_of_pos
 
 
 #: ``(local_experts, device)`` → 分派暂存。一步 48 层共用一块,不必每层分配。
 _DISP_SCRATCH: dict = {}
-
-
-def mega_bar_probe(*args) -> torch.Tensor:
-    """常驻网格栅栏的冒烟入口。
-
-    Args:
-        *args: 与扩展入口同序的位置参数（``out`` / ``gate`` / ``blocks`` / ``threads`` /
-            ``iters``）。
-
-    Returns:
-        每块看到的代次快照。
-    """
-    return _kernels().mega_bar_probe(*args)
-
-
-def moe_decode_block(*args) -> torch.Tensor:
-    """decode 单层 MoE 块的合成入口：一次调用顶掉十余次 pybind 往返。
-
-    权重与全部中间缓冲都由调用方给，本入口不做分配——分配本身实测只有 1.4 us/次，
-    把它搬进 C++ 省不下那笔钱，而这个入口赚的是参数编组与 Python 包装那约 4 us/次。
-
-    Args:
-        *args: 与扩展入口同序的位置参数，见 ``kernels/corex_ops.h`` 的声明。
-
-    Returns:
-        最终 MoE 输出张量（即调用方传入的 ``out``）。
-    """
-    return _kernels().moe_decode_block(*args)
 
 
 def _disp_scratch(local_experts: int, device: torch.device) -> torch.Tensor:
@@ -1341,53 +1381,6 @@ def _disp_scratch(local_experts: int, device: torch.device) -> torch.Tensor:
         buf = torch.empty(local_experts, dtype=torch.int32, device=device)
         _DISP_SCRATCH[key] = buf
     return buf
-
-
-def moe_grouped_gemm(w, x: torch.Tensor, offsets: torch.Tensor,
-                     out: torch.Tensor | None = None) -> torch.Tensor:
-    """按专家分段做**张量核 GEMM**，用于 prefill 的大 M。
-
-    与 :func:`moe_grouped` 的区别只在用哪类内核：那个是「一列一线程、逐行串行」的
-    GEMV 结构，适合 decode 时每专家 1-2 行；这里是每段一次 ``w4a8_gemm_tcu``，
-    适合 prefill 时每专家上百行。
-
-    **为什么需要它**：作业 ``q4prebase3`` 的 ``seq=2048`` 账本里
-    ``moe_grouped_kernel`` 是 **2178 ms / 30.4%**，第一项。那时
-    ``tokens = 2048 x top_k(10) = 20480`` 行散在 128 个本地专家上、每专家约 160 行，
-    而 GEMV 结构下每行都要串行走完整个 K —— 权重被按段重读，有效带宽只有几 GB/s。
-    同一批行按段喂给 ``w4a8_gemm_tcu`` 则是标准的 ``[160, 2560] x [2560, 1024]``，
-    那是本卡张量核最擅长的形状（实测 2.3 ms/次、算力受限档）。
-
-    Args:
-        w: 专家栈，:class:`W4A8MoEWeight`，``[E, N, K]``。
-        x: 激活，``[tokens, K]``，**已按专家号排好序**。
-        offsets: ``[E+1]`` int32 前缀和，设备侧。
-        out: 可选输出缓冲，``[tokens, N]``；不给则分配。
-
-    Returns:
-        ``[tokens, N]``，dtype 同 ``x``。
-
-    Raises:
-        ValueError: 形状不自洽，或 K/group 不满足张量核的对齐要求（此时调用方应当
-            继续用 :func:`moe_grouped`）。
-    """
-    module = _kernels()
-    tokens = x.shape[0]
-    dtype = x.dtype
-    if tokens == 0:
-        return torch.zeros((0, w.n), dtype=dtype, device=x.device)
-    act = _compute_dtype(x).reshape(tokens, w.k).contiguous()
-    xq = torch.zeros(act.shape, dtype=torch.int8, device=act.device)
-    xs = torch.zeros(tokens, dtype=torch.float32, device=act.device)
-    result = (torch.zeros((tokens, w.n), dtype=act.dtype, device=act.device)
-              if out is None else out)
-    if out is not None:
-        out.zero_()
-    bounds = offsets.to(dtype=torch.int32, device=act.device).contiguous()
-    module.quant_act_i8(act, xq, xs)
-    module.moe_grouped_gemm(xq, xs, w.packed, w.scale, bounds, result,
-                            w.group_size)
-    return _restore(result, dtype)
 
 
 def moe_router(logits: torch.Tensor, top_k: int,
@@ -1439,16 +1432,16 @@ def moe_router(logits: torch.Tensor, top_k: int,
             f"fused router needs 0 < top_k <= min(32, {experts}), got {top_k}.")
     if logits.dtype not in (torch.bfloat16, torch.float32):
         raise ValueError(f"fused router needs bf16 or fp32 logits, got {logits.dtype}.")
-    module = _kernels()
     if not logits.is_contiguous():
+        # 内核按 ``token * experts`` 取行，带行间距的视图会读错行（出口也会拒）。
         logits = logits.contiguous()
     index = torch.empty((tokens, top_k), dtype=torch.int64, device=logits.device)
     weight = torch.empty((tokens, top_k), dtype=logits.dtype, device=logits.device)
     if tokens == 0:
         return index, weight
-    # 不套 ``torch.cuda.device(...)``：扩展入口自带 ``CUDAGuard``，而 decode 一步要发
-    # 48 次，每次都是一个纯开销的上下文管理器。
-    module.moe_router(logits, index, weight, top_k, normalize)
+    _moe_ops().shim.moe_router(_ptr(logits), _ptr(index), _ptr(weight), tokens, experts,
+                               int(top_k), 1 if normalize else 0, _dcode(logits),
+                               _stream() or 0)
     return index, weight
 
 
@@ -1480,7 +1473,7 @@ def attn_sparse(q: torch.Tensor, kcache: torch.Tensor, vcache: torch.Tensor,
         ValueError: 形状与权重不自洽。
         RuntimeError: 扩展不可用。
     """
-    module = _kernels()
+    module = _attn_ops().shim
     if q.dim() != 3:
         raise ValueError("attn_sparse expects q as [rows, nh, hd]")
     rows, nh, hd = q.shape
@@ -1494,7 +1487,11 @@ def attn_sparse(q: torch.Tensor, kcache: torch.Tensor, vcache: torch.Tensor,
         sel_len = sel_len.to(torch.int32)
     if ctx.dtype != torch.int32:
         ctx = ctx.to(torch.int32)
-    module.attn_sparse(q, kcache, vcache, sel_idx, sel_len, ctx, out, float(scale))
+    # 几何全给裸指针出口：ABI 面没有形状，``rows`` 只能由调用方从 q 读出来。
+    module.attn_sparse(_ptr(q), _ptr(kcache), _ptr(vcache), _ptr(sel_idx), _ptr(sel_len),
+                       _ptr(ctx), _ptr(out), float(scale), int(rows), int(nh),
+                       int(kcache.shape[0]), int(hd), int(kcache.shape[1]),
+                       int(sel_idx.shape[-1]), _stream())
     return out
 
 
@@ -1533,7 +1530,7 @@ def qsa_block_keys(flat_keys: torch.Tensor, table: torch.Tensor,
         ValueError: 形状不自洽或 ``ratio`` 超出内核上限。
         RuntimeError: 扩展不可用。
     """
-    module = _kernels()
+    module = _attn_ops().shim
     if table.dim() != 3:
         raise ValueError("table must be [rows, max_blocks, ratio]")
     rows, max_blocks, _ratio = table.shape
@@ -1548,79 +1545,169 @@ def qsa_block_keys(flat_keys: torch.Tensor, table: torch.Tensor,
     arange = torch.arange(blk_total, device=table.device, dtype=torch.int32)
     block_row = torch.div(arange, max_blocks, rounding_mode="floor")
     block_batch = torch.div(block_row, int(seq), rounding_mode="floor")
-    module.qsa_block_keys(flat_keys, table, weight, flat_cos, flat_sin,
-                          block_row, block_batch, out, int(seq), int(tokens),
-                          int(rotary_dim), float(eps))
+    module.qsa_block_keys(_ptr(flat_keys), _ptr(table), _ptr(weight), _ptr(flat_cos),
+                          _ptr(flat_sin), _ptr(block_row), _ptr(block_batch), _ptr(out),
+                          int(rows), int(seq), int(tokens), int(max_blocks), int(_ratio),
+                          int(head_dim), int(rotary_dim), float(eps), _stream())
     return out
 
 
-def _w8a8_rows(packed: pack.KnQWeight, act: torch.Tensor) -> torch.Tensor:
-    """用三个 W8A8 内核做一次预填充投影：量化激活、int8 GEMM、乘两个 scale。
+def _prefill_nk_tcu(w: QWeight, x: torch.Tensor):
+    """把一个 nk 投影当成「只有一个专家」交给分组张量核 GEMM。
 
-    这是本后端 int8 权重的预填充实现。它替掉的是「每次调用把整份权重反量化成
-    bf16 再 GEMM」那条路，那条路在 4B 上每个请求固定多付一次全量权重转换
-    （``pack.KnQWeight.dequant_kn`` 的 docstring 记的是 174.8 ms 一档的代价），
-    而这里权重全程留在 int8。
-
-    ``N`` 超过 :data:`pack.LIB_MAX_N` 时沿列切块，每块的累加器单独分配：``[K, N]``
-    矩阵的列切片不连续，而 ``w8a8_gemm`` 要求最内层连续，正确写法是切一次权重再
-    GEMM，而不是把不连续的视图递进去。
+    为什么值得单开一条：``linear_prefill`` 原来一律先 ``pack.as_kn(w)``，对 nk 原生的
+    ``QWeight`` 这意味着为这个权重转置一整份 ``[K, N]`` 副本——4B 是 4.3 GB，Occamy 是
+    35 GB，而卡只有 31.7 GiB，两份布局根本放不下。分组内核本来就是 nk 原生（mat-b
+    吃的就是「固定 n 的 4 个相邻 k」），所以 ``E = 1``、``offsets = [0, rows]`` 正好
+    表达「整个投影一次算完」，一次转置都不用做。
 
     Args:
-        packed: int8 权重，``[K, N]`` 矩阵加 ``[N]`` 个 fp32 列 scale。
+        w: nk 原生的 int8 投影，``wq`` 是连续 ``[N, K]``。
+        x: 激活，``[rows, K]``。
+
+    Returns:
+        ``[rows, N]``，dtype 同 ``x``；内核缺失或短段守卫拒绝时返回 ``None``，
+        调用方退回库的 TN 出口（``_w8a8_lib_rows``）。
+
+    Note:
+        默认不开（``COFFIN_PREFILL_NK=1`` 才走）。4B 上实测这一档把吞吐从 2468
+        掉到 662 tok/s（预填充 512 行从 207 ms 变成 774 ms），因为分组内核按专家切
+        并行度，``E = 1`` 只剩一维可用；它换来的是峰值显存 9.41 -> 6.01 GiB——
+        也就是库里那一趟 workspace。权重放得下时走库的 TN 出口（本来就不转置），
+        放不下时（Occamy 的 35 GB 在 31.7 GiB 的卡上）才换这一档。
+    """
+    if not _PREFILL_NK:
+        return None
+    rows, k = x.shape
+    if rows < 4:
+        return None
+    stack = QWeightMoE(w.wq.unsqueeze(0), w.scale.unsqueeze(0).contiguous(),
+                       k=k)
+    bounds = torch.tensor([0, rows], dtype=torch.int32, device=x.device)
+    try:
+        return moe_grouped_i8_tcu(stack, x, bounds)
+    except ValueError:
+        return None
+
+
+def _w8a8_lib_rows(w: QWeight, act: torch.Tensor) -> torch.Tensor:
+    """int8 预填充投影，三步全在 torch 之外：量化 → ``GemmEx`` → epilogue。
+
+    权重就是盘上那份 nk 原缓冲 ``[N, K]``，直接按 ``OP_T`` 递进 ``cublasGemmEx``
+    （TN：`[N, K]` 的 nk 行主序缓冲在列主序下就是 `[K, N]`），**一次转置都不做**。
+
+    ``N`` 超过 :data:`pack.LIB_MAX_N` 时沿**行**切：nk 布局下这一步是连续切片，切出来
+    仍是一块 ``[width, K]`` 的 nk 权重，``GemmOps.i8_nk`` 照原样吃，不需要指针偏移。
+
+    Args:
+        w: nk 原生的 int8 权重，``wq`` 是连续 ``[N, K]``，``scale`` 是 ``[N]`` fp32。
         act: 激活，``[M, K]``，bf16 或 fp32。
 
     Returns:
         ``[M, N]``，dtype 同 ``act``。
 
     Raises:
-        RuntimeError: 扩展不可用。这条路径没有纯 torch 的回退——调用方
-            :func:`linear_prefill` 只在 int8 权重且 ``M`` 够大时才走到这里，
-            而那种形状上退回参考实现比慢更糟。
+        ValueError: 权重不是 nk 连续，或 dtype/形状不符。
+        RtError: 找不到 ``libcublas``，或 GEMM 启动失败。
     """
-    module = _kernels()
     rows, k = act.shape
-    n = packed.n
+    n = int(w.wq.shape[0])
+    if int(w.wq.shape[1]) != int(k):
+        raise ValueError(f"weight holds K = {w.wq.shape[1]}, activation has {k}")
+    stream = _stream()
     xq = torch.empty((rows, k), dtype=torch.int8, device=act.device)
     xs = torch.empty(rows, dtype=torch.float32, device=act.device)
     out = torch.empty((rows, n), dtype=act.dtype, device=act.device)
-    # 量化排在循环外：一份激活只按行量化一次，切块只在 N 上做，所以每块共用同一
-    # 份 int8 激活和同一份 scale。
-    module.quant_act_i8(act, xq, xs)
-    use_tcu = _use_tcu_gemm(rows, k, n, hasattr(module, "w8a8_gemm_tcu"))
+    w8a8 = _w8a8_ops()
+    gemm = _gemm_ops()
+    # 一份激活只量化一次：切块只沿 N 做，每块共用同一份 int8 激活和同一份行 scale。
+    w8a8.quant_act_i8(act, xq, xs, stream=stream)
     for start in range(0, n, pack.LIB_MAX_N):
         stop = min(n, start + pack.LIB_MAX_N)
         width = stop - start
-        block = packed.wt[:, start:stop]
+        block = w.wq[start:stop]
         if not block.is_contiguous():
             block = block.contiguous()
-        if use_tcu:
-            # 融合路径没有 int32 缓冲，也没有第二个内核：累加器留在寄存器里，
-            # 乘完两个 scale 直接出浮点。
-            module.w8a8_gemm_tcu(xq, block, xs, packed.scale[start:stop],
-                                 out[:, start:stop])
-            continue
         acc = torch.empty((rows, width), dtype=torch.int32, device=act.device)
-        module.w8a8_gemm(xq, block, acc)
-        # 行距传 ``n`` 而不是块宽：``out`` 的列切片在最内层仍然连续到 ``n``，
-        # 用块宽当行距会让第二行写回到第一行的尾部。
-        module.w8a8_epilogue(acc, xs, packed.scale[start:stop],
-                             out[:, start:stop], n)
+        gemm.i8_nk(xq, block, acc, stream=stream)
+        # 行距传 ``n``：``out`` 的列切片在最内层连续到 ``n``，用块宽当行距会把第二行
+        # 写回第一行的尾部。
+        w8a8.epilogue(acc, xs, w.scale[start:stop], out[:, start:stop], stride=n,
+                      stream=stream)
     return out
 
 
-def linear_prefill(w: torch.Tensor | QWeight | pack.KnWeight,
+def _gemm_nk_rows(w: torch.Tensor, act: torch.Tensor) -> torch.Tensor:
+    """稠密（bf16/fp32）预填充投影，直接把 ``[N, K]`` 交给库，不再转 ``kn``。
+
+    ``torch.matmul([M, K], [K, N])`` 在这里被 ``GemmEx`` 顶掉：``transa = T`` 让
+    ``[N, K]`` 的行主序缓冲就是库要的列主序 ``[K, N]``，``lda = K`` 就是它的行宽，
+    所以整份转置副本（4B 上 4.3 GB）根本不存在。
+
+    Args:
+        w: ``[N, K]`` 稠密权重，bf16 或 fp32。
+        act: 激活，``[M, K]``，bf16 或 fp32。
+
+    Returns:
+        ``[M, N]``，dtype 同 ``w``。
+
+    Raises:
+        ShapeError: 形状或 dtype 不符。
+        RtError: 找不到 ``libcublas``。
+    """
+    rows, k = act.shape
+    n = int(w.shape[0])
+    if int(w.shape[1]) != int(k):
+        raise ValueError(f"weight holds K = {w.shape[1]}, activation has {k}")
+    wt = w if w.is_contiguous() else w.contiguous()
+    if wt.dtype not in (torch.bfloat16, torch.float32):
+        # 库的 TN 出口只有 bf16 与 fp32 两个实例。fp16 权重（参考实现那一档的遗留）
+        # 先拓宽成 bf16——bf16 的 8 位指数装得下 fp16 的 5 位，这次转换不丢信息。
+        wt = wt.to(torch.bfloat16)
+    # GEMM 两个操作数必须同一 dtype，与旧路径同一条规矩：由权重决定，激活跟着它。
+    lhs = act if act.dtype == wt.dtype else act.to(wt.dtype)
+    gemm = _gemm_ops()
+    stream = _stream()
+    # bf16 是被要求「必须做」的那一档：库在 ixblas 下把它按 ``ld`` 转 f16 再走自研
+    # fp16 张量核（fp32 累加，39.7 TFLOP/s），厂商那侧 bf16→f32 是 34.8 且算对。
+    # fp32 权重（参考实现那一档）走 ``f32_nk``，两者形状契约一样。
+    run = gemm.f32_nk if wt.dtype == torch.float32 else gemm.bf16_nk
+    if n < 8:
+        # 与 ``torch.matmul`` 那条同样的理由（N < 8 时整 tile 大部分空转，补零到 8 列
+        # 再切回是 13.4x，结果逐位相同）：这里补的是**行**——``[8, K]``，因为 nk 布局
+        # 下每行才是连续的一整段权重，补列等于转置。
+        pad = torch.zeros((8, k), dtype=wt.dtype, device=wt.device)
+        pad[:n] = wt
+        return run(lhs, pad, stream=stream)[:, :n]
+    if n <= pack.LIB_MAX_N:
+        return run(lhs, wt, stream=stream)
+    out = run(lhs, wt[:pack.LIB_MAX_N], stream=stream)
+    full = torch.empty((rows, n), dtype=out.dtype, device=out.device)
+    full[:, :pack.LIB_MAX_N] = out
+    for start in range(pack.LIB_MAX_N, n, pack.LIB_MAX_N):
+        stop = min(n, start + pack.LIB_MAX_N)
+        full[:, start:stop] = run(lhs, wt[start:stop], stream=stream)
+    return full
+
+
+def linear_prefill(w: torch.Tensor | QWeight,
                    x: torch.Tensor) -> torch.Tensor:
     """预填充分块投影（大 ``M``），此时 GEMM 胜过流式读权重。
 
     库只用在这张卡已知能算对的宽度内：输出列超过 :data:`pack.LIB_MAX_N` 时它的
     GEMM 在 ``N = 248320``（就是 ``lm_head``）返回 NaN，而那正是最经不起这种错误
-    的一个形状。切块判定在 :func:`_w8a8_rows` 里，内核里还有第二道断言。
+    的一个形状。切块判定在 :func:`_w8a8_lib_rows` / :func:`_gemm_nk_rows` 里，内核
+    里还有第二道断言。切块沿**权重行**做：nk 布局下每行才是连续的一整段权重，所以
+    按块递进库不需要任何拷贝。
 
     ``M`` 低于 :data:`_PREFILL_MIN_M` 时仍然走自写 GEMV，int8 权重也一样：那条
     分界是实测的（``27B-4CARD-PLAN.md`` §3.4，M=1 上 W8A8 慢 42%），不是可调
     参数。这里额外把分界判断提到 int8 反量化之前，所以小 ``M`` 的 int8 预填充
     不再先付一次全量反量化再把它丢掉。
+
+    两条主要分支都不经过 torch 的算子：int8 走 ``quant_act_i8``(ABI) + ``GemmEx``
+    + ``epilogue``(ABI)，稠密 bf16/fp32 走 ``GemmEx`` 的 TN（``[N, K]`` 原缓冲即
+    列主序 ``[K, N]``）。``torch.empty`` 只是分配，不是算子。
 
     Args:
         w: 任意可接受存储形式的 ``[N, K]`` 投影权重。
@@ -1632,26 +1719,6 @@ def linear_prefill(w: torch.Tensor | QWeight | pack.KnWeight,
     Raises:
         RuntimeError: 扩展不可用，而宽 ``N`` 形状需要它。
     """
-    if isinstance(w, W4A8Weight):
-        rows_w4 = int(x.shape[0])
-        # 大 M：反量化成 bf16 走厂商 GEMM。**必须放在读 ``packed.wt`` 之前** ——
-        # ``W4A8Weight`` 没有 ``.wt`` 字段，激活 dtype 只能由这里自己定（bf16，与
-        # ``w4_dequant`` 的输出对齐）。
-        #
-        # 为什么 M=512 才值得（作业 371，q_proj 512x12288x2560）：
-        #   反量化 198.4 us（79.6 MB @ 401.3 GB/s）+ 厂商 bf16 GEMM 728.2 us
-        #   = 935.9 us，对 ``w4_gemm_tcu`` 的 1934.8 us 是 2.07 倍，且逐位可复原。
-        # 小 M 不走：反量化那 79 MB 是固定成本，摊不薄。
-        # `x.dim() != 2` 时交给 `_w4_rows`：它自己会 reshape，而这条分支只做二维。
-        if (x.dim() == 2 and rows_w4 >= _W4_DEQUANT_MIN_M and (w.n & 3) == 0
-                and w.k * w.n * 2 <= _W4_DEQUANT_MAX_BYTES):
-            act = _compute_dtype(x).reshape(rows_w4, w.k)
-            lhs = act if act.dtype == torch.bfloat16 else act.to(torch.bfloat16)
-            if not lhs.is_contiguous():
-                lhs = lhs.contiguous()
-            return _restore(torch.matmul(lhs, _dequant_w4(w)), x.dtype)
-        return _w4_rows(w, x)
-    packed = pack.as_kn(w)
     rows = x.shape[0]
     if rows < _PREFILL_MIN_M:
         # 低于预填充区间时 GEMM 每个 tile 都要读一遍权重，输给整次调用只读一遍的
@@ -1659,46 +1726,17 @@ def linear_prefill(w: torch.Tensor | QWeight | pack.KnWeight,
         return _gemv_rows(w, x)
     dtype = x.dtype
     act = _compute_dtype(x)
-    if packed.int8:
-        # int8 权重不再反量化。反量化那条路留给没有 W8A8 内核的后端；这里权重全程
-        # 保持 int8，省下的不只是时间还有一整份 bf16 副本的显存。
-        return _restore(_w8a8_rows(packed, act), dtype)
-    weight_dtype = packed.wt.dtype
-    # GEMM 两个操作数必须同一 dtype，而本卡 bf16 和 fp16 的 TFLOP/s 一样（M=2048 时
-    # 32.6），所以由权重自己的 dtype 决定，激活跟着它，而不是反过来。
-    lhs = act.to(weight_dtype)
-    if packed.n < 8:
-        # **N < 8 一律补零到 8 列，取回前 ``n`` 列**：GEMM 的 N 方向 tile 是 8 的倍数，
-        # N 小于 8 时整 tile 里大部分通道在空转。实测同一个 ``[512, 2560] x [2560, 1]``：
-        # 直接乘 **853 us**（3.07 GFLOP/s），补零到 8 列再切回是 **63.6 us（13.4x）**，
-        # 且结果**逐位相同**（补的是 0，点积里多出来的项精确为 0）。补到 16/32 无进一步
-        # 收益（63.5 / 63.0 us），所以取 8。
-        #
-        # 覆盖到的真实形状（``COFFIN_MOE_SHAPE=1`` 与 ``record_shapes`` 都量过）：
-        #   * ``N = 1``：每层一次的标量投影（48 次/遍，曾 1.03 ms/次 = 49.3 ms）；
-        #   * ``N = 4``：``gated_residual`` 的 ``block_inject_weight``（``hc_count=4``，
-        #     96 次/遍，``[512, 10240] x [10240, 4]`` 曾 0.36 ms/次 = 34.5 ms）。
-        # 两者都是「无效 FLOPs 极便宜、tile 却大部分空转」的典型。
-        #
-        # 走过的弯路，别重试：``torch.mv`` 会让算子链变成 ``aten::mv -> aten::addmv_``，
-        # **仍是 1.04 ms/次**（端到端 1402.99 -> 1408.86，噪声内）。瓶颈不在 API 选择，
-        # 在**形状**——不换 API、只补零就能快 13 倍。归因见作业 315 / 380。
-        pad = 8
-        width = int(packed.n)
-        wp = torch.zeros((packed.k, pad), dtype=weight_dtype, device=lhs.device)
-        wp[:, :width] = packed.wt
-        return _restore(torch.matmul(lhs, wp)[:, :width], dtype)
-    if packed.n <= pack.LIB_MAX_N:
-        return _restore(torch.matmul(lhs, packed.wt), dtype)
-    out = torch.empty((rows, packed.n), dtype=weight_dtype, device=x.device)
-    for start in range(0, packed.n, pack.LIB_MAX_N):
-        stop = min(packed.n, start + pack.LIB_MAX_N)
-        # ``[K, N]`` 矩阵的列切片不连续；这次拷贝无法避免，但会摊到 ``M`` 行上。
-        # 结果拷出来而不是通过 ``out=`` 写进去，因为 ``out`` 的列切片同样不连续，
-        # 而 ``matmul`` 不接受那样的输出。
-        block = packed.wt[:, start:stop].contiguous()
-        out[:, start:stop].copy_(torch.matmul(lhs, block))
-    return _restore(out, dtype)
+    if isinstance(w, QWeight) and w.wq.is_contiguous():
+        # nk 原生的 int8 权重：量化 → ``GemmEx`` → epilogue，三步都在 torch 之外，
+        # 权重用**盘上那份**原缓冲，一次转置都不做。
+        if _PREFILL_NK:
+            out = _prefill_nk_tcu(w, x)
+            if out is not None:
+                return _restore(out, dtype)
+        return _restore(_w8a8_lib_rows(w, act), dtype)
+    # 稠密 nk 权重（bf16/fp32）：``[N, K]`` 直接进库、也不 ``torch.matmul``。
+    # 这是 ``--fp16`` 那一支，bf16 GEMM 就从这里接进链路。
+    return _restore(_gemm_nk_rows(w, act), dtype)
 
 
 # 归一化
@@ -1740,15 +1778,17 @@ def rms_norm(x: torch.Tensor, w: torch.Tensor, stride: int = 0,
     Raises:
         RuntimeError: 扩展不可用。
     """
-    module = _kernels()
     dtype = x.dtype
     width = x.shape[-1]
     act = _compute_dtype(x)
     rows = _pitch_rows(act, width)
     gain = w if w.dtype == act.dtype else w.to(act.dtype)
-    y = module.rms_norm(rows, gain.contiguous(),
-                        rows.stride(0) if stride == 0 else stride, eps)
-    return _restore(y.view(x.shape), dtype)
+    out = _norm_out((rows.shape[0], width), act)
+    _norm_ops().shim.rms_norm(_ptr(rows), _ptr(gain.contiguous()), _ptr(out),
+                              rows.shape[0], width,
+                              int(rows.stride(0) if stride == 0 else stride),
+                              float(eps), _dcode(act), _stream() or 0)
+    return _restore(out.view(x.shape), dtype)
 
 
 def rms_norm_gated(x: torch.Tensor, w: torch.Tensor, gate: torch.Tensor,
@@ -1767,15 +1807,18 @@ def rms_norm_gated(x: torch.Tensor, w: torch.Tensor, gate: torch.Tensor,
     Raises:
         RuntimeError: 扩展不可用。
     """
-    module = _kernels()
     dtype = x.dtype
     width = x.shape[-1]
     act = _compute_dtype(x)
     gate_c = _compute_dtype(gate)
     gain = w if w.dtype == act.dtype else w.to(act.dtype)
-    y = module.rms_norm_gated(act.reshape(-1, width), gain.contiguous(),
-                              gate_c.reshape(-1, width), eps)
-    return _restore(y.view(x.shape), dtype)
+    x2 = act.reshape(-1, width)
+    g2 = gate_c.reshape(-1, width)
+    out = _norm_out((x2.shape[0], width), act)
+    _norm_ops().shim.rms_norm_gated(_ptr(x2), _ptr(gain.contiguous()), _ptr(g2),
+                                    _ptr(out), x2.shape[0], width, float(eps),
+                                    _dcode(act), _stream() or 0)
+    return _restore(out.view(x.shape), dtype)
 
 
 def add_rms_norm(x: torch.Tensor, add: torch.Tensor, w: torch.Tensor,
@@ -1801,16 +1844,17 @@ def add_rms_norm(x: torch.Tensor, add: torch.Tensor, w: torch.Tensor,
     Raises:
         RuntimeError: 扩展不可用。
     """
-    module = _kernels()
     width = x.shape[-1]
     act = _compute_dtype(x)
     act_add = _compute_dtype(add)
     rows = _pitch_rows(act, width)
     rows_add = _pitch_rows(act_add, width)
     gain = w if w.dtype == act.dtype else w.to(act.dtype)
-    y = module.add_rms_norm(rows, rows_add, gain.contiguous(), out, 
-                            rows.stride(0) if stride == 0 else stride, eps)
-    return y.view(x.shape) if y.dtype == out.dtype else y.to(out.dtype).view(out.shape)
+    stride0 = rows.stride(0) if stride == 0 else stride
+    _norm_ops().shim.add_rms_norm(_ptr(rows_add), _ptr(rows), _ptr(gain.contiguous()),
+                                  _ptr(out.view(-1, width)), rows.shape[0], width,
+                                  int(stride0), float(eps), _dcode(act), _stream() or 0)
+    return out
 
 
 def kv_quant(x: torch.Tensor, out_q: torch.Tensor,
@@ -1831,10 +1875,12 @@ def kv_quant(x: torch.Tensor, out_q: torch.Tensor,
     Raises:
         RuntimeError: 扩展不可用。
     """
-    module = _kernels()
     act = _compute_dtype(x)
     width = act.shape[-1]
-    return module.kv_quant(_pitch_rows(act, width), out_q, out_s)
+    rows = _pitch_rows(act, width)
+    _attn_ops().shim.kv_quant(_ptr(rows), _ptr(out_q), _ptr(out_s), rows.shape[0], width,
+                              int(rows.stride(0)), _dcode(act), _stream() or 0)
+    return out_q
 
 
 def kv_store(k: torch.Tensor, v: torch.Tensor, ks: torch.Tensor, vs: torch.Tensor,
@@ -1865,7 +1911,12 @@ def kv_store(k: torch.Tensor, v: torch.Tensor, ks: torch.Tensor, vs: torch.Tenso
     Raises:
         RuntimeError: 扩展不可用。
     """
-    return _kernels().kv_store(k, v, ks, vs, slot, kc, vc, ksc, vsc)
+    nkv, hd = int(k.shape[0]), int(k.shape[1])
+    max_seq = int(kc.shape[1])
+    _attn_ops().shim.kv_store(_ptr(k), _ptr(v), _ptr(ks), _ptr(vs), _ptr(slot), _ptr(kc),
+                              _ptr(vc), _ptr(ksc), _ptr(vsc), nkv, hd, max_seq,
+                              1 if slot.dtype == torch.int64 else 0, _stream() or 0)
+    return kc
 
 
 def kv_pool_store(k: torch.Tensor, v: torch.Tensor, ks: torch.Tensor, vs: torch.Tensor,
@@ -1901,8 +1952,15 @@ def kv_pool_store(k: torch.Tensor, v: torch.Tensor, ks: torch.Tensor, vs: torch.
     Raises:
         RuntimeError: 扩展不可用（此时不会返回 ``False``，而不是静默降级）。
     """
-    return bool(_kernels().kv_pool_store(k, v, ks, vs, slot, kc, vc, ksc, vsc,
-                                         int(layer), bool(head_major)))
+    nkv, hd = int(k.shape[0]), int(k.shape[1])
+    # 池的两种布局：``head_major`` 时槽位轴在 size(2)，否则在 size(1)。
+    nslots = int(kc.shape[2] if head_major else kc.shape[1])
+    code = _attn_ops().shim.kv_pool_store(_ptr(k), _ptr(v), _ptr(ks), _ptr(vs), _ptr(slot),
+                                          _ptr(kc), _ptr(vc), _ptr(ksc), _ptr(vsc), nkv, hd,
+                                          nslots, int(layer), 1 if head_major else 0,
+                                          1 if slot.dtype == torch.int64 else 0,
+                                          _stream() or 0)
+    return code == 0
 
 
 def silu_mul(gate: torch.Tensor, up: torch.Tensor,
@@ -1929,12 +1987,24 @@ def silu_mul(gate: torch.Tensor, up: torch.Tensor,
     Raises:
         RuntimeError: 扩展不可用。
     """
-    module = _kernels()
     if gate.dim() == 1:
-        return module.silu_mul(gate, up, out)
-    width = gate.shape[-1]
-    return module.silu_mul(_pitch_rows(gate, width), _pitch_rows(up, width),
-                           _pitch_rows(out, width))
+        g, u, o, rows = gate, up, out, 1
+    else:
+        width = gate.shape[-1]
+        g = _pitch_rows(gate, width)
+        u = _pitch_rows(up, width)
+        o = _pitch_rows(out, width)
+        rows = int(g.shape[0])
+    width = int(g.shape[-1])
+    # 内核对单行也按 pitch 走指针，要求 pitch 不窄于行宽；一维连续向量的 stride(0)
+    # 是 1，直接送进去会被出口以「row pitch narrower than the row width」挡下。
+    dense = rows == 1
+    gp = width if dense else int(g.stride(0))
+    up_p = width if dense else int(u.stride(0))
+    op = width if dense else int(o.stride(0))
+    _attn_ops().shim.silu_mul(_ptr(g), _ptr(u), _ptr(o), rows, width, gp, up_p, op,
+                              _dcode(g), _stream() or 0)
+    return out
 
 
 def rope_apply(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor,
@@ -1957,7 +2027,11 @@ def rope_apply(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor,
     Raises:
         RuntimeError: 扩展不可用。
     """
-    return _kernels().rope_apply(q, k, cos, sin, q_out, k_out, rotary_dim)
+    _attn_ops().shim.rope_apply(_ptr(q), _ptr(k), _ptr(cos), _ptr(sin),
+                                _ptr(q_out), _ptr(k_out), int(q.shape[0]),
+                                int(q.shape[1]), int(k.shape[1]), int(q.shape[2]),
+                                int(rotary_dim), _stream() or 0)
+    return q_out
 
 
 # 注意力
@@ -1989,6 +2063,59 @@ def _split_k(part_acc: torch.Tensor | None, part_ml: torch.Tensor | None,
     return part_acc, part_ml
 
 
+def _attn_slice_call(q: torch.Tensor, gate: torch.Tensor, kcache: torch.Tensor,
+                     vcache: torch.Tensor, kscale: torch.Tensor, vscale: torch.Tensor,
+                     out: torch.Tensor, part_acc: torch.Tensor, part_ml: torch.Tensor,
+                     *, flat: int, nh: int, hd: int, rep: int, scale: float, draft: int,
+                     mask: torch.Tensor | None, mask_block: int, stride: int, max_seq: int,
+                     stride_head: int, map_rows: int, ctx_anchor: int,
+                     pos2slot: torch.Tensor | None, ctx_lens: torch.Tensor | None,
+                     pos: torch.Tensor | None) -> None:
+    """把一次注意力调用交给 C ABI 出口，几何不合就抛。
+
+    四个公开入口只差 ``AttnLayout`` 的那几个数，所以它们在这一个函数里汇合——与设备侧
+    汇到 ``launch_attn_slice`` 是同一个理由：稠密和分页两条路不能各自漂移。
+
+    Args:
+        q, gate: ``[flat, nh, hd]`` bf16 查询与输出门（稠密）。
+        kcache, vcache: int8 缓存，布局由 ``stride`` / ``stride_head`` 选。
+        kscale, vscale: fp32 反量化 scale。
+        out: ``[flat, nh, hd]`` bf16 目的地。
+        part_acc, part_ml: split-K 暂存。
+        flat: 行数。
+        nh: 查询头数。
+        hd: 头宽。
+        rep: 每个 KV 头对应的查询头数。
+        scale: ``hd ** -0.5``。
+        draft: 共用一行历史的查询数。
+        mask: 可选的 uint8 保留掩码。
+        mask_block: 掩码的块大小。
+        stride: 相邻槽位之间的行距。
+        max_seq: 窗口上限。
+        stride_head: 相邻 KV 头之间的行距。
+        map_rows: ``pos2slot`` 是否整张 ``[B, max_seq]`` 映射。
+        ctx_anchor: ``ctx_lens`` 是否装锚点下标。
+        pos2slot, ctx_lens, pos: 三个设备侧窗口定义，至少给一个。
+
+    Raises:
+        RuntimeError: 出口拒绝了这组几何。
+    """
+    rc = _attn_ops().shim.attn_slice(
+        _ptr(q), _ptr(gate), _ptr(kcache), _ptr(vcache), _ptr(kscale), _ptr(vscale), _ptr(out),
+        _ptr(part_acc), _ptr(part_ml),
+        0 if mask is None else _ptr(mask),
+        0 if pos2slot is None else _ptr(pos2slot),
+        0 if ctx_lens is None else _ptr(ctx_lens),
+        0 if pos is None else _ptr(pos),
+        float(scale), int(flat), int(nh), int(hd), int(rep), int(part_acc.shape[-2]),
+        int(draft), int(mask_block), int(stride), int(max_seq), int(stride_head),
+        int(map_rows), int(ctx_anchor), _stream() or 0)
+    if rc:
+        raise RuntimeError(
+            f"coffin_attn_slice rejected the geometry (flat={flat} nh={nh} hd={hd} rep={rep} "
+            f"stride={stride}/{stride_head} max_seq={max_seq} code={rc})")
+
+
 def attn_decode(q: torch.Tensor, gate: torch.Tensor, kcache: torch.Tensor,
                 vcache: torch.Tensor, kscale: torch.Tensor, vscale: torch.Tensor,
                 out: torch.Tensor, pos: torch.Tensor, rep: int, scale: float,
@@ -2017,10 +2144,14 @@ def attn_decode(q: torch.Tensor, gate: torch.Tensor, kcache: torch.Tensor,
     Raises:
         RuntimeError: 扩展不可用。
     """
-    module = _kernels()
-    pa, pm = _split_k(part_acc, part_ml, (q.shape[0],), q)
-    return module.attn_decode(q.contiguous(), gate.contiguous(), kcache, vcache, kscale,
-                              vscale, out, pos, rep, scale, pa, pm)
+    nh, hd = int(q.shape[0]), int(q.shape[1])
+    seq = int(kcache.shape[1])
+    pa, pm = _split_k(part_acc, part_ml, (nh,), q)
+    _attn_slice_call(q.contiguous(), gate.contiguous(), kcache, vcache, kscale, vscale,
+                     out, pa, pm, flat=1, nh=nh, hd=hd, rep=rep, scale=scale, draft=1,
+                     mask=None, mask_block=0, stride=1, max_seq=seq, stride_head=seq,
+                     map_rows=0, ctx_anchor=0, pos2slot=None, ctx_lens=None, pos=pos)
+    return out
 
 
 def attn_paged(q: torch.Tensor, gate: torch.Tensor, kpool: torch.Tensor,
@@ -2054,10 +2185,20 @@ def attn_paged(q: torch.Tensor, gate: torch.Tensor, kpool: torch.Tensor,
     Raises:
         RuntimeError: 扩展不可用。
     """
-    module = _kernels()
-    pa, pm = _split_k(part_acc, part_ml, (q.shape[0],), q)
-    return module.attn_paged(q.contiguous(), gate.contiguous(), kpool, vpool, kscale,
-                             vscale, pos2slot, out, pos, max_pos, rep, scale, pa, pm, head_major)
+    nh, hd = int(q.shape[0]), int(q.shape[1])
+    nkv = int(kpool.shape[0]) if head_major else int(kpool.shape[1])
+    nslots = int(kpool.shape[1]) if head_major else int(kpool.shape[0])
+    stride_slot = 1 if head_major else nkv
+    stride_head = nslots if head_major else 1
+    pa, pm = _split_k(part_acc, part_ml, (nh,), q)
+    # ``pos2slot`` 是 ``pool.pos2slot[row]``，首个元素已经是本行第一个位置，所以内核的不加
+    # 行偏移（``map_rows=0``）；搞错这一步，单次解码步就会读到相邻行的键。
+    _attn_slice_call(q.contiguous(), gate.contiguous(), kpool, vpool, kscale, vscale,
+                     out, pa, pm, flat=1, nh=nh, hd=hd, rep=rep, scale=scale, draft=1,
+                     mask=None, mask_block=0, stride=stride_slot, max_seq=int(max_pos),
+                     stride_head=stride_head, map_rows=0, ctx_anchor=0, pos2slot=pos2slot,
+                     ctx_lens=None, pos=pos)
+    return out
 
 
 def attn_paged_batch(q: torch.Tensor, gate: torch.Tensor, kpool: torch.Tensor,
@@ -2091,9 +2232,15 @@ def attn_paged_batch(q: torch.Tensor, gate: torch.Tensor, kpool: torch.Tensor,
     Raises:
         RuntimeError: 扩展不可用。
     """
-    module = _kernels()
-    rows, nh = q.shape[0], q.shape[1]
+    rows, nh, hd = int(q.shape[0]), int(q.shape[1]), int(q.shape[2])
+    nkv = int(kpool.shape[0]) if head_major else int(kpool.shape[1])
+    nslots = int(kpool.shape[1]) if head_major else int(kpool.shape[0])
+    stride_slot = 1 if head_major else nkv
+    stride_head = nslots if head_major else 1
     pa, pm = _split_k(part_acc, part_ml, (rows, nh), q)
+    # 这里的 ``context_lens`` 就是键数，锚点那次转换不适用（``ctx_anchor=0``）；``slots``
+    # 是整个 ``[B, max_seq]`` 映射，所以内核要偏移到第 ``b`` 行（``map_rows=1``）。
+    #
     # 在边界上把操作数变成稠密的，而不是相信调用方传的。内核通过 ``data_ptr()`` 把
     # ``q`` 和 ``gate`` 当成一整块平的 ``[B, nh, hd]`` 来索引，所以列视图会悄悄读到
     # 错误的字节——而构造门的自然写法正是这样的视图（融合 ``[.., 2*hd]`` 投影的
@@ -2102,9 +2249,13 @@ def attn_paged_batch(q: torch.Tensor, gate: torch.Tensor, kpool: torch.Tensor,
     # 而查询和池里的字节逐位相同，这个现象被当成内核缺陷查了好几个会话
     # （``docs/STAGE_LOCALISED.md``）。调用方本来就传稠密张量时这次拷贝是空操作，
     # 所以它属于边界而不属于每个调用点。
-    return module.attn_paged_batch(q.contiguous(), gate.contiguous(), kpool, vpool, kscale,
-                                   vscale, slots, context_lens.contiguous(), out, max_seq,
-                                   rep, scale, pa, pm, head_major)
+    _attn_slice_call(q.contiguous(), gate.contiguous(), kpool, vpool, kscale, vscale,
+                     out, pa, pm, flat=rows, nh=nh, hd=hd, rep=rep, scale=scale, draft=1,
+                     mask=None, mask_block=0, stride=stride_slot, max_seq=int(max_seq),
+                     stride_head=stride_head, map_rows=1, ctx_anchor=0,
+                     pos2slot=slots.contiguous() if slots is not None else None,
+                     ctx_lens=context_lens.contiguous(), pos=None)
+    return out
 
 
 def attn_paged_multi_q(q: torch.Tensor, gate: torch.Tensor, kpool: torch.Tensor,
@@ -2143,17 +2294,27 @@ def attn_paged_multi_q(q: torch.Tensor, gate: torch.Tensor, kpool: torch.Tensor,
     Raises:
         RuntimeError: 扩展不可用。
     """
-    module = _kernels()
-    rows, draft, nh = q.shape[0], q.shape[1], q.shape[2]
+    rows, draft, nh, hd = (int(v) for v in q.shape)
+    nkv = int(kpool.shape[0]) if head_major else int(kpool.shape[1])
+    nslots = int(kpool.shape[1]) if head_major else int(kpool.shape[0])
+    stride_slot = 1 if head_major else nkv
+    stride_head = nslots if head_major else 1
     pa, pm = _split_k(part_acc, part_ml, (rows * draft, nh), q)
-    mask = block_mask if block_mask is not None else torch.empty(
-        0, dtype=torch.uint8, device=q.device)
+    # 契约里掩码是可选的；「精确注意力」是以空张量传来的，把它当成掩码会把每个键都清零。
+    masked = block_mask if block_mask is not None and int(block_mask.numel()) > 0 else None
+    # 这里的 ``ctx_lens`` 是锚点的最后下标而不是计数：第 ``j`` 个查询需要
+    # ``anchor + 1 + j`` 个键，内核按 ``ctx_anchor`` 把两项都加上。``slots`` 是整张映射。
+    #
     # 在边界上把操作数变成稠密的，理由见 ``attn_paged_batch``：内核通过
     # ``data_ptr()`` 把门当成一整块平来索引，而每个调用方都是把门构造成融合投影的
     # 列切片。
-    return module.attn_paged_multi_q(q.contiguous(), gate.contiguous(), kpool, vpool, kscale,
-                                     vscale, slots, ctx_lens.contiguous(), out, max_seq,
-                                     rep, scale, pa, pm, mask, mask_block, head_major)
+    _attn_slice_call(q.contiguous(), gate.contiguous(), kpool, vpool, kscale, vscale,
+                     out, pa, pm, flat=rows * draft, nh=nh, hd=hd, rep=rep, scale=scale,
+                     draft=draft, mask=masked, mask_block=int(mask_block) if masked else 0,
+                     stride=stride_slot, max_seq=int(max_seq), stride_head=stride_head,
+                     map_rows=1, ctx_anchor=1, pos2slot=slots.contiguous(),
+                     ctx_lens=ctx_lens.contiguous(), pos=None)
+    return out
 
 
 # 门控 DeltaNet
@@ -2175,7 +2336,8 @@ def conv1d_silu(conv_w: torch.Tensor, x: torch.Tensor, conv_state: torch.Tensor,
     Raises:
         RuntimeError: 扩展不可用。
     """
-    _kernels().conv1d_silu(conv_w, x, conv_state, out)
+    _conv_ops().shim.conv1d_silu(_ptr(conv_w), _ptr(x), _ptr(conv_state), _ptr(out),
+                                 int(conv_w.shape[0]), _stream() or 0)
     return out
 
 
@@ -2194,7 +2356,11 @@ def conv1d_silu_seq(conv_w: torch.Tensor, x: torch.Tensor,
     Raises:
         RuntimeError: 扩展不可用。
     """
-    return _kernels().conv1d_silu_seq(conv_w, x, conv_state)
+    tokens, channels = int(x.shape[0]), int(x.shape[1])
+    out = torch.empty((tokens, channels), dtype=torch.float32, device=x.device)
+    _conv_ops().shim.conv1d_silu_seq(_ptr(conv_w), _ptr(x), _ptr(conv_state), _ptr(out),
+                                     tokens, channels, int(x.stride(0)), _stream() or 0)
+    return out
 
 
 def conv1d_silu_batch(conv_w: torch.Tensor, x: torch.Tensor, conv_state: torch.Tensor,
@@ -2213,7 +2379,10 @@ def conv1d_silu_batch(conv_w: torch.Tensor, x: torch.Tensor, conv_state: torch.T
     Raises:
         RuntimeError: 扩展不可用。
     """
-    _kernels().conv1d_silu_batch(conv_w, x, conv_state, out)
+    _conv_ops().shim.conv1d_silu_batch(_ptr(conv_w), _ptr(x), _ptr(conv_state), _ptr(out),
+                                       int(x.shape[0]), int(x.shape[1]),
+                                       int(x.stride(0)), int(conv_state.stride(0)),
+                                       int(out.stride(0)), _stream() or 0)
     return out
 
 
@@ -2246,8 +2415,11 @@ def delta_prologue(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, b: torch.T
     Raises:
         RuntimeError: 扩展不可用。
     """
-    _kernels().delta_prologue(q, k, v, b, a, neg_expA, dt_bias, q_out, k_out, v_out,
-                              beta, g, qscale, rep)
+    nv, dk, dv = int(v.shape[0]), int(q.shape[1]), int(v.shape[1])
+    _attn_ops().shim.delta_prologue(_ptr(q), _ptr(k), _ptr(v), _ptr(b), _ptr(a), _ptr(neg_expA),
+                                    _ptr(dt_bias), _ptr(q_out), _ptr(k_out), _ptr(v_out),
+                                    _ptr(beta), _ptr(g), float(qscale), int(rep), nv, dk, dv,
+                                    _stream() or 0)
 
 
 def delta_prologue_batch(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
@@ -2279,8 +2451,13 @@ def delta_prologue_batch(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     Raises:
         RuntimeError: 扩展不可用。
     """
-    _kernels().delta_prologue_batch(q, k, v, b, a, neg_expA, dt_bias, q_out, k_out,
-                                    v_out, beta, g, qscale, rep)
+    rows, nv, dk, dv = (int(v.shape[0]), int(v.shape[1]), int(q.shape[2]),
+                       int(v.shape[2]))
+    _attn_ops().shim.delta_prologue_batch(_ptr(q), _ptr(k), _ptr(v), _ptr(b), _ptr(a),
+                                          _ptr(neg_expA), _ptr(dt_bias), _ptr(q_out),
+                                          _ptr(k_out), _ptr(v_out), _ptr(beta), _ptr(g),
+                                          float(qscale), int(rep), rows, nv, dk, dv,
+                                          _stream() or 0)
 
 
 def delta_prep_seq(qkv: torch.Tensor, b: torch.Tensor, a: torch.Tensor,
@@ -2309,8 +2486,51 @@ def delta_prep_seq(qkv: torch.Tensor, b: torch.Tensor, a: torch.Tensor,
     Raises:
         RuntimeError: 扩展不可用。
     """
-    _kernels().delta_prep_seq(qkv, b, a, neg_expA, dt_bias, q_out, k_out, v_out, beta, g,
-                              qscale, rep)
+    T, nv = int(qkv.shape[0]), int(q_out.shape[0])
+    dk, dv = int(q_out.shape[2]), int(v_out.shape[2])
+    kdim = dk * (nv // int(rep))
+    _attn_ops().shim.delta_prep_seq(_ptr(qkv), _ptr(b), _ptr(a), _ptr(neg_expA), _ptr(dt_bias),
+                                    _ptr(q_out), _ptr(k_out), _ptr(v_out), _ptr(beta), _ptr(g),
+                                    float(qscale), int(rep), T, nv, dk, dv, kdim,
+                                    int(qkv.shape[1]), int(b.stride(0)), int(a.stride(0)),
+                                    _stream() or 0)
+
+
+def _delta_dims(st: torch.Tensor) -> tuple[int, int, int, int]:
+    """从状态张量读 ``(rows, heads, dk, dv)``。
+
+    单行入口的状态是 ``[heads, dk, dv]``（decode 一行），批处理是 ``[B, heads, dk, dv]``。
+    内核按 ``b * heads * dk * dv`` 算行偏移，所以 ``rows`` 必须与实际秩一致。
+
+    Args:
+        st: 循环状态。
+
+    Returns:
+        ``(rows, heads, dk, dv)``。
+    """
+    shape = tuple(int(v) for v in st.shape)
+    if len(shape) == 4:
+        return shape[0], shape[1], shape[2], shape[3]
+    return 1, shape[0], shape[1], shape[2]
+
+
+def _delta_call(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, beta: torch.Tensor,
+                g: torch.Tensor, st: torch.Tensor, out: torch.Tensor,
+                record: torch.Tensor | None, slot: int) -> None:
+    """把一次门控 delta 步交给 C ABI 出口。
+
+    Args:
+        q, k, v, beta, g: 输入。
+        st: 状态，原地更新。
+        out: 输出缓冲区。
+        record: 可选的更新日志；``None`` 表示不记录。
+        slot: 日志中的位置。
+    """
+    rows, heads, dk, dv = _delta_dims(st)
+    _attn_ops().shim.delta(_ptr(q), _ptr(k), _ptr(v), _ptr(beta), _ptr(g), _ptr(st), _ptr(out),
+                           0 if record is None else _ptr(record), int(slot),
+                           0 if record is None else int(record.shape[1]), rows, heads, dk, dv,
+                           _stream() or 0)
 
 
 def delta(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, beta: torch.Tensor,
@@ -2332,7 +2552,8 @@ def delta(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, beta: torch.Tensor,
     Raises:
         RuntimeError: 扩展不可用。
     """
-    return _kernels().delta(q, k, v, beta, g, st, out)
+    _delta_call(q, k, v, beta, g, st, out, None, 0)
+    return out
 
 
 def delta_batch(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, beta: torch.Tensor,
@@ -2354,7 +2575,8 @@ def delta_batch(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, beta: torch.T
     Raises:
         RuntimeError: 扩展不可用。
     """
-    return _kernels().delta_batch(q, k, v, beta, g, st, out)
+    _delta_call(q, k, v, beta, g, st, out, None, 0)
+    return out
 
 
 def delta_record(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
@@ -2373,7 +2595,8 @@ def delta_record(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     Raises:
         RuntimeError: 扩展不可用或输入布局不符合内核契约。
     """
-    return _kernels().delta_record(q, k, v, beta, g, st, out, record, slot)
+    _delta_call(q, k, v, beta, g, st, out, record, int(slot))
+    return out
 
 
 def delta_batch_record(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
@@ -2393,7 +2616,8 @@ def delta_batch_record(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     Raises:
         RuntimeError: 扩展不可用或输入布局不符合内核契约。
     """
-    return _kernels().delta_batch_record(q, k, v, beta, g, st, out, record, slot)
+    _delta_call(q, k, v, beta, g, st, out, record, int(slot))
+    return out
 
 
 def delta_commit(base: torch.Tensor, record: torch.Tensor, st: torch.Tensor,
@@ -2412,7 +2636,10 @@ def delta_commit(base: torch.Tensor, record: torch.Tensor, st: torch.Tensor,
     Raises:
         RuntimeError: 扩展不可用或输入布局不符合内核契约。
     """
-    return _kernels().delta_commit(base, record, st, steps)
+    heads, dk, dv = (int(v) for v in base.shape)
+    _attn_ops().shim.delta_commit(_ptr(base), _ptr(record), _ptr(st), heads, dk, dv,
+                                  int(steps), _stream() or 0)
+    return st
 
 
 def delta_normed(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
@@ -2451,11 +2678,19 @@ def delta_normed(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     Raises:
         RuntimeError: 扩展不可用。
     """
-    module = _kernels()
-    args = (q, k, v, b, a, neg_expA, dt_bias, z, nw, st, out, qscale, rep)
-    if record is None:
-        return module.delta_normed(*args)
-    return module.delta_normed_record(*args, record, slot)
+    shim = _attn_ops().shim
+    nv, dk, dv = (int(v_) for v_ in st.shape)
+    rc = shim.delta_normed(_ptr(q), _ptr(k), _ptr(v), _ptr(b), _ptr(a), _ptr(neg_expA),
+                           _ptr(dt_bias), _ptr(z), _ptr(nw), _ptr(st), _ptr(out),
+                           float(qscale), int(rep), nv, dk, dv,
+                           _dcode(out), _dcode(z),
+                           0 if record is None else _ptr(record), int(slot),
+                           0 if record is None else int(record.shape[0]), _stream() or 0)
+    if rc:
+        raise RuntimeError(
+            f"coffin_delta_normed rejected the geometry (dk={dk} dv={dv} rep={rep}, "
+            f"code={rc}); keep the delta_prologue/delta/rms_norm_gated chain for this model")
+    return out
 
 
 def delta_normed_seq(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
@@ -2494,26 +2729,36 @@ def delta_normed_seq(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     Raises:
         RuntimeError: 扩展不可用。
     """
-    module = _kernels()
-    args = (q, k, v, b, a, neg_expA, dt_bias, z, nw, st, out, qscale, rep)
-    if record is None:
-        return module.delta_normed_seq(*args)
-    return module.delta_normed_seq_record(*args, record, slot)
+    shim = _attn_ops().shim
+    nv, dk, dv = (int(v_) for v_ in st.shape)
+    rc = shim.delta_normed_seq(_ptr(q), _ptr(k), _ptr(v), _ptr(b), _ptr(a), _ptr(neg_expA),
+                               _ptr(dt_bias), _ptr(z), _ptr(nw), _ptr(st), _ptr(out),
+                               float(qscale), int(rep), nv, dk, dv,
+                               _dcode(out), _dcode(z), int(q.shape[0]),
+                               int(q.stride(0)), int(k.stride(0)), int(v.stride(0)),
+                               int(b.stride(0)), int(z.stride(0)),
+                               0 if record is None else _ptr(record), int(slot),
+                               0 if record is None else int(record.shape[0]), _stream() or 0)
+    if rc:
+        raise RuntimeError(
+            f"coffin_delta_normed_seq rejected the geometry (dk={dk} dv={dv} rep={rep}, "
+            f"code={rc}); keep the three-op chain for this model")
+    return out
 
 
 # 超连接（Gated Residual）
 #
-# 这三个适配器背后是 ``kernels/hyper.cu`` 的三个内核，它们一层里被调两套、48 层就是
-# 96 套，每套从八次 torch 启动压到三次。三者的权重全部按内核的 ``[K, N]`` 契约收，
-# 转置由 ``pack.as_kn`` 按对象身份记忆化承担一次——与 ``linear`` 同一条路，所以
-# 模型侧不需要知道本后端的布局。
+# 只剩分组归一化这一支：``kernels/hyper.cu`` 里的 ``grouped_rms_norm_kernel``。原来的
+# ``hyper_down`` / ``hyper_up`` 是两个吃 ``[K, N]``（kn）权重的投影内核，kn 布局整条
+# 删除后它们也一起撤下，``models/qwen4exp/gated_residual.py`` 会退回
+# ``backends/reference`` 的同名实现。归一化不吃投影权重，所以留在这里。
 
 
 def _hyper_rows(x: torch.Tensor) -> torch.Tensor:
     """把 ``[..., width]`` 摊平成内核要求的 ``[rows, width]`` 连续张量。
 
     不用 :func:`_pitch_rows`：那个按行间距做 ``as_strided`` 视图，而
-    ``hyper.cu`` 的三个内核都用 ``ptr + row * width`` 直接寻址、并在入口
+    ``hyper.cu`` 的内核用 ``ptr + row * width`` 直接寻址、并在入口
     ``TORCH_CHECK(is_contiguous())``。带间距的视图会被内核拒绝；更糟的是把它
     ``reshape`` 成连续的内存会静默拷贝，于是内核写进临时张量、调用方拿到旧值。
 
@@ -2529,71 +2774,6 @@ def _hyper_rows(x: torch.Tensor) -> torch.Tensor:
     if not x.is_contiguous():
         raise ValueError("hyper ops need contiguous activations")
     return x.reshape(-1, x.shape[-1])
-
-
-#: 超连接权重从 W4A8 实体化成 bf16 的缓存，键是 ``(id(W4A8Weight), 激活 dtype)``。
-#:
-#: 为什么键里带 dtype：内核对权重与激活的 dtype 一致性有硬断言，而同一个
-#: ``W4A8Weight`` 在不同臂上可能配不同的激活 dtype；只按 ``id()`` 记住一份会让第二次
-#: 拿到 dtype 不符的矩阵，然后被内核拒绝。
-#:
-#: 为什么必须实体化：``hyper.cu`` 的三个内核只吃 bf16/fp32 的致密矩阵，没有反量化
-#: 通路（那是 ``w4a8_gemv`` 的事，而它的输出形状是"激活 × 列"，与这里的
-#: ``[lowrank, K]`` 权重转置对不上）。而真机量化产物确实覆盖了超连接的投影：它们是
-#: 二维、行数 10240/320，全部过了 ``classify`` 的 q4 判据。
-#:
-#: 代价是每套超连接多 58.7 MB 常驻：``input_mix_weight_down`` 的 ``[10240, 2560]``
-#: 是 52.4 MB、``input_mix_weight_up`` 的 ``[10240, 320]`` 是 6.55 MB、写门的
-#: ``[4, 10240]`` 是 81.9 KB（bf16 实体化）。48 层 × 2 套 = 96 套合计 **约 5.6 GB**。
-#: 这是拿显存换 768 次发射（768 × 5.75 us 的启动地板 = 4.4 ms）的取舍，不是免费的，
-#: 也不是笔误。真机上必须把 ``resident=`` 打出来并与基线比：那个差值是这笔账的实付金额。
-#:
-#: 用普通 dict 而不是 weakref 表：``W4A8Weight`` 带 ``__slots__`` 且没有
-#: ``__weakref__`` 槽位，弱引用建不出来；而这个字典的条目数是模型的固定几何
-#: （每层两套 × 三个权重），不是一个随调用增长的缓存，同时持有强引用正好挡住
-#: ``id()`` 被回收后复用。
-_HYPER_DENSE: dict[tuple[int, torch.dtype], "pack.KnWeight"] = {}
-
-
-def _hyper_weight(w, act_dtype: torch.dtype) -> "pack.KnWeight":
-    """把超连接的权重备成内核能读的 ``[K, N]`` 致密矩阵，dtype 强制对齐激活。
-
-    ``hyper.cu`` 的入口断言是 ``wt.scalar_type() == normed.scalar_type()``，所以权重
-    dtype 必须显式跟着激活走，不能指望"加载器已经把它转成 bf16 了"：
-
-    * ``W4A8Weight`` 没有转置形态，只能先实体化成 ``act_dtype`` 再转置（这是当前唯一
-      能跑的路，代价见 :data:`_HYPER_DENSE`）。
-    * ``pack.as_kn`` 对**已经打包**的权重是幂等直返的，不会改 dtype。而 ``KnWeight``
-      不是 ``nn.Module`` 也不是 buffer，``model.to(dtype=...)`` 搬不动它——于是真机上
-      会出现"激活 bf16、权重 fp32"，内核直接拒绝（作业 4543，on 臂第一层就死在这里）。
-      这一条与 ``gdn.py`` 记录的 fp32 输出外溢是同一类事故：**dtype 契约必须由适配器
-      自己收口，不能靠上游自觉**。
-
-    Args:
-        w: 契约布局 ``[N, K]`` 的权重：``nn.Parameter``、``pack.KnWeight`` 或
-            :class:`W4A8Weight`。
-        act_dtype: 归一化激活的 dtype，内核要求权重与它一致。
-
-    Returns:
-        ``[K, N]`` 连续致密矩阵的打包形式，dtype 为 ``act_dtype``。
-
-    Raises:
-        ValueError: 既不是可识别的权重类型，也不是二维张量。
-    """
-    if isinstance(w, W4A8Weight):
-        key = (id(w), act_dtype)
-        hit = _HYPER_DENSE.get(key)
-        if hit is not None:
-            return hit
-        dense = pack.to_kn(w.to(act_dtype), act_dtype)
-        _HYPER_DENSE[key] = dense
-        return dense
-    packed = pack.as_kn(w, act_dtype)
-    if packed.wt.dtype == act_dtype:
-        return packed
-    # 已打包但 dtype 不符（``as_kn`` 幂等直返那条路）。这一步只在首次见到该权重时
-    # 发生一次，之后由 ``as_kn`` 的对象身份缓存接管。
-    return pack.KnWeight(packed.wt.to(act_dtype).contiguous())
 
 
 def hyper_norm(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor,
@@ -2619,73 +2799,14 @@ def hyper_norm(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor,
         RuntimeError: 扩展不可用。
         ValueError: 某个操作数不是连续布局。
     """
-    module = _kernels()
     act = _compute_dtype(x)
     gain = w if w.dtype == torch.float32 else w.to(torch.float32)
-    return module.hyper_norm(_hyper_rows(act), gain.contiguous(),
-                             _hyper_rows(out), hidden, hc, eps)
+    a = _hyper_rows(act)
+    o = _hyper_rows(out)
+    _attn_ops().shim.hyper_norm(_ptr(a), _ptr(gain.contiguous()), _ptr(o), int(a.shape[0]),
+                                int(hidden), int(hc), float(eps), _dcode(a), _stream() or 0)
+    return out
 
-
-def hyper_down(normed: torch.Tensor, wt: torch.Tensor, out: torch.Tensor,
-               hc: int) -> torch.Tensor:
-    """经融合内核做读门的降维投影，并 ``silu(v / hc)``。
-
-    除以 ``hc`` 发生在 silu **之前**，与内核一致：silu 不是线性的，顺序换了就是
-    另一条曲线。
-
-    Args:
-        normed: 归一化后的激活，``[..., K]`` 连续。
-        wt: 降维权重，契约布局 ``[lowrank, K]``；内核要 ``[K, lowrank]``，转置由
-            :func:`pack.as_kn` 按对象身份记忆化承担，与 :func:`linear` 同一条路。
-        out: 目的地，``[..., lowrank]``，dtype 同 ``normed``，原地写入。
-        hc: 读门除数。
-
-    Returns:
-        ``out``，便于调用链串接。
-
-    Raises:
-        RuntimeError: 扩展不可用。
-        ValueError: 某个操作数不是连续布局。
-    """
-    module = _kernels()
-    act = _compute_dtype(normed)
-    packed = _hyper_weight(wt, act.dtype)
-    return module.hyper_down(_hyper_rows(act), packed.wt, _hyper_rows(out), hc)
-
-
-def hyper_up(normed: torch.Tensor, up_wt: torch.Tensor, low: torch.Tensor,
-             inj_wt: torch.Tensor, mixed: torch.Tensor, inject: torch.Tensor,
-             hidden: int, hc: int, lowrank: int) -> torch.Tensor:
-    """经融合内核做读门升维、加权 mean 与写门，一次启动。
-
-    读门塌缩是 ``mean`` 不是 ``sum``，写门是 ``2 * sigmoid(dot / hc)``；三处都在
-    内核里，这里的职责只是把两个权重备成 ``[K, N]``。
-
-    Args:
-        normed: 归一化后的激活，``[..., hidden * hc]`` 连续。
-        up_wt: 升维权重，契约布局 ``[hidden * hc, lowrank]``。
-        low: 降维输出，``[..., lowrank]`` 连续。
-        inj_wt: 写门权重，契约布局 ``[hc, hidden * hc]``。
-        mixed: 读门塌缩结果的目的地，``[..., hidden]``，原地写入。
-        inject: 写门的目的地，``[..., hc]`` fp32，原地写入。
-        hidden: 每路宽度。
-        hc: 路数。
-        lowrank: 降维秩。
-
-    Returns:
-        ``mixed``，便于调用链串接。
-
-    Raises:
-        RuntimeError: 扩展不可用。
-        ValueError: 某个操作数不是连续布局。
-    """
-    module = _kernels()
-    act = _compute_dtype(normed)
-    packed_up = _hyper_weight(up_wt, act.dtype)
-    packed_inj = _hyper_weight(inj_wt, act.dtype)
-    return module.hyper_up(_hyper_rows(act), packed_up.wt, _hyper_rows(low),
-                           packed_inj.wt, _hyper_rows(mixed), _hyper_rows(inject),
-                           hidden, hc, lowrank)
 
 
 #: 三角求解里每个块的行数，从大到小。在本卡 L=512 上对块大小 32/64/128/256 实测：
@@ -2788,8 +2909,8 @@ def triangular_solve(lower: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
             藏到一条更慢的路径后面。
     """
     try:
-        module = _kernels()
-    except RuntimeError:
+        solve = _solve_ops()
+    except (RuntimeError, Exception):
         # 本主机没有工具链：纯 torch 替换仍然给出答案，让结构性调用或参考实现路径的
         # 调用方照常工作。
         return _solve_blocked(lower, rhs)
@@ -2805,7 +2926,8 @@ def triangular_solve(lower: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
     # ``[2, 18, 22, 22, 22, 22]``，且两轮之间还在变（读到的垃圾每次都不同）。
     # 所以「省掉一次实体化」这句话在契约上是对的、在实现上是错的：要省这 16.78 MB，
     # 得给 ``rhs`` 和 ``out`` 各传一个批步长，那是改内核，不是改这一行。
-    return module.triangular_solve(lower.contiguous(), rhs.contiguous())
+    return solve.triangular_solve(lower.contiguous(), rhs.contiguous(),
+                                  stream=_stream())
 
 
 #: 本后端用内核承担的算子。按「适配器与算子同名」的约定从本模块收集，所以写了适配器
@@ -2907,7 +3029,7 @@ _DECODE_OPS: frozenset[str] = frozenset({
     "conv1d_silu_seq", "conv1d_silu_batch", "delta_prologue", "delta_prologue_batch",
     "delta_prep_seq", "delta", "delta_record", "delta_batch",
     "delta_batch_record", "delta_commit", "delta_normed",
-    "hyper_norm", "hyper_down", "hyper_up",
+    "hyper_norm",
 })
 
 
@@ -2918,10 +3040,10 @@ def caps() -> Caps:
     Returns:
         一个记录：``device="cuda"``（CoreX 实现了那个命名空间），两种 dtype 都是
         bf16，因为预填充 GEMM 在本卡上 bf16 和 fp16 都到 32.6 TFLOP/s，转换不值
-        它的流量；``weight_layout="kn"``：加载器存的每份权重是 ``[K, N]``，库 GEMM 与张量核
-        GEMM 都要这个布局（当初选它是因为**库**的 ``[N, K]`` 解码 GEMV 只有 16-30 GB/s，而
-        库的 ``[K, N]`` 有 360-406 GB/s，那是一次库对库的比较，不是布局对布局）。解码的 int8
-        投影另取一份 ``[N, K]`` 副本走手写 nk 内核，实测 1.02-1.63 倍；
+        它的流量；``weight_layout="nk"``：契约与加载器一致，都是 ``[N, K]``。库 GEMM 与张量核
+        GEMM 用 ``transa = T`` 直接吃这份 ``[N, K]``，一次转置都不做（当初库的 ``[N, K]``
+        解码 GEMV 只有 16-30 GB/s、而库的 ``[K, N]`` 有 360-406 GB/s，那是一次库对库的
+        比较，不是布局对布局；现在库 GEMM 走 TN、解码 int8 走 nk，实测差 1.02-1.63 倍）；
         ``attn_split=32``：切片轴就是内核的 ``grid.y``，切片数由 ``part_acc.size(-2)`` 读，
         所以改这里就够、不用改内核。切分是给键范围*分区*，各块读的是**不相交**的区间，所以
         提高它不增加 KV 流量，只多出 ``part_acc``/``part_ml`` 那一趟（几十 KB）和 combine。
@@ -2964,7 +3086,7 @@ def caps() -> Caps:
         batch_attn="attn_paged_batch" in native,
         int8_weights=True,
         recurrent_state=True,
-        weight_layout="kn",
+        weight_layout="nk",
     )
 
 
@@ -3049,3 +3171,7 @@ def reason_table() -> str:
 
 #: 模块本身满足协议；在这里点名协议是为了让签名漂移不会被类型检查器漏掉。
 _PROTOCOL: type[Backend] = Backend
+
+
+
+

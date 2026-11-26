@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING, Iterator
 #: 地方完全不同。默认关，因为每一步一次 ``print`` 会把 decode 的墙钟拖坏。
 _DEBUG_STEP = bool(os.environ.get("COFFIN_DEBUG_STEP"))
 
-import torch
+from cxrt.modes import inference_mode
 
 from .block_manager import BlockManager
 from .config import EngineConfig
@@ -574,7 +574,7 @@ class LLMEngine:
             if not self.scheduler.has_work():
                 break
 
-    @torch.inference_mode()
+    @inference_mode()
     def generate(self, token_ids: list[int],
                  params: SamplingParams | None = None,
                  mm=None) -> dict:

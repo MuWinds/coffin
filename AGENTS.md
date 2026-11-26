@@ -19,6 +19,7 @@
 | `ops/` | 与模型族无关的设备算子：`dtypes.py`、`gemv.py`、`embed.py`、`norm.py`、`rope.py`、`delta.py` |
 | `models/qwen35/` | Qwen3.5-4B 一族：`model.py`、`blocks.py`、`batch.py`（批投影）、`linear_attn.py`、`full_attn.py`、`mtp.py`、`weights.py`、`tuning.py` |
 | `hip_ops.py` + `kernels/` | HIP 内核的 host 薄壳与 `.cu` 源码（`batch.cu` 是批核） |
+| `cxrt/` | CoreX 设备运行时：ctypes 直调 `libcudart`，`driver` / `memory` / `array` / `stream` / `build` / `shim` / `norm` / `gemv` / `attn` / `w8a8` / `solve` / `conv`；corex 推理链的 torch-free 地基，`python3 -m cxrt.selftest` 在卡上自检 |
 | `serving/` | 常驻引擎服务：`runtime_service.py`、运行时 mixin、socket 传输；不承载 HTTP 协议和 CLI 解析器 |
 | `entrypoints/openai/` | OpenAI HTTP/SSE 适配：`app.py`、请求规范化、流式 tool-call、引擎 socket 客户端 |
 | `entrypoints/cli/` | 命令行入口：`runtime.py` 启动/控制引擎，`openai.py` 启动 HTTP 适配器 |
@@ -35,6 +36,10 @@ cache / utils ←  engine/*  ←  serving/ ← entrypoints/cli/
 ```
 
 - `ops/` 不许 import `models/`，模型族可以 import `ops/`。
+- `cxrt/` 不许 import `torch`，也不许 import `backends`：`backends/__init__.py` 在
+  import 期就解析后端并装载 `reference` / `vendor`，而它们直接 `import torch`。住进
+  `backends` 的任何模块因此都不可能 torch-free。它只按路径去编
+  `backends/corex/kernels` 里的内核源码，不 import 那个包。
 - 同一族内的模块互相 import；跨族只通过 `engine_api`。
 - 只有 `engine_api.py` 知道“有哪些模型族”。
 - `engine/sequence.py` / `engine/config.py` 不 import 其它引擎模块；
@@ -76,6 +81,7 @@ cache / utils ←  engine/*  ←  serving/ ← entrypoints/cli/
 | `ENGINE_MODEL` / `--model` | checkpoint 目录；架构由它的 `config.json` 决定，启动日志会打印 `模型名 (架构族) at 路径` |
 | `ENGINE_SOCK` / `--sock` | 引擎 socket，默认 `/tmp/qwen35.sock`；跑第二个模型时换一个 |
 | `--served-model-name` | OpenAI 适配器的 `/v1/models` id；默认取引擎报告的目录名 |
+| `COFFIN_NO_TORCH=1` | 进程里装 `cxrt.torchshim` 顶替 `torch`（必须在任何 import 之前生效，`run_chat.py` 已处理）。判据见 `docs/COREX-NO-TORCH.md`；`python3 tools/audit_no_torch.py --runtime` 是这个判定的机器版 |
 
 ## 改完怎么验
 

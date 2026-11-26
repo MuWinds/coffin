@@ -301,7 +301,7 @@ class FullAttn:
         return bops.kv_quant(x, out_q, out_s), out_s
 
     def __call__(self, x: torch.Tensor, pos1, cos_tbl, sin_tbl, mask_idx,
-                 rope_delta=None) -> torch.Tensor:
+                 rope_delta=None, cos_g=None, sin_g=None) -> torch.Tensor:
         """针对一行的单 token 解码步。
 
         Args:
@@ -313,6 +313,9 @@ class FullAttn:
             mask_idx: 设备侧位置计数器，CPU 回退掩码用。
             rope_delta: 可选的 mRoPE 偏移，只加在旋转用的 ``pos1`` 上。纯文本时为
                 零（``None``），文本路径因此保持和图像功能出现之前逐位相同。
+            cos_g: 可选的、已经按 ``pos1 + rope_delta`` 查好的余弦行，形状
+                ``[1, hd/2]``。给了它就不再查表（见 :meth:`_forward` 的步内提升）。
+            sin_g: 同上，正弦行。
 
         Returns:
             ``[hidden]``，经 ``o_proj`` 之后的加门注意力输出。
@@ -328,9 +331,16 @@ class FullAttn:
         # 旋转去读 mRoPE 位置，prompt 含图像之后那就是
         # ``token_index + rope_delta``。没有图像时 ``rope_delta`` 为 0，查表和以前
         # 逐位相同。
-        idx = pos1 if rope_delta is None else pos1 + rope_delta
-        cos = cos_tbl.index_select(0, idx)
-        sin = sin_tbl.index_select(0, idx)
+        # 调用方（``_forward``）已经把步内唯一的那次查表做完了：8 个全注意力层用的是
+        # 同一个 ``pos1 + rope_delta``，逐层再查一遍只是把同一行 8 次搬到设备上。
+        # ``cos_g``/``sin_g`` 为 ``None`` 时仍按原来的逐层路径，所以预填充、批处理、
+        # verify 全都不受影响。
+        if cos_g is None:
+            idx = pos1 if rope_delta is None else pos1 + rope_delta
+            cos = cos_tbl.index_select(0, idx)
+            sin = sin_tbl.index_select(0, idx)
+        else:
+            cos, sin = cos_g, sin_g
         q, k = self.rope(q, k, cos, sin)
 
         qk, sk = self._quant(k, self.k_i81, self.k_s1)

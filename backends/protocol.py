@@ -33,9 +33,40 @@ Constraints:
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
+import sys
 from typing import Any, Callable, ClassVar, Mapping, Protocol, runtime_checkable
 
-import torch
+#: 本模块**从不主动 import torch**。这个属性恒为 ``None``，它存在只是为了让调用方
+#: （以及 ``tests/test_protocol_torchfree.py``）能问「契约有没有把 torch 拉进来」。
+#: 需要 torch 的地方（只有 :func:`make_device`）改成先看 ``sys.modules``：谁已经把
+#: torch 拿进来了，就跟着用；没人拿，就返回 :class:`DeviceRef`，绝不替调用方决定。
+torch = None
+
+#: 契约里 dtype 的类型别名。有 torch 时就是 ``torch.dtype``；没有 torch 时是
+#: :class:`cxrt.dtypes.DType`。两个方向都只是标注，运行时不做 isinstance 判定——
+#: 谁把自己的 dtype 传上来，谁自己解释。
+DType = Any
+
+#: 契约里 device 的类型别名。有 torch 时是 ``torch.device``；没有 torch 时是
+#: :class:`DeviceRef`。同样只作标注。
+DeviceLike = Any
+
+#: 默认 dtype 取 ``cxrt`` 的那个（``F32``），不取 ``torch.float32``：契约自己的默认
+#: 不该以「装了 torch」为前提。torch 调用方要 ``torch.float32`` 就显式传。
+from cxrt.dtypes import F32 as _DEFAULT_DTYPE
+
+#: 没有 torch 时 :func:`make_device` 的返回值。它只提供 ``type``/``index`` 与
+#: ``str()``，够模型代码拼日志、够下游按序号取设备；不够拿去做 torch 分配，
+#: 那种场景本来就必须有 torch。
+@dataclass(frozen=True, slots=True)
+class DeviceRef:
+    """``torch.device`` 的等价物：``type`` + ``index``。"""
+
+    type: str
+    index: int
+
+    def __str__(self) -> str:
+        return f"{self.type}:{self.index}"
 
 
 #: 一个算子条目。签名按 :class:`Ops` 的字段逐个文档化；后端绑的是闭包和
@@ -82,11 +113,15 @@ class Caps:
     #: ``len(native)/len(Ops.NAMES)``，那是新平台迁移进度的进度条。
     native: frozenset[str] = frozenset()
     #: 内核和 int8 KV 缓存所用的激活 dtype。替换 ``ops.dtypes.D``。
-    act_dtype: torch.dtype = torch.float32
+    #:
+    #: 有 torch 时默认 ``torch.float32``（与改动前逐位一致）；没有 torch 时默认
+    #: :data:`cxrt.dtypes.F32`。字段本身不强制类型，corex 后端可以直接填一个
+    #: ``cxrt.dtypes.DType``，只要消费方认得。
+    act_dtype: DType = _DEFAULT_DTYPE
     #: 投影权重 dtype。替换 ``ops.dtypes.WF``；gfx906 上是 fp16，因为那颗芯片有
     #: packed fp16 数学而没有 packed bf16 数学，而有 packed bf16 的芯片应当跟随
     #: :attr:`act_dtype`。
-    weight_dtype: torch.dtype = torch.float32
+    weight_dtype: DType = _DEFAULT_DTYPE
     #: 解码步能捕获进设备图并重放。内核在捕获流之外启动的后端必须报 ``False``：
     #: 那种图重放出来的是过期输出而不是报错，属于静默的正确性 bug，而非性能问题。
     graph: bool = False
@@ -115,14 +150,15 @@ class Caps:
     #: 不被支持或不可信时才该报 ``False``，不能仅因为自己没有原生快照内核就报
     #: ``False``——那会白白丢掉主要的 token 延迟收益。
     recurrent_state: bool = False
-    #: 本后端希望投影权重以哪种布局存放：``"nk"``（checkpoint 的 ``[N, K]``
-    #: 行主序，本引擎当前的约定）或 ``"kn"``（``[K, N]``，即 ``x @ Wt``）。
+    #: 投影权重在**盘上**与**算子入口**上的存放布局。``"nk"`` 是唯一标准布局：
+    #: ``[N, K]`` 行主序、一行输出通道一段连续字节，加载器读什么就交什么，不做转置。
+    #: ``"kn"``（``[K, N]``，即 ``x @ Wt``）只作为个别算子或磁盘格式的内部例外存在，
+    #: 后端自己在那里转，不得反过来要求加载器或 checkpoint 迁就它。
     #:
-    #: 这不是装饰性字段。在 Iluvatar BI-V100 上，``nn.Linear`` 产出的 ``[N, K]``
+    #: 这个字段不是装饰。在 Iluvatar BI-V100 上，``nn.Linear`` 产出的 ``[N, K]``
     #: 布局实测 19-30 GB/s，占掉一个解码步 92% 的时间，而 ``[K, N]`` 达到
-    #: 362-410 GB/s：一个布局决定换来 14-22 倍。算子契约仍是 ``[N, K]``，因为
-    #: checkpoint 就是那样；``"kn"`` 后端自己在加载时转置一次，自行承担成本和
-    #: 额外缓冲区。
+    #: 362-410 GB/s：一个布局决定换来 14-22 倍。那正是 kn 留下例外入口的理由——库
+    #: GEMM 与张量核 GEMM 按 ``[K, N]`` 吃——但那是这两个算子的成本，不是契约的成本。
     weight_layout: str = "nk"
 
 
@@ -158,7 +194,7 @@ class Ops:
     #: :attr:`Caps.weight_dtype`，这个取舍是对的，因为预填充是算力受限的。
     linear_prefill: OpFn | None = None
     #: ``moe_grouped(w, x, offsets) -> y``：稀疏专家的融合投影。
-    #: ``w`` 是 :class:`W4A8MoEWeight`（``[E, N, K]`` 的专家栈），``x`` 是
+    #: ``w`` 是 :class:`int8_weights.QWeightMoE`（``[E, N, K]`` 的 nk 专家栈），``x`` 是
     #: ``[tokens, K]`` 且已按专家号排好序，``offsets`` 是 ``[E+1]`` 的前缀和
     #: （第 ``e`` 个专家吃 ``x[offsets[e]:offsets[e+1]]``）。返回 ``[tokens, N]``。
     #:
@@ -167,26 +203,16 @@ class Ops:
     #: 权重读取被放大到 token 数的倍数。按专家分组后每个专家的权重在一个步里
     #: 只读一遍，这是 decode 期 MoE 唯一可行的形态。
     moe_grouped: OpFn | None = None
-    #: ``moe_grouped_gemm(w, x, offsets, out=None) -> y``：同一件事的**大 M 形态**，
-    #: 按专家分段各做一次张量核 GEMM。
+    #: ``moe_grouped_i8(w, x, offsets) -> y``：同一件事的 int8 形态，也是唯一形态。
     #:
-    #: 为什么要有两个而不是一个：``moe_grouped`` 是「一列一线程、逐行串行」的 GEMV
-    #: 结构，decode 时每专家 1-2 行正合适；prefill 时每专家上百行，同一结构下每行都要
-    #: 串行走完整个 K，权重被按段重读。实测（``q4prebase3``，``seq=2048``）
-    #: ``moe_grouped`` 是 **2178 ms / 30.4%**、单次 22.7 ms，而同类工作的张量核 GEMM
-    #: 只要 2.30 ms/次。行数分档由模型侧按 ``tokens`` 决定。
-    #: ``None`` 表示后端只有一个入口，模型侧退回 ``moe_grouped``。
-    moe_grouped_gemm: OpFn | None = None
-    #: ``moe_grouped_i8(w, x, offsets) -> y``：同一件事的 int8 形态。
-    #:
-    #: ``w`` 是 int8 专家栈（``[E, K, N]`` 的 int8 加 ``[E, N]`` 的逐列 scale），
+    #: ``w`` 是 int8 专家栈（``[E, N, K]`` 的 nk 布局加 ``[E, N]`` 的逐列 scale），
     #: ``x`` / ``offsets`` 的约定与 :attr:`moe_grouped` 相同。
     #:
-    #: 为什么单独一个算子而不是把 :attr:`moe_grouped` 泛化：两者的分组粒度不同。
-    #: W4A8 的 scale 是逐 (weight-group, 列) 的，分片必须每片各乘一次；int8 的 scale
-    #: 只跟输出列与专家有关，与 k 无关，所以分片可以先把整数和加起来、最后一次乘两个
-    #: scale。这条差别决定了部分和的类型（int32 对 fp32）和归约的次数，混成一个入口
-    #: 会让「哪一套算术」变成运行期才知道的事。
+    #: 为什么与 :attr:`moe_grouped` 分成两个名字：后者的语义是「按 offsets 逐段取专家」
+    #: （参考后端与 oracle 用它），而这里的分组粒度是 int8 的——scale 只跟输出列
+    #: 与专家有关、与 k 无关，所以分片可以先把整数和加起来、最后一次乘两个 scale。
+    #: 这条差别决定了部分和的类型（int32 对 fp32）和归约的次数，混成一个入口会让
+    #: 「哪一套算术」变成运行期才知道的事。
     #:
     #: ``None`` 表示后端没有 int8 分组内核，模型侧退回逐专家的 ``linear``。
     moe_grouped_i8: OpFn | None = None
@@ -256,6 +282,11 @@ class Ops:
     #: 成别的样子，缓存就会和读它的内核脱节。两个输出都是调用方持有、原地写入的
     #: 缓冲区。
     kv_quant: OpFn | None = None
+    #: ``kv_store(k, v, ks, vs, slot, kc, vc, ksc, vsc) -> kc``：把**一个**解码 token 的
+    #: k/v 与每头 scale 写进线性 KV 缓存的 ``slot`` 列。原来是四行 ``index_copy_``，共用
+    #: 一个槽位号、搬 ``nkv * hd`` 字节；融合成一次启动省三次发射（每层、每步）。
+    #: 只覆盖单槽位形状：多 token 的行表由调用方自己逐张量写回。
+    kv_store: OpFn | None = None
     #: ``kv_pool_store(k, v, ks, vs, slot, kc, vc, ksc, vsc, layer, head_major) -> bool``：
     #: 把**一个**解码 token 的 k/v 与它们的每头 scale 写进 paged 池的 ``[layer, slot]``
     #: 单元。池是 ``[layers, slots, nkv, hd]``（``head_major`` 时 ``[layers, nkv, slots,
@@ -450,7 +481,7 @@ class Ops:
     hyper_norm: OpFn | None = None
     #: ``hyper_down(normed, wt, out, hc) -> out``：读门的降维投影，输出已做
     #: ``silu(v / hc)``。``normed`` 是 ``[rows, K]``，``wt`` 是**契约布局**
-    #: ``[lowrank, K]``（``weight_layout == "kn"`` 的后端自己在加载时转置一次，
+    #: ``[lowrank, K]``（nk；没有任何后端要 ``[K, N]``：corex 的 kn 内核与转换已删除，
     #: 与 :attr:`linear` 同一条约定），``out`` 是 ``[rows, lowrank]``。
     #:
     #: 除以 ``hc`` 必须发生在 silu **之前**：``silu`` 不是线性的，顺序换了就是另一条
@@ -492,6 +523,20 @@ class Ops:
     #: 预分配**，所以这个入口在稳态下不分配内存；它存在的唯一理由是省掉十余次 pybind
     #: 往返，实测每次约 2 us 的编组加上 1.9 us 的 Python 包装。
     moe_decode_block: OpFn | None = None
+    #: ``moe_decode_prepare(tensors, top_k, slices, with_shared) -> handle``：把 `moe_decode_block`
+    #: 的 29 个张量入参（``x`` 之外的全部）在装载时编组一次，之后每步只剩
+    #: ``moe_decode_run(handle, x)``。省的是**逐参 pybind 转换**，与算术无关，
+    #: 所以两条路的数值逐位相同。``None`` 表示后端没有句柄入口。
+    moe_decode_prepare: OpFn | None = None
+    #: ``moe_decode_run(handle, x) -> out``：用句柄算一层 MoE，只收激活与句柄号。
+    moe_decode_run: OpFn | None = None
+    #: ``moe_layer_prepare(...) -> handle``：把一层 MoE 的常量连同 ``post_ln`` 增益、
+    #: 归一化落地缓冲、p2p 累加位与四个槽区/计数指针装进同一个句柄。
+    #: ``None`` 表示后端没有这个融合入口（此时逐层退回四段 Python 编排）。
+    moe_layer_prepare: OpFn | None = None
+    #: ``moe_layer_run(handle, x_res, h, round) -> 下一层残差增量``：残差累加 + 归一化 +
+    #: 整块 + 跨 rank 求和 + 加共享专家，一次 Python→C 往返。数值口径与原四段逐位相同。
+    moe_layer_run: OpFn | None = None
 
     #: ``shared_gate_scale(x, w, src, out) -> out``：共享专家门，``out = src * sigmoid(x . w)``。
     #: 参考链要六次启动才得到一个标量，这个入口一次启动完成，``out`` 由调用方按形状复用。
@@ -669,8 +714,8 @@ class Backend(Protocol):
         """返回本后端在这台主机上的能力标志。"""
 
     @property
-    def device(self) -> torch.device:
-        """本后端所有分配都应该使用的 ``torch.device``。
+    def device(self) -> DeviceLike:
+        """本后端所有分配都应该使用的设备。
 
         Returns:
             ``torch.device(caps.device, caps.device_index)``。模型代码用它替换自己
@@ -678,20 +723,28 @@ class Backend(Protocol):
         """
 
 
-def make_device(caps: Caps) -> torch.device:
-    """把一条 :class:`Caps` 记录解析成要用来分配的 ``torch.device``。
+def make_device(caps: Caps) -> DeviceLike:
+    """把一条 :class:`Caps` 记录解析成要用来分配的设备。
 
     Args:
         caps: 后端的能力记录。
 
     Returns:
-        ``torch.device(caps.device, caps.device_index)``；``"cpu"`` 时丢掉序号，
-        因为并非所有受支持的 torch 版本都接受 ``torch.device("cpu", 0)``。
+        **已经**有 torch 的环境里给 ``torch.device(caps.device, caps.device_index)``
+        （``"cpu"`` 时丢掉序号：并非所有受支持的 torch 版本都接受
+        ``torch.device("cpu", 0)``）；确认没有 torch 时给 :class:`DeviceRef`——同样有
+        ``type``/``index`` 与 ``str()``，但没有 torch 设备身份。
+
+        判据是 ``sys.modules`` 而不是 ``import torch``：这里主动 import 一次就等于替
+        调用方决定「这条进程要拖 2 GB 的 torch 进来」，而那正是要摘掉的东西。
 
     Raises:
         ValueError: ``caps.device`` 不是 torch 认识的设备类型。在这里失败，好过在
             模型构建到一半的首次分配时才失败。
     """
+    t = sys.modules.get("torch")
+    if t is None:  # pragma: no cover - corex 路径
+        return DeviceRef(caps.device, 0 if caps.device == "cpu" else caps.device_index)
     if caps.device == "cpu":
-        return torch.device("cpu")
-    return torch.device(caps.device, caps.device_index)
+        return t.device("cpu")
+    return t.device(caps.device, caps.device_index)

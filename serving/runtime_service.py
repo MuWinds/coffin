@@ -24,6 +24,7 @@ import engine_api
 from engine import llm_engine
 from engine.config import EngineConfig
 from engine.sequence import SamplingParams
+from utils import chat_protocol
 
 from .runtime_parts import (
     RuntimeChatMixin,
@@ -186,6 +187,27 @@ class Server(
             self.load_s = time.time() - t0
             self.tok = AutoTokenizer.from_pretrained(model_dir)
             self.eos = _eos_ids(self.tok)
+            # 两个模型族的模板来源不同（qwen3.5 在 tokenizer_config.json，occamy
+            # 1.0 在同目录的 chat_template.jinja），这里统一补齐成 tok.chat_template
+            # 一份，后面渲染、判思考、切推理段都只看它。
+            _tpl = chat_protocol.ensure_template(self.tok, model_dir)
+            self.markers = chat_protocol.markers_from(None)
+            # 模板缺了哪一项，工具调用或推理段就永远不会以训练格式出现；启动
+            # 日志点名比事后排查请求便宜得多。
+            _present = chat_protocol.template_presence(_tpl)
+            _missing = [k for k, v in _present.items() if not v]
+            self.template_thinks = _present.get("think_open", False)
+            # 闭合标记在词表里是单 token 时，推理段的 token 数才数得准。
+            _vocab = self.tok.get_vocab()
+            self.think_close_id = _vocab.get(self.markers["think_close"])
+            # 流式解码保留了结构标记，只剔 ``<|...|>`` 形状的轮次控制 token。
+            self.control_texts = tuple(
+                t for t in (getattr(self.tok, "all_special_tokens", None) or ())
+                if isinstance(t, str) and t.startswith("<|") and t.endswith("|>"))
+            print(f"[serve] chat template: {'loaded' if _tpl else 'missing'}"
+                  f" thinks={self.template_thinks}"
+                  f" markers_missing={','.join(_missing) if _missing else 'none'}",
+                  flush=True)
             if self.cfg.spec_k and self.cfg.spec_batch:
                 # 批 MTP 要多占约 1.25 GiB 的回滚快照加上草稿模型的分页 KV；宁可
                 # 在这里提前拒绝，也不要到 capture 里面才 OOM。报告不了空闲显存的

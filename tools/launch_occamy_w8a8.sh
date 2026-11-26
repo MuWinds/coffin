@@ -3,16 +3,17 @@ set -u
 
 # Occamy-1.0 离线量化为 W8A8（int8 权重 + int8 激活）预量化目录。
 #
-# 与 W4A8 那条路的区别只有两处：用的是 quant_disk.py（逐输出列 absmax /127），
-# 以及产物 35 GB 而不是 19 GB——一张 32 GB 的卡放不下，所以 W8A8 只能四卡（或两卡）跑。
-# 选 W8A8 的理由是精度：真权重上 4-bit 的 RMS 相对误差是 11.8%，int8 是 0.4% 量级，
+# 产物是 4-bit 那条路删掉之后唯一的量化形态：quant_disk.py（逐输出行 absmax /127），
+# 盘上 ``int8 [N, K]`` + 每行一个 fp32 scale（nk 布局），
+# 以及产物 35 GB——一张 32 GB 的卡放不下，所以只能四卡（或两卡）跑。
+# 选它的理由是精度：真权重上 4-bit 的 RMS 相对误差是 11.8%，int8 是 0.4% 量级，
 # 而本卡 int8 的 GEMM 速率是 49.07 TINT8-OPS/s，预填充侧并不吃亏。
 
 H=/data/home/2024240384035
 PY=/data/software/Anaconda3/2024.10-1/envs/py310/bin/python
 ENGINE_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 MODEL=$H/models/occamy-1.0
-OUT=$H/models/occamy-1.0-W8A8-kn
+OUT=$H/models/occamy-1.0-W8A8-nk
 
 export PATH=/data/software/Anaconda3/2024.10-1/envs/py310/bin:$PATH
 export TORCH_EXTENSIONS_DIR=$H/torch_ext_coffin_corex
@@ -43,7 +44,7 @@ echo "PICKED_CARD=$PICKED"
 
 "$PY" -B -u "$ENGINE_ROOT/tools/quant_disk.py" \
     --checkpoint "$MODEL" --out "$OUT" --weight-dtype bf16 \
-    --device auto --include-vision || exit $?
+    --device auto --layout nk --include-vision || exit $?
 
 "$PY" -B - "$MODEL" "$OUT" <<'PY'
 import json, re, sys
@@ -71,7 +72,7 @@ actual = set(report["tensors"])
 missing = expected - actual
 if missing:
     raise SystemExit(f"MISSING={len(missing)} first={sorted(missing)[0]}")
-if report.get("format") != "coffin-int8-kn-v1" or report.get("kinds", {}).get("int8", 0) == 0:
+if report.get("format") != "coffin-int8-nk-v1" or report.get("kinds", {}).get("int8", 0) == 0:
     raise SystemExit("INVALID_INDEX")
 routers = [k for k in actual if k.endswith("mlp.gate.weight")]
 dense_kept = [k for k in routers if report["tensors"][k]["kind"] == "dense"]

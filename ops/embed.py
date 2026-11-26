@@ -23,7 +23,6 @@ import torch
 from int8_weights import QWeight
 from ops.dtypes import D
 from ops.gemv import GEMV
-from w4a8_weights import W4A8Weight
 
 
 class TiedEmbedding:
@@ -43,9 +42,8 @@ class TiedEmbedding:
                 结构测试之所以便宜靠的就是它。
         """
         self.q = w if isinstance(w, QWeight) else None
-        self.q4 = w if isinstance(w, W4A8Weight) else None
         self.gemv = GEMV(w, bench)
-        self.w = None if self.q is not None or self.q4 is not None else w
+        self.w = None if self.q is not None else w
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -57,8 +55,6 @@ class TiedEmbedding:
         """
         if self.q is not None:
             return self.q.n, self.q.k
-        if self.q4 is not None:
-            return self.q4.n, self.q4.k
         return tuple(self.w.shape)
 
     def lookup(self, ids: torch.Tensor) -> torch.Tensor:
@@ -74,8 +70,6 @@ class TiedEmbedding:
             ``[T, hidden]`` 的 bf16 激活。
         """
         if self.q is None:
-            if self.q4 is not None:
-                return self.q4.rows(ids).to(D)
             return self.w.index_select(0, ids).to(D)
         rows, scale = self.q.rows(ids)
         return (rows.float() * scale[:, None]).to(D)

@@ -1,23 +1,24 @@
-"""Qwen3.5 工具调用线格式的解析与序列化。
+"""Qwen3.5 / Occamy 工具调用线格式的解析与序列化。
 
 格式是 checkpoint 定的，不是我们定的：对话模板教模型用下面这样的正文回答工具
-请求，所以解析器必须恰好接受这种文本，不能再宽容。
+请求，所以解析器必须恰好接受这种文本，不能再宽容。下面每个开标签都对应一个同名
+的闭合标签（写法见 ``chat_protocol.DEFAULT_MARKERS``）：
 
     <tool_call>
     <function=get_weather>
     <parameter=city>
     Beijing
-    </parameter>
-    </function>
-    </tool_call>
+    <闭合标签>
+    <闭合标签>
+    <闭合标签>
 
-一个调用可以带多个 ``<function=...>`` 块和多个 ``<parameter=...>`` 块。
-参数值是原始文本而不是 JSON：格式里没有引号概念，所以 ``0755`` 和 ``celsius``
-都会以字符串到达，而能被解析成 JSON 字面量的值必须刻意去壳（见 ``_coerce``）。
+一个调用可以带多个 ``<function=...>`` 块和多个 ``<parameter=...>`` 块。参数值是
+原始文本而不是 JSON：格式里没有引号概念，所以 ``0755`` 和 ``celsius`` 的取值都以
+字符串到达，类型由工具 schema 声明的那一个决定（见 ``chat_protocol.convert_param``）。
 ``<tool_call>`` 里直接放 ``{"name": ..., "arguments": {...}}`` 的 JSON 兜底形式也
 接受，因为有 checkpoint 就是这么输出的。
 
-开着思考时，推理段在 ``<think>...</think>`` 里，且可能出现在调用之前；
+开着思考时，推理段在 ``<think>`` 与它的闭合标签之间，且可能出现在调用之前；
 ``split_thinking`` 把两者分开，OpenAI 外壳才能把 ``reasoning_content`` 和答案一起
 返回。
 
@@ -25,7 +26,8 @@ Module: ``coffin/utils/tool_call.py``。依赖图的叶子：只用标准库，�
 ``serving/`` 和 ``tests/test_openai.py`` 都能依赖它。
 
 Constraints:
-    * 标签和配套的模板是 checkpoint 契约。不重新训练模板就改这些正则，会让
+    * 标签和配套的模板是 checkpoint 契约。模板文本是标记的权威来源，本模块的
+      默认值只是后备（见 ``chat_protocol``）。不重新训练模板就改这些标签，会让
       所有工具调用静默地识别不出来——模型输出看起来还是对的。
     * 解析永远不为畸形输入抛异常：截断或只写了一半的块只是产出更少的调用，
       因为这段代码跑在已经降级的生成结果上，把它变成服务端错误等于杀掉整个
@@ -37,16 +39,11 @@ Constraints:
 from __future__ import annotations
 
 import json
-import re
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-_TC = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
-_TC_OPEN = "<tool_call>"
-_FN = re.compile(r"<function=([^>\n]+)>(.*?)</function>", re.DOTALL)
-_PARAM = re.compile(r"<parameter=([^>\n]+)>(.*?)</parameter>", re.DOTALL)
-_THINK = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+from utils import chat_protocol
 
 
 @dataclass
@@ -93,52 +90,41 @@ class ToolCall:
         return f"ToolCall(name={self.name!r}, arguments={self.arguments!r})"
 
 
-def split_thinking(text: str) -> tuple[str, str]:
+def split_thinking(text: str, markers: dict[str, str] | None = None) -> tuple[str, str]:
     """把推理段和答案分开，返回 ``(thinking, answer)``。
 
-    模板已经把开头的 ``<think>`` 发在 prompt 里了，所以生成文本通常只带闭合的
-    ``</think>``；两种形状以及被截断（未闭合）的 ``<think>`` 都处理。
+    转发到 ``chat_protocol.split_thinking``，保留这个名字是因为服务层、agent
+    循环和测试都按它引用。
 
     Args:
         text: 从 prompt 之后切出来的原始生成文本。
+        markers: 标记表；``None`` 用这一族的后备值。
 
     Returns:
-        ``(thinking, answer)``，两者都已去空白。模型没有推理时 ``thinking``
-        是 ``""``。遇到未闭合的 ``<think>`` 时，标签之前的部分算答案，残缺的
-        推理段算 ``thinking``，被截断的一轮因此仍有可用文本。
+        ``(thinking, answer)``，两者都已去空白。
     """
-    if not text:
-        return "", ""
-    m = _THINK.search(text)
-    if m:
-        return m.group(1).strip(), (text[:m.start()] + text[m.end():]).strip()
-    if "</think>" in text:
-        i = text.index("</think>")
-        return text[:i].strip(), text[i + len("</think>"):].strip()
-    if "<think>" in text:
-        i = text.index("<think>")
-        return text[i + len("<think>"):].strip(), text[:i].strip()
-    return "", text.strip()
+    return chat_protocol.split_thinking(text, markers)
 
 
-def strip_thinking(text: str) -> str:
+def strip_thinking(text: str, markers: dict[str, str] | None = None) -> str:
     """``text`` 里属于答案的那一半，供丢弃推理段的调用方使用。
 
     Args:
         text: 原始生成文本；允许为空。
+        markers: 标记表；``None`` 用这一族的后备值。
 
     Returns:
         去掉推理块并去过空白的答案。
     """
-    return split_thinking(text)[1]
+    return chat_protocol.strip_thinking(text, markers)
 
 
 def _coerce(value: str) -> Any:
     """把无歧义的 JSON 字面量去壳，其余原样保留。
 
-    只转换 ``true``/``false``/``null``、对象/数组和数字，所以 ``"Beijing"``、
-    ``"0755"``、``"celsius"`` 仍是字符串。这个格式本身不携带类型信息，猜得再宽
-    一点（日期、写成 ``yes`` 的布尔）就会改坏工具自己去校验的参数。
+    只在没有工具 schema 时使用（本地 agent 循环、裸探针）。走 OpenAI 的那条路
+    一定带 schema，类型由 :func:`chat_protocol.convert_param` 按声明决定：这里
+    猜得越宽，``0755`` 这种字符串型参数被改成数字的机会越大。
 
     Args:
         value: 一对 ``<parameter=...>`` 之间的原始文本。
@@ -157,7 +143,48 @@ def _coerce(value: str) -> Any:
     return s
 
 
-def _parse_block(block: str) -> list[ToolCall]:
+def _spans(text: str, marker_block: dict[str, str], open_key: str,
+           stops: tuple[str, ...] = ()) -> list[tuple[str, str]]:
+    """按标记表扫出 ``<name=...>`` 块的 ``(名字, 正文)``。
+
+    正文到闭合标签、下一个同种开标签或调用方点名的停靠标签为止，所以被截断的
+    块（生成撞上 token 预算）仍然能交出一段残缺的取值，而不是整块作废。
+
+    Args:
+        text: 要扫的文本。
+        marker_block: 标记表。
+        open_key: 开标签在标记表里的键（``function_open`` / ``param_open``）。
+        stops: 额外的正文终止标记。
+
+    Returns:
+        ``(名字, 正文)`` 列表，按出现顺序排列。
+    """
+    open_tag = marker_block[open_key]
+    close_tag = marker_block["function_close" if open_key == "function_open"
+                             else "param_close"]
+    out: list[tuple[str, str]] = []
+    pos = 0
+    while True:
+        i = text.find(open_tag, pos)
+        if i < 0:
+            return out
+        head_end = text.find(">", i + len(open_tag))
+        if head_end < 0:
+            return out                      # 名字还没写完，这一块不算
+        name = text[i + len(open_tag):head_end].strip()
+        body = head_end + 1
+        ends = [k for k in (text.find(close_tag, body),) if k >= 0]
+        for stop in stops:
+            k = text.find(stop, body)
+            if k >= 0:
+                ends.append(k)
+        end = min(ends) if ends else len(text)
+        out.append((name, text[body:end]))
+        pos = end + (len(close_tag) if text.startswith(close_tag, end) else 0)
+
+
+def _parse_block(block: str, markers: dict[str, str] | None,
+                 specs: dict[str, dict[str, str]] | None) -> list[ToolCall]:
     """解析一个 ``<tool_call>`` 块的内部，先试模板形式。
 
     原生形式先试且一试到底：含 ``<function=...>`` 的块绝不会再落到 JSON 分支，
@@ -165,18 +192,29 @@ def _parse_block(block: str) -> list[ToolCall]:
 
     Args:
         block: ``<tool_call>`` 标签之间的文本，不含标签本身。
+        markers: 标记表；``None`` 用后备值。
+        specs: 工具 schema 的 ``函数名 -> 参数类型`` 表；``None`` 表示本条请求
+            没有 schema，退回按字面量猜类型的老规则。
 
     Returns:
         块里的全部调用，按顺序排列；两种形式都不匹配时为空——畸形的块被当成
         「没有调用」，而不是一个错误。
     """
+    mk = chat_protocol.markers_from(markers)
     calls: list[ToolCall] = []
-    fns = list(_FN.finditer(block))
+    fns = _spans(block, mk, "function_open", (mk["function_open"],))
     if fns:
-        for m in fns:
-            args = {pm.group(1).strip(): _coerce(pm.group(2))
-                    for pm in _PARAM.finditer(m.group(2))}
-            calls.append(ToolCall(name=m.group(1).strip(), arguments=args, raw=m.group(0)))
+        for name, body in fns:
+            args: dict[str, Any] = {}
+            for pname, raw in _spans(body, mk, "param_open",
+                                     (mk["param_open"], mk["function_close"])):
+                if specs is None:
+                    args[pname] = _coerce(raw)
+                else:
+                    args[pname] = chat_protocol.convert_param(
+                        raw, chat_protocol.param_type(specs, name, pname))
+            calls.append(ToolCall(name=name, arguments=args,
+                                  raw=f"{mk['function_open']}{name}{mk['function_close']}"))
         return calls
     try:
         obj = json.loads(block.strip())
@@ -199,11 +237,45 @@ def _parse_block(block: str) -> list[ToolCall]:
     return calls
 
 
-def parse_tool_calls(text: str) -> list[ToolCall]:
+def _blocks(text: str, markers: dict[str, str] | None) -> list[str]:
+    """取出每个 ``<tool_call>`` 块的内部。
+
+    窗口截断成半个标记时没有闭合标签，此时尾部整体算一个块——这是生成撞上
+    ``max_tokens`` 时的常见形状，丢掉它等于把已经想好的调用扔掉。
+
+    Args:
+        text: assistant 文本。
+        markers: 标记表。
+
+    Returns:
+        块内文本列表，不含标签本身。
+    """
+    mk = chat_protocol.markers_from(markers)
+    open_tag, close_tag = mk["tool_open"], mk["tool_close"]
+    out: list[str] = []
+    pos = 0
+    while True:
+        i = text.find(open_tag, pos)
+        if i < 0:
+            return out
+        body = i + len(open_tag)
+        j = text.find(close_tag, body)
+        if j < 0:
+            out.append(text[body:])             # 生成被截断
+            return out
+        out.append(text[body:j])
+        pos = j + len(close_tag)
+
+
+def parse_tool_calls(text: str, tools=None,
+                     markers: dict[str, str] | None = None) -> list[ToolCall]:
     """从模型回复里取出所有工具调用，没有则返回空列表。
 
     Args:
         text: 已经去掉 prompt 的 assistant 文本；其中可能仍有推理块。
+        tools: 请求里的工具 schema 数组。给了就按它声明的类型定型，没给（本地
+            agent 循环）才按字面量猜。
+        markers: 标记表；``None`` 用这一族的后备值。
 
     Returns:
         按生成顺序排列的调用。未闭合的 ``<tool_call>``——生成到一半撞上 token
@@ -211,26 +283,26 @@ def parse_tool_calls(text: str) -> list[ToolCall]:
     """
     if not text:
         return []
-    blocks = [m.group(1) for m in _TC.finditer(text)]
-    if not blocks and _TC_OPEN in text:
-        blocks = [text.split(_TC_OPEN, 1)[1]]      # 生成被截断
+    specs = None if tools is None else chat_protocol.param_types(tools)
     calls: list[ToolCall] = []
-    for b in blocks:
-        calls.extend(_parse_block(b))
+    for block in _blocks(text, markers):
+        calls.extend(_parse_block(block, markers, specs))
     return calls
 
 
-def has_tool_call(text: str) -> bool:
+def has_tool_call(text: str, tools=None, markers: dict[str, str] | None = None) -> bool:
     """``text`` 里有没有 ``parse_tool_calls`` 能变成调用的内容。
 
     Args:
         text: assistant 文本；可以为空。
+        tools: 工具 schema；含义同 :func:`parse_tool_calls`。
+        markers: 标记表。
 
     Returns:
         至少解析出一个调用时为 ``True``，也就是循环该去执行工具，而不是把
         这个回答当成最终答案。
     """
-    return bool(parse_tool_calls(text))
+    return bool(parse_tool_calls(text, tools, markers))
 
 
 def tool_result_message(call: ToolCall, result: Any, name: str | None = None) -> dict[str, str]:

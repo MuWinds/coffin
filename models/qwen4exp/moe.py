@@ -26,7 +26,7 @@ Constraints:
       只有非融合的兜底路径仍然用 ``index_add_``，它不参与服务路径。
     * int8 打包时必须逐 expert 保持 ``[K, N]`` 行主序，不能把 512 个专家摊平成
       一个 2D 矩阵——``grouped_gemm`` 用固定偏移寻址。
-    * W4A8 分派路径上不许出现主机往返。``.tolist()`` / ``int(tensor)`` 每次都要
+    * 量化分派路径上不许出现主机往返。``.tolist()`` / ``int(tensor)`` 每次都要
       等一次设备到主机的拷贝，而 decode 一步只有 1 个 token、48 层各来一遍，
       付的全是固定开销：分组内核吃的是设备指针，前缀和没有理由回主机。
 """
@@ -275,9 +275,9 @@ class Experts(nn.Module):
         if config.hidden_act not in _ACTIVATIONS:
             raise ValueError(f"unsupported activation {config.hidden_act!r}.")
         self.act_fn = _ACTIVATIONS[config.hidden_act]
-        #: W4A8 的专家栈与分派函数；``None`` 表示走 bf16 的逐专家循环。
-        #: 挂在属性上而不是做成子模块：:class:`W4A8MoEWeight` 不是 ``nn.Module``
-        #: （它只持有 packed 缓冲区与 scale），做成子模块会被 ``state_dict`` 收走，
+        #: int8 的专家栈与分派函数；``None`` 表示走 bf16 的逐专家循环。
+        #: 挂在属性上而不是做成子模块：:class:`~int8_weights.QWeightMoE` 不是 ``nn.Module``
+        #: （它只持有 int8 缓冲与 scale），做成子模块会被 ``state_dict`` 收走，
         #: 而它本来就不该出现在 ``state_dict`` 里。
         self._grouped = None
         self._quant_gate_up = None
@@ -322,15 +322,15 @@ class Experts(nn.Module):
         return table
 
     def set_quantized(self, gate_up, down) -> None:
-        """把专家栈换成 W4A8 版本，并启用分组投影。
+        """把专家栈换成 int8 版本，并启用分组投影。
 
         参数从 ``state_dict`` 里摘掉：量化权重不是 ``nn.Parameter``，留着 bf16 的
         ``Parameter`` 会让显存白白多占一份——48 层的专家是 60.4 GB，那一份正好是
         装得下与装不下之间的差距。
 
         Args:
-            gate_up: :class:`W4A8MoEWeight`，``[E, 2*I, H]``。
-            down: :class:`W4A8MoEWeight`，``[E, H, I]``。
+            gate_up: :class:`~int8_weights.QWeightMoE`，``[E, 2*I, H]``（nk 原生）。
+            down: :class:`~int8_weights.QWeightMoE`，``[E, H, I]``（nk 原生）。
 
         Raises:
             ValueError: 专家数与当前分片不一致。混用两个 checkpoint 的专家栈会
@@ -356,15 +356,15 @@ class Experts(nn.Module):
         self.gate_up_proj = None
         self.down_proj = None
         # 融合分派只有在分组内核可用时才有意义：它算出的 ``offsets`` / 行序是给
-        # ``moe_grouped`` 用的。两者必须一起开，否则会拿一条路的输出喂另一条路。
+        # ``moe_grouped_i8`` 用的。两者必须一起开，否则会拿一条路的输出喂另一条路。
         self._dispatch = self._make_dispatch()
 
     def _make_grouped(self):
         """返回一个 ``(x, offsets, down_proj=False) -> y`` 的分派函数。
 
         按**行数**在两个入口之间选：行少（decode，每专家 1-2 行）走
-        ``moe_grouped`` 的 GEMV 结构；行多（prefill，每专家上百行）走
-        ``moe_grouped_gemm`` 的按专家分段张量核 GEMM。
+        ``moe_grouped_i8`` 的 GEMV 结构；行多（prefill，每专家上百行）走
+        ``moe_grouped_i8_tcu`` 的按专家分段张量核 GEMM。
 
         分界取 :data:`_GEMM_MIN_ROWS`。这个数是按「每专家平均行数」定的，而不是
         绝对 tokens——因为决定 GEMV 输赢的是每段有多长：段内只有 1-2 行时张量核的
@@ -380,8 +380,8 @@ class Experts(nn.Module):
         from backends import ops as bops
 
         gate_up_weight, down_weight = self._quant_gate_up, self._quant_down
-        gemm_ok = ("moe_grouped_gemm" in _caps().native
-                   and getattr(bops, "moe_grouped_gemm", None) is not None)
+        gemm_ok = ("moe_grouped_i8_tcu" in _caps().native
+                   and getattr(bops, "moe_grouped_i8_tcu", None) is not None)
 
         def grouped(x: torch.Tensor, offsets: torch.Tensor,
                     down_proj: bool = False) -> torch.Tensor:
@@ -414,8 +414,8 @@ class Experts(nn.Module):
             # batch 内摊薄、单步耗时接近平坦。这一条正是那次扩展失败的怀疑点。
             rows_per_expert = rows / float(max(1, self.num_local_experts))
             if gemm_ok and rows_per_expert >= _GEMM_MIN_ROWS:
-                return bops.moe_grouped_gemm(weight, x, offsets)
-            return bops.moe_grouped(weight, x, offsets)
+                return bops.moe_grouped_i8_tcu(weight, x, offsets)
+            return bops.moe_grouped_i8(weight, x, offsets)
 
         return grouped
 
@@ -481,7 +481,7 @@ class Experts(nn.Module):
 
         Raises:
             ValueError: ``top_k_index`` 与 ``top_k_weights`` 形状不一致，或下标
-                越界。越界检查在 W4A8 分派路径上默认跳过（见
+                越界。越界检查在量化分派路径上默认跳过（见
                 :data:`_CHECK_DISPATCH`），路由正确时它永远不会触发。
         """
         if top_k_index.shape != top_k_weights.shape:
@@ -544,7 +544,7 @@ class Experts(nn.Module):
             # prefill 时是几百，量级差两个数量级，64 这个门两边都不踩线。
             #
             # **注意**：分组内核本身只扫 ``offsets[e+1] - offsets[e]`` 行（见
-            # ``moe_grouped`` 的内核），尾部它本来就不碰 —— 所以这里省的是**主机侧**
+            # ``moe_grouped_i8`` 的内核），尾部它本来就不碰 —— 所以这里省的是**主机侧**
             # 那几项，不是内核时间。
             if int(hidden_states.shape[0]) >= 64:
                 valid = int(offsets[-1].item())
@@ -648,7 +648,7 @@ class Experts(nn.Module):
         counts = torch.bincount(sorted_local, minlength=self.num_local_experts)
 
         if self._grouped is not None:
-            # 前缀和全程留在设备上：``moe_grouped`` 本来就收设备侧 int32 指针，
+            # 前缀和全程留在设备上：``moe_grouped_i8`` 本来就收设备侧 int32 指针，
             # ``.tolist()`` 再 ``torch.tensor(...)`` 只是来回搬一趟，代价是每层
             # 一次主机同步。
             offsets = torch.zeros(counts.numel() + 1, dtype=torch.int32,

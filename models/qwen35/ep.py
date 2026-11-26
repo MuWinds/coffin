@@ -647,6 +647,26 @@ class P2pReduce:
         blocks = max(1, min(64, (total + threads * 8 - 1) // (threads * 8)))
         return blocks, threads
 
+    def _check_payload(self, x: torch.Tensor, rows: int) -> None:
+        """校验本 rank 交上来的载荷是否还是约定里的 ``[rows, hidden]`` bf16。
+
+        Args:
+            x: 待校验的贡献。
+            rows: 已从 ``x.shape[0]`` 取出的行数。
+
+        Raises:
+            ValueError: 形状、行数或 dtype 超出约定。
+        """
+        if x.dim() != 2 or int(x.shape[1]) != self.hidden:
+            raise ValueError(
+                f"p2p combine expects [rows, {self.hidden}], got {tuple(x.shape)}")
+        if rows > self.rows:
+            raise ValueError(
+                f"p2p combine payload {rows} rows exceeds the {self.rows} the slot "
+                f"area was sized for; raise COFFIN_EP_ROWS")
+        if x.dtype != torch.bfloat16:
+            raise ValueError(f"p2p combine needs bf16, got {x.dtype}")
+
     def all_reduce_sum(self, x: torch.Tensor) -> torch.Tensor:
         """把各 rank 的专家部分和加成本 rank 的完整输出。
 
@@ -660,24 +680,27 @@ class P2pReduce:
             ValueError: dtype/形状超出约定，或行数超过槽区容量。
         """
         rows = int(x.shape[0])
-        if x.dim() != 2 or int(x.shape[1]) != self.hidden:
-            raise ValueError(
-                f"p2p combine expects [rows, {self.hidden}], got {tuple(x.shape)}")
-        if rows > self.rows:
-            raise ValueError(
-                f"p2p combine payload {rows} rows exceeds the {self.rows} the slot "
-                f"area was sized for; raise COFFIN_EP_ROWS")
-        if x.dtype != torch.bfloat16:
-            raise ValueError(f"p2p combine needs bf16, got {x.dtype}")
+        # 解码步上 ``x`` 每层都是同一块缓冲（MoE 驱动的输出），行数也恒为 1：形状校验、
+        # ``_out[:rows]`` 的切片和 ``_grid`` 都只在换缓冲时做一次。三样加起来约 25 µs，
+        # 40 层就是 1 ms/步——而它们每一步算出来的东西完全一样。
+        if x.is_contiguous():
+            key = (id(x), rows)
+            if getattr(self, "_fast_key", None) != key:
+                self._check_payload(x, rows)
+                self._fast_key = key
+                self._fast_val = (x, self._out[:rows], *self._grid(rows * self.hidden))
+            src, out, blocks, threads = self._fast_val
+        else:
+            self._check_payload(x, rows)
+            src, out = x.contiguous(), self._out[:rows]
+            blocks, threads = self._grid(rows * self.hidden)
         self._round += 1
-        out = self._out[:rows]
-        blocks, threads = self._grid(rows * self.hidden)
         if _EP_TRACE and (self._round <= 4 or self._round % 40 in (0, 1)):
             # 会合是按轮次号对齐的：四个 rank 各自打印自己这一轮的序号，
             # 谁多跑/少跑一轮立刻能看出来（挂死时就靠这个定位）。
             print(f"[ep] rank={self.rank} round={self._round} rows={rows}",
                   flush=True)
-        self._module.p2p_combine(x.contiguous(), out, *self._slot_ptr,
+        self._module.p2p_combine(src, out, *self._slot_ptr,
                                  *self._flag_ptr, self.rank, self._round,
                                  blocks, threads)
         # 探针只在 close() 时读回：轮内做任何 D2H 都会强制同步、把四个 rank 的会合

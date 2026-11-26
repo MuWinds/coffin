@@ -64,7 +64,7 @@ python3 run_chat.py --raw "The capital of France is" -n 32
 python3 run_chat.py --chat "introduce yourself" --system "Keep it short" -n 64
 python3 run_chat.py --bench -n 128                               # 固定 prompt，报 tok/s
 python3 run_chat.py --raw "..." -n 32 --no-graph                 # 不重放设备图，跑即时路径
-python3 run_chat.py --model $HOME/models/Qwen3.5-4B-int8kn --int8 --raw "..." -n 32
+python3 run_chat.py --model $HOME/models/Qwen3.5-4B-int8-nk --int8 --raw "..." -n 32
 ```
 
 三点要记住：
@@ -155,6 +155,21 @@ curl -s http://127.0.0.1:18080/v1/chat/completions \
 图片走 OpenAI 的 `image_url` data URL，服务端解码成 PIL 再喂视觉塔。像素上限是显存和延迟
 的唯一真开关（默认 1 MP 约 1024 图像 token），见第 6 节的图像一组。
 
+思考与工具调用跟 checkpoint 的对话模板走，不跟模型名走：qwen3.5（4B）和
+occamy 1.0（MoE）共用 Qwen3.5 那一族的线格式，模板来源却不同——前者写在
+`tokenizer_config.json`，后者是同目录的 `chat_template.jinja`，加载时统一补成
+`tokenizer.chat_template`。
+
+| 行为 | 契约 |
+| --- | --- |
+| 推理段 | 走 `reasoning_content`，与 `content` 同时流出；`usage.reasoning_tokens` 报落在推理段里的 token 数 |
+| 工具调用 | `<tool_call>` 转成结构化 `tool_calls`，`finish_reason` 为 `tool_calls`；推理段里写出来的调用不算 |
+| 参数类型 | 只认请求 `tools` 里声明的那一个：`{"type": "string"}` 的 `0755` 保持字符串，`integer` 才转数字 |
+| 流式一致性 | 把 `function.arguments` 的片段拼起来，与非流式返回的字符串逐字相同 |
+
+`--served-model-name` 不参与这些判断：同一个引擎既能服务 4B，也能服务 occamy 1.0，
+换模型不需要改外壳。
+
 ## 5. 多卡
 
 多卡的约定是环境变量，不是新入口：`RANK` / `WORLD_SIZE` / `MASTER_ADDR` /
@@ -241,14 +256,13 @@ OpenAI 适配器侧的开关与它对应：`--default-max-tokens`（默认 8192�
 权重可以是原始 checkpoint（加载时量化），也可以是离线量化好的目录：后者省掉每次启动的量化开销，也让大模型不必在显存里先铺一份稠密副本，推荐使用 int8 量化进行推理部署。
 
 ```sh
-python3 tools/quant_disk.py      --checkpoint $HOME/models/occamy-1.0 --out $HOME/models/occamy-1.0-W8A8-kn --include-vision
-python3 tools/quant_disk_w4a8.py --checkpoint $HOME/models/Qwen3.8-27B --out $HOME/models/Qwen3.8-27B-W4A8-g128 --group-size 128 --include-vision
-python3 tools/quant_disk_qwen4.py --checkpoint <src> --out <dst>      # Qwen3.8 一族
+python3 tools/quant_disk.py      --checkpoint $HOME/models/occamy-1.0 --out $HOME/models/occamy-1.0-W8A8-nk --include-vision
+python3 tools/quant_disk.py      --checkpoint $HOME/models/Qwen3.5-4B --out $HOME/models/Qwen3.5-4B-int8-nk
 ```
 
-产物目录里有一份 `quant_index.json`（格式 `coffin-int8-kn-v1` / `coffin-w4a8-kn-v1`），
-加载时用 `--int8` 认它。`tools/launch_occamy_w8a8.sh`、`tools/launch_qwen38_w4a8.sh` 是完整
-链路示例：挑健康卡 → 量化到磁盘 → 回读校验每个源张量都在产物里 → 打印产物大小。校验那一
+产物目录里有一份 `quant_index.json`（格式 `coffin-int8-nk-v1`，权重布局 `nk`：盘上
+`int8 [N, K]` + 每行一个 fp32 scale），加载时用 `--int8` 认它。`tools/launch_occamy_w8a8.sh`
+是完整链路示例：挑健康卡 → 量化到磁盘 → 回读校验每个源张量都在产物里 → 打印产物大小。校验那一
 步不要跳，漏张量的表现是权重看着齐了但输出不对。
 
 ## 10. 排障

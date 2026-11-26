@@ -367,7 +367,7 @@ def chunk_gated_delta_rule(query: torch.Tensor, key: torch.Tensor, value: torch.
 #: ``_fused_in_proj`` 的失效原因只打一次。
 #:
 #: 真机产物里 ``in_proj_a/b``（``N=48``）没有 ``scale_key``，装载器于是走 ``set_bf16``，
-#: 而四路拼接要求四个成员都是 :class:`W4A8Weight` —— 也就是说这条「4 次投影 + 4 次
+#: 而四路拼接要求四个成员都是 int8 ``QWeight`` —— 也就是说这条「4 次投影 + 4 次
 #: 量化压成 1 次」的路径在 artifact 上**从来没有跑过**，退回的是四次独立调用。这个
 #: 事实在账本上只表现为「每层投影次数比设计值多」，所以必须留一行日志；36 个 GDN 层
 #: 各打一次只会把别的信号淹掉，所以每进程只打一次。
@@ -379,7 +379,7 @@ def _log_in_proj_skip(module: nn.Module, weight) -> None:
 
     Args:
         module: 没能进组的那一个成员。
-        weight: 它当时的权重对象；``None`` 表示还没挂上，非 :class:`W4A8Weight`
+        weight: 它当时的权重对象；``None`` 表示还没挂上，非 :class:`~int8_weights.QWeight`
             表示是 bf16 回填的。
     """
     global _IN_PROJ_SKIP_LOGGED
@@ -486,15 +486,14 @@ class GatedDeltaNet(nn.Module):
     def _fused_in_proj(self):
         """把四个 ``in_proj`` 沿输出轴拼成一个权重，返回一次投影的闭包。
 
-        四个投影共享 ``K = hidden_size`` 且都是 W4A8（同 ``group_size``），所以
-        ``cat_output`` 的契约正好成立：``packed`` 是 ``[ceil(K/2), N_i]``、
-        ``scale`` 是 ``[groups, N_i]``，沿 N 拼接后与拼好的 ``packed`` 一一对应 ——
-        **不需要重排，数值逐位等价**。
+        四个投影共享 ``K = hidden_size`` 且都是 int8（``wq`` 是 ``[N_i, K]``、
+        ``scale`` 是 ``[N_i]``），所以 :func:`~models.qwen4exp.proj.cat_output`
+        的契约正好成立：沿第 0 轴拼行，每行带着自己的 absmax scale —— **不需要
+        重排，数值逐位等价**。
 
-        为什么值得：decode 一步里 W4A8 投影共 316 次 ``w4a8_dot`` + 约 403 次
-        ``quant_act_i8``（``q4budget2``），而 GDN 的四个投影在 36 个线性层上各一次。
-        合并后把这部分从「4 次投影 + 4 次量化」压到「1 次投影 + 1 次量化」，
-        并且激活只读一遍。
+        为什么值得：decode 一步里量化投影共 316 次内核调用 + 约 403 次激活量化
+        （``q4budget2``），而 GDN 的四个投影在 36 个线性层上各一次。合并后把这部分
+        从「4 次投影 + 4 次量化」压到「1 次投影 + 1 次量化」，并且激活只读一遍。
 
         Returns:
             ``(hidden) -> packed_output`` 的闭包，输出最后一维是
@@ -505,21 +504,22 @@ class GatedDeltaNet(nn.Module):
         if cached is not None:
             return cached[1]
 
-        from w4a8_weights import W4A8Weight
+        from int8_weights import QWeight
+        from models.qwen4exp.proj import cat_output
 
         parts = (self.in_proj_qkv, self.in_proj_z, self.in_proj_b, self.in_proj_a)
         weights = []
         for module in parts:
             weight = getattr(module, "_quantized", None)
-            if not isinstance(weight, W4A8Weight) or module.bias is not None:
-                # 非量化路径（bf16 ``[K,N]``）也能拼，但那条路不是 decode 的热路径，
-                # 而拼接会让 ``pack.as_kn`` 的身份记忆化失效。所以只在 W4A8 上做。
-                # 有 bias 的站点同样跳过：``W4A8Weight`` 里没有 bias。
+            if not isinstance(weight, QWeight) or module.bias is not None:
+                # 非量化路径（bf16 ``[N, K]``）也能拼，但那条路不是 decode 的热路径，
+                # 而拼接会让权重对象身份变化、破坏按身份的记忆化。所以只在 int8 上做。
+                # 有 bias 的站点同样跳过：``QWeight`` 里没有 bias。
                 _log_in_proj_skip(module, weight)
                 self._fused_in_cache = ((), None)
                 return None
             weights.append(weight)
-        merged = W4A8Weight.cat_output(weights)
+        merged = cat_output(weights)
         total_out = sum(module.out_features for module in parts)
 
         def project(hidden: torch.Tensor) -> torch.Tensor:
@@ -736,14 +736,14 @@ class GatedDeltaNet(nn.Module):
         batch, seq, _ = hidden_states.shape
 
         # 四个 in_proj 吃**同一份** hidden_states。分开调用会把激活重复读四遍、
-        # 并且各发一次内核（W4A8 路径上每次还额外带一次 ``quant_act_i8``）。
+        # 并且各发一次内核（量化路径上每次还额外带一次激活量化）。
         #
-        # 实测依据（作业 ``q4budget2``/``q4attrib3``）：一步 decode 里 ``w4a8_dot`` 316 次、
+        # 实测依据（作业 ``q4budget2``/``q4attrib3``）：一步 decode 里量化投影内核 316 次、
         # ``quant_act_i8`` 约 403 次，而 GDN 的四个投影在 36 个线性层上各出现一次 ——
         # 合并后这部分从 4 次投影 + 4 次量化降到 1 次投影 + 1 次量化。
         #
-        # 用 :meth:`W4A8Weight.cat_output` 沿输出轴拼：四者共享 ``K`` 与 ``group_size``，
-        # 而 scale 是逐组的 ``[groups, N]``，沿 N 拼接正好与拼接后的 packed 对齐，
+        # 用 :func:`~models.qwen4exp.proj.cat_output` 沿输出轴拼：四者共享 ``K``，
+        # 而 scale 是逐输出行的 ``[N_i]``，沿行拼接正好与拼接后的 ``wq`` 对齐，
         # 所以**不需要额外转置或重排，数值上也逐位等价**。
         fused = self._fused_in_proj()
         if fused is not None:

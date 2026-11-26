@@ -83,13 +83,25 @@ class RMSNorm:
         """
         if x.dtype != D:
             x = x.to(D)
-        xf = _rows(x)
+            xf = _rows(x)
+            return bops.rms_norm(xf, self.g, xf.stride(0), 1e-6).view(x.shape)
+        # 缓存键必须带上形状和步长。只按 ``id(x)`` 判会错：预填充阶段各层拿到的
+        # 是同一块 ``[M, hidden]`` 缓冲的不同视图，``id`` 可能相同而行数不同，于是
+        # 解码步缓存的「一行」被拿去喂 ``M = 32`` 的调用——内核只覆盖了第一行，
+        # ``.view(x.shape)`` 直接抛 ``shape '[32, 2560]' is invalid for input of
+        # size 2560``（图捕获阶段的崩溃就是这个）。形状静态时签名不变，缓存照样命中。
+        sig = (id(x), x.shape, x.stride())
+        if getattr(self, "_call_sig", None) != sig:
+            # 解码步里同一块激活会被逐 token 反复归一化：``_rows`` 与 ``stride`` 的
+            # 结果只取决于这块缓冲本身，缓存下来即可，形状仍从 ``x`` 现取。
+            self._call_sig = sig
+            self._call_xf = _rows(x)
+        xf = self._call_xf
         return bops.rms_norm(xf, self.g, xf.stride(0), 1e-6).view(x.shape)
 
     def add_residual(self, x: torch.Tensor, add: torch.Tensor,
                      out: torch.Tensor) -> torch.Tensor:
         """把残差相加折进这次归一化：先 ``x += add``，再归一化写进 ``out``。
-
         解码层的 pre-norm 半边是 ``h = mix(norm(x)); x = x + h``，随后 MLP 前
         还要再 ``norm(x)`` 一次。拆成两个算子就是两次 launch、两次读残差行；
         在这张卡 5.75 us 的 launch 下限面前，成本就是 launch 本身。融合起来是
@@ -118,21 +130,29 @@ class RMSNorm:
             ValueError: ``out`` 不稠密，或者 ``out`` 就是 ``x``。前者会写进一个
                 副本——结果无声丢失；后者会覆盖残差。
         """
-        if x.dtype != D or out.dtype != D:
-            raise TypeError(f"add_residual accumulates {D} in place and writes {D}; "
-                            f"got x={x.dtype}, out={out.dtype}")
-        # 不稠密的 ``out`` 会被 reshape 成副本，内核写进副本，调用方拿到的是没变的
-        # ``out``，而且不报错。这是本次调用里唯一没法在下游被发现的布局错误。
-        if out.stride(-1) != 1 or _rows(out).data_ptr() != out.data_ptr():
-            raise ValueError("add_residual needs a dense destination; "
-                             f"got strides {tuple(out.stride())}")
-        if out is x or out.data_ptr() == x.data_ptr():
-            raise ValueError("add_residual cannot write over the residual it "
-                             "accumulates: the sum is still needed")
-        if add.dtype != D:
-            add = add.to(D)
-        xf = _rows(x)
-        bops.add_rms_norm(xf, _rows(add), self.g, _rows(out), xf.stride(0), 1e-6)
+        key = (id(x), id(add), id(out))
+        if getattr(self, "_fast_key", None) != key:
+            # 校验与视图构造只在**换了一组缓冲**时做一次。解码步上这三个位置每层
+            # 每 token 完全相同，而这段校验要付四次 ``_rows``、两次 dtype 比较和
+            # 三次 ``data_ptr``——单次约 20 µs，一层两次，40 层就是 1.6 ms/步。
+            if x.dtype != D or out.dtype != D:
+                raise TypeError(f"add_residual accumulates {D} in place and writes {D}; "
+                                f"got x={x.dtype}, out={out.dtype}")
+            # 不稠密的 ``out`` 会被 reshape 成副本，内核写进副本，调用方拿到的是没变的
+            # ``out``，而且不报错。这是本次调用里唯一没法在下游被发现的布局错误。
+            if out.stride(-1) != 1 or _rows(out).data_ptr() != out.data_ptr():
+                raise ValueError("add_residual needs a dense destination; "
+                                 f"got strides {tuple(out.stride())}")
+            if out is x or out.data_ptr() == x.data_ptr():
+                raise ValueError("add_residual cannot write over the residual it "
+                                 "accumulates: the sum is still needed")
+            if add.dtype != D:
+                add = add.to(D)
+            xf = _rows(x)
+            self._fast_key = key
+            self._fast_val = (xf, _rows(add), _rows(out), xf.stride(0))
+        xf, af, of, stride = self._fast_val
+        bops.add_rms_norm(xf, af, self.g, of, stride, 1e-6)
         return out
 
 
