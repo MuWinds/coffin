@@ -36,10 +36,11 @@ constexpr int I8_EXP_MT = 16;
 //: 但那份重读落在 L1/L2 里——同一专家的 32 KB 激活块在这张卡上会被十几条 warp 同时读。）
 constexpr int I8_EXP_WCOL = 2;
 
-//: 一步的 K 跨度 = 32 条通道 x 16 字节。
+//: 一步的 K 跨度：宽档 32 条通道 x 16 字节 = 512，窄档（TP4 down K=128）32 x 4 字节 = 128。
 constexpr int I8_EXP_STEPK = 512;
+constexpr int I8_EXP_STEPK_NARROW = 128;
 
-template <typename XT>
+template <typename XT, int VB = 16>
 __global__ void moe_grouped_i8_expert_nk_kernel(const int8_t* __restrict__ a,
                                                 const int8_t* __restrict__ wn,
                                                 const float* __restrict__ ws,
@@ -60,6 +61,7 @@ __global__ void moe_grouped_i8_expert_nk_kernel(const int8_t* __restrict__ a,
     const int nc = min(I8_EXP_WCOL, N - colbase);
 
     const int8_t* ebase = wn + (size_t)expert * (size_t)N * (size_t)K;
+    constexpr int STEPK = 32 * VB;
 
     for (int rt = r0; rt < r1; rt += I8_EXP_MT) {
         const int rows = min(I8_EXP_MT, r1 - rt);
@@ -70,32 +72,56 @@ __global__ void moe_grouped_i8_expert_nk_kernel(const int8_t* __restrict__ a,
             for (int m = 0; m < I8_EXP_MT; ++m) acc[c][m] = 0;
         }
 
-        for (int kb = 0; kb < K; kb += I8_EXP_STEPK) {
-            const int k0 = kb + lane * 16;
-            int4 w[I8_EXP_WCOL];
+        for (int kb = 0; kb < K; kb += STEPK) {
+            const int k0 = kb + lane * VB;
+            if constexpr (VB == 16) {
+                int4 w[I8_EXP_WCOL];
 #pragma unroll
-            for (int c = 0; c < I8_EXP_WCOL; ++c) {
-                if (c < nc) {
-                    w[c] = *reinterpret_cast<const int4*>(
-                        ebase + (size_t)(colbase + c) * K + k0);
+                for (int c = 0; c < I8_EXP_WCOL; ++c) {
+                    if (c < nc) {
+                        w[c] = *reinterpret_cast<const int4*>(
+                            ebase + (size_t)(colbase + c) * K + k0);
+                    }
                 }
-            }
-            // 激活直接从全局读，不再经共享内存过一道：一趟 16 行要 32 KB 共享内存，
-            // 那会把每 SM 的常驻块压到 1 个（8 条 warp），延迟就藏不住——实测同一条
-            // 几何带共享内存只有 59 GB/s，而这份 16 行 x K 的激活块被同一专家的所有
-            // 列块重读，落在 L1/L2 里，不占 HBM。
+                // 激活直接从全局读，不再经共享内存过一道：一趟 16 行要 32 KB 共享内存，
+                // 那会把每 SM 的常驻块压到 1 个（8 条 warp），延迟就藏不住——实测同一条
+                // 几何带共享内存只有 59 GB/s，而这份 16 行 x K 的激活块被同一专家的所有
+                // 列块重读，落在 L1/L2 里，不占 HBM。
 #pragma unroll
-            for (int m = 0; m < I8_EXP_MT; ++m) {
-                if (m < rows) {
-                    const int4 av = *reinterpret_cast<const int4*>(
-                        a + (size_t)(rt + m) * K + k0);
+                for (int m = 0; m < I8_EXP_MT; ++m) {
+                    if (m < rows) {
+                        const int4 av = *reinterpret_cast<const int4*>(
+                            a + (size_t)(rt + m) * K + k0);
 #pragma unroll
-                    for (int c = 0; c < I8_EXP_WCOL; ++c) {
-                        if (c < nc) {
-                            acc[c][m] = __dp4a(w[c].x, av.x, acc[c][m]);
-                            acc[c][m] = __dp4a(w[c].y, av.y, acc[c][m]);
-                            acc[c][m] = __dp4a(w[c].z, av.z, acc[c][m]);
-                            acc[c][m] = __dp4a(w[c].w, av.w, acc[c][m]);
+                        for (int c = 0; c < I8_EXP_WCOL; ++c) {
+                            if (c < nc) {
+                                acc[c][m] = __dp4a(w[c].x, av.x, acc[c][m]);
+                                acc[c][m] = __dp4a(w[c].y, av.y, acc[c][m]);
+                                acc[c][m] = __dp4a(w[c].z, av.z, acc[c][m]);
+                                acc[c][m] = __dp4a(w[c].w, av.w, acc[c][m]);
+                            }
+                        }
+                    }
+                }
+            } else {
+                int w[I8_EXP_WCOL];
+#pragma unroll
+                for (int c = 0; c < I8_EXP_WCOL; ++c) {
+                    if (c < nc) {
+                        w[c] = *reinterpret_cast<const int*>(
+                            ebase + (size_t)(colbase + c) * K + k0);
+                    }
+                }
+#pragma unroll
+                for (int m = 0; m < I8_EXP_MT; ++m) {
+                    if (m < rows) {
+                        const int av = *reinterpret_cast<const int*>(
+                            a + (size_t)(rt + m) * K + k0);
+#pragma unroll
+                        for (int c = 0; c < I8_EXP_WCOL; ++c) {
+                            if (c < nc) {
+                                acc[c][m] = __dp4a(w[c], av, acc[c][m]);
+                            }
                         }
                     }
                 }
@@ -146,12 +172,23 @@ inline void launch_moe_grouped_i8_expert(const int8_t* a, const int8_t* wn, cons
     // 由寄存器而不是共享内存决定（同一条几何带 32 KB 共享内存时只剩 1 个块 / 8 条 warp）。
     const dim3 block(I8_EXP_THREADS);
     const dim3 grid((unsigned)((N + I8_EXP_COLS - 1) / I8_EXP_COLS), (unsigned)experts);
+    const bool wide = (K % I8_EXP_STEPK) == 0;
     if (out_code == 1) {
-        moe_grouped_i8_expert_nk_kernel<uint16_t><<<grid, block, 0, stream>>>(
-            a, wn, ws, xs, offsets, reinterpret_cast<uint16_t*>(out), K, N);
+        if (wide) {
+            moe_grouped_i8_expert_nk_kernel<uint16_t, 16><<<grid, block, 0, stream>>>(
+                a, wn, ws, xs, offsets, reinterpret_cast<uint16_t*>(out), K, N);
+        } else {
+            moe_grouped_i8_expert_nk_kernel<uint16_t, 4><<<grid, block, 0, stream>>>(
+                a, wn, ws, xs, offsets, reinterpret_cast<uint16_t*>(out), K, N);
+        }
     } else {
-        moe_grouped_i8_expert_nk_kernel<float><<<grid, block, 0, stream>>>(
-            a, wn, ws, xs, offsets, reinterpret_cast<float*>(out), K, N);
+        if (wide) {
+            moe_grouped_i8_expert_nk_kernel<float, 16><<<grid, block, 0, stream>>>(
+                a, wn, ws, xs, offsets, reinterpret_cast<float*>(out), K, N);
+        } else {
+            moe_grouped_i8_expert_nk_kernel<float, 4><<<grid, block, 0, stream>>>(
+                a, wn, ws, xs, offsets, reinterpret_cast<float*>(out), K, N);
+        }
     }
 }
 

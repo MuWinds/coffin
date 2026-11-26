@@ -48,6 +48,10 @@ class GemvShim:
             "coffin_gemv_nk_i8", [p, p, i, p, ll, ll, p, i, i, i, p])
         self.nk_i8_m = shim.export(
             "coffin_gemv_nk_i8_m", [p, p, i, p, ll, ll, ll, p, i, i, i, p])
+        self.nk_dense = shim.export(
+            "coffin_gemv_nk_dense", [p, p, i, ll, ll, p, i, p])
+        self.nk_dense_m = shim.export(
+            "coffin_gemv_nk_dense_m", [p, p, i, ll, ll, ll, p, i, p])
         self.path = shim.path
 
 

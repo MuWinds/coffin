@@ -45,9 +45,9 @@ extern "C" int coffin_moe_grouped_i8_expert(const void* a, const void* xs, const
         return cx::fail(e, "tokens/k/cols/experts must be positive, got %d/%d/%d/%d", tokens, k,
                         cols, experts);
     }
-    if (k % I8_EXP_STEPK != 0) {
+    if (k % I8_EXP_STEPK_NARROW != 0) {
         return cx::fail(e, "prefilling grouped kernel needs k %% %d == 0, got k = %d",
-                        I8_EXP_STEPK, k);
+                        I8_EXP_STEPK_NARROW, k);
     }
     if (out_code != 0 && out_code != 1) {
         return cx::fail(e, "unknown destination dtype code %d", out_code);

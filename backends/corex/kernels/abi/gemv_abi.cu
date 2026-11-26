@@ -170,4 +170,56 @@ int coffin_gemv_nk_i8_m(const void* wtn, const void* x, int x_code, const void* 
     return cx::finish(e);
 }
 
+// @brief 解码期稠密（bf16/fp32）投影，权重 ``[N, K]``（nk）。
+//
+// 替掉路由等小 M 稠密投影对 ``cublasGemmEx`` 的调用：在 BI-V100 上 ``GemmEx`` 算
+// ``[1, 2048] x [256, 2048]^T`` 单次 471 us（40 层即 19 ms/步），而该 nk GEMV 核约
+// 12-15 us。
+int coffin_gemv_nk_dense(const void* wtn, const void* x, int x_code,
+                         long long N, long long K, void* y, int threads,
+                         void* stream, char* err, int errlen) {
+    const cx::Err e{err, errlen};
+    g_cx_stream = static_cast<cudaStream_t>(stream);
+    if (!wtn || !x || !y) return cx::fail(e, "gemv_nk_dense needs non-null args");
+    if (N <= 0 || K <= 0) return cx::fail(e, "gemv_nk_dense got N=%lld K=%lld", N, K);
+    if (!is_half_or_float(x_code)) return cx::fail(e, "activation dtype code %d", x_code);
+    const int th = threads > 0 ? threads : pick_nk_threads((int)N);
+    if (th % 32 != 0) return cx::fail(e, "threads must be a multiple of 32; got %d", th);
+    if (x_code == cx::kBF16) {
+        launch_nk_dense_rows<uint16_t>(static_cast<const uint16_t*>(wtn),
+                                       static_cast<const uint16_t*>(x),
+                                       static_cast<uint16_t*>(y), (int)N, (int)K, 1, th);
+    } else {
+        launch_nk_dense_rows<float>(static_cast<const float*>(wtn),
+                                    static_cast<const float*>(x),
+                                    static_cast<float*>(y), (int)N, (int)K, 1, th);
+    }
+    return cx::finish(e);
+}
+
+// @brief 批处理稠密（bf16/fp32）投影，权重 ``[N, K]``（nk），``M <= 8``。
+int coffin_gemv_nk_dense_m(const void* wtn, const void* x, int x_code,
+                           long long N, long long K, long long M, void* y, int threads,
+                           void* stream, char* err, int errlen) {
+    const cx::Err e{err, errlen};
+    g_cx_stream = static_cast<cudaStream_t>(stream);
+    if (!wtn || !x || !y) return cx::fail(e, "gemv_nk_dense_m needs non-null args");
+    if (N <= 0 || K <= 0 || M <= 0) {
+        return cx::fail(e, "gemv_nk_dense_m got M=%lld N=%lld K=%lld", M, N, K);
+    }
+    if (!is_half_or_float(x_code)) return cx::fail(e, "activation dtype code %d", x_code);
+    const int th = threads > 0 ? threads : pick_nk_threads((int)N);
+    if (th % 32 != 0) return cx::fail(e, "threads must be a multiple of 32; got %d", th);
+    if (x_code == cx::kBF16) {
+        launch_nk_dense_rows<uint16_t>(static_cast<const uint16_t*>(wtn),
+                                       static_cast<const uint16_t*>(x),
+                                       static_cast<uint16_t*>(y), (int)N, (int)K, (int)M, th);
+    } else {
+        launch_nk_dense_rows<float>(static_cast<const float*>(wtn),
+                                    static_cast<const float*>(x),
+                                    static_cast<float*>(y), (int)N, (int)K, (int)M, th);
+    }
+    return cx::finish(e);
+}
+
 }  // extern "C"

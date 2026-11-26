@@ -585,57 +585,66 @@ class P2pReduce:
             raise ValueError(
                 "p2p combine exchanges IPC handles over torch.distributed, but no "
                 "process group is initialized")
-        from backends.corex import _kernels
+        from backends.corex import _p2p_ops, _stream
 
         self.rank, self.world = int(rank), int(world)
         self.rows, self.hidden = int(rows), int(hidden)
-        self._module = _kernels()
+        self._shim = _p2p_ops()
+        self._get_stream = _stream
         self._round = 0
-        total = self.rows * self.hidden
-        self._slots = torch.zeros(self.world * total, dtype=torch.float32,
-                                  device="cuda")
-        #: 尾部留一个 abort 槽 + 探针环（64 格 × 3 个 int64），见 ``_P2P_PROF``。
-        self._flags = torch.zeros(self.world + 1 + 3 * 64, dtype=torch.int64,
-                                  device="cuda")
-        self._out = torch.empty(self.rows, self.hidden, dtype=torch.float32,
-                                device="cuda")
+        self._max_elems = self.rows * self.hidden
+        #: 单个半区（4 个 rank 槽位合计）的元素数；奇偶双缓冲按它错开，防止变长调用踩区。
+        self._buf_stride = self.world * self._max_elems
+        #: 直接用 ``cudaMalloc`` 分配独立基址，绕开 PyTorch 缓存分配器的子块偏移：
+        #: ``cudaIpcOpenMemHandle`` 在本卡上按段基址映射，若从缓存段中间切出 ``flags``，
+        #: 对端写 flag 会落进错误的权重内存。
+        self._slot_bytes = 2 * self._buf_stride * 2  # bf16 = 2 bytes
+        self._flag_bytes = (self.world + 2) * 8      # int64 = 8 bytes
+        #: 解码单行（``rows == 1``）的四槽输出环：每层最多两次归约，四槽保证跨层 ``carry``
+        #: 在下一层 ``in_ln`` 消费前绝不被覆写，同时消除每层 ``torch.empty``。
+        self._out_ring = tuple(
+            torch.empty((1, self.hidden), dtype=torch.bfloat16, device="cuda")
+            for _ in range(4))
+        self._out_ring_1d = tuple(t.view(-1) for t in self._out_ring)
         self._slot_ptr = [0] * self.world
         self._flag_ptr = [0] * self.world
-        self._slot_ptr[self.rank] = self._slots.data_ptr()
-        self._flag_ptr[self.rank] = self._flags.data_ptr()
-        slot_handles = self._exchange(self._module.p2p_handle(self._slots))
-        flag_handles = self._exchange(self._module.p2p_handle(self._flags))
+        self._slot_ptr[self.rank] = self._shim.alloc(self._slot_bytes)
+        self._flag_ptr[self.rank] = self._shim.alloc(self._flag_bytes)
+        slot_handles = self._exchange(self._shim.get_handle(self._slot_ptr[self.rank]))
+        flag_handles = self._exchange(self._shim.get_handle(self._flag_ptr[self.rank]))
         for peer in range(self.world):
             if peer == self.rank:
                 continue
-            self._slot_ptr[peer] = self._module.p2p_open(slot_handles[peer])
-            self._flag_ptr[peer] = self._module.p2p_open(flag_handles[peer])
+            self._slot_ptr[peer] = self._shim.open_handle(slot_handles[peer])
+            self._flag_ptr[peer] = self._shim.open_handle(flag_handles[peer])
+        dist.barrier()
 
-    def _exchange(self, handle: torch.Tensor) -> list[torch.Tensor]:
-        """把本 rank 的 IPC 句柄广播给所有人，收齐每个人的句柄。
+    def _exchange(self, handle: bytes) -> list[bytes]:
+        """把本 rank 的 64 字节 IPC 句柄广播给所有人，收齐每个人的句柄。
 
         Args:
-            handle: :meth:`p2p_handle <backends.corex._kernels.p2p_handle>` 产出的
-                CPU uint8 张量。
+            handle: :meth:`P2pShim.get_handle` 产出的 64 字节串。
 
         Returns:
-            长度 ``world`` 的句柄张量列表，下标是 rank。
+            长度 ``world`` 的字节串列表，下标是 rank。
 
         Raises:
-            RuntimeError: 收回来的句柄数量或大小不对（进程组配置错位）。
+            RuntimeError: 收回来的句柄数量不对（进程组配置错位）。
         """
         import torch.distributed as dist
 
-        payload = [handle.clone() for _ in range(self.world)]
-        dist.all_gather_object(payload, handle.clone())
-        if len(payload) != self.world:
+        payload: list[bytes | None] = [None] * self.world
+        dist.all_gather_object(payload, handle)
+        if len(payload) != self.world or any(h is None for h in payload):
             raise RuntimeError(
                 f"p2p handle exchange got {len(payload)} handles for "
                 f"world={self.world}")
-        return payload
+        return payload  # type: ignore[return-value]
 
     def _grid(self, total: int) -> tuple[int, int]:
-        """按载荷大小挑网格：decode 一行也要用满 SM，预填充分块不超 64 块。
+        """按载荷大小挑常驻网格：decode 用 1 块，预填充上限 16 块（每 SM 1 块）。
+
+        BI-V100 有 16 个 SM，上限 16 块保证所有块同时常驻，多块原子到达发布不会死锁。
 
         Args:
             total: 元素数（``rows * hidden``）。
@@ -644,22 +653,25 @@ class P2pReduce:
             ``(blocks, threads)``。
         """
         threads = 256
-        blocks = max(1, min(64, (total + threads * 8 - 1) // (threads * 8)))
+        if total <= 2048 * 4:
+            return 1, threads
+        blocks = max(1, min(16, (total + threads * 8 - 1) // (threads * 8)))
         return blocks, threads
 
     def _check_payload(self, x: torch.Tensor, rows: int) -> None:
-        """校验本 rank 交上来的载荷是否还是约定里的 ``[rows, hidden]`` bf16。
+        """校验本 rank 交上来的载荷是否满足 bf16 与容量约定。
 
         Args:
-            x: 待校验的贡献。
-            rows: 已从 ``x.shape[0]`` 取出的行数。
+            x: 待校验的贡献，一维 ``[hidden]`` 或二维 ``[rows, hidden]``。
+            rows: 已算出的行数。
 
         Raises:
             ValueError: 形状、行数或 dtype 超出约定。
         """
-        if x.dim() != 2 or int(x.shape[1]) != self.hidden:
+        if x.dim() not in (1, 2) or int(x.shape[-1]) != self.hidden:
             raise ValueError(
-                f"p2p combine expects [rows, {self.hidden}], got {tuple(x.shape)}")
+                f"p2p combine expects [rows, {self.hidden}] or [{self.hidden}], got "
+                f"{tuple(x.shape)}")
         if rows > self.rows:
             raise ValueError(
                 f"p2p combine payload {rows} rows exceeds the {self.rows} the slot "
@@ -667,67 +679,88 @@ class P2pReduce:
         if x.dtype != torch.bfloat16:
             raise ValueError(f"p2p combine needs bf16, got {x.dtype}")
 
-    def all_reduce_sum(self, x: torch.Tensor) -> torch.Tensor:
-        """把各 rank 的专家部分和加成本 rank 的完整输出。
+    def all_reduce_sum(self, x: torch.Tensor,
+                       add: torch.Tensor | None = None) -> torch.Tensor:
+        """把各 rank 的贡献（可选先加本地 ``add``）求和并直接返回 bf16 结果。
 
         Args:
-            x: 本 rank 的贡献，bf16 ``[rows, hidden]``，连续 CUDA。
+            x: 本 rank 的贡献，bf16 ``[rows, hidden]`` 或 ``[hidden]``，CUDA。
+            add: 可选同元素数 bf16 张量；非空时在写对端槽前融合成 ``bf16(x + add)``，
+                省去一次独立的逐元素加发射（MoE TP 合并 ``experts + shared`` 用）。
 
         Returns:
-            求和结果，dtype 与 ``x`` 相同。
+            求和结果，形状与 dtype 同 ``x``。
 
         Raises:
             ValueError: dtype/形状超出约定，或行数超过槽区容量。
         """
-        rows = int(x.shape[0])
-        # 解码步上 ``x`` 每层都是同一块缓冲（MoE 驱动的输出），行数也恒为 1：形状校验、
-        # ``_out[:rows]`` 的切片和 ``_grid`` 都只在换缓冲时做一次。三样加起来约 25 µs，
-        # 40 层就是 1 ms/步——而它们每一步算出来的东西完全一样。
-        if x.is_contiguous():
-            key = (id(x), rows)
-            if getattr(self, "_fast_key", None) != key:
-                self._check_payload(x, rows)
-                self._fast_key = key
-                self._fast_val = (x, self._out[:rows], *self._grid(rows * self.hidden))
-            src, out, blocks, threads = self._fast_val
+        is_1d = x.dim() == 1
+        rows = 1 if is_1d else int(x.shape[0])
+        if rows == 1 and x.is_contiguous() and x.dtype == torch.bfloat16 and int(x.shape[-1]) == self.hidden:
+            src = x
+            blocks, threads = 1, 256
         else:
             self._check_payload(x, rows)
-            src, out = x.contiguous(), self._out[:rows]
+            src = x if x.is_contiguous() else x.contiguous()
             blocks, threads = self._grid(rows * self.hidden)
+        add_ptr = 0
+        if add is not None:
+            if add.dtype != torch.bfloat16 or add.numel() != src.numel():
+                raise ValueError(
+                    f"p2p combine add mismatch: {tuple(add.shape)} {add.dtype} vs "
+                    f"{tuple(src.shape)} {src.dtype}")
+            add_c = add if add.is_contiguous() else add.contiguous()
+            add_ptr = add_c.data_ptr()
         self._round += 1
+        if rows == 1:
+            slot_idx = self._round & 3
+            out = self._out_ring_1d[slot_idx] if is_1d else self._out_ring[slot_idx]
+        else:
+            out = torch.empty_like(src)
         if _EP_TRACE and (self._round <= 4 or self._round % 40 in (0, 1)):
-            # 会合是按轮次号对齐的：四个 rank 各自打印自己这一轮的序号，
-            # 谁多跑/少跑一轮立刻能看出来（挂死时就靠这个定位）。
             print(f"[ep] rank={self.rank} round={self._round} rows={rows}",
                   flush=True)
-        self._module.p2p_combine(src, out, *self._slot_ptr,
-                                 *self._flag_ptr, self.rank, self._round,
-                                 blocks, threads)
-        # 探针只在 close() 时读回：轮内做任何 D2H 都会强制同步、把四个 rank 的会合
-        # 打散（实测每 40 轮取一次，下一轮就有 peer 掉出 barrier，落到 abort 锁存）。
-        # 例外：`COFFIN_P2P_PROF_AT=N` 让四个 rank 在**同一轮**（同一层刚会合完）各取一次。
-        # 它们本来就对齐在 barrier 上，一起暂停不会产生偏斜，取完继续跑。
-        if _P2P_PROF and _P2P_PROF_AT and self._round == _P2P_PROF_AT:
-            self._dump_prof()
-        # 会合超时不再让卡停在核心里：内核把中止号写进 ``flags[world]`` 并锁存，
-        # 之后的轮次直接出零结果返回。宿主每 200 轮查一次这个槽（一步 40 层，
-        # 约等于每 5 步一次同步，对吞吐无感），把「静默错数」变成一次明确异常，
-        # 进程能正常退出，不需要再 kill -9。
+        self._shim.combine_bf16(
+            src.data_ptr(), add_ptr, out.data_ptr(),
+            self._slot_ptr[0], self._slot_ptr[1], self._slot_ptr[2], self._slot_ptr[3],
+            self._flag_ptr[0], self._flag_ptr[1], self._flag_ptr[2], self._flag_ptr[3],
+            self._buf_stride, rows * self.hidden,
+            self.rank, self._round, blocks, threads, self._get_stream() or 0)
         if self._round % 200 == 0 or _EP_CHECK:
-            if int(self._flags[self.world]) != 0:
+            ab = self.abort_round()
+            if ab != 0:
                 raise RuntimeError(
                     f"p2p combine rendezvous aborted at round {self._round} "
-                    f"(abort published at round {int(self._flags[self.world])}) "
+                    f"(abort published at round {ab}) "
                     f"on rank {self.rank}: a peer left the barrier")
-        return out.to(x.dtype)
+        return out
+
+    def abort_round(self) -> int:
+        """读回本卡的中止锁存轮次（0 表示未中止）。"""
+        ptr = self._flag_ptr[self.rank]
+        return 0 if not ptr else self._shim.read_abort(ptr)
 
     def close(self) -> None:
-        """释放槽区与计数。对端映射随进程退出一起消失。"""
-        if _P2P_PROF:
-            self._dump_prof()
-        self._slots = None
-        self._flags = None
-        self._out = None
+        """释放对端 IPC 映射、槽区与计数。"""
+        for peer in range(self.world):
+            if peer == self.rank:
+                continue
+            try:
+                self._shim.close_handle(self._slot_ptr[peer])
+                self._shim.close_handle(self._flag_ptr[peer])
+            except Exception:  # noqa: BLE001
+                pass
+            self._slot_ptr[peer] = 0
+            self._flag_ptr[peer] = 0
+        try:
+            self._shim.free(self._slot_ptr[self.rank])
+            self._shim.free(self._flag_ptr[self.rank])
+        except Exception:  # noqa: BLE001
+            pass
+        self._slot_ptr[self.rank] = 0
+        self._flag_ptr[self.rank] = 0
+        self._out_ring = ()
+        self._out_ring_1d = ()
 
     def _dump_prof(self) -> None:
         """把内核环形探针一次读回，按「载荷写完 / flag 发出 / 等到齐」两段统计。

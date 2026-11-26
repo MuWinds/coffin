@@ -82,21 +82,32 @@ extern "C" int coffin_moe_grouped_i8_tcu(const void* at, const void* xs, const v
     }
 
     const cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
-    constexpr int NTH = (MI8_BM / 64) * (MI8_BN / 64) * 64;
-    constexpr size_t kShmem = 2 * (size_t)((MI8_BM / 64) * (MI8_BK / 16) * 1024
-                                           + (MI8_BN / 64) * (MI8_BK / 16) * 1024);
-    const dim3 grid((unsigned)((n + MI8_BN - 1) / MI8_BN), (unsigned)experts);
-
     const int8_t* atp = reinterpret_cast<const int8_t*>(at);
     const float* xsp = reinterpret_cast<const float*>(xs);
     const int8_t* wp = reinterpret_cast<const int8_t*>(w);
     const float* wsp = reinterpret_cast<const float*>(ws);
     const int* off = reinterpret_cast<const int*>(offsets);
 
+    // TP4 下 gate_up 只有 N=256：用 512 宽 tile 会让一半 warp 空转并多占一倍共享内存。
     auto launch = [&](auto tag) {
         using XT = decltype(tag);
-        moe_grouped_i8_tcu_kernel<XT><<<grid, NTH, kShmem, s>>>(
-            atp, rows, wp, reinterpret_cast<XT*>(out), xsp, wsp, off, k, n);
+        if (n <= 256) {
+            constexpr int TBN = 256;
+            constexpr int NTH = (MI8_BM / 64) * (TBN / 64) * 64;
+            constexpr size_t kShmem = 2 * (size_t)((MI8_BM / 64) * (MI8_BK / 16) * 1024
+                                                   + (TBN / 64) * (MI8_BK / 16) * 1024);
+            const dim3 grid((unsigned)((n + TBN - 1) / TBN), (unsigned)experts);
+            moe_grouped_i8_tcu_kernel<XT, TBN><<<grid, NTH, kShmem, s>>>(
+                atp, rows, wp, reinterpret_cast<XT*>(out), xsp, wsp, off, k, n);
+        } else {
+            constexpr int TBN = MI8_BN;
+            constexpr int NTH = (MI8_BM / 64) * (TBN / 64) * 64;
+            constexpr size_t kShmem = 2 * (size_t)((MI8_BM / 64) * (MI8_BK / 16) * 1024
+                                                   + (TBN / 64) * (MI8_BK / 16) * 1024);
+            const dim3 grid((unsigned)((n + TBN - 1) / TBN), (unsigned)experts);
+            moe_grouped_i8_tcu_kernel<XT, TBN><<<grid, NTH, kShmem, s>>>(
+                atp, rows, wp, reinterpret_cast<XT*>(out), xsp, wsp, off, k, n);
+        }
     };
     if (out_code == cx::kBF16) launch(uint16_t{});
     else launch(float{});

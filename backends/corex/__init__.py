@@ -366,6 +366,13 @@ _SOLVE_OPS: Any = None
 
 
 
+#: 快速取当前 CUDA 流句柄的 C 扩展入口缓存，避免每步 870+ 次走
+#: ``torch.cuda.current_stream()``（其内部每次读环境变量并构造 Python ``Stream``）。
+_FAST_STREAM: Any = None
+_FAST_DEV: Any = None
+_FAST_SINGLE_DEV: bool = False
+
+
 def _stream() -> int | None:
     """当前流的句柄：**没有 torch 时就是默认流 0**。
 
@@ -376,12 +383,15 @@ def _stream() -> int | None:
     现在它**先看 torch 在不在场**：``sys.modules`` 里没有 torch，或者那一个是
     :mod:`cxrt.torchshim`（本项目的壳，``cuda`` 上没有 ``current_stream``），就返回
     ``0``——``cudart`` 的默认流本来就是这条链唯一在用的流，我们自己建的流与它之间不需要
-    任何同步，因为链上没有第二个所有者了。真 torch 在场时仍然跟随它（服务端可能把
-    decoder 挂在别的流上），这条兼容不是为了保住 torch，而是为了留住那条路径的数值。
+    任何同步，因为链上没有第二个所有者了。真 torch 在场时走 ``_cuda_getCurrentRawStream``
+    直取裸流号，语义与 ``torch.cuda.current_stream().cuda_stream`` 完全一致。
 
     Returns:
         流句柄号，或 ``None``（没有 CUDA 上下文时）。
     """
+    global _FAST_STREAM, _FAST_DEV, _FAST_SINGLE_DEV
+    if _FAST_STREAM is not None:
+        return _FAST_STREAM(0) if _FAST_SINGLE_DEV else _FAST_STREAM(_FAST_DEV())
     tl = sys.modules.get("torch")
     if tl is None:
         return 0
@@ -390,7 +400,19 @@ def _stream() -> int | None:
     if current is None:
         # 壳没有流的概念：它跑的是 numpy，不存在跨流竞态。
         return 0
-    return int(current().cuda_stream)
+    s = int(current().cuda_stream)
+    c_mod = getattr(tl, "_C", None)
+    raw = getattr(c_mod, "_cuda_getCurrentRawStream", None)
+    dev = getattr(c_mod, "_cuda_getDevice", None)
+    if raw is not None and dev is not None:
+        try:
+            if int(raw(int(dev()))) == s:
+                _FAST_STREAM = raw
+                _FAST_DEV = dev
+                _FAST_SINGLE_DEV = (int(cuda.device_count()) == 1)
+        except Exception:
+            pass
+    return s
 
 
 def _gemm_ops() -> Any:
@@ -449,6 +471,34 @@ def _gemv_ops() -> Any:
 
 #: MoE 族 ABI 句柄。``None`` 表示还没编过。
 _MOE_OPS: Any = None
+
+#: 四卡 P2P 归约 ABI 句柄。``None`` 表示还没编过。
+_P2P_OPS: Any = None
+
+#: 分组张量核转置激活缓存：``(rows, k, device)`` → ``[k, rows]`` int8。
+_MOE_AT_SCRATCH: dict = {}
+
+
+def _p2p_ops() -> Any:
+    """返回四卡 P2P 归约的 ABI 面，首次调用时编译并装载。"""
+    global _P2P_OPS
+    if _P2P_OPS is None:
+        from cxrt import open_runtime
+
+        _P2P_OPS = open_runtime().build_p2p(_arch() or DEFAULT_ARCH)
+    return _P2P_OPS
+
+
+def _moe_at_scratch(tokens: int, k: int, device: torch.device) -> torch.Tensor:
+    """取（必要时分配）分组张量核专用的 ``[k, tokens]`` int8 转置缓冲。"""
+    key = (tokens, k, device)
+    buf = _MOE_AT_SCRATCH.get(key)
+    if buf is None:
+        if len(_MOE_AT_SCRATCH) >= 8:
+            _MOE_AT_SCRATCH.clear()
+        buf = torch.empty((k, tokens), dtype=torch.int8, device=device)
+        _MOE_AT_SCRATCH[key] = buf
+    return buf
 
 
 def _norm_ops() -> Any:
@@ -572,6 +622,10 @@ def _ptr(t: torch.Tensor) -> int:
     return int(t.data_ptr())
 
 
+#: torch.dtype → ABI 整数码缓存，省去每次 ``_dcode`` 的局部 import 与字符串拆分。
+_DCODE_MAP: dict[Any, int] = {}
+
+
 def _dcode(t: torch.Tensor) -> int:
     """取 dtype 的内核整数码。
 
@@ -581,9 +635,15 @@ def _dcode(t: torch.Tensor) -> int:
     Returns:
         ``cx::Tensor`` 认的 dtype 码。
     """
+    dt = t.dtype
+    code = _DCODE_MAP.get(dt)
+    if code is not None:
+        return code
     from cxrt.tensors import code_of
 
-    return code_of(t.dtype)
+    code = code_of(dt)
+    _DCODE_MAP[dt] = code
+    return code
 
 
 def _norm_out(shape: tuple[int, ...], like: torch.Tensor) -> torch.Tensor:
@@ -603,7 +663,7 @@ def _norm_out(shape: tuple[int, ...], like: torch.Tensor) -> torch.Tensor:
 
 
 def _gemv_nk(nkw: torch.Tensor, ws: torch.Tensor, act: torch.Tensor) -> torch.Tensor:
-    """nk 原生的 int8 解码投影，走 ABI，不经过 torch 扩展。
+    """nk 原生的 int8 解码投影，直调 ABI shim，不经过 torch 扩展与多层包装校验。
 
     收的是**裸缓冲**而不是 ``QWeight``：``QWeight.wq`` 就是 ``[N, K]`` 的那一份，
     零拷贝传进来即可，于是「哪条权重来源」与「怎么算」在这里分开。
@@ -619,30 +679,43 @@ def _gemv_nk(nkw: torch.Tensor, ws: torch.Tensor, act: torch.Tensor) -> torch.Te
     Raises:
         ShapeError: 形状、dtype 或对齐不符（``K % 4``、bf16 需 8 字节对齐）。
     """
-    ops = _gemv_ops()
-    stream = _stream()
+    shim = _gemv_ops().shim
+    stream = _stream() or 0
+    n = int(nkw.shape[0])
+    k = int(nkw.shape[1])
+    xcode = _dcode(act)
+    unroll = _GEMV_NK_UNROLL or 4
+    w_ptr = nkw.data_ptr()
+    s_ptr = ws.data_ptr()
     if act.dim() == 1:
-        return ops.nk_i8(nkw, act, ws, unroll=_GEMV_NK_UNROLL, width=_GEMV_NK_WIDTH,
-                         stream=stream)
-    rows = act.shape[0]
+        out = torch.empty((n,), dtype=act.dtype, device=act.device)
+        shim.nk_i8(w_ptr, act.data_ptr(), xcode, s_ptr, n, k, out.data_ptr(),
+                   128, unroll, _GEMV_NK_WIDTH, stream)
+        return out
+    rows = int(act.shape[0])
     if rows <= _ROW_CHUNK:
-        return ops.nk_i8_m(nkw, act, ws, unroll=_GEMV_NK_UNROLL, width=_GEMV_NK_WIDTH,
-                           stream=stream)
-    out = torch.empty((rows, int(nkw.shape[0])), dtype=act.dtype, device=act.device)
+        out = torch.empty((rows, n), dtype=act.dtype, device=act.device)
+        shim.nk_i8_m(w_ptr, act.data_ptr(), xcode, s_ptr, n, k, rows,
+                     out.data_ptr(), 128, unroll, _GEMV_NK_WIDTH, stream)
+        return out
+    out = torch.empty((rows, n), dtype=act.dtype, device=act.device)
     for start in range(0, rows, _ROW_CHUNK):
         stop = min(rows, start + _ROW_CHUNK)
-        out[start:stop] = ops.nk_i8_m(nkw, act[start:stop].contiguous(), ws,
-                                     unroll=_GEMV_NK_UNROLL, width=_GEMV_NK_WIDTH,
-                                     stream=stream)
+        chunk = act[start:stop]
+        if not chunk.is_contiguous():
+            chunk = chunk.contiguous()
+        dst = out[start:stop]
+        shim.nk_i8_m(w_ptr, chunk.data_ptr(), xcode, s_ptr, n, k, stop - start,
+                     dst.data_ptr(), 128, unroll, _GEMV_NK_WIDTH, stream)
     return out
 
 
 def _gemm_nk_dense(w: torch.Tensor, act: torch.Tensor) -> torch.Tensor:
-    """稠密（bf16/fp32）权重的一次投影，走库，形状按 ``act`` 的维数收放。
+    """稠密（bf16/fp32）权重的一次投影：小 M 走自研 nk GEMV，大 M 走库 GEMM。
 
-    解码也用它：``GemvOps`` 只有 int8 入口，而 bf16 权重没有对应的 nk GEMV，所以稠密
-    这一档统一落到 ``GemmEx``（``N = 1`` 时库内部按 GEMV 处理）。代价是每次调用多付
-    库的固定开销（7.5-11 us），换来这条路径上不再出现 torch 张量参数。
+    在 BI-V100 上 ``cublasGemmEx`` 算解码路由 ``[1, 2048] x [256, 2048]^T`` 单次要
+    471 us（40 层即 19 ms/步），而 ``coffin_gemv_nk_dense`` 约 12-15 us。这里在
+    ``M <= _ROW_CHUNK``（1..8）且权重大致规整时直调 nk 稠密 GEMV，大 M 仍走库。
 
     Args:
         w: ``[N, K]`` 稠密权重，bf16 或 fp32。
@@ -651,6 +724,23 @@ def _gemm_nk_dense(w: torch.Tensor, act: torch.Tensor) -> torch.Tensor:
     Returns:
         与 ``act`` 前导维数一致的输出。
     """
+    if (w.dtype in (torch.bfloat16, torch.float32) and w.is_contiguous()
+            and int(w.shape[1]) % 4 == 0):
+        n, k = int(w.shape[0]), int(w.shape[1])
+        lhs = act if act.dtype == w.dtype else act.to(w.dtype)
+        if not lhs.is_contiguous():
+            lhs = lhs.contiguous()
+        if lhs.dim() == 1:
+            out = torch.empty((n,), dtype=w.dtype, device=w.device)
+            _gemv_ops().shim.nk_dense(w.data_ptr(), lhs.data_ptr(), _dcode(lhs),
+                                      n, k, out.data_ptr(), 128, _stream() or 0)
+            return out
+        rows = int(lhs.shape[0])
+        if rows <= _ROW_CHUNK:
+            out = torch.empty((rows, n), dtype=w.dtype, device=w.device)
+            _gemv_ops().shim.nk_dense_m(w.data_ptr(), lhs.data_ptr(), _dcode(lhs),
+                                        n, k, rows, out.data_ptr(), 128, _stream() or 0)
+            return out
     if act.dim() == 2:
         return _gemm_nk_rows(w, act)
     return _gemm_nk_rows(w, act.unsqueeze(0))[0]
@@ -1006,16 +1096,6 @@ def moe_grouped_i8_tcu(w, x: torch.Tensor, offsets: torch.Tensor, slices: int = 
     dtype = x.dtype
     if tokens == 0:
         return torch.empty((0, w.n), dtype=dtype, device=x.device)
-    # 每专家不足 4 行时**不要**进这个内核：``tools/probe_corex_moe_i8.py`` 在
-    # 8 专家 / K=2048 / N=512 上量到每专家 1、2、3 行的相对 RMS 分别是 0.86、0.72、
-    # 0.86（同一个栈走 GEMV 结构是 0.008，也就是量化噪声本身），每专家 4 行起才
-    # 回到 0.0087。共享内存里的 64 行 tile 在末端没有零填充，短段的垃圾行会被 mma
-    # 算进有效行——症状是「输出看着像话但数值不对」，所以宁可在这里失败。
-    experts = len(w)
-    if tokens < 4 * experts:
-        raise ValueError(
-            f"moe_grouped_i8_tcu needs >= 4 rows per expert; got {tokens} rows for "
-            f"{experts} experts")
 
     if x.dtype == torch.int8:
         if scales is None:
@@ -1037,11 +1117,8 @@ def moe_grouped_i8_tcu(w, x: torch.Tensor, offsets: torch.Tensor, slices: int = 
         bounds = offsets
     else:
         bounds = offsets.to(dtype=torch.int32, device=x.device).contiguous()
-    # 激活按 k 主序再摆一份：内核的 mat-a 字是「同 k 的 4 个相邻行」。这份拷贝是
-    # 每投影一次（8 MB 量级），相对于省下的算力可以忽略。
-    # 用分块转置核而不是 ``xq.t().contiguous()``：后者实测只有 15.7 GB/s，占掉张量核
-    # 那条路两成的时间。
-    at = torch.empty((w.k, tokens), dtype=torch.int8, device=x.device)
+    # 复用 ``[k, tokens]`` 转置缓冲，避免预填充每层 2 次 × 40 层重复分配。
+    at = _moe_at_scratch(tokens, int(w.k), x.device)
     ops = _moe_ops().shim
     stream = _stream() or 0
     rc = ops.transpose_i8(_ptr(xq), _ptr(at), int(tokens), int(w.k), stream)
@@ -1055,6 +1132,28 @@ def moe_grouped_i8_tcu(w, x: torch.Tensor, offsets: torch.Tensor, slices: int = 
         raise RuntimeError(f"coffin_moe_grouped_i8_tcu rejected the geometry "
                            f"(rows={tokens} K={w.k} N={w.n} E={len(w)}, code={rc})")
     return out if x.dtype == torch.int8 else _restore(out, dtype)
+
+
+def moe_gather_sum(hid: torch.Tensor, slot_pos: torch.Tensor,
+                   weights: torch.Tensor, tokens: int, top_k: int,
+                   out: torch.Tensor | None = None) -> torch.Tensor:
+    """按槽位收集专家输出、乘路由权重并在 fp32 中定序累加到 ``[tokens, hidden]``。"""
+    rows, hidden = int(hid.shape[0]), int(hid.shape[1])
+    if out is None or out.shape != (tokens, hidden) or out.device != hid.device \
+            or out.dtype != hid.dtype:
+        out = torch.empty((tokens, hidden), dtype=hid.dtype, device=hid.device)
+    if tokens == 0:
+        return out
+    hid_c = hid if hid.is_contiguous() else hid.contiguous()
+    sp = (slot_pos if slot_pos.dtype == torch.int32 and slot_pos.is_contiguous()
+          else slot_pos.to(dtype=torch.int32, device=hid.device).contiguous())
+    rw = weights if weights.is_contiguous() else weights.contiguous()
+    if rw.dtype not in (torch.bfloat16, torch.float32):
+        rw = rw.float()
+    _moe_ops().shim.moe_gather_sum(_ptr(hid_c), _ptr(sp), _ptr(rw), _ptr(out),
+                                   _dcode(hid_c), _dcode(rw), int(tokens), int(top_k),
+                                   int(hidden), int(rows), _stream() or 0)
+    return out
 
 
 def gather_quant_i8(x: torch.Tensor, index: torch.Tensor,
@@ -1666,6 +1765,8 @@ def _gemm_nk_rows(w: torch.Tensor, act: torch.Tensor) -> torch.Tensor:
         wt = wt.to(torch.bfloat16)
     # GEMM 两个操作数必须同一 dtype，与旧路径同一条规矩：由权重决定，激活跟着它。
     lhs = act if act.dtype == wt.dtype else act.to(wt.dtype)
+    if not lhs.is_contiguous():
+        lhs = lhs.contiguous()
     gemm = _gemm_ops()
     stream = _stream()
     # bf16 是被要求「必须做」的那一档：库在 ixblas 下把它按 ``ld`` 转 f16 再走自研
@@ -1725,7 +1826,10 @@ def linear_prefill(w: torch.Tensor | QWeight,
         # GEMV。分界必须走在打包之后、任何按 dtype 的分支之前。
         return _gemv_rows(w, x)
     dtype = x.dtype
-    act = _compute_dtype(x)
+    # ``quant_act_i8`` 与 ``GemmEx`` 都按连续行主序寻址；上游 ``GEMVGroup.prefill``
+    # 切出来的 ``up``（``silu_mul(gate, up, up)``）带行间距 ``2 * inter``，不先做
+    # 连续化会让量化核跨行错读 ``gate`` 与 ``up``。
+    act = _compute_dtype(x).contiguous()
     if isinstance(w, QWeight) and w.wq.is_contiguous():
         # nk 原生的 int8 权重：量化 → ``GemmEx`` → epilogue，三步都在 torch 之外，
         # 权重用**盘上那份**原缓冲，一次转置都不做。

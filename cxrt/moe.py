@@ -43,6 +43,8 @@ class MoeShim:
         ll = ctypes.c_longlong
         self.shared_gate_scale = shim.export(
             "coffin_shared_gate_scale", [p, p, p, p, i, i, ll, ll, ll, i, p])
+        self.moe_gather_sum = shim.export(
+            "coffin_moe_gather_sum", [p, p, p, p, i, i, i, i, i, i, p])
         self.moe_router = shim.export(
             "coffin_moe_router", [p, p, p, i, i, i, i, i, p])
         self.moe_dispatch = shim.export(

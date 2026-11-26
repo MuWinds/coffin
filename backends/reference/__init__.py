@@ -94,6 +94,22 @@ def _linear(w: torch.Tensor | QWeight, x: torch.Tensor,
     return F.linear(x.to(compute), dense).to(x.dtype)
 
 
+def _moe_gather_sum(hid: torch.Tensor, slot_pos: torch.Tensor,
+                    weights: torch.Tensor, tokens: int, top_k: int,
+                    out: torch.Tensor | None = None) -> torch.Tensor:
+    """按槽位收集专家输出、乘路由权重并沿 top_k 累加，参考实现。"""
+    hidden = int(hid.shape[-1])
+    if out is None:
+        out = torch.empty((tokens, hidden), dtype=hid.dtype, device=hid.device)
+    sp = slot_pos.reshape(tokens, top_k).long()
+    valid = sp >= 0
+    safe = sp.clamp_min(0)
+    gathered = hid.index_select(0, safe.reshape(-1)).view(tokens, top_k, hidden).float()
+    w = weights.reshape(tokens, top_k).float() * valid.float()
+    out.copy_((gathered * w[:, :, None]).sum(dim=1).to(out.dtype))
+    return out
+
+
 def _moe_grouped_merge(w, x: torch.Tensor, offsets: torch.Tensor,
                        rw: torch.Tensor, *, weight_dtype) -> torch.Tensor:
     """参考语义下的归并形态：分组投影后按行权重加权求和。
@@ -1263,6 +1279,7 @@ def build(caps: Caps | None = None) -> Ops:
         moe_grouped_i8=functools.partial(_moe_grouped, weight_dtype=c.weight_dtype),
         moe_grouped_i8_merge=functools.partial(_moe_grouped_merge,
                                                weight_dtype=c.weight_dtype),
+        moe_gather_sum=_moe_gather_sum,
         moe_router=_moe_router,
         # 参考后端不实现这个合成入口：它是「同一串参考算子少跨几次语言边界」的加速形态，
         # 语义与逐个调用完全一致。在这里给一个能跑的替代只会掩盖「有人以为参考路径也走它」。

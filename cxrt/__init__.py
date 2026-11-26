@@ -44,6 +44,7 @@ from cxrt.conv import ConvOps, ConvShim, load_conv_shim
 from cxrt.gemv import GemvOps, GemvShim, load_gemv_shim
 from cxrt.linalg import Cublas, GemmOps
 from cxrt.moe import MoeOps, MoeShim, load_moe_shim
+from cxrt.p2p import P2pShim, load_p2p_shim
 from cxrt.solve import SolveOps, SolveShim, load_solve_shim
 from cxrt.w8a8 import W8A8Ops, W8A8Shim, load_w8a8_shim
 from cxrt.norm import RMSNormOps
@@ -55,11 +56,11 @@ __all__ = [
     "ConvOps", "ConvShim", "Cublas",
     "BuildError", "Cudart", "DType", "Event", "F32", "GemmOps", "GemvOps", "GemvShim",
     "HostBuffer",
-    "I8", "I32", "I64", "MoeOps", "MoeShim", "NormShim", "RMSNormOps", "RtError", "Runtime",
+    "I8", "I32", "I64", "MoeOps", "MoeShim", "NormShim", "P2pShim", "RMSNormOps", "RtError", "Runtime",
     "ShapeError",
     "Shim", "SolveOps", "SolveShim", "Stream", "U8", "U32", "W8A8Ops", "W8A8Shim",
-    "build", "cache_key", "corex_root", "kernels_dir", "load_attn_shim", "load_conv_shim", "load_gemv_shim",
-    "load_moe_shim", "load_norm_shim", "load_solve_shim", "load_w8a8_shim", "open_runtime",
+    "build", "build_gemm", "cache_key", "corex_root", "kernels_dir", "load_attn_shim", "load_conv_shim", "load_gemv_shim",
+    "load_moe_shim", "load_norm_shim", "load_p2p_shim", "load_solve_shim", "load_w8a8_shim", "open_runtime",
 ]
 
 #: 默认目标 ISA。CoreX 的 ``clang`` 用 ``--cuda-gpu-arch=ivcore10``。
@@ -218,6 +219,27 @@ class Runtime:
         )
         return W8A8Ops(load_w8a8_shim(lib))
 
+    def build_p2p(self, arch: str = DEFAULT_ARCH) -> P2pShim:
+        """编（或复用）``abi/p2p_reduce_abi.cu`` 并绑成四卡 P2P 归约面。
+
+        Args:
+            arch: 目标 ISA。
+
+        Returns:
+            :class:`P2pShim`。
+
+        Raises:
+            BuildError: 工具链缺失或编译失败。
+        """
+        root = kernels_dir()
+        lib = build(
+            sources=[root / "abi" / "p2p_reduce_abi.cu"],
+            includes=[root],
+            arch=arch,
+            name="coffin_p2p",
+        )
+        return load_p2p_shim(lib)
+
     def build_gemm(self, lib: str | None = None) -> GemmOps:
         """绑定预填充 GEMM 的库面，不编任何内核、不 import torch。
 
@@ -289,6 +311,11 @@ class Runtime:
         """释放流并把池里的空闲块还给驱动。幂等。"""
         self.stream.close()
         self.alloc.trim()
+
+
+def build_gemm(lib: str | None = None) -> GemmOps:
+    """模块级快捷入口：绑定预填充 GEMM 的库面，不编任何内核、不 import torch。"""
+    return GemmOps(Cublas(lib))
 
 
 def open_runtime(index: int = 0, lib: str | None = None,

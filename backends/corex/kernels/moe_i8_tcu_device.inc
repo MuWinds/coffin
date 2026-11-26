@@ -12,9 +12,9 @@
 #define COFFIN_MOE_I8_TCU_DEVICE_INC
 
 #include "corex_i8.h"
-#include "corex_ops.h"
 #include "corex_scalar.h"
 
+#include <cassert>
 #include <cuda_runtime.h>
 #include <mma.h>
 
@@ -137,25 +137,23 @@ __device__ __forceinline__ void mma_tile(const unsigned* a0, const unsigned* a1,
     }
 }
 
-// @brief 把权重的一段从 ``[K, N]`` 搬进共享内存。
+// @brief 把转置激活的一段从 ``[K, rows]`` 搬进共享内存（支持任意起止行与非 4 对齐段）。
 //
-// 一个线程搬一个 uint32：``[K, N]`` 里固定 k 的 4 个相邻 n 连续，正好是加载器要的字，
-// 所以是一次全局读对一次共享写，没有转置运算。
+// ``[K, rows]`` 里固定 k 的 4 个相邻行连续；当 ``mt0`` 与 4 对齐且未触及段尾 ``m_end`` 时
+// 走 32 位整字读，否则按字节拼字并对超出 ``m_end`` 的槽位补零。这样每专家任意行数
+// （含 1/2/3 行与任意奇偶偏移）都能安全进张量核，不再需要外部按 4 对齐校验或 D2H 同步。
 //
-// @param sa 目的段起点。
-// @param W k-主序操作数：``[K, rows]`` 的转置激活（``transpose_i8`` 的产物）。
-// @param n0 本块在行方向（= 激活的 row）的起点。
-// @param k0 本块在 K 方向的起点。
-// @param N 行数（``[K, rows]`` 的 rows）。
-// @param K k 维长度。
-// @param tid 本线程在线性任务表里的下标。
-// @tparam TBK 本段的 k 步长。
-// @tparam BMw 本块在 MMA-M（= 行方向）的 tile 宽；块几何是模板参数，
-//             因为深 K 形状要换一套。
-// @tparam NTH 每块线程数。
+// @param sa    目的段起点。
+// @param at    ``[K, rows]`` 转置后的 int8 激活。
+// @param mt0   本块在行方向的起点（从 ``offsets[e]`` 步进）。
+// @param m_end 本专家有效行上界（``min(r1, rows)``）。
+// @param rows  ``at`` 的行宽（总激活行数）。
+// @param k0    本块在 K 方向的起点。
+// @param K     k 维长度。
+// @param tid   本线程在线性任务表里的下标。
 template <int TBK, int BMw, int NTH>
-__device__ __forceinline__ void stage_w(int8_t* sa, const int8_t* __restrict__ W,
-                                        int n0, int k0, int N, int K, int tid) {
+__device__ __forceinline__ void stage_at(int8_t* sa, const int8_t* __restrict__ at,
+                                         int mt0, int m_end, int rows, int k0, int K, int tid) {
     constexpr int J = BMw / 4;
 #pragma unroll
     for (int rep = 0; rep < (TBK * J + NTH - 1) / NTH; ++rep) {
@@ -164,11 +162,20 @@ __device__ __forceinline__ void stage_w(int8_t* sa, const int8_t* __restrict__ W
         int const k = t / J;
         int const j = t % J;
         int const gk = k0 + k;
-        int const gn4 = n0 + j * 4;
+        int const gn4 = mt0 + j * 4;
         unsigned v = 0;
-        // 尾块（N 不是 BM 的整数倍）补零：补零不改变结果，越界读才会。
-        if (gk < K && gn4 + 3 < N)
-            v = *reinterpret_cast<const unsigned*>(W + (size_t)gk * N + gn4);
+        if (gk < K && gn4 < m_end) {
+            const int8_t* p = at + (size_t)gk * (size_t)rows + gn4;
+            if (((reinterpret_cast<uintptr_t>(p) & 3u) == 0u) && (gn4 + 3 < m_end)) {
+                v = *reinterpret_cast<const unsigned*>(p);
+            } else {
+                const unsigned b0 = (unsigned)(uint8_t)p[0];
+                const unsigned b1 = (gn4 + 1 < m_end) ? (unsigned)(uint8_t)p[1] : 0u;
+                const unsigned b2 = (gn4 + 2 < m_end) ? (unsigned)(uint8_t)p[2] : 0u;
+                const unsigned b3 = (gn4 + 3 < m_end) ? (unsigned)(uint8_t)p[3] : 0u;
+                v = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+            }
+        }
         int const w = j >> 4;
         int const n4 = (j & 15) * 4;
         *reinterpret_cast<unsigned*>(sa + w * (TBK / 16) * 1024 + (k >> 4) * 1024
@@ -299,7 +306,7 @@ __device__ __forceinline__ void store_epi_rows(const v4i32* acc, XT* __restrict_
 // @param xs       ``[rows]`` 逐行激活 scale。
 // @param ws       ``[E, N]`` 逐 (专家, 列) 权重 scale。
 // @param offsets  ``[E+1]`` 每专家行区间。
-template <typename XT>
+template <typename XT, int TBN = MI8_BN>
 __global__ void moe_grouped_i8_tcu_kernel(const int8_t* __restrict__ at, int rows,
                                           const int8_t* __restrict__ wstack,
                                           XT* __restrict__ out,
@@ -308,7 +315,7 @@ __global__ void moe_grouped_i8_tcu_kernel(const int8_t* __restrict__ at, int row
                                           const int* __restrict__ offsets,
                                           int K, int N) {
     constexpr int WRt = MI8_BM / 64;
-    constexpr int WCt = MI8_BN / 64;
+    constexpr int WCt = TBN / 64;
     constexpr int NTH = WRt * WCt * 64;
     constexpr int SAt = WRt * (MI8_BK / 16) * 1024;
     constexpr int SBt = WCt * (MI8_BK / 16) * 1024;
@@ -322,9 +329,9 @@ __global__ void moe_grouped_i8_tcu_kernel(const int8_t* __restrict__ at, int row
     int const wn = warp % WCt;   // 沿 MMA-N（列）
     int const e = blockIdx.y;
     const int r0 = offsets[e];
-    const int r1 = offsets[e + 1];
+    const int r1 = min(offsets[e + 1], rows);
     if (r0 >= r1) return;
-    const int n0 = blockIdx.x * MI8_BN;
+    const int n0 = blockIdx.x * TBN;
     const int8_t* wbase = wstack + (size_t)e * (size_t)N * (size_t)K;
     // 逐 (专家, 列) 的 scale：内层的 n 是列号，专家偏移必须在这里落一次，否则每个专家
     // 都会用第 0 个专家的列 scale（小形状单专家时看不出，真实 256 专家时全错）。
@@ -337,19 +344,19 @@ __global__ void moe_grouped_i8_tcu_kernel(const int8_t* __restrict__ at, int row
         for (int i = 0; i < 16; ++i) {
             acc[i].x = 0; acc[i].y = 0; acc[i].z = 0; acc[i].w = 0;
         }
-        // mat-a = 激活 ``[K, rows]``：固定 k 的 4 个相邻行连续，一次全局读对一次共享写。
-        stage_w<MI8_BK, MI8_BM, NTH>(sa, at, mt0, 0, rows, K, tid);
+        // mat-a = 激活 ``[K, rows]``：支持任意对齐与段尾补零。
+        stage_at<MI8_BK, MI8_BM, NTH>(sa, at, mt0, r1, rows, 0, K, tid);
         // mat-b = 权重 nk ``[N, K]``：固定 n 的 4 个相邻 k 连续。
-        stage_act<MI8_BK, MI8_BN, NTH>(sb, wbase, n0, 0, N, K, tid);
+        stage_act<MI8_BK, TBN, NTH>(sb, wbase, n0, 0, N, K, tid);
         __syncthreads();
 
         for (int kb = 0; kb < nk; ++kb) {
             int const cur = kb & 1;
             if (kb + 1 < nk) {
-                stage_w<MI8_BK, MI8_BM, NTH>(sa + (cur ^ 1) * SAt, at, mt0,
-                                             (kb + 1) * MI8_BK, rows, K, tid);
-                stage_act<MI8_BK, MI8_BN, NTH>(sb + (cur ^ 1) * SBt, wbase, n0,
-                                               (kb + 1) * MI8_BK, N, K, tid);
+                stage_at<MI8_BK, MI8_BM, NTH>(sa + (cur ^ 1) * SAt, at, mt0, r1, rows,
+                                              (kb + 1) * MI8_BK, K, tid);
+                stage_act<MI8_BK, TBN, NTH>(sb + (cur ^ 1) * SBt, wbase, n0,
+                                            (kb + 1) * MI8_BK, N, K, tid);
             }
             const int8_t* wa = sa + cur * SAt + wm * (MI8_BK / 16) * 1024;
             const int8_t* wb = sb + cur * SBt + wn * (MI8_BK / 16) * 1024;
@@ -364,8 +371,7 @@ __global__ void moe_grouped_i8_tcu_kernel(const int8_t* __restrict__ at, int row
             }
             __syncthreads();
         }
-        store_epi_rows<XT>(acc, out, xs, ws_for_e, mt0 + 64 * wm, n0 + 64 * wn,
-                           min(r1, rows), N);
+        store_epi_rows<XT>(acc, out, xs, ws_for_e, mt0 + 64 * wm, n0 + 64 * wn, r1, N);
     }
 }
 

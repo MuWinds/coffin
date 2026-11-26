@@ -110,6 +110,93 @@ class ParallelContext:
                     os.environ.get("COFFIN_EP_SHM", "/dev/shm/coffin_ep.bin"),
                     int(os.environ.get("COFFIN_EP_SLOT_BYTES", str(64 << 20))))
 
+    def init_p2p(self, hidden: int, rows: int | None = None) -> None:
+        """在 CUDA 设备就绪后按模型 ``hidden`` 初始化四卡设备侧 P2P 归约器。
+
+        TP4 下若走 CPU Gloo，每层 2~3 次全归约会产生 80~120 次 D2H+同步+TCP+H2D
+        （单步 55~60 ms）；启用设备侧 IPC all-to-all 后主机零同步，单次 ~20-30 us。
+        ``COFFIN_TP_COLLECTIVE=gloo`` 可显式关闭以回退 CPU Gloo。
+
+        Args:
+            hidden: 模型隐藏宽度。
+            rows: 槽区最大行数；``None`` 读取 ``COFFIN_TP_ROWS`` 或默认 2048。
+        """
+        if self._p2p is not None or self.mode != "tp":
+            return
+        kind = os.environ.get("COFFIN_TP_COLLECTIVE", "auto").strip()
+        if kind not in {"auto", "p2p", "gloo"}:
+            raise ValueError(
+                f"COFFIN_TP_COLLECTIVE must be auto / p2p / gloo, got {kind!r}")
+        if kind == "gloo" or self.world_size != 4:
+            return
+        max_rows = int(rows if rows is not None else os.environ.get("COFFIN_TP_ROWS", "2048"))
+        try:
+            # 预先装载所有 CoreX ABI 库与 cuBLAS 句柄并做一次 barrier：避免四个 rank
+            # 在首轮 prefill 才抢编译锁，导致先到的 rank 在第 1 轮 P2P 自旋超时。
+            import backends.corex as _corex
+
+            for _fn in (_corex._gemm_ops, _corex._w8a8_ops, _corex._gemv_ops,
+                        _corex._norm_ops, _corex._conv_ops, _corex._attn_ops,
+                        _corex._solve_ops, _corex._moe_ops):
+                _fn()
+            dist.barrier()
+
+            from models.qwen35.ep import P2pReduce
+
+            p2p = P2pReduce(self.rank, self.world_size, max_rows, int(hidden))
+            # 启动自检：同时验单块（decode）与多块（prefill）两轮归约，并把双缓冲
+            # 奇偶半区都预热一遍；任一卡拓扑不通或结果不对立刻暴露在装载期。
+            probe_val = float(self.rank + 1)
+            expect = float(self.world_size * (self.world_size + 1) // 2)
+            p1 = torch.full((1, int(hidden)), probe_val, dtype=torch.bfloat16, device="cuda")
+            o1 = p2p.all_reduce_sum(p1)
+            p2 = torch.full((min(64, max_rows), int(hidden)), probe_val,
+                            dtype=torch.bfloat16, device="cuda")
+            o2 = p2p.all_reduce_sum(p2)
+            torch.cuda.synchronize()
+            ab = p2p.abort_round()
+            err1 = float((o1.float() - expect).abs().max())
+            err2 = float((o2.float() - expect).abs().max())
+            if ab != 0 or err1 > 1e-2 or err2 > 1e-2:
+                p2p.close()
+                raise RuntimeError(
+                    f"p2p startup self-test failed (abort={ab} err1={err1:.3e} err2={err2:.3e})")
+            dist.barrier()
+            self._p2p = p2p
+        except Exception as exc:                              # noqa: BLE001
+            if kind == "p2p":
+                raise
+            if self.rank == 0:
+                print(f"[tp] p2p combine unavailable ({type(exc).__name__}: "
+                      f"{str(exc)[:160]}); falling back to gloo", flush=True)
+            return
+        if self.rank == 0:
+            print(f"[tp] p2p combine ready: world={self.world_size} rows={max_rows} "
+                  f"hidden={hidden} (double-buffered bf16 IPC, self-test ok)",
+                  flush=True)
+
+    def reduce_sum(self, tensor: torch.Tensor,
+                   add: torch.Tensor | None = None) -> torch.Tensor:
+        """跨 rank 求和（可选先加同形本地张量 ``add``），优先走设备侧 P2P。
+
+        Args:
+            tensor: 本 rank 的贡献，bf16 或其他浮点张量。
+            add: 可选本地加数（如 TP MoE 合并 ``experts + shared``），非空时在写对端槽
+                之前完成相加，省去一次独立 kernel 发射。
+
+        Returns:
+            与 ``tensor`` 同形状、同 dtype、同设备的跨 rank 求和结果。
+        """
+        p2p = self._p2p
+        if (p2p is not None and tensor.is_cuda and tensor.dtype == torch.bfloat16
+                and int(tensor.shape[-1]) == p2p.hidden):
+            rows = 1 if tensor.dim() == 1 else int(tensor.shape[0])
+            if rows <= p2p.rows:
+                self.sum_calls += 1
+                return p2p.all_reduce_sum(tensor, add=add)
+        src = tensor if add is None else (tensor + add.reshape(tensor.shape))
+        return self.reduce(src.float()).to(tensor.dtype)
+
     def reduce(self, tensor: torch.Tensor, *, maximum: bool = False) -> torch.Tensor:
         """在 CPU 上以 fp32 做全归约，回传本 rank 当前流。
 
@@ -752,7 +839,7 @@ def shard_weight(key: str, value, cfg: dict, rank: int, world_size: int):
     if isinstance(value, QWeight):
         shape = (value.n, value.k)
     elif isinstance(value, QWeightMoE):
-        shape = value.wq.shape[-2:]
+        shape = value.nk_stack().shape[-2:]
     else:
         shape = value.shape
     if ".linear_attn." in key and key.endswith("in_proj_qkv.weight"):
@@ -1002,6 +1089,8 @@ def load_weights(model_dir: str | Path, device: torch.device,
                 else:
                     value = value.to(device)
                 sd[key] = value
+    if parallel.mode == "tp" and device.type == "cuda":
+        parallel.init_p2p(int(cfg["hidden_size"]))
     return sd
 
 
@@ -1028,8 +1117,8 @@ class RowParallelProjection:
         self.proj, self.w, self.N, self.K = projection, projection.w, projection.N, projection.K
         self.parallel = parallel
 
-    def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        """切出本 rank 的 K 段、算局部点积，跨 rank 以 fp32 求和后窄化。"""
+    def _slice_k(self, x: torch.Tensor) -> torch.Tensor:
+        """核对形状并在收到全局宽度时切出本 rank 对应的 K 段。"""
         if x.dim() not in (1, 2):
             raise ValueError("row parallel activation shape mismatch")
         if x.shape[-1] != self.K:
@@ -1037,20 +1126,22 @@ class RowParallelProjection:
                 raise ValueError("row parallel input width does not match shard count")
             start = self.parallel.rank * self.K
             x = x[..., start:start + self.K].contiguous()
-        # 局部投影自己会量化激活（w8a8 内核按行 absmax），所以这里不需要、也不应该
-        # 再喂一个跨 rank 统一的 scale：每个 rank 的 K 段不同，统一 scale 只会把
-        # 量程压到最坏的那一段。部分和在 fp32 里相加后再窄化——bf16 加三个部分和
-        # 会在末位上丢有效位，而这是每层每个 token 都要走一次的地方。
-        partial = self.proj(x)
-        return self.parallel.reduce(partial.float()).to(x.dtype)
+        return x
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        """切出本 rank 的 K 段、算局部点积，跨 rank 以 fp32 求和后窄化。"""
+        partial = self.proj(self._slice_k(x))
+        return self.parallel.reduce_sum(partial)
 
     def linear_m(self, x: torch.Tensor) -> torch.Tensor:
-        """批处理（多行）沿用同一切分与归约契约。"""
-        return self.__call__(x)
+        """批处理（多行）走 ``proj.linear_m`` 再归约。"""
+        partial = self.proj.linear_m(self._slice_k(x))
+        return self.parallel.reduce_sum(partial)
 
     def prefill(self, x: torch.Tensor) -> torch.Tensor:
-        """预填充沿用同一切分与归约契约；分块由调用方决定。"""
-        return self.__call__(x)
+        """预填充走 ``proj.prefill``（大 M 走库 GEMM 而非逐 8 行 GEMV）再归约。"""
+        partial = self.proj.prefill(self._slice_k(x))
+        return self.parallel.reduce_sum(partial)
 
 
 def row_projection(projection):

@@ -27,29 +27,31 @@ __global__ void moe_dispatch_kernel(const IT* expert_idx, const int* local_table
                                     int* slot_of_pos, int* offsets, int* cursor,
                                     int slots, int local_experts, int num_experts,
                                     int top_k) {
-    // 只有前缀和那段需要 LDS：计数器留在全局（``offsets[e+1]``），游标留在调用方
-    // 常驻的 ``cursor`` 上。两张表加起来 2 KB 量级，一次搬进共享内存是为了让
-    // 「扫一遍 512 个桶」从全局内存变成 LDS。
+    // 计数器、前缀和、游标与块和全部留在 LDS 中，省掉阶段 1/2/4 的全局内存清零与全局
+    // 原子加，并把阶段 3 的串行 256 步扫描换成两级并行前缀和（每块 16 个桶）。
     extern __shared__ int lds[];
-    int* counts = lds;                    // [local_experts]，从 offset[e+1] 抄来
-    int* starts = counts + local_experts;    // [local_experts + 1]，前缀和
+    int* counts = lds;                                    // [local_experts]
+    int* starts = counts + local_experts;                 // [local_experts + 1]
+    int* lds_cursor = starts + local_experts + 1;         // [local_experts]
+    int* chunk_off = lds_cursor + local_experts;          // [(local_experts + 15) / 16]
 
     const int tid = threadIdx.x;
     const int nthreads = blockDim.x;
+    (void)cursor;
 
-    // 阶段 1：清计数与两个位置表。位置表必须整体清（含有效前缀之外的尾部），
+    // 阶段 1：清 LDS 计数/游标与全局位置表。位置表必须整体清（含有效前缀之外的尾部），
     // 理由见文件头。
-    for (int e = tid; e <= local_experts; e += nthreads) offsets[e] = 0;
-    for (int e = tid; e < local_experts; e += nthreads) cursor[e] = 0;
+    for (int e = tid; e < local_experts; e += nthreads) {
+        counts[e] = 0;
+        lds_cursor[e] = 0;
+    }
     for (int p = tid; p < slots; p += nthreads) {
         token_of_pos[p] = 0;
         slot_of_pos[p] = 0;
     }
     __syncthreads();
 
-    // 阶段 2：计数。桶号顺手留在 ``slot_pos[t]`` 上，阶段 4 再换成真实位置——
-    // 这样省掉一张 ``[slots]`` 的中间表，而 ``slot_pos[t]`` 的写者与读者是同一个
-    // 线程，所以这一张表不需要任何同步。
+    // 阶段 2：在 LDS 上并行计数。桶号顺手留在 ``slot_pos[t]`` 上，阶段 4 再换成真实位置。
     for (int t = tid; t < slots; t += nthreads) {
         const int g = static_cast<int>(expert_idx[t]);
         int e = -1;
@@ -61,35 +63,53 @@ __global__ void moe_dispatch_kernel(const IT* expert_idx, const int* local_table
             continue;
         }
         slot_pos[t] = e;                       // 暂时存桶号，阶段 4 换成位置
-        atomicAdd(&offsets[e + 1], 1);
+        atomicAdd(&counts[e], 1);
     }
     __syncthreads();
 
-    // 阶段 3：前缀和。把计数器并行抄进 LDS，再让一个线程串行扫——桶数只有 128/512，
-    // 扫完是微秒级；旧的写法是 tid 0 直接对全局内存读改写，那 512 次依赖全局延迟
-    // 的迭代本身就是几十微秒
-    for (int e = tid; e < local_experts; e += nthreads) counts[e] = offsets[e + 1];
+    // 阶段 3：两级并行前缀和（每段 16 桶）。256 桶只需 16 线程并行各扫 16 项 +
+    // tid 0 扫 16 个段和 + 16 线程并行回写，深度从 256 降到 48 且无全局往返。
+    constexpr int CHUNK = 16;
+    const int nchunks = (local_experts + CHUNK - 1) / CHUNK;
+    for (int c = tid; c < nchunks; c += nthreads) {
+        const int b0 = c * CHUNK;
+        const int b1 = b0 + CHUNK < local_experts ? b0 + CHUNK : local_experts;
+        int sum = 0;
+        for (int e = b0; e < b1; ++e) sum += counts[e];
+        chunk_off[c] = sum;
+    }
     __syncthreads();
     if (tid == 0) {
         int running = 0;
-        for (int e = 0; e < local_experts; ++e) {
-            starts[e] = running;
-            running += counts[e];
+        for (int c = 0; c < nchunks; ++c) {
+            const int v = chunk_off[c];
+            chunk_off[c] = running;
+            running += v;
         }
         starts[local_experts] = running;
+        offsets[local_experts] = running;
     }
     __syncthreads();
-    for (int e = tid; e <= local_experts; e += nthreads) offsets[e] = starts[e];
+    for (int c = tid; c < nchunks; c += nthreads) {
+        const int b0 = c * CHUNK;
+        const int b1 = b0 + CHUNK < local_experts ? b0 + CHUNK : local_experts;
+        int running = chunk_off[c];
+        for (int e = b0; e < b1; ++e) {
+            starts[e] = running;
+            offsets[e] = running;
+            running += counts[e];
+        }
+    }
+    __syncthreads();
 
-    // 阶段 4：并行分配位置。
+    // 阶段 4：利用 LDS 游标并行分配位置。
     //
-    // 每一行的位置由原子递增决定，所以段内排列不确定
-    // 允许这样做的依据是合并侧按槽位号定序求和，不读排列本身；而如果哪天有人把合并
-    // 改回 ``index_add_``，这里就会立刻变成不可复现
+    // 每一行的位置由原子递增决定，所以段内排列不确定；合并侧按槽位号定序求和，
+    // 不读排列本身。
     for (int t = tid; t < slots; t += nthreads) {
         const int e = slot_pos[t];
         if (e < 0) continue;
-        const int pos = starts[e] + atomicAdd(&cursor[e], 1);
+        const int pos = starts[e] + atomicAdd(&lds_cursor[e], 1);
         token_of_pos[pos] = t / top_k;
         slot_of_pos[pos] = t;
         slot_pos[t] = pos;

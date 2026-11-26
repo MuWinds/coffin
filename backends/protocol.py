@@ -240,6 +240,10 @@ class Ops:
     #: 「固定 n 的 4 个相邻 k 连续」正好是 mat-b 要的字，一次转置都不做（激活另摆一份
     #: k 主序副本的代价由后端自己承担）。``None`` 表示后端没有这一形态。
     moe_grouped_i8_tcu: OpFn | None = None
+    #: ``moe_gather_sum(hid, slot_pos, weights, tokens, top_k, out=None) -> out``：
+    #: 预填充 MoE 收尾融合——按槽位表收集 ``hid``、乘路由权重并在 fp32 中定序累加到
+    #: ``[tokens, hidden]``，省掉 ``[tokens, top_k, hidden]`` 中间张量与四次小核发射。
+    moe_gather_sum: OpFn | None = None
     #: ``moe_dispatch(expert_idx, local_table, slots, local_experts, num_experts,
     #: top_k) -> (offsets, slot_pos, token_of_pos)``：一次内核算出分组要的前缀和与行序。
     #:

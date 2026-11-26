@@ -193,8 +193,14 @@ void launch_rows(const float* q, const float* k, const float* v, const float* be
     // 本部件每个在飞的 block 只跑得动约 3 GB/s（见下面 ``launch_rows`` 的注释），而解码期
     // 一行只有 ``heads`` = 32 个块。所以真正要加的是**块数**：把值轴切成 4 段后
     // 网格变成 (32, 4) = 128 个块，共享里那份 q/k 副本因此被读 4 遍——每份 2 KB，可以忽略。
-    const int ncol = dv < THREADS / DELTA_WAY ? dv : THREADS / DELTA_WAY;
-    const int blocks_y = (dv + ncol - 1) / ncol;
+    int ncol = dv < THREADS / DELTA_WAY ? dv : THREADS / DELTA_WAY;
+    int blocks_y = (dv + ncol - 1) / ncol;
+    // TP4 下每卡只有 8 个头（EP4 为 32 个），单行解码仅 8x4=32 块，喂不饱 16 SM；
+    // 在保持至少 64 线程（一个完整 wavefront）的前提下拆细列块，把总块数抬到 >=64。
+    while ((int64_t)heads * blocks_y * rows < 64 && ncol >= 16 && (ncol % 2 == 0)) {
+        ncol /= 2;
+        blocks_y = (dv + ncol - 1) / ncol;
+    }
     const int threads = ncol * DELTA_WAY;
     const size_t smem = (size_t)(2 * dk + DELTA_WAY * dv) * sizeof(float);
     delta_kernel<DELTA_WAY><<<dim3(heads, blocks_y, rows), threads, smem, stream>>>(

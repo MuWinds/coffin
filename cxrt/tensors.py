@@ -87,6 +87,11 @@ def is_array(t: TensorLike) -> bool:
     return isinstance(t, Array)
 
 
+#: dtype 对象（``torch.dtype`` / ``np.dtype`` / ``DType``）到 ABI 整数码的缓存，
+#: 避免热路径上每次 ``code_of`` 都走 ``str(dtype).rsplit``。
+_DTYPE_OBJ_CACHE: dict[Any, int] = {}
+
+
 def code_of(t_or_dtype: TensorLike | DType | Any) -> int:
     """把 dtype（或一个张量的 dtype）映射成 ABI 整数码。
 
@@ -101,16 +106,25 @@ def code_of(t_or_dtype: TensorLike | DType | Any) -> int:
         ShapeError: 名字认不出来。抛而不是回退到 fp32：静默回退会把「传错了
             dtype」变成一次数值漂移，而且只在那条形状上出现。
     """
-    if isinstance(t_or_dtype, DType):
-        return t_or_dtype.code
     dtype = getattr(t_or_dtype, "dtype", t_or_dtype)
+    try:
+        cached = _DTYPE_OBJ_CACHE.get(dtype)
+        if cached is not None:
+            return cached
+    except TypeError:
+        cached = None
     if isinstance(dtype, DType):
+        _DTYPE_OBJ_CACHE[dtype] = dtype.code
         return dtype.code
     name = str(dtype)
     suffix = name.rsplit(".", 1)[-1]
     code = _SUFFIX_CODES.get(suffix)
     if code is None:
         raise ShapeError(f"unknown dtype {name!r}; add it to cxrt.tensors._SUFFIX_CODES")
+    try:
+        _DTYPE_OBJ_CACHE[dtype] = code
+    except TypeError:
+        pass
     return code
 
 

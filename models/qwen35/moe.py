@@ -50,31 +50,19 @@ _GEMM_ROWS = 64
 
 #: 「按专家跨行」预填充核的启用门限（激活行数）。低于它时每专家只有一两行，跨行复用
 #: 换不到东西，逐行核（块与行一一对应）反而更省地址运算；高于它时权重按行重读的放大
-#: 已经超过一切固定成本——512 token 的预填充块 = 4096 行、每专家 16 行，就是 16 倍的
-#: 权重流量。256 行（32 token）是两种几何的交叉点。
-_EXPERT_ROW_MIN = 256
+#: 已经超过一切固定成本。
+_EXPERT_ROW_MIN = 64
 
-#: 「按专家跨行」核每步沿 K 走 32 条通道 x 16 字节 = 512，所以两个投影的 K 必须是它的整数倍
-#: （本族 2048 / 512）。不满足时不接这个入口，回到逐行核——那条路对任意 K 都成立。
-_EXPERT_K_ALIGN = 512
+#: 分组张量核（``moe_grouped_i8_tcu``）的启用门限（激活行数）。``stage_at`` 已支持任意
+#: 偏移与非 4 倍数段长（段尾补零），因此不再需要按 4 对齐校验或 D2H 同步；高于此门限时
+#: 张量核的 19.2 TMAC/s 远胜 dp4a 的 0.96 TMAC/s。
+_TCU_ROW_MIN = int(os.environ.get("COFFIN_MOE_TCU_MIN_ROWS", "256") or "256")
 
-#: 张量核版的专家核按 64 行 / 64 k 分片，所以只要求 K 是 64 的整数倍（比 dp4a 版宽松）。
+#: 「按专家跨行」核支持 K 为 512 倍数（16B 宽步）与 128 倍数（4B 窄步，覆盖 TP4 down K=128）。
+_EXPERT_K_ALIGN = 128
+
+#: 张量核版的专家核按 32 k 分片（前端校验 64 对齐），TP4 down K=128 与 gate_up K=2048 均满足。
 _EXPERT_TCU_ALIGN = 64
-
-#: 张量核版**每专家**至少要的行数。少于此值它的 64 行 tile 末端没有零填充，垃圾行会
-#: 被 mma 算进有效行（``tools/probe_corex_moe_i8.py`` 实测每专家 1/2/3 行时 rel_rms
-#: 0.86/0.72/0.86，4 行起才回到 0.0087）。后端包装层会抛 ``ValueError``，这里提前按
-#: 行数预算判掉，免得把一条能走 dp4a 的请求打成 500。
-_EXPERT_TCU_MIN_ROWS = 4
-
-#: 张量核版还要求**每一段**（每专家分到的行数）是 4 的倍数，否则整段产出全零。
-#: 实测见 ``tools/probe_corex_moe_i8_geom.py``（E/N/K 全一致，只改段长）：
-#: 段长全为 4 的倍数时 rel_rms 0.0088；只要有一段是 3 或 5 行，整次调用 rel_rms
-#: **1.0**（输出全零）。原因是它的激活分片以「同一 k 上 4 个相邻行」为一个字搬运，
-#: 段首/段尾不落在 4 的边界上时这个字既读不到有效行、也回写不到正确行。
-#: 真实路由的段长不可能天然对齐，所以这里按段长**逐段**判（一次 D2H 取值），
-#: 不满足就退回 dp4a。``COFFIN_MOE_I8_TCU=0`` 可整条关掉。
-_EXPERT_TCU_ROW_GRAN = 4
 
 
 def _fuse_experts(sd: dict, p: str, num_experts: int):
@@ -210,12 +198,16 @@ class SparseMoE:
         self.hidden = int(cfg["hidden_size"])
         self.inter = int(cfg["moe_intermediate_size"])
 
+        self.parallel = parallel_context()
+        #: 是不是张量并行。TP 下共享专家的门标量在各卡完全一致，所以 ``shared_down`` 保持
+        #: 本地部分和，与路由专家的部分和相加后再做**一次**全归约（每层 3 次 → 2 次）。
+        self._is_tp = self.parallel is not None and self.parallel.mode == "tp"
         # 路由矩阵保持稠密：它决定选哪 8 个专家，4-bit 噪声会翻转选择。
         self.router = GEMV(sd[f"{p}.gate.weight"], bench)
         self.shared_gate_up = _proj(
             sd, [f"{p}.shared_expert.gate_proj", f"{p}.shared_expert.up_proj"], bench)
-        self.shared_down = row_projection(
-            _proj(sd, [f"{p}.shared_expert.down_proj"], bench))
+        shared_down = _proj(sd, [f"{p}.shared_expert.down_proj"], bench)
+        self.shared_down = shared_down if self._is_tp else row_projection(shared_down)
         # 共享专家门是 [1, hidden] 的逐 token 标量，不走 GEMV：本卡的一行内核按列块
         # 组织，N=1 这种宽度没有保证；而它只有 4 KB 权重，一次 matmul 的代价可以忽略。
         self.shared_gate_w = sd[f"{p}.shared_expert_gate.weight"]
@@ -225,7 +217,6 @@ class SparseMoE:
 
         self.gate_up, self.down = _fuse_experts(sd, p, self.num_experts)
 
-        self.parallel = parallel_context()
         #: 本 rank 的专家数。单卡 / ``pp`` / ``tp`` 下等于全局值；``ep`` 下是
         #: 专家栈的首轴（加载器读盘时就裁好了），不能拿 ``cfg`` 的全局值去覆盖它。
         self.local_experts = self.num_experts
@@ -234,7 +225,8 @@ class SparseMoE:
         self._is_ep = self.parallel is not None and self.parallel.mode == "ep"
         if self._is_ep:
             begin, end = self.parallel.expert_range(self.num_experts)
-            stacked = getattr(self.gate_up, "wq", self.gate_up)
+            stacked = (self.gate_up.nk_stack()
+                       if isinstance(self.gate_up, QWeightMoE) else self.gate_up)
             self.local_experts = int(stacked.shape[0])
             if self.local_experts != end - begin:
                 raise ValueError(
@@ -299,6 +291,8 @@ class SparseMoE:
                             if ("silu_mul_quant" in native
                                 and isinstance(self.gate_up, QWeightMoE))
                             else None)
+        self._gather_sum = (getattr(bops, "moe_gather_sum", None)
+                            if "moe_gather_sum" in native else None)
         #: 多流那一路的复用缓冲：``(rows, width, dtype, device)`` → 张量。三块分别是
         #: gate/up 的输出、激活乘积、以及归并核的 ``[tokens, H]`` 目的地。按层复用，
         #: 因为它们只在层内活，而每层新建等于每步白付 120 次分配。
@@ -308,7 +302,8 @@ class SparseMoE:
         #: decode 单行的整块驱动。它只省 pybind 编组与 Python 包装（约 4 us/次 x 17 次），
         #: 分配与发射照付，所以上限是个位数百分比；``COFFIN_LAYER_DRIVER=1`` 才启用，
         #: 便于同二进制 A/B。
-        self._block_driver = getattr(bops, "moe_decode_block", None)
+        self._block_driver = (getattr(bops, "moe_decode_block", None)
+                              if "moe_decode_block" in native else None)
         # 专家并行下这条也开着：`moe_block.cu` 现在从映射表的宽度取**全局**专家数
         # （分派内核的边界检查要用它），并把「不属于本 rank 的槽位」的逐行权重在设备上
         # 清零。这两条不加就是「首 token 正确、其后逐 token 变胡话」。
@@ -317,8 +312,10 @@ class SparseMoE:
         #: 句柄入口（``moe_decode_prepare`` / ``moe_decode_run``）。装载时把 26 个常量
         #: 编组一次，解码步里每次只传 ``(handle, x)``——省的是 pybind 的逐参转换，
         #: 与算术无关，所以数值与 30 参那条路逐位相同。缺任一个就退回老形态。
-        self._block_prepare = getattr(bops, "moe_decode_prepare", None)
-        self._block_run = getattr(bops, "moe_decode_run", None)
+        self._block_prepare = (getattr(bops, "moe_decode_prepare", None)
+                               if "moe_decode_prepare" in native else None)
+        self._block_run = (getattr(bops, "moe_decode_run", None)
+                           if "moe_decode_run" in native else None)
         if self._block_prepare is None or self._block_run is None:
             self._block_run = None
         self._block_handle = 0
@@ -326,8 +323,10 @@ class SparseMoE:
         #: `add_residual`（79 次）、`moe_decode_run`（40 次）、`all_reduce_sum`（40 次）
         #: 合计约 13.5 ms，而它们的内核时间只有 8 / 73 / 20 us——大头是每层的
         #: **四次 Python→C 往返与适配器准备**。并成一次就是一层省三次往返。
-        self._layer_prepare = getattr(bops, "moe_layer_prepare", None)
-        self._layer_run = getattr(bops, "moe_layer_run", None)
+        self._layer_prepare = (getattr(bops, "moe_layer_prepare", None)
+                               if "moe_layer_prepare" in native else None)
+        self._layer_run = (getattr(bops, "moe_layer_run", None)
+                           if "moe_layer_run" in native else None)
         if self._layer_prepare is None or self._layer_run is None:
             self._layer_run = None
         self._layer_handle = 0
@@ -657,7 +656,14 @@ class SparseMoE:
         if shared.shape != flat.shape:
             shared = shared.reshape(flat.shape)
         with stages.span("moe.experts"):
-            out = self._experts(flat, index, weights) + shared
+            if self._is_tp:
+                # TP 下 shared_down 与专家 down 同为局部部分和、且门标量跨卡一致：
+                # 在 P2P 核内直接做 ``bf16(experts + shared)`` 并只做一次全归约，省掉
+                # 每层一次通信与一次独立加法发射。
+                local_exp = self._experts(flat, index, weights, do_reduce=False)
+                out = self._reduce(local_exp, x.dtype, add=shared)
+            else:
+                out = self._experts(flat, index, weights) + shared
         return out if out.shape == shape else out.reshape(shape)
 
     def _project(self, proj, x: torch.Tensor, kind: str):
@@ -736,87 +742,47 @@ class SparseMoE:
             self._gate_buf = buf = torch.empty_like(hidden)
         return self._gate_scale(x, self._gate_w32, hidden, buf)
 
-    @staticmethod
-    def _tcu_rows_aligned(offsets: torch.Tensor) -> bool:
-        """每专家的段长是否都是 ``_EXPERT_TCU_ROW_GRAN`` 的整数倍。
-
-        ``moe_grouped_i8_tcu`` 的激活分片以「同一 k 上 4 个相邻行」为一个字，段首/段尾
-        不落在 4 边界上时整次调用产出全零（实测 rel_rms 1.0）。真实路由的段长由
-        top-k 决定，无法天然对齐，所以这里必须逐段查。
-
-        代价是一次 D2H 取值（每层一次）。相对一次 2000 行预填充的几十毫秒可以忽略，
-        换来的是不会把「看着像话但数值全错」的 token 送出去。
-
-        Args:
-            offsets: ``[E + 1]`` int32 的每专家行区间。
-
-        Returns:
-            ``True`` 表示可以进张量核。
-        """
-        if offsets.numel() <= 1:
-            return True
-        seg = (offsets[1:] - offsets[:-1]) % _EXPERT_TCU_ROW_GRAN
-        return int(seg.abs().max().item()) == 0
-
     def _experts(self, x: torch.Tensor, index: torch.Tensor,
-                 weights: torch.Tensor) -> torch.Tensor:
+                 weights: torch.Tensor, *, do_reduce: bool = True) -> torch.Tensor:
         """按专家分组算路由部分，再对每个 token 的 top_k 项定序求和。
 
         Args:
             x: ``[tokens, H]``。
             index: ``[tokens, top_k]`` 的全局专家下标。
             weights: ``[tokens, top_k]`` 的路由权重。
+            do_reduce: 是否在本函数末尾做跨 rank 归约；TP 融合路径传 ``False``，
+                由上层把 ``experts`` 与 ``shared`` 合并成一次全归约。
 
         Returns:
             ``[tokens, H]``；不发生路由的 token 得到全零行。
         """
         tokens, top_k = index.shape
         flat_index = index.reshape(-1)
-        # 多行（prefill）也走分组内核。实测依据：M=512 时逐专家循环要 **173 ms/层**
-        # （256 个专家 × nonzero/index_select/两次 linear，一层上千次算子），占单层的 98%。
-        # 多行也走分组内核（实测 M=512 时 6.5x、M=128 时 9.2x）。曾经的「多行数值对不上」
-        # 查下去是 `pos = token * top_k + slot_of_pos` 把展平位置又叠了一次 token 号，与
-        # 内核无关；修完后对 fp32 基准是 1.9e-2（= A8 激活量化的固有误差，decode 那条路
-        # 一直就是这个口径）。``COFFIN_MOE_I8_GROUPED=0`` 可退回逐专家路径做对照。
         old_multi_row = (os.environ.get("COFFIN_MOE_I8_GROUPED") == "0"
                          and tokens > 1)
         grouped_i8 = None if old_multi_row else self._grouped_i8
         if (self.parallel is not None and self.parallel.mode == "ep"
                 and (self._dispatch is None or grouped_i8 is None)):
-            # 逐专家的兜底路径按**全局**专家号去索引专家栈，而这张卡只装了 1/world
-            # 那一段：形状照样合法，结果是错的行。宁可在这里响亮地失败。
             raise RuntimeError(
                 "expert parallel needs the native moe_dispatch and moe_grouped_i8 "
                 "kernels; the per-expert fallback would index a full-width stack "
                 "while this rank holds only its own slice")
         if self._dispatch is not None and grouped_i8 is not None:
-            # 第四、五个实参依次是**本 rank**的专家数与全局专家数：分派内核要按局部
-            # 桶数做前缀和，按全局数建表。ep 下两者差 world_size 倍，写反了不会报错，
-            # 只会把一半槽位塞进不存在的桶。
             offsets, slot_pos, token_of_pos, slot_of_pos = self._dispatch(
                 flat_index, self._expert_table(flat_index.device), flat_index.numel(),
                 self.local_experts, self.num_experts, top_k)
             rows = int(token_of_pos.numel())
-            # 预填充那一档（每专家十几行）换「按专家跨行」核：它把该专家的行一趟扫完，
-            # 权重每层每专家只读一遍。行数少（decode 的 1-2 行）时逐行核才是最优的。
-            # 张量核版还多一条**行数预算**：每专家不足 4 行时它的 tile 末尾没有零填充，
-            # 结果会被垃圾行污染（后端包装层会抛 ValueError）。这里按 ``rows`` 直接
-            # 预算掉，亏的只是这一批换 dp4a，不是整条请求失败。
+            # 张量核已支持任意段长与非 4 对齐偏移（``stage_at`` 内部段尾补零），
+            # 无需 D2H 查表即可在预填充段直接走 19.2 TMAC/s 的张量核；中小段走
+            # ``moe_grouped_i8_expert``（支持 K=128 与 K=2048）。
             tcu_ok = (self._grouped_i8_tcu is not None
                       and os.environ.get("COFFIN_MOE_I8_TCU") != "0"
-                      and rows >= _EXPERT_TCU_MIN_ROWS * self.local_experts
-                      and self._tcu_rows_aligned(offsets))
-            expert_rows = (rows >= _EXPERT_ROW_MIN
-                           and (tcu_ok or self._grouped_i8_expert is not None))
+                      and rows >= _TCU_ROW_MIN)
+            expert_rows = (tcu_ok or (rows >= _EXPERT_ROW_MIN
+                                      and self._grouped_i8_expert is not None))
             if ((grouped_i8 is not None or expert_rows) and self._gather_quant is not None
                     and self._silu_quant is not None
                     and (expert_rows or self._merge_tokens is not None)):
-                # 整条链上不再出现单独的量化发射：取行与量化合成一次、SwiGLU 乘积与
-                # 量化合成一次，两次分组投影直接吃 int8 激活。gate/up 的输出仍按 bf16
-                # 落盘（``silu_mul_quant`` 的 amax 就是按落盘的 bf16 算的），所以与
-                # 「index_select → quant_act → grouped → silu_mul → quant_act → grouped」
-                # 逐位相同；省下的是每层 5 次启动，以及 ``[rows, K]`` bf16 中间结果的
-                # 一写一读。
                 xq, xs = self._gather_quant(x, token_of_pos)
                 gu = self._act_buf(rows, 2 * self.inter, x.dtype, x.device)
                 grouped = ((self._grouped_i8_tcu if tcu_ok else self._grouped_i8_expert)
@@ -827,95 +793,44 @@ class SparseMoE:
                 act, aq, a_s = self._silu_quant(gate, up, act)
                 out = self._act_buf(tokens, self.hidden, x.dtype, x.device)
                 if expert_rows:
-                    # down 也走同一个核，收尾用一次 ``index_add_``：它搬的是
-                    # rows x H 的激活（16 MB），相对 down 那份 268 MB 的权重流量可以忽略。
-                    # ``merge_tokens`` 那条路是逐行分块核的收尾，吃不到这里的跨行复用。
                     hid = self._act_buf(rows, self.hidden, x.dtype, x.device)
                     grouped(self.down, aq, offsets, 0, a_s, hid)
-                    # 收尾按 token **收集**再归约，而不是 ``index_add_`` 散写。
-                    # 实测（2048 token 一块、每卡 rows=4096）那一对
-                    # ``hid * w`` + ``index_add_`` 在 20 层上是 167 ms：``indexFuncLargeIndex``
-                    # 走的是带原子加的散写，对 16 MB 的激活只有几十 GB/s，而这一步的总流量
-                    # 按带宽算只要几毫秒。``slot_pos`` 是 [tokens, top_k] 的行号，先
-                    # ``index_select`` 成 [tokens, top_k, H]（整行连续读）再在 k 上求和，
-                    # 两个方向都是稠密访存。
-                    sl = slot_pos.reshape(-1)
-                    if sl.numel() == rows:
-                        g = hid.index_select(0, sl).view(tokens, top_k, self.hidden)
-                        g.mul_(weights.reshape(tokens, top_k)[:, :, None])
-                        out.copy_(g.sum(1))
-                        return self._reduce(out, x.dtype)
-                    out.zero_()
-                    out.index_add_(0, token_of_pos.long(),
-                                   hid * weights.reshape(-1)[:, None])
-                    return self._reduce(out, x.dtype)
-                return self._reduce(
-                    self._merge_tokens(self.down, aq, offsets, weights.reshape(-1),
-                                       slot_pos, slot_of_pos, tokens, top_k,
-                                       scales=a_s, out=out),
-                    x.dtype)
-            # 收拢成「按专家排好序」的行，然后两次分组投影：gate/up 一次出中间量，
-            # 过 SwiGLU 之后再投一次 down。两次都必须用分组内核——按专家分组的意义
-            # 就是让每个专家 2 MB 的权重在一个解码步里只被读一遍。
-            # 位置表是 int32，``index_select`` 直接收。**但别为这个去掉 ``.long()``**：
-            # 实测每层少两次转换核（一步 80 次发射）端到端净变化为零（四档 +1.5/+1.6/-1.9/-2.3%），
-            # 说明单次发射的边际成本远低于 7.5 us —— CPU 时间花在 bops 包装与模型侧 Python glue，
-            # 不在发射本身。要省就得整条链一起换成一个内核（见 ``shared_gate_scale``）。
+                    if self._gather_sum is not None:
+                        self._gather_sum(hid, slot_pos, weights, tokens, top_k, out=out)
+                    else:
+                        sl = slot_pos.reshape(-1)
+                        if sl.numel() == rows:
+                            g = hid.index_select(0, sl).view(tokens, top_k, self.hidden)
+                            g.mul_(weights.reshape(tokens, top_k)[:, :, None])
+                            out.copy_(g.sum(1))
+                        else:
+                            out.zero_()
+                            out.index_add_(0, token_of_pos.long(),
+                                           hid * weights.reshape(-1)[:, None])
+                    return self._reduce(out, x.dtype) if do_reduce else out
+                merged = self._merge_tokens(self.down, aq, offsets, weights.reshape(-1),
+                                            slot_pos, slot_of_pos, tokens, top_k,
+                                            scales=a_s, out=out)
+                return self._reduce(merged, x.dtype) if do_reduce else merged
             packed = x.index_select(0, token_of_pos.long())
             gate, up = self._group(self.gate_up, packed, offsets).chunk(2, dim=-1)
             activated = bops.silu_mul(gate, up, up)
             if self._merge_tokens is not None:
-                # 收尾整段并进归并核：路由权重按槽位号在核里取（省一次
-                # ``index_select`` 与一次 fp32 转换）、专家并行的有效行掩码按
-                # ``offsets[E]`` 在设备上判（省 ``arange``/``lt``/``to``/``mul`` 四次）、
-                # 多流的累加直接在核里写成 ``[tokens, H]``（省 ``zero_``/``mul``/
-                # ``index_add_`` 与两次 ``.long()``）。单流与多流都走这一个入口。
-                return self._reduce(
-                    self._merge_tokens(self.down, activated, offsets,
-                                       weights.reshape(-1), slot_pos, slot_of_pos,
-                                       tokens, top_k),
-                    x.dtype)
-            # ``slot_of_pos`` 是**展平后的**槽位号（``token * top_k + slot``），不是槽位内的
-            # 0..top_k-1 —— 实测 tokens=8、slots=64 时它的取值范围是 0..63。所以逐行权重
-            # 和回写位置用的都是它本身；再叠一次 ``token * top_k`` 会让下标飞出缓冲区
-            # （decode 时 token 恒为 0，两种写法重合，这正是只有多行才炸的原因）。
+                merged = self._merge_tokens(self.down, activated, offsets,
+                                            weights.reshape(-1), slot_pos, slot_of_pos,
+                                            tokens, top_k)
+                return self._reduce(merged, x.dtype) if do_reduce else merged
             pos = slot_of_pos.long()
             flat_weights = weights.reshape(-1).index_select(0, pos)
             if self.local_experts != self.num_experts:
-                # 专家并行下 ``[valid, slots)`` 这些行不属于本 rank：分派内核不把它们
-                # 排进行序（尾部位置表清 0），但分组内核仍然按 ``slots`` 行算了它们，
-                # 于是它们带着**真实的投影值**落到槽位 0 上——恒等映射时这批行不存在，
-                # 所以这个清零只在 ep 下需要，而漏掉它会让每条 token 多算 6 个假专家，
-                # 输出从第二个 token 起就变成胡话（实测：首 token 正常，其后全乱）。
-                #
-                # 掩码用 ``arange < offsets[-1]`` 而不是 ``offsets[-1].item()``：后者是
-                # 一次 D2H 同步，qwen4exp 在 decode 上量到每层一次同步会把 EP4 拖慢
-                # 11.7%（主机预取被打断），而这里整个比较都留在设备上。
                 keep = (torch.arange(pos.numel(), dtype=torch.int32, device=pos.device)
                         < offsets[-1])
                 flat_weights = flat_weights * keep.to(flat_weights.dtype)
             if self._grouped_i8_merge is not None and tokens == 1:
-                # down 的输出对单条解码来说要的就是 top_k 行加权之和，让归约核顺手做完：
-                # 省掉 [top_k, H] 的激活、一次 mul、一次 index_add_ 和一次 sum（实测
-                # 0.184 ms，比 down 的投影本身 0.059 ms 还贵）。
-                return self._reduce(
-                    self._grouped_i8_merge(self.down, activated, offsets, flat_weights),
-                    x.dtype)
+                merged = self._grouped_i8_merge(self.down, activated, offsets, flat_weights)
+                return self._reduce(merged, x.dtype) if do_reduce else merged
             hidden = self._group(self.down, activated, offsets)
             if os.environ.get("COFFIN_MOE_TAIL_FAST", "1") != "0":
-                # 多行解码的收尾：直接把 64 行按**token** 累加到 ``[tokens, H]``，而不是
-                # 先落到 ``[tokens*top_k, H]`` 再 ``view(...).sum(1)``。
-                #
-                # 省掉的是两个内核：``aten::sum`` 与 ``reduce_kernel``，稳态实测各
-                # 38 µs/层（= 1.54 ms/step 各）。它们只搬 32 KB，38 µs 全是小 grid 的
-                # 固定成本（折算 0.86 GB/s），纯属发射与并行度浪费。换成同一个
-                # ``index_add_`` 里的 8 路原子加之后，40 层一共少 80 次发射、
-                # 少 3.1 ms/step，缓冲也从 256 KB 缩到 32 KB。
-                #
-                # 数值：8 路原子加与原来「先散写 64 行、再按 top_k 归约」是同一个加法的
-                # 不同结合顺序，bf16 下都可能差末位；这条路径本来就走 ``index_add_``
-                # （见本文件开头的定序说明），所以口径没有变化。
-                # ``COFFIN_MOE_TAIL_FAST=0`` 可回到旧写法做 A/B。
                 n = tokens
                 buf = self._tail_buf
                 if (buf is None or buf.shape[0] != n or buf.shape[1] != self.hidden
@@ -924,15 +839,14 @@ class SparseMoE:
                         (n, self.hidden), dtype=x.dtype, device=x.device)
                 buf.zero_()
                 buf.index_add_(0, token_of_pos.long(), hidden * flat_weights[:, None])
-                return self._reduce(buf, x.dtype)
-            # 分派内核把有效行紧密排在前缀里、尾部清 0，所以尾部那几个位置会带着
-            # 全零贡献落到槽位 0 上——加法里加 0 不改值，写法比切片简单且不需要同步。
+                return self._reduce(buf, x.dtype) if do_reduce else buf
             buf = torch.zeros((tokens * top_k, self.hidden),
                               dtype=x.dtype, device=x.device)
             buf.index_add_(0, pos, hidden * flat_weights[:, None])
-            return self._reduce(buf.view(tokens, top_k, self.hidden).sum(dim=1), x.dtype)
-        return self._reduce(
-            self._experts_dense(x, index, weights, tokens, top_k), x.dtype)
+            res = buf.view(tokens, top_k, self.hidden).sum(dim=1)
+            return self._reduce(res, x.dtype) if do_reduce else res
+        res = self._experts_dense(x, index, weights, tokens, top_k)
+        return self._reduce(res, x.dtype) if do_reduce else res
 
     def _act_buf(self, rows: int, width: int, dtype: torch.dtype,
                  device: torch.device) -> torch.Tensor:
@@ -956,29 +870,35 @@ class SparseMoE:
                                                    device=device)
         return buf
 
-    def _reduce(self, value: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    def _reduce(self, value: torch.Tensor, dtype: torch.dtype,
+                add: torch.Tensor | None = None) -> torch.Tensor:
         """把各 rank 的部分和加起来；单卡 / 流水并行直接返回。
 
         两种并行都只算出部分和，所以这一步不是可选的优化：漏掉它得到的是安静的错误。
 
-        * ``tp``：专家的 ``down`` 按 K（中间宽度）分片，每卡算的是一段 K 的部分和，
-          走 Gloo 的 fp32 全归约。
-        * ``ep``：每卡只算自己那 1/world 专家的槽位，未命中的槽位是零行，走同机
-          共享内存求和（40 层一步一次，1.3 ms；同一条路走 gloo 是 14-20 ms）。
+        * ``tp``：专家的 ``down`` 按 K（中间宽度）分片，每卡算的是一段 K 的部分和；
+          优先走设备侧 P2P 归约（支持融合加本地 ``add``），不可用时退回 Gloo。
+        * ``ep``：每卡只算自己那 1/world 专家的槽位，未命中的槽位是零行，走设备侧
+          P2P 或同机共享内存求和。
 
         Args:
             value: 本 rank 的浮点结果。
             dtype: 返回的 dtype，与激活一致。
+            add: 可选本地加数（TP 下合并 ``shared`` 时传入）。
 
         Returns:
             ``value``（单卡 / 流水）或跨 rank 求和后窄化回 ``dtype`` 的结果。
         """
         if self.parallel is None or self.parallel.mode not in {"tp", "ep"}:
-            return value
+            return value if add is None else (value + add)
         if self.parallel.mode == "tp":
-            return self.parallel.reduce(value).to(dtype)
+            out = self.parallel.reduce_sum(value, add=add)
+            return out if out.dtype == dtype else out.to(dtype)
         # 流水并行里专家是完整的，再加一次全归约等于把结果乘上世界大小。
-        return self.parallel.combine(value).to(dtype)
+        out = self.parallel.combine(value)
+        if add is not None:
+            out = out + add
+        return out if out.dtype == dtype else out.to(dtype)
 
     def _group(self, stack, x: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
         """用分组内核按专家投影一整栈 int8 权重。

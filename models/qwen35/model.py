@@ -551,7 +551,11 @@ class Qwen35:
             x, carry = layer.step(x, ctx, carry)
         self.pos1.add_(1)
         if self.pipe is None:
-            self.logits_single.copy_(self.lm_head(self.norm(x + carry)))
+            if x.dtype == self.norm.g.dtype and carry.dtype == self.norm.g.dtype:
+                h_out = self.norm.add_residual(x, carry, carry)
+            else:
+                h_out = self.norm(x + carry)
+            self.logits_single.copy_(self.lm_head(h_out))
             return
         # 段间只传激活：中间段把 hidden 交给下一段，末段把 logits 送回 rank 0。
         # 末段必须在这里早退，否则它会去等一个永远不会来的回包。

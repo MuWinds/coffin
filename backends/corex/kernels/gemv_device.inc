@@ -593,12 +593,64 @@ __global__ void gemv_nk_dense_kernel(const XT* __restrict__ wtn,
     float acc[M];
 #pragma unroll
     for (int m = 0; m < M; ++m) acc[m] = 0.f;
-    for (int k = lane; k < K; k += 32) {
-        const float wv = CxScalar<XT>::to_float(row[k]);
+    // 4 元素向量化路径（bf16 每 lane 8 字节、每组 256 字节连续读，比逐元素 2 字节读少 4 倍发射）；
+    // 不满足 4 倍数或 8 字节对齐时退回标量循环，保证任意形状与切片都正确。
+    const bool vec4 = (K % 4 == 0) &&
+        ((reinterpret_cast<uintptr_t>(row) & 7u) == 0) &&
+        ((reinterpret_cast<uintptr_t>(x) & 7u) == 0);
+    if (vec4) {
+        const int step = 32 * 4;
+        const int steps = K / step;
+        int s = 0;
+        for (; s + 4 <= steps; s += 4) {
 #pragma unroll
-        for (int m = 0; m < M; ++m) {
-            acc[m] = fmaf(wv, CxScalar<XT>::to_float(x[(size_t)(m < rows ? m : 0) * K + k]),
-                          acc[m]);
+            for (int u = 0; u < 4; ++u) {
+                const int off = (s + u) * step + lane * 4;
+                alignas(8) XT w4[4];
+                NkLoad<XT>::four(row + off, w4);
+#pragma unroll
+                for (int m = 0; m < M; ++m) {
+                    alignas(8) XT x4[4];
+                    NkLoad<XT>::four(x + (size_t)(m < rows ? m : 0) * K + off, x4);
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        acc[m] = fmaf(CxScalar<XT>::to_float(w4[i]),
+                                      CxScalar<XT>::to_float(x4[i]), acc[m]);
+                    }
+                }
+            }
+        }
+        for (; s < steps; ++s) {
+            const int off = s * step + lane * 4;
+            alignas(8) XT w4[4];
+            NkLoad<XT>::four(row + off, w4);
+#pragma unroll
+            for (int m = 0; m < M; ++m) {
+                alignas(8) XT x4[4];
+                NkLoad<XT>::four(x + (size_t)(m < rows ? m : 0) * K + off, x4);
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    acc[m] = fmaf(CxScalar<XT>::to_float(w4[i]),
+                                  CxScalar<XT>::to_float(x4[i]), acc[m]);
+                }
+            }
+        }
+        for (int k = steps * step + lane; k < K; k += 32) {
+            const float wv = CxScalar<XT>::to_float(row[k]);
+#pragma unroll
+            for (int m = 0; m < M; ++m) {
+                acc[m] = fmaf(wv, CxScalar<XT>::to_float(x[(size_t)(m < rows ? m : 0) * K + k]),
+                              acc[m]);
+            }
+        }
+    } else {
+        for (int k = lane; k < K; k += 32) {
+            const float wv = CxScalar<XT>::to_float(row[k]);
+#pragma unroll
+            for (int m = 0; m < M; ++m) {
+                acc[m] = fmaf(wv, CxScalar<XT>::to_float(x[(size_t)(m < rows ? m : 0) * K + k]),
+                              acc[m]);
+            }
         }
     }
 #pragma unroll

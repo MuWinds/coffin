@@ -89,22 +89,29 @@ struct Geom {
     int per;
 };
 
-// @brief 按 ``(K, N, rows, slices)`` 定块几何；与原来的主机包装逐字同一套。
-Geom geometry(int k, int n, int rows, int slices) {
-    const int vb = (k % I8_NK_WIDE_BYTES == 0 && k <= I8_NK_WIDE_K) ? I8_NK_WIDE_BYTES : 4;
-    const int wcol = (vb == I8_NK_WIDE_BYTES && k < I8_NK_SHALLOW_K) ? I8_NK_WCOL_SHALLOW : 1;
+// @brief 按 ``(K, N, rows, slices, single)`` 定块几何。
+//
+// TP4 下 down 投影的 ``K = 128``：原来套 16 字节宽步（``STEPK = 512``）配 2 片
+// （``per = 64``），导致主循环 0 次、直接掉进 16 通道半空尾循环且白做双分片；
+// 这里在 ``K == 128``（或 ``K < 512``）上改用 4 字节步（``STEPK = 128``、32 通道满载、
+// ``WCOL = 4``），且单 token 归并（``mcnt`` 非空）走 ``span = 1`` 省一半块发射与部分和读取。
+Geom geometry(int k, int n, int rows, int slices, bool single) {
+    const bool wide = (k % I8_NK_WIDE_BYTES == 0 && k >= 512 && k <= I8_NK_WIDE_K);
+    const int vb = wide ? I8_NK_WIDE_BYTES : 4;
+    const int wcol = (k < I8_NK_SHALLOW_K && k % 128 == 0) ? I8_NK_WCOL_SHALLOW : 1;
     const int warps = (k < I8_NK_SHALLOW_K) ? I8_NK_WARPS_SHALLOW : I8_NK_WARPS;
     Geom g{};
     g.vb = vb;
     g.wcol = wcol;
     g.warps = warps;
-    g.cols = (vb == I8_NK_WIDE_BYTES) ? (n + warps * wcol - 1) / (warps * wcol)
-                                     : (n + I8_COLS - 1) / I8_COLS;
+    g.cols = (n + warps * wcol - 1) / (warps * wcol);
     g.cols_tail = (n + I8_COLS - 1) / I8_COLS;
-    // 自动值固定 2：1 片时主体核会把结果直接写成单行，归并仍要多一趟读改写；而按
-    // 「K 装得下一轮宽步就取 1 片」试过，实测文本退化（见原主机包装的注释）。
     int span = slices;
-    if (span <= 0) span = 2;
+    if (span <= 0) {
+        // 单 token 时 ``mcnt`` 非空，``span == 1`` 仍写 ``part`` 并就地做完末块收尾；
+        // 多行时 ``mcnt == nullptr``，必须保持 ``span >= 2`` 让主体核写 ``part``。
+        span = (single && (k == 128 || k == 512)) ? 1 : 2;
+    }
     if (span > I8_MAX_SLICES) span = I8_MAX_SLICES;
     if (span > k) span = k;
     if (span < 1) span = 1;
@@ -113,22 +120,38 @@ Geom geometry(int k, int n, int rows, int slices) {
     return g;
 }
 
-// @brief 主体核的三种模板档：宽步 + 一 warp 多列 / 宽步 + 一列 / 4 字节步。
+// @brief 主体核的模板派发：含 ``K = 128`` / ``K = 512`` 编译期特化。
 template <typename XT>
 void launch_main(const Geom& g, const int8_t* a, const int8_t* w, const float* ws,
                  const float* xs, const int* off, int32_t* part, int* mcnt, const void* rw,
                  const int* slot_of_pos, int rw16, XT* dst, int k, int n, int experts, int rows,
                  cudaStream_t s) {
     const dim3 grid((unsigned)g.cols, (unsigned)rows, (unsigned)g.span);
-    const dim3 block((unsigned)(g.vb == I8_NK_WIDE_BYTES ? g.warps * 32 : I8_COLS));
+    const dim3 block((unsigned)(g.warps * 32));
     const size_t smem = (size_t)k * sizeof(int8_t);
     if (g.vb == I8_NK_WIDE_BYTES) {
         if (g.wcol > 1) {
-            moe_grouped_i8_nk_kernel<XT, I8_NK_WIDE_BYTES, I8_NK_WCOL_SHALLOW>
+            if (k == 512 && g.span == 1) {
+                moe_grouped_i8_nk_kernel<XT, I8_NK_WIDE_BYTES, I8_NK_WCOL_SHALLOW, 512>
+                    <<<grid, block, smem, s>>>(a, w, ws, xs, off, part, mcnt, rw, slot_of_pos,
+                                               rw16, dst, k, n, experts, rows, g.span, g.per);
+            } else {
+                moe_grouped_i8_nk_kernel<XT, I8_NK_WIDE_BYTES, I8_NK_WCOL_SHALLOW>
+                    <<<grid, block, smem, s>>>(a, w, ws, xs, off, part, mcnt, rw, slot_of_pos,
+                                               rw16, dst, k, n, experts, rows, g.span, g.per);
+            }
+        } else {
+            moe_grouped_i8_nk_kernel<XT, I8_NK_WIDE_BYTES, 1>
+                <<<grid, block, smem, s>>>(a, w, ws, xs, off, part, mcnt, rw, slot_of_pos, rw16,
+                                           dst, k, n, experts, rows, g.span, g.per);
+        }
+    } else if (g.wcol > 1) {
+        if (k == 128 && g.span == 1) {
+            moe_grouped_i8_nk_kernel<XT, 4, I8_NK_WCOL_SHALLOW, 128>
                 <<<grid, block, smem, s>>>(a, w, ws, xs, off, part, mcnt, rw, slot_of_pos, rw16,
                                            dst, k, n, experts, rows, g.span, g.per);
         } else {
-            moe_grouped_i8_nk_kernel<XT, I8_NK_WIDE_BYTES, 1>
+            moe_grouped_i8_nk_kernel<XT, 4, I8_NK_WCOL_SHALLOW>
                 <<<grid, block, smem, s>>>(a, w, ws, xs, off, part, mcnt, rw, slot_of_pos, rw16,
                                            dst, k, n, experts, rows, g.span, g.per);
         }
@@ -177,7 +200,7 @@ extern "C" int coffin_moe_grouped_i8_merge(const void* a, const void* xs, const 
                         experts);
     }
 
-    const Geom g = geometry(k, n, rows, slices);
+    const Geom g = geometry(k, n, rows, slices, true);
     const cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess) return cx::fail(e, "cannot read the current device");
@@ -252,14 +275,14 @@ extern "C" int coffin_moe_grouped_i8_merge_tokens(
         return cx::fail(e, "%d activation rows do not split into %d x %d", rows, tokens, top_k);
     }
 
-    const Geom g = geometry(k, n, rows, slices);
+    const bool single = tokens == 1;
+    const Geom g = geometry(k, n, rows, slices, single);
     const cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess) return cx::fail(e, "cannot read the current device");
     int32_t* part = reinterpret_cast<int32_t*>(
         part_buffer(dev, (size_t)g.span * rows * n * sizeof(int32_t), s));
     if (part == nullptr) return cx::fail(e, "cannot allocate the split-K partial buffer");
-    const bool single = tokens == 1;
     int* mcnt = single ? counter_buffer(dev, g.cols) : nullptr;
     if (single && mcnt == nullptr) return cx::fail(e, "cannot allocate the arrival counters");
 

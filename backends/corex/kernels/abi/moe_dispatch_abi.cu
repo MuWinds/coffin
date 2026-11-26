@@ -79,7 +79,8 @@ int check_dispatch(const cx::Tensor& idx, const cx::Tensor& table, const cx::Ten
         return cx::fail(err, "expert_idx must hold %d slots, got %lld", slots,
                         (long long)(idx.rows * idx.cols));
     }
-    const int64_t smem = (2 * (int64_t)local_experts + 1) * (int64_t)sizeof(int);
+    const int64_t nchunks = ((int64_t)local_experts + 15) / 16;
+    const int64_t smem = (3 * (int64_t)local_experts + 1 + nchunks) * (int64_t)sizeof(int);
     if (smem > 48 * 1024) {
         return cx::fail(err, "dispatch needs %lld bytes of dynamic shared memory (> 48 KB "
                              "without extra attributes); local_experts=%d",
@@ -131,7 +132,8 @@ extern "C" int coffin_moe_dispatch(const void* expert_idx, const void* local_tab
     if (slots == 0) return cx::finish(e);
 
     const cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
-    const int64_t smem = (2 * (int64_t)local_experts + 1) * (int64_t)sizeof(int);
+    const int64_t nchunks = ((int64_t)local_experts + 15) / 16;
+    const int64_t smem = (3 * (int64_t)local_experts + 1 + nchunks) * (int64_t)sizeof(int);
     // 线程数按槽位数分两档：decode 只有 10 个槽位，开 512 个线程纯属浪费发射；
     // prefill 512 token 有 5120 个，每线程 10 个比 20 个少一半循环。
     const int threads = (slots >= 1024) ? 512 : 256;

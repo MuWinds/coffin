@@ -85,18 +85,21 @@ class RMSNorm:
             x = x.to(D)
             xf = _rows(x)
             return bops.rms_norm(xf, self.g, xf.stride(0), 1e-6).view(x.shape)
-        # 缓存键必须带上形状和步长。只按 ``id(x)`` 判会错：预填充阶段各层拿到的
-        # 是同一块 ``[M, hidden]`` 缓冲的不同视图，``id`` 可能相同而行数不同，于是
-        # 解码步缓存的「一行」被拿去喂 ``M = 32`` 的调用——内核只覆盖了第一行，
-        # ``.view(x.shape)`` 直接抛 ``shape '[32, 2560]' is invalid for input of
-        # size 2560``（图捕获阶段的崩溃就是这个）。形状静态时签名不变，缓存照样命中。
-        sig = (id(x), x.shape, x.stride())
-        if getattr(self, "_call_sig", None) != sig:
-            # 解码步里同一块激活会被逐 token 反复归一化：``_rows`` 与 ``stride`` 的
-            # 结果只取决于这块缓冲本身，缓存下来即可，形状仍从 ``x`` 现取。
-            self._call_sig = sig
-            self._call_xf = _rows(x)
-        xf = self._call_xf
+        if x.dim() == 2 and x.stride(-1) == 1:
+            return bops.rms_norm(x, self.g, x.stride(0), 1e-6)
+        # 缓存键必须用 ``data_ptr`` 而非 ``id(x)``：一维解码张量 ``x`` 被
+        # ``_rows`` 转成二维视图 ``xf`` 后，原 Python 包装对象不再被引用，下一
+        # token 释放并复用同一个 ``id(x)`` 时会误命中上一 token 的旧缓冲。
+        # 只有 ``xf`` 与 ``x`` 共享底层存储（零拷贝视图）时才缓存，由 ``_call_xf``
+        # 持有存储引用以防止分配器在缓存有效期内复用同一 ``data_ptr``。
+        sig = (x.data_ptr(), x.shape, x.stride())
+        if getattr(self, "_call_sig", None) == sig:
+            xf = self._call_xf
+        else:
+            xf = _rows(x)
+            if xf.data_ptr() == x.data_ptr():
+                self._call_sig = sig
+                self._call_xf = xf
         return bops.rms_norm(xf, self.g, xf.stride(0), 1e-6).view(x.shape)
 
     def add_residual(self, x: torch.Tensor, add: torch.Tensor,
@@ -130,28 +133,43 @@ class RMSNorm:
             ValueError: ``out`` 不稠密，或者 ``out`` 就是 ``x``。前者会写进一个
                 副本——结果无声丢失；后者会覆盖残差。
         """
-        key = (id(x), id(add), id(out))
-        if getattr(self, "_fast_key", None) != key:
-            # 校验与视图构造只在**换了一组缓冲**时做一次。解码步上这三个位置每层
-            # 每 token 完全相同，而这段校验要付四次 ``_rows``、两次 dtype 比较和
-            # 三次 ``data_ptr``——单次约 20 µs，一层两次，40 层就是 1.6 ms/步。
-            if x.dtype != D or out.dtype != D:
-                raise TypeError(f"add_residual accumulates {D} in place and writes {D}; "
-                                f"got x={x.dtype}, out={out.dtype}")
-            # 不稠密的 ``out`` 会被 reshape 成副本，内核写进副本，调用方拿到的是没变的
-            # ``out``，而且不报错。这是本次调用里唯一没法在下游被发现的布局错误。
-            if out.stride(-1) != 1 or _rows(out).data_ptr() != out.data_ptr():
-                raise ValueError("add_residual needs a dense destination; "
-                                 f"got strides {tuple(out.stride())}")
-            if out is x or out.data_ptr() == x.data_ptr():
-                raise ValueError("add_residual cannot write over the residual it "
-                                 "accumulates: the sum is still needed")
-            if add.dtype != D:
-                add = add.to(D)
-            xf = _rows(x)
+        # 与 ``__call__`` 相同，必须按底层地址、形状与步长做键，且仅在三者均为
+        # bf16 零拷贝视图时缓存；否则上一 token 回收的一维包装对象会复用 ``id``，
+        # 让本步读写到上一 token 已失效的残差缓冲。
+        if x.dtype == D and add.dtype == D and out.dtype == D:
+            key = (
+                x.data_ptr(), add.data_ptr(), out.data_ptr(),
+                x.shape, x.stride(), add.shape, add.stride(),
+                out.shape, out.stride(),
+            )
+            if getattr(self, "_fast_key", None) == key:
+                xf, af, of, stride = self._fast_val
+                bops.add_rms_norm(xf, af, self.g, of, stride, 1e-6)
+                return out
+        else:
+            key = None
+
+        if x.dtype != D or out.dtype != D:
+            raise TypeError(f"add_residual accumulates {D} in place and writes {D}; "
+                            f"got x={x.dtype}, out={out.dtype}")
+        # 不稠密的 ``out`` 会被 reshape 成副本，内核写进副本，调用方拿到的是没变的
+        # ``out``，而且不报错。这是本次调用里唯一没法在下游被发现的布局错误。
+        of = _rows(out)
+        if out.stride(-1) != 1 or of.data_ptr() != out.data_ptr():
+            raise ValueError("add_residual needs a dense destination; "
+                             f"got strides {tuple(out.stride())}")
+        if out is x or out.data_ptr() == x.data_ptr():
+            raise ValueError("add_residual cannot write over the residual it "
+                             "accumulates: the sum is still needed")
+        add_bf16 = add if add.dtype == D else add.to(D)
+        xf = _rows(x)
+        af = _rows(add_bf16)
+        stride = xf.stride(0)
+        if (key is not None
+                and xf.data_ptr() == x.data_ptr()
+                and af.data_ptr() == add.data_ptr()):
             self._fast_key = key
-            self._fast_val = (xf, _rows(add), _rows(out), xf.stride(0))
-        xf, af, of, stride = self._fast_val
+            self._fast_val = (xf, af, of, stride)
         bops.add_rms_norm(xf, af, self.g, of, stride, 1e-6)
         return out
 

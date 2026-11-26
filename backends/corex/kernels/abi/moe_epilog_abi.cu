@@ -119,3 +119,92 @@ extern "C" int coffin_shared_gate_scale(const void* x, const void* w, const void
     }
     return cx::finish(e);
 }
+
+namespace {
+
+// @brief 按槽位表把专家投影结果加权归并到 ``[tokens, hidden]``，一次启动。
+//
+// 替代 ``hid.index_select(0, slot_pos).view(tokens, top_k, H) * weights -> sum(1) -> copy_``：
+// 2048 token 预填充下省掉 64 MiB 中间张量与 4 次发射，且用 fp32 按固定槽位序累加。
+template <typename XT, typename WT>
+__global__ void moe_gather_sum_kernel(const XT* __restrict__ hid,
+                                      const int* __restrict__ slot_pos,
+                                      const WT* __restrict__ rw,
+                                      XT* __restrict__ out,
+                                      int tokens, int top_k, int hidden, int rows) {
+    const int col = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int tok = (int)blockIdx.y;
+    if (col >= hidden || tok >= tokens) return;
+    const int base = tok * top_k;
+    float acc = 0.f;
+    for (int j = 0; j < top_k; ++j) {
+        const int r = slot_pos[base + j];
+        if (r < 0 || r >= rows) continue;
+        acc += CxScalar<XT>::to_float(hid[(size_t)r * (size_t)hidden + col])
+               * CxScalar<WT>::to_float(rw[base + j]);
+    }
+    out[(size_t)tok * (size_t)hidden + col] = CxScalar<XT>::from_float(acc);
+}
+
+}  // namespace
+
+// @brief 预填充 MoE 收尾融合：按槽位收集、乘路由权重、fp32 累加写回 ``out``。
+//
+// @param hid ``[rows, hidden]`` 专家 down 投影结果，bf16 或 fp32。
+// @param slot_pos ``[tokens * top_k]`` int32，槽位到收拢行号，无效槽位为 ``-1``。
+// @param rw ``[tokens * top_k]`` 路由权重，bf16 或 fp32。
+// @param out ``[tokens, hidden]`` 目的地，dtype 与 ``hid`` 一致。
+// @param out_code ``hid`` / ``out`` 的 dtype 码。
+// @param rw_code ``rw`` 的 dtype 码。
+// @param tokens token 数。
+// @param top_k 每 token 激活专家数。
+// @param hidden 隐藏宽度。
+// @param rows ``hid`` 的行数。
+// @param stream 目标流；空指针表示默认流。
+// @param err 错误缓冲，可为空。
+// @param errlen 错误缓冲字节数。
+// @return ``0`` 成功。
+extern "C" int coffin_moe_gather_sum(const void* hid, const void* slot_pos, const void* rw,
+                                     void* out, int out_code, int rw_code, int tokens, int top_k,
+                                     int hidden, int rows, void* stream, char* err, int errlen) {
+    const cx::Err e{err, errlen};
+    if (!hid || !slot_pos || !rw || !out) {
+        return cx::fail(e, "hid, slot_pos, rw and out must be non-null");
+    }
+    if ((out_code != cx::kBF16 && out_code != cx::kF32) ||
+        (rw_code != cx::kBF16 && rw_code != cx::kF32)) {
+        return cx::fail(e, "hid/out and rw must be bf16 or fp32, got %d/%d", out_code, rw_code);
+    }
+    if (tokens <= 0 || top_k <= 0 || hidden <= 0 || rows <= 0) {
+        return cx::fail(e, "tokens/top_k/hidden/rows must be positive, got %d/%d/%d/%d",
+                        tokens, top_k, hidden, rows);
+    }
+    const cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
+    constexpr int kThreads = 256;
+    const dim3 grid((unsigned)((hidden + kThreads - 1) / kThreads), (unsigned)tokens);
+    const int* sp = reinterpret_cast<const int*>(slot_pos);
+    if (out_code == cx::kBF16) {
+        if (rw_code == cx::kBF16) {
+            moe_gather_sum_kernel<uint16_t, uint16_t><<<grid, kThreads, 0, s>>>(
+                reinterpret_cast<const uint16_t*>(hid), sp,
+                reinterpret_cast<const uint16_t*>(rw), reinterpret_cast<uint16_t*>(out),
+                tokens, top_k, hidden, rows);
+        } else {
+            moe_gather_sum_kernel<uint16_t, float><<<grid, kThreads, 0, s>>>(
+                reinterpret_cast<const uint16_t*>(hid), sp,
+                reinterpret_cast<const float*>(rw), reinterpret_cast<uint16_t*>(out),
+                tokens, top_k, hidden, rows);
+        }
+    } else if (rw_code == cx::kBF16) {
+        moe_gather_sum_kernel<float, uint16_t><<<grid, kThreads, 0, s>>>(
+            reinterpret_cast<const float*>(hid), sp,
+            reinterpret_cast<const uint16_t*>(rw), reinterpret_cast<float*>(out),
+            tokens, top_k, hidden, rows);
+    } else {
+        moe_gather_sum_kernel<float, float><<<grid, kThreads, 0, s>>>(
+            reinterpret_cast<const float*>(hid), sp,
+            reinterpret_cast<const float*>(rw), reinterpret_cast<float*>(out),
+            tokens, top_k, hidden, rows);
+    }
+    return cx::finish(e);
+}
