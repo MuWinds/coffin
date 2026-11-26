@@ -254,6 +254,11 @@ class SparseMoE:
         self._grouped_i8 = (getattr(bops, "moe_grouped_i8", None)
                             if ("moe_grouped_i8" in native
                                 and isinstance(self.gate_up, QWeightMoE)) else None)
+        self._router_dispatch = (bops.moe_router_dispatch
+                                 if self._is_tp and self._grouped_i8 is not None
+                                 and self._dispatch is not None and "moe_router_dispatch" in native
+                                 else None)
+        self._route_buffers = None
         #: 预填充那一档的入口：按专家切块、把他的行一趟扫完，权重每层每专家只读一遍。
         #: 专家栈只有 nk 一种布局，所以这里不再按 ``layout`` 分叉。
         self._grouped_i8_expert = (getattr(bops, "moe_grouped_i8_expert", None)
@@ -647,7 +652,7 @@ class SparseMoE:
                                  else shared.reshape(out.shape))
                 return out if out.shape == shape else out.reshape(shape)
         with stages.span("moe.route"):
-            weights, index = self._route(x, kind)
+            weights, index, dispatch = self._route(x, kind)
         # 路由与分组按二维算（专家内核与 top-k 都只认二维），共享专家则保留原始
         # 维数交给投影：单条解码时 ``x`` 是一维，``GEMV`` 只在一维输入上给出
         # ``[N]``，扁平化会把它变成 ``GEMVGroup`` 不接受的 ``[1, N]``。
@@ -660,7 +665,7 @@ class SparseMoE:
                 # TP 下 shared_down 与专家 down 同为局部部分和、且门标量跨卡一致：
                 # 在 P2P 核内直接做 ``bf16(experts + shared)`` 并只做一次全归约，省掉
                 # 每层一次通信与一次独立加法发射。
-                local_exp = self._experts(flat, index, weights, do_reduce=False)
+                local_exp = self._experts(flat, index, weights, do_reduce=False, dispatch=dispatch)
                 out = self._reduce(local_exp, x.dtype, add=shared)
             else:
                 out = self._experts(flat, index, weights) + shared
@@ -701,18 +706,31 @@ class SparseMoE:
             kind: 调用形态，决定路由矩阵走哪一档投影。
 
         Returns:
-            ``(weights, index)``，形状同为 ``[tokens, top_k]``；下标是 int64。
+            权重、专家下标和可选的分派表。下标和权重形状均为 ``[tokens, top_k]``。
         """
         logits = self._project(self.router, x, kind)
         if logits.dim() == 1:
             logits = logits.unsqueeze(0)
+        if self._router_dispatch is not None and kind == "decode" and logits.shape[0] == 1:
+            buffers = self._route_buffers
+            if (buffers is None or buffers[1].dtype != logits.dtype
+                    or buffers[1].device != logits.device):
+                shape = (1, self.top_k)
+                sizes = (self.num_experts + 1, self.top_k, self.top_k, self.top_k)
+                index = torch.empty(shape, dtype=torch.int64, device=logits.device)
+                weights = torch.empty(shape, dtype=logits.dtype, device=logits.device)
+                layout = torch.empty(sum(sizes), dtype=torch.int32, device=logits.device)
+                self._route_buffers = buffers = (index, weights, layout, layout.split(sizes))
+            index, weights, layout, dispatch = buffers
+            self._router_dispatch(logits, index, weights, layout)
+            return weights, index, dispatch
         if self._router is not None:
             index, weights = self._router(logits, self.top_k, True)
-            return weights, index
+            return weights, index, None
         probs = torch.softmax(logits.float(), dim=-1)
         weights, index = torch.topk(probs, self.top_k, dim=-1)
         weights = weights / weights.sum(dim=-1, keepdim=True)
-        return weights.to(logits.dtype), index
+        return weights.to(logits.dtype), index, None
 
     def _shared(self, x: torch.Tensor, kind: str) -> torch.Tensor:
         """共享专家：``sigmoid(x @ W_gate) * down(silu(gate(x)) * up(x))``。
@@ -743,7 +761,7 @@ class SparseMoE:
         return self._gate_scale(x, self._gate_w32, hidden, buf)
 
     def _experts(self, x: torch.Tensor, index: torch.Tensor,
-                 weights: torch.Tensor, *, do_reduce: bool = True) -> torch.Tensor:
+                 weights: torch.Tensor, *, do_reduce: bool = True, dispatch=None) -> torch.Tensor:
         """按专家分组算路由部分，再对每个 token 的 top_k 项定序求和。
 
         Args:
@@ -752,12 +770,12 @@ class SparseMoE:
             weights: ``[tokens, top_k]`` 的路由权重。
             do_reduce: 是否在本函数末尾做跨 rank 归约；TP 融合路径传 ``False``，
                 由上层把 ``experts`` 与 ``shared`` 合并成一次全归约。
+            dispatch: 单 token 路由已算好的四张分派表。
 
         Returns:
             ``[tokens, H]``；不发生路由的 token 得到全零行。
         """
         tokens, top_k = index.shape
-        flat_index = index.reshape(-1)
         old_multi_row = (os.environ.get("COFFIN_MOE_I8_GROUPED") == "0"
                          and tokens > 1)
         grouped_i8 = None if old_multi_row else self._grouped_i8
@@ -768,9 +786,12 @@ class SparseMoE:
                 "kernels; the per-expert fallback would index a full-width stack "
                 "while this rank holds only its own slice")
         if self._dispatch is not None and grouped_i8 is not None:
-            offsets, slot_pos, token_of_pos, slot_of_pos = self._dispatch(
-                flat_index, self._expert_table(flat_index.device), flat_index.numel(),
-                self.local_experts, self.num_experts, top_k)
+            if dispatch is None:
+                flat_index = index.reshape(-1)
+                dispatch = self._dispatch(
+                    flat_index, self._expert_table(flat_index.device), flat_index.numel(),
+                    self.local_experts, self.num_experts, top_k)
+            offsets, slot_pos, token_of_pos, slot_of_pos = dispatch
             rows = int(token_of_pos.numel())
             # 张量核已支持任意段长与非 4 对齐偏移（``stage_at`` 内部段尾补零），
             # 无需 D2H 查表即可在预填充段直接走 19.2 TMAC/s 的张量核；中小段走

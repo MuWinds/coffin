@@ -47,6 +47,8 @@ class MoeShim:
             "coffin_moe_gather_sum", [p, p, p, p, i, i, i, i, i, i, p])
         self.moe_router = shim.export(
             "coffin_moe_router", [p, p, p, i, i, i, i, i, p])
+        self.moe_router_dispatch = shim.export(
+            "coffin_moe_router_dispatch", [p, p, p, p, i, i, i, p])
         self.moe_dispatch = shim.export(
             "coffin_moe_dispatch", [p, p, p, p, p, p, p, i, i, i, i, i, p])
         # 分组 int8 的「一个专家一趟」核：目的地 dtype 由调用方给（ABI 面没有 dtype 可读）。

@@ -54,10 +54,10 @@ constexpr float ROUTER_NEG = -3.0e38f;
 // @param n          专家数（512）。
 // @param top_k      每 token 取的专家数，不超过 32：每个 lane 只保存**自己那一槽**的结果。
 // @param normalize  是否把 top-k 概率再归一化（``norm_topk_prob``）。
-template <int ELEMS, typename XT>
+template <int ELEMS, typename XT, bool DISPATCH = false>
 __global__ void moe_router_t(const XT* __restrict__ logits, int64_t* __restrict__ out_idx,
                              XT* __restrict__ out_w, int tokens, int n, int top_k,
-                             int normalize) {
+                             int normalize, int* __restrict__ layout = nullptr) {
     const int lane = threadIdx.x % ROUTER_LANES;
     const int group = threadIdx.x / ROUTER_LANES;
     const int real = (int)(blockIdx.x * ROUTER_GROUPS + group);
@@ -144,6 +144,34 @@ __global__ void moe_router_t(const XT* __restrict__ logits, int64_t* __restrict_
         // 归一化路径用 top-k 自己的和；不归一化时权重就是概率 ``v / Σv``。
         const float w = normalize ? (mine_v / top_sum) : (mine_v / sum);
         out_w[at] = CxScalar<XT>::from_float(w);
+    }
+
+    if (DISPATCH) {
+        // 单 token 且各 rank 都持有全部专家时，每个入选专家只有一行。
+        // 专家 e 的起始行就是入选编号中小于 e 的个数，可在同一块内直接构造四张表。
+        __shared__ int selected[ROUTER_LANES];
+        const int tid = threadIdx.x;
+        if (tid < top_k) selected[tid] = mine_i;
+        __syncthreads();
+        for (int e = tid; e <= n; e += blockDim.x) {
+            int start = 0;
+            for (int j = 0; j < top_k; ++j) start += selected[j] < e;
+            layout[e] = start;
+        }
+        if (tid < top_k) {
+            int pos = 0, valid = 0;
+            for (int j = 0; j < top_k; ++j) {
+                pos += selected[j] < mine_i;
+                valid += selected[j] < n;
+            }
+            int* slot_pos = layout + n + 1;
+            int* token_of_pos = slot_pos + top_k;
+            int* slot_of_pos = token_of_pos + top_k;
+            slot_pos[tid] = mine_i < n ? pos : -1;
+            token_of_pos[tid] = 0;
+            if (mine_i < n) slot_of_pos[pos] = tid;
+            if (tid >= valid) slot_of_pos[tid] = 0;
+        }
     }
 }
 

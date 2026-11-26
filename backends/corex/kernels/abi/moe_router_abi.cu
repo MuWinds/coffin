@@ -89,9 +89,9 @@ int check_router(const cx::Tensor& logits, const cx::Tensor& idx, const cx::Tens
 // @param err 错误缓冲，可为空。
 // @param errlen 错误缓冲字节数。
 // @return ``0`` 成功。
-extern "C" int coffin_moe_router(const void* logits, void* out_idx, void* out_w, int tokens,
-                                 int experts, int top_k, int normalize, int code,
-                                 void* stream, char* err, int errlen) {
+static int run_router(const void* logits, void* out_idx, void* out_w, int* layout, int tokens,
+                      int experts, int top_k, int normalize, int code,
+                      void* stream, char* err, int errlen) {
     const cx::Err e{err, errlen};
     const cx::DType dt = (cx::DType)code;
     const cx::Tensor src = cx::Tensor::matrix(const_cast<void*>(logits), tokens, experts,
@@ -104,28 +104,47 @@ extern "C" int coffin_moe_router(const void* logits, void* out_idx, void* out_w,
     const cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
     const dim3 block(ROUTER_LANES * ROUTER_GROUPS);
     const dim3 grid((unsigned)((tokens + ROUTER_GROUPS - 1) / ROUTER_GROUPS));
-    const bool narrow = experts <= 16 * ROUTER_LANES;
     int64_t* idx_ptr = reinterpret_cast<int64_t*>(idx.data);
-    if (dt == cx::kBF16) {
-        const uint16_t* src_ptr = reinterpret_cast<const uint16_t*>(src.data);
-        uint16_t* w_ptr = reinterpret_cast<uint16_t*>(w.data);
-        if (narrow) {
-            moe_router_t<16, uint16_t><<<grid, block, 0, s>>>(
-                src_ptr, idx_ptr, w_ptr, tokens, experts, top_k, normalize ? 1 : 0);
+    auto launch = [&](auto tag) {
+        using XT = decltype(tag);
+        const XT* in = reinterpret_cast<const XT*>(src.data);
+        XT* weight = reinterpret_cast<XT*>(w.data);
+        if (layout) {
+            if (experts <= 8 * ROUTER_LANES) {
+                moe_router_t<8, XT, true><<<1, block, 0, s>>>(
+                    in, idx_ptr, weight, 1, experts, top_k, normalize, layout);
+            } else if (experts <= 16 * ROUTER_LANES) {
+                moe_router_t<16, XT, true><<<1, block, 0, s>>>(
+                    in, idx_ptr, weight, 1, experts, top_k, normalize, layout);
+            } else {
+                moe_router_t<32, XT, true><<<1, block, 0, s>>>(
+                    in, idx_ptr, weight, 1, experts, top_k, normalize, layout);
+            }
+        } else if (experts <= 16 * ROUTER_LANES) {
+            moe_router_t<16, XT><<<grid, block, 0, s>>>(
+                in, idx_ptr, weight, tokens, experts, top_k, normalize);
         } else {
-            moe_router_t<32, uint16_t><<<grid, block, 0, s>>>(
-                src_ptr, idx_ptr, w_ptr, tokens, experts, top_k, normalize ? 1 : 0);
+            moe_router_t<32, XT><<<grid, block, 0, s>>>(
+                in, idx_ptr, weight, tokens, experts, top_k, normalize);
         }
-    } else {
-        const float* src_ptr = reinterpret_cast<const float*>(src.data);
-        float* w_ptr = reinterpret_cast<float*>(w.data);
-        if (narrow) {
-            moe_router_t<16, float><<<grid, block, 0, s>>>(
-                src_ptr, idx_ptr, w_ptr, tokens, experts, top_k, normalize ? 1 : 0);
-        } else {
-            moe_router_t<32, float><<<grid, block, 0, s>>>(
-                src_ptr, idx_ptr, w_ptr, tokens, experts, top_k, normalize ? 1 : 0);
-        }
-    }
+    };
+    if (dt == cx::kBF16) launch(uint16_t{});
+    else launch(float{});
     return cx::finish(e);
+}
+
+extern "C" int coffin_moe_router(const void* logits, void* out_idx, void* out_w, int tokens,
+                                 int experts, int top_k, int normalize, int code,
+                                 void* stream, char* err, int errlen) {
+    return run_router(logits, out_idx, out_w, nullptr, tokens, experts, top_k, normalize,
+                      code, stream, err, errlen);
+}
+
+// @brief 单 token 路由并分派到完整专家表。layout 连续存放偏移及三张槽位表。
+extern "C" int coffin_moe_router_dispatch(const void* logits, void* out_idx, void* out_w,
+                                          int* layout, int experts, int top_k, int code,
+                                          void* stream, char* err, int errlen) {
+    if (!layout) return cx::fail(cx::Err{err, errlen}, "dispatch layout must be non-null");
+    return run_router(logits, out_idx, out_w, layout, 1, experts, top_k, 1, code,
+                      stream, err, errlen);
 }

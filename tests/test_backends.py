@@ -61,7 +61,7 @@ FP32_TOL = 1e-5
 #: ``qsa.py`` 的 ``attn_sparse`` / ``qsa_block_keys``），
 #: 所以参考后端答 ``None`` 在当前设计下是正确的。这是**临时桩**：参考实现补齐之后
 #: 删掉这个集合，下面两条 totality 断言就该重新覆盖整张算子表。
-_NATIVE_ONLY = frozenset({"moe_dispatch",
+_NATIVE_ONLY = frozenset({"moe_dispatch", "moe_router_dispatch",
                           "attn_sparse", "qsa_block_keys"})
 
 #: 参考后端今天必须答满的名字，按契约顺序。

@@ -266,6 +266,9 @@ class Ops:
     #: 契约要求与参考实现同语义：fp32 softmax（先减行内最大值）、按概率降序、等值取
     #: 小下标。``None`` 表示后端没有这个内核，模型侧走参考实现那条 torch 链。
     moe_router: OpFn | None = None
+    #: 单 token、全量专家表的归一化路由。下标和权重写入调用方的 [1, top_k] 缓冲，
+    #: layout 依次存放专家偏移及三张分派表，所需 int32 数量为 experts + 1 + 3 * top_k。
+    moe_router_dispatch: OpFn | None = None
     #: ``rms_norm(x, w, stride=0, eps=1e-6) -> y``：对 ``[M, N]`` 最后一轴做零中心
     #: RMSNorm（有效系数 ``1 + w``，由调用方折好）。``stride`` 是行与行之间的元素
     #: 间距，让指向更宽缓冲区的视图能原地归一化而不必拷贝；``0`` 表示「从 ``x`` 里

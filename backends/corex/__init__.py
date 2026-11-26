@@ -1544,6 +1544,29 @@ def moe_router(logits: torch.Tensor, top_k: int,
     return index, weight
 
 
+def moe_router_dispatch(logits: torch.Tensor, index: torch.Tensor,
+                        weight: torch.Tensor, layout: torch.Tensor) -> None:
+    """对一行 logits 做归一化路由，向调用方的连续缓冲写入下标、权重和四张分派表。"""
+    if logits.ndim != 2 or logits.shape[0] != 1:
+        raise ValueError("moe_router_dispatch expects logits shaped [1, experts]")
+    experts = logits.shape[1]
+    top_k = index.numel()
+    if not 0 < top_k <= min(experts, 32) or experts > 1024:
+        raise ValueError(f"invalid router geometry: experts={experts}, top_k={top_k}")
+    if logits.dtype not in (torch.bfloat16, torch.float32):
+        raise ValueError(f"router needs bf16 or fp32 logits, got {logits.dtype}")
+    if (index.shape != (1, top_k) or weight.shape != index.shape
+            or layout.shape != (experts + 1 + 3 * top_k,)
+            or index.dtype != torch.int64 or weight.dtype != logits.dtype
+            or layout.dtype != torch.int32):
+        raise ValueError("invalid router output shape or dtype")
+    if any(t.device != logits.device or not t.is_contiguous() for t in (index, weight, layout)):
+        raise ValueError("router outputs must be contiguous and on the logits device")
+    logits = logits.contiguous()
+    _moe_ops().shim.moe_router_dispatch(_ptr(logits), _ptr(index), _ptr(weight), _ptr(layout),
+                                        experts, top_k, _dcode(logits), _stream() or 0)
+
+
 def attn_sparse(q: torch.Tensor, kcache: torch.Tensor, vcache: torch.Tensor,
                 sel_idx: torch.Tensor, sel_len: torch.Tensor,
                 ctx: torch.Tensor, out: torch.Tensor | None = None,
